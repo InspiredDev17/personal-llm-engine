@@ -70,6 +70,24 @@ runtime directory. The socket path is a direct `.sock` child, length bounded,
 created mode 0600, and removed only when its device/inode still match the
 listener that created it. There is no TCP listener or network client.
 
+The Rust data plane is permanently offline; this is not a runtime option that
+a request, model, or operator flag can relax. Its exact dependency graph has no
+network client, and architecture tests reject Internet socket APIs, raw socket
+FFI, asynchronous networking modules, and process-spawning paths that could be
+used as indirect production egress. The approved transport module may use only
+Unix-domain stream primitives. Sanitized security events leave through that
+same authenticated local channel to Go; the engine has no cloud telemetry
+exporter.
+
+Code-level absence is one layer, not an operating-system sandbox. A production
+service definition must independently deny outbound networking while allowing
+the configured Unix socket and bounded local files. The target-specific
+service profile and an operated no-egress test are cutover evidence; they do
+not belong inside model data or backend selection. Go separately owns the
+platform-wide local-only routing decision and must reject remote primary,
+fallback, verifier, and manual-override destinations in that mode. ADR-0006
+records this split.
+
 Protocol v2 frames use a fixed 16-byte little-endian header, 8 MiB
 complete-frame cap, closed directional kinds, and message-specific bounds.
 Generation and cancellation commands use fixed schemas and strict Ed25519

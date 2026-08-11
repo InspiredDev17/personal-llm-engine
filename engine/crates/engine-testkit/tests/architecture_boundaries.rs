@@ -313,6 +313,9 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("Rust source must be readable");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .map_or(source.as_str(), |(production, _tests)| production);
         if canonical == approved_unix_lock {
             assert_eq!(
                 source.matches(unsafe_block_marker.as_str()).count(),
@@ -350,8 +353,48 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 path.display()
             );
         }
+        assert_no_outbound_or_process_egress(&source, production_source, &path);
     }
     assert!(collect_files(&root, "build.rs").is_empty());
+}
+
+fn assert_no_outbound_or_process_egress(source: &str, production_source: &str, path: &Path) {
+    let network_markers = [
+        ["Tcp", "Stream"].concat(),
+        ["Udp", "Socket"].concat(),
+        ["Socket", "Addr"].concat(),
+        ["To", "Socket", "Addrs"].concat(),
+        ["tokio::", "net"].concat(),
+        ["async_std::", "net"].concat(),
+        ["smol::", "net"].concat(),
+        ["mio::", "net"].concat(),
+        ["libc::", "socket"].concat(),
+        ["libc::", "connect"].concat(),
+        ["AF_", "INET"].concat(),
+        ["SOCK_", "RAW"].concat(),
+        ["SYS_", "socket"].concat(),
+    ];
+    for marker in &network_markers {
+        assert!(
+            !source.contains(marker),
+            "prohibited outbound egress marker {marker:?} found in {}",
+            path.display()
+        );
+    }
+
+    let process_markers = [
+        ["process::", "Command"].concat(),
+        ["Command", "::new"].concat(),
+        ["libc::", "exec"].concat(),
+        ["posix_", "spawn"].concat(),
+    ];
+    for marker in &process_markers {
+        assert!(
+            !production_source.contains(marker),
+            "prohibited production process egress marker {marker:?} found in {}",
+            path.display()
+        );
+    }
 }
 
 fn internal_dependencies(manifest: &str) -> BTreeSet<String> {

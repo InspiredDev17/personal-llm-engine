@@ -42,6 +42,7 @@ token data, generated text, and engine events are untrusted.
 | Secret leakage in errors/logs | bounded control-free diagnostics; static/sanitized error guidance; no host path/package/prompt in protocol failures | review daemon operational logging before release |
 | Cancellation failure | Go sends a higher-nonce signed same-stream cancellation before close; Rust watches concurrently; disconnect/malformed follow-up cancels fail-closed; CPU loop checks the request-local flag | multi-worker cancellation and long-running production-model latency qualification remain |
 | Dependency compromise | minimal exact lock, checked-in source-replacement vendor graph, SPDX checksums/licenses, exact boundary tests, no AI stack or build-time fetch | reproduce the release archive/offline build and renew advisory review for each release |
+| Prompt/event egress from Rust | permanent offline data-plane boundary; no network client dependency; architecture tests reject Internet sockets, raw socket FFI, async networking, subprocess egress, and cloud telemetry; authenticated UDS is the only communications path | production service definition must independently deny outbound networking and pass an operated no-egress test on each supported OS |
 | Unsafe/FFI memory error | unsafe is denied by default; one architecture-tested Unix module calls `flock` with a live owned descriptor, checks the result, exposes no raw descriptor/clone, and contains no pointer operation | independently review each target OS; isolate and document any future backend unsafe invariants separately |
 | Agent Green spoofing/control | engine has no Agent Green client/key; model cannot emit authoritative decision; Go maps allowlisted telemetry | live mapping/delivery belongs to Go integration tests |
 
@@ -71,4 +72,5 @@ tests fail; a backend differs from
 CPU beyond documented tolerance; active cancellation is required but not
 implemented; a client path, TCP/outbound network, dynamic loading, Python,
 TypeScript, model code, tool, memory, approval, or Agent Green authority appears;
-or rollback through Go cannot be demonstrated.
+the target service lacks independent OS egress confinement; an operated
+no-egress test fails; or rollback through Go cannot be demonstrated.

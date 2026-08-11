@@ -84,6 +84,11 @@ Before the native runtime becomes mandatory:
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;
+- ship a target-specific service definition that denies Rust outbound
+  networking, then prove CPU and accelerated inference over the protected UDS
+  while that denial is active;
+- require Go's platform-wide local-only mode to reject every remote primary,
+  fallback, verifier, and manual override before sovereign cutover;
 - complete Agent Green telemetry mapping in Go, never in the model or engine;
 - canary the provider behind Go routing and preserve instant rollback;
 - retire third-party runtimes only after equivalent production evidence.

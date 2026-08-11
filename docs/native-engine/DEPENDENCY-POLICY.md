@@ -12,6 +12,14 @@ No Python, Node, or TypeScript runtime may enter production, tests, fixtures,
 conversion, or a build-critical path. Model-supplied code and plugins are never
 dependencies.
 
+The engine may not gain egress indirectly through standard-library Internet
+sockets, raw socket FFI, asynchronous network modules, subprocess execution,
+or an external telemetry exporter. The protected Unix-domain stream in
+`engine-server` is the sole approved communications primitive. Architecture
+tests enforce source markers in addition to the exact dependency allowlist;
+production deployment independently applies an operating-system outbound
+network denial as specified by ADR-0006.
+
 ## Approval record
 
 Before adding a dependency, commit:
