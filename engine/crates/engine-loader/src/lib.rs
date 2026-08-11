@@ -538,6 +538,21 @@ mod tests {
             registry.verify_package_bytes(&model_id, &tampered, &budget),
             Err(EngineError::SignatureFailure(_))
         ));
+
+        for index in 0..fixture.bytes().len() {
+            let mut mutation = fixture.to_bytes();
+            mutation[index] ^= 1;
+            assert!(
+                registry.verify_package_bytes(&model_id, &mutation, &budget).is_err(),
+                "single-byte package mutation at offset {index} was accepted"
+            );
+        }
+        for end in 0..fixture.bytes().len() {
+            assert!(
+                registry.verify_package_bytes(&model_id, &fixture.bytes()[..end], &budget).is_err(),
+                "package truncation at offset {end} was accepted"
+            );
+        }
     }
 
     #[test]

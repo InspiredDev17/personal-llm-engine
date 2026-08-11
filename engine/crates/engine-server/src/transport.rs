@@ -5,6 +5,7 @@ use personalai_engine_protocol::{FRAME_HEADER_BYTES, Frame, MAX_FRAME_PAYLOAD_BY
 use personalai_engine_types::EngineError;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -96,6 +97,22 @@ pub struct UnixFrameConnection {
 }
 
 impl UnixFrameConnection {
+    /// Clones the underlying local stream for a bounded full-duplex control watcher.
+    pub fn try_clone(&self) -> Result<Self, EngineError> {
+        let stream = self
+            .stream
+            .try_clone()
+            .map_err(|_| EngineError::backend_failure("Unix stream clone failed"))?;
+        Ok(Self { stream })
+    }
+
+    /// Stops further inbound reads without closing the outbound event stream.
+    pub fn shutdown_inbound(&self) -> Result<(), EngineError> {
+        self.stream
+            .shutdown(Shutdown::Read)
+            .map_err(|_| EngineError::backend_failure("Unix stream read shutdown failed"))
+    }
+
     /// Reads exactly one inbound frame without trusting its declared allocation size.
     pub fn read_inbound_frame(&mut self) -> Result<Frame, EngineError> {
         let mut header = [0_u8; FRAME_HEADER_BYTES];
@@ -143,7 +160,9 @@ impl UnixFrameConnection {
 mod tests {
     use super::*;
     use personalai_engine_protocol::FrameKind;
+    use std::net::Shutdown;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::thread;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -198,6 +217,36 @@ mod tests {
             UnixFrameListener::bind(&config),
             Err(EngineError::AuthenticationFailure(_))
         ));
+        fs::remove_dir(&directory).expect("temporary directory must remove");
+    }
+
+    #[test]
+    fn truncated_payload_fails_without_waiting_for_the_io_timeout() {
+        let directory = temporary_directory();
+        fs::create_dir(&directory).expect("temporary runtime directory must create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions must set");
+        let socket = directory.join("engine.sock");
+        let config = ServiceConfig::new("/models", &directory, &socket)
+            .expect("temporary config must validate");
+        let listener = UnixFrameListener::bind(&config).expect("socket must bind");
+        let client_socket = socket.clone();
+        let (release_client, hold_client) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(client_socket).expect("client must connect");
+            let encoded = Frame::new(FrameKind::Capability, vec![1, 2, 3])
+                .expect("frame must construct")
+                .encode()
+                .expect("frame must encode");
+            stream.write_all(&encoded[..=FRAME_HEADER_BYTES]).expect("partial frame must write");
+            stream.shutdown(Shutdown::Write).expect("client write side must close");
+            hold_client.recv().expect("server must release client");
+        });
+        let mut connection = listener.accept().expect("server must accept");
+        assert!(matches!(connection.read_inbound_frame(), Err(EngineError::ProtocolViolation(_))));
+        release_client.send(()).expect("client must be released");
+        client.join().expect("client must finish");
+        drop(listener);
         fs::remove_dir(&directory).expect("temporary directory must remove");
     }
 

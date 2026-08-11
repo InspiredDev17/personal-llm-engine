@@ -14,8 +14,6 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(unix)]
-use std::sync::atomic::AtomicBool;
 
 const USAGE: &str = "usage:
   personalai-engine version
@@ -258,9 +256,8 @@ fn serve(config: ServeConfig, errors: &mut impl Write) -> Result<(), CliError> {
     let mut runtime = CpuEngineRuntime::new(service, control_key);
     runtime.load_registered_model(&config.model_id, &config.budget)?;
     let listener = UnixFrameListener::bind(runtime.service().config())?;
-    let cancelled = AtomicBool::new(false);
     loop {
-        if let Err(error) = runtime.serve_one(&listener, &cancelled) {
+        if let Err(error) = runtime.serve_one(&listener) {
             match error.kind() {
                 EngineErrorKind::InvalidInput
                 | EngineErrorKind::Cancellation

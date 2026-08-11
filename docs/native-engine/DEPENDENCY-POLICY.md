@@ -72,8 +72,11 @@ links, unsafe use, network/process/file capabilities, and advisory status.
 
 ## Release requirements
 
-Production releases must vendor the reviewed Cargo graph, build offline from a
-fresh environment, publish a CycloneDX or SPDX SBOM with checksums/licenses,
-record Rust/toolchain/target flags, retain advisory results, and make the
-dependency archive reproducible. Vendoring and SBOM publication are not yet
-claimed for this development workspace and remain a production stop gate.
+The reviewed Cargo graph is checked in under `engine/vendor`, and Cargo replaces
+crates.io with that directory while offline. `release/native-engine.spdx` is an
+SPDX 2.3 inventory of every locked external version, archive checksum, and
+license. Boundary tests require the vendor and SBOM package sets to equal the
+lockfile and prohibit Python/TypeScript in the release tree. Each production
+release must still reproduce a fresh offline build, record
+Rust/toolchain/target flags and advisory results, and verify the dependency
+archive before publication.

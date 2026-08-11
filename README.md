@@ -19,9 +19,11 @@ provider adapter; it has no HTTP or remote-network fallback.
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only
 conversion/signing operations, an approved production package, stochastic
-sampling, optimized ARM64, Metal, CUDA, performance qualification, fuzzing,
-release vendoring, and SBOM publication remain required before replacement of
-existing production runtimes.
+sampling, optimized ARM64, Metal, CUDA, performance qualification, and
+coverage-guided fuzzing remain required before replacement of existing
+production runtimes. The locked dependency graph is checked in under
+`engine/vendor`, Cargo is offline/source-replaced by default, and
+`release/native-engine.spdx` records package versions, checksums, and licenses.
 
 ## Build and verify
 
@@ -46,6 +48,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   download, updater, dynamic-library discovery, or model-supplied code;
 - clients send a registered `ModelId`, never a path;
 - Rust holds only public verification keys; Go signs control requests;
+- Go sends signed same-stream cancellation and Rust observes disconnects while
+  CPU generation is active;
 - packages are fixed-format data, exact-hash pinned, and signer verified;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
 - the engine cannot execute tools, approve actions, mutate platform memory, or

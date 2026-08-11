@@ -40,6 +40,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "cpu-reference")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use std::thread;
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -388,11 +390,7 @@ impl CpuEngineRuntime {
     /// A caller-owned outer loop decides service lifetime and restart policy.
     /// The method never opens a network connection or performs filesystem model
     /// discovery.
-    pub fn serve_one(
-        &mut self,
-        listener: &UnixFrameListener,
-        cancelled: &AtomicBool,
-    ) -> Result<ServeOutcome, EngineError> {
+    pub fn serve_one(&mut self, listener: &UnixFrameListener) -> Result<ServeOutcome, EngineError> {
         let mut connection = listener.accept()?;
         let frame = connection.read_inbound_frame()?;
         let mut session = AuthenticatedControlSession::new(self.trusted_control_key.clone());
@@ -429,14 +427,34 @@ impl CpuEngineRuntime {
                 let model = self.models.get(&model_key).ok_or_else(|| {
                     EngineError::internal_invariant("loaded model disappeared during admission")
                 })?;
-                let usage = self
-                    .service
-                    .run_next_greedy(model, sequence_id, cancelled, |event| {
-                        write_generation_event(&mut connection, &event)
-                    })?
-                    .ok_or_else(|| {
-                        EngineError::internal_invariant("admitted request was not scheduled")
+                let cancellation_connection = connection.try_clone()?;
+                let cancelled = AtomicBool::new(false);
+                let watcher_done = AtomicBool::new(false);
+                let generation_result = thread::scope(|scope| {
+                    let watcher = scope.spawn(|| {
+                        watch_generation_cancellation(
+                            cancellation_connection,
+                            session,
+                            request_id,
+                            &cancelled,
+                            &watcher_done,
+                        );
+                    });
+                    let result =
+                        self.service.run_next_greedy(model, sequence_id, &cancelled, |event| {
+                            write_generation_event(&mut connection, &event)
+                        });
+                    watcher_done.store(true, Ordering::Release);
+                    let shutdown_result = connection.shutdown_inbound();
+                    watcher.join().map_err(|_| {
+                        EngineError::internal_invariant("cancellation watcher panicked")
                     })?;
+                    shutdown_result?;
+                    result
+                });
+                let usage = generation_result?.ok_or_else(|| {
+                    EngineError::internal_invariant("admitted request was not scheduled")
+                })?;
                 Ok(ServeOutcome::Generated { request_id, sequence_id, usage })
             }
         }
@@ -446,6 +464,28 @@ impl CpuEngineRuntime {
     pub const fn service(&self) -> &EngineService {
         &self.service
     }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn watch_generation_cancellation(
+    mut connection: UnixFrameConnection,
+    mut session: AuthenticatedControlSession,
+    active_request_id: RequestId,
+    cancelled: &AtomicBool,
+    watcher_done: &AtomicBool,
+) {
+    let command = connection.read_inbound_frame().and_then(|frame| session.decode_command(&frame));
+    if watcher_done.load(Ordering::Acquire) {
+        return;
+    }
+    if matches!(command, Ok(InboundCommand::Cancel(request_id)) if request_id == active_request_id)
+    {
+        cancelled.store(true, Ordering::Release);
+        return;
+    }
+    // A disconnect, malformed follow-up, mismatched cancellation, or second
+    // generation command makes the active stream untrustworthy. Fail closed.
+    cancelled.store(true, Ordering::Release);
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -627,7 +667,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use personalai_engine_crypto::control_plane_signature_message;
-    use personalai_engine_protocol::{GenerationRequestEnvelope, attach_generation_signature};
+    use personalai_engine_protocol::{
+        CancellationEnvelope, GenerationRequestEnvelope, attach_cancellation_signature,
+        attach_generation_signature,
+    };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{ContextLimit, ModelHashAlgorithm, ResourceBudget, SignerKeyId};
@@ -698,6 +741,70 @@ mod tests {
             session.decode_command(&frame),
             Err(EngineError::AuthenticationFailure(_))
         ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_same_stream_cancellation_reaches_active_request() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::mpsc;
+        use std::thread;
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let runtime_root = PathBuf::from("/tmp")
+            .join(format!("personalai-engine-cancel-{}-{sequence}", std::process::id()));
+        fs::create_dir(&runtime_root).expect("runtime root must create");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+            .expect("runtime root permissions must set");
+        let socket_path = runtime_root.join("engine.sock");
+        let config = ServiceConfig::new("/models", &runtime_root, &socket_path)
+            .expect("runtime config must validate");
+        let listener = UnixFrameListener::bind(&config).expect("runtime socket must bind");
+
+        let signing_key = SigningKey::from_bytes(&[0x51; 32]);
+        let key_id = SignerKeyId::from_bytes([0x52; 16]).expect("key ID must validate");
+        let trusted_key =
+            TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
+                .expect("control key must validate");
+        let request = request(505, ModelId::new("decoder-cancel").expect("model ID must validate"));
+        let generation = signed_generation_frame(&request, 1, key_id, &signing_key);
+        let unsigned_cancel = CancellationEnvelope::unsigned_bytes(request.request_id(), 2, key_id)
+            .expect("cancellation must encode");
+        let cancel_transcript = control_plane_signature_message(&unsigned_cancel)
+            .expect("cancellation transcript must construct");
+        let cancel_signature = signing_key.sign(&cancel_transcript).to_bytes();
+        let cancel_payload = attach_cancellation_signature(&unsigned_cancel, &cancel_signature)
+            .expect("cancellation signature must attach");
+        let cancellation = Frame::new(FrameKind::Cancellation, cancel_payload)
+            .expect("cancellation frame must construct")
+            .encode()
+            .expect("cancellation frame must encode");
+
+        let client_path = socket_path.clone();
+        let (release_client, hold_client) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(client_path).expect("client must connect");
+            stream.write_all(&generation).expect("generation must write");
+            stream.write_all(&cancellation).expect("cancellation must write");
+            hold_client.recv().expect("server must release client");
+        });
+        let mut connection = listener.accept().expect("connection must accept");
+        let first = connection.read_inbound_frame().expect("generation frame must read");
+        let mut session = AuthenticatedControlSession::new(trusted_key);
+        assert!(matches!(session.decode_command(&first), Ok(InboundCommand::Generate(_))));
+        let cancelled = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        watch_generation_cancellation(connection, session, request.request_id(), &cancelled, &done);
+        assert!(cancelled.load(Ordering::Acquire));
+        release_client.send(()).expect("client must be released");
+        client.join().expect("client must finish");
+        drop(listener);
+        fs::remove_dir(&runtime_root).expect("runtime root must clean");
     }
 
     #[test]
@@ -873,9 +980,7 @@ mod tests {
             .expect("request frame must encode");
         let client_path = socket_path.clone();
         let client = thread::spawn(move || runtime_test_client(client_path, &encoded));
-        let outcome = runtime
-            .serve_one(&listener, &AtomicBool::new(false))
-            .expect("runtime must serve generation");
+        let outcome = runtime.serve_one(&listener).expect("runtime must serve generation");
         assert!(
             matches!(outcome, ServeOutcome::Generated { request_id, .. } if request_id.get() == 404)
         );
@@ -913,6 +1018,25 @@ mod tests {
             }
         }
         event_kinds
+    }
+
+    fn signed_generation_frame(
+        request: &GenerationRequest,
+        nonce: u64,
+        key_id: SignerKeyId,
+        signing_key: &SigningKey,
+    ) -> Vec<u8> {
+        let unsigned = GenerationRequestEnvelope::unsigned_bytes(request, nonce, key_id)
+            .expect("request must encode");
+        let transcript =
+            control_plane_signature_message(&unsigned).expect("transcript must construct");
+        let signature = signing_key.sign(&transcript).to_bytes();
+        let payload =
+            attach_generation_signature(&unsigned, &signature).expect("signature must attach");
+        Frame::new(FrameKind::GenerationRequest, payload)
+            .expect("request frame must construct")
+            .encode()
+            .expect("request frame must encode")
     }
 
     fn service() -> EngineService {

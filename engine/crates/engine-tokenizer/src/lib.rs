@@ -642,6 +642,18 @@ mod tests {
             FirstPartyBpeTokenizer::parse(data, &tiny_pool),
             Err(EngineError::ResourceExhaustion(_))
         ));
+
+        for end in 0..data.len() {
+            assert!(
+                FirstPartyBpeTokenizer::parse(&data[..end], &pool).is_err(),
+                "tokenizer truncation at offset {end} was accepted"
+            );
+        }
+        for index in 0..data.len() {
+            let mut mutation = data.to_vec();
+            mutation[index] ^= 1;
+            let _bounded_result = FirstPartyBpeTokenizer::parse(&mutation, &pool);
+        }
     }
 
     #[test]

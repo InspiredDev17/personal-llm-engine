@@ -255,9 +255,21 @@ mod tests {
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(Frame::decode_inbound_exact(&trailing).is_err());
-        let mut unknown = encoded;
+        let mut unknown = encoded.clone();
         unknown[8] = 99;
         assert!(Frame::decode_inbound_exact(&unknown).is_err());
+
+        for end in 0..encoded.len() {
+            assert!(
+                Frame::decode_inbound_exact(&encoded[..end]).is_err(),
+                "frame truncation at offset {end} was accepted"
+            );
+        }
+        for index in 0..encoded.len() {
+            let mut mutation = encoded.clone();
+            mutation[index] ^= 1;
+            let _bounded_result = Frame::decode_inbound_exact(&mutation);
+        }
     }
 
     #[test]

@@ -1,0 +1,2 @@
+# Preserve audited upstream vendor bytes, including their original whitespace.
+engine/vendor/** -whitespace

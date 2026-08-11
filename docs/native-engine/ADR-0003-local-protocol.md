@@ -8,6 +8,8 @@ closed directional kinds, exact little-endian fields, and an 8 MiB total cap.
 Generation/cancellation bodies are fixed schemas authenticated by the Go
 control-plane Ed25519 identity and a strictly increasing connection nonce.
 Responses are fixed typed generation events correlated to the request ID.
+Cancellation uses a higher-nonce signed command on the active full-duplex
+stream; disconnect or invalid follow-up control data cancels fail-closed.
 
 Reject TCP, HTTP fallback, arbitrary serialization, recursive messages,
 client-supplied paths, model installation, tools, approvals, memory mutation,

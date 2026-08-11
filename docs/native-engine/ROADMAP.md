@@ -23,11 +23,11 @@ memory, tool, approval, or Agent Green behavior.
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
 | 7. Scheduler | COMPLETE for current single-worker runtime | Count/byte admission, FIFO lifecycle and queued cancellation |
-| 8. UDS/Go adapter | COMPLETE for local reference path | Ed25519-authenticated requests, nonce checks, UDS runtime, Go `NATIVE_ENGINE` adapter and real socket tests |
+| 8. UDS/Go adapter | COMPLETE for local reference path | Ed25519-authenticated requests/cancellation, active same-stream cancellation/disconnect watcher, nonce checks, UDS runtime, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PLANNED | Fuzz/fault/performance/SBOM/vendoring and reversible migration |
+| 12. Production cutover | PARTIAL | Fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, mutual response trust, durable replay and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -42,6 +42,8 @@ memory, tool, approval, or Agent Green behavior.
   scheduler, authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.
+- Exhaustive canonical-fixture truncation/single-byte mutation suites, signed
+  active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
 
 ## Next software release gate: production model operations
 
@@ -69,11 +71,12 @@ performance evidence. Model metadata cannot select code or kernels.
 
 Before the native runtime becomes mandatory:
 
-- fuzz every package/tokenizer/frame parser and run fault-injection tests;
-- add concurrent active cancellation and fair multi-sequence scheduling;
+- run continuous coverage-guided fuzzing in addition to the deterministic
+  package/tokenizer/frame mutation and partial-transport fault suites;
+- add fair multi-sequence scheduling (active same-stream cancellation is done);
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
-- vendor release dependencies, generate an SBOM, and pass license/advisory
-  review from a fresh offline build;
+- reproduce the checked-in vendor graph and SPDX from a fresh offline build and
+  renew license/advisory review;
 - complete Agent Green telemetry mapping in Go, never in the model or engine;
 - canary the provider behind Go routing and preserve instant rollback;
 - retire third-party runtimes only after equivalent production evidence.

@@ -86,13 +86,90 @@ fn workspace_external_dependencies_match_the_cryptography_allowlist() {
 }
 
 #[test]
+fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
+    let root = engine_root();
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");
+    let vendor = root.join("vendor");
+    let config = fs::read_to_string(root.join(".cargo/config.toml"))
+        .expect("Cargo source configuration must exist");
+    assert!(config.contains("replace-with = \"vendored-sources\""));
+    assert!(config.contains("directory = \"vendor\""));
+
+    let mut expected = BTreeSet::new();
+    for package in lock.split("[[package]]").skip(1) {
+        if lock_value(package, "source").is_none() {
+            continue;
+        }
+        let name = lock_value(package, "name").expect("locked package must have a name");
+        let checksum = lock_value(package, "checksum").expect("external package needs checksum");
+        expected.insert(name.to_owned());
+        let vendored_checksum = fs::read_to_string(vendor.join(name).join(".cargo-checksum.json"))
+            .expect("vendored package checksum metadata must exist");
+        assert!(
+            vendored_checksum.contains(&format!("\"package\": \"{checksum}\""))
+                || vendored_checksum.contains(&format!("\"package\":\"{checksum}\"")),
+            "vendored archive checksum differs for {name}"
+        );
+    }
+    let observed = fs::read_dir(&vendor)
+        .expect("vendor directory must exist")
+        .map(|entry| {
+            entry.expect("vendor entry must be readable").file_name().to_string_lossy().into_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(observed, expected, "vendored package set differs from Cargo.lock");
+
+    for path in collect_all_files(&vendor) {
+        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+        assert!(
+            !matches!(extension, "py" | "pyi" | "sage" | "ts" | "tsx"),
+            "vendored release graph contains a prohibited language file: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
+    let root = engine_root();
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");
+    let sbom = fs::read_to_string(
+        root.parent()
+            .expect("engine must have repository parent")
+            .join("release/native-engine.spdx"),
+    )
+    .expect("release SPDX document must exist");
+    assert!(sbom.starts_with("SPDXVersion: SPDX-2.3\n"));
+    let observed_names = sbom
+        .lines()
+        .filter_map(|line| line.strip_prefix("PackageName: "))
+        .filter(|name| *name != "personalai-native-engine")
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut expected_names = BTreeSet::new();
+    for package in lock.split("[[package]]").skip(1) {
+        if lock_value(package, "source").is_none() {
+            continue;
+        }
+        let name = lock_value(package, "name").expect("locked package must have a name");
+        let checksum = lock_value(package, "checksum").expect("external package needs checksum");
+        expected_names.insert(name.to_owned());
+        assert!(
+            sbom.contains(&format!("PackageChecksum: SHA256: {checksum}")),
+            "SPDX document omits checksum for {name}"
+        );
+    }
+    assert_eq!(observed_names, expected_names, "SPDX package set differs from Cargo.lock");
+}
+
+#[test]
 fn workspace_contains_no_python_or_typescript() {
     let root = engine_root();
     let repository = root.parent().expect("engine must have repository parent");
     for path in collect_all_files(repository) {
         let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         assert!(
-            !matches!(extension, "py" | "pyi" | "ts" | "tsx"),
+            !matches!(extension, "py" | "pyi" | "sage" | "ts" | "tsx"),
             "prohibited language file found: {}",
             path.display()
         );
@@ -238,7 +315,9 @@ fn rust_sources_have_no_listener_dynamic_loading_or_unsafe_block() {
             unsafe_block_marker.as_str(),
             dynamic_open_marker.as_str(),
         ] {
-            if canonical == approved_unix_transport && marker == unix_listener_marker {
+            if canonical == approved_unix_transport
+                && (marker == unix_listener_marker || marker == network_module_marker)
+            {
                 continue;
             }
             assert!(
@@ -324,7 +403,7 @@ fn collect_all_files(root: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             if entry.file_type().expect("entry type must be readable").is_dir() {
-                if name != "target" && name != ".git" {
+                if name != "target" && name != ".git" && name != "vendor" {
                     pending.push(path);
                 }
             } else {

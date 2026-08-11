@@ -75,12 +75,14 @@ cancellation commands use fixed schemas and strict Ed25519 signatures over a
 domain-separated SHA-384 transcript. A connection session accepts strictly
 increasing nonzero nonces. Rust stores only the configured Go public key.
 
-The current runtime processes one command per accepted connection and executes
-one CPU sequence at a time. The Go adapter opens one connection per generation,
-signs with the Go-held private key, closes on context cancellation, validates
-request IDs/event schemas/usage, and exposes canonical platform responses. It
-has no HTTP fallback. Concurrent in-flight cancellation and multi-worker
-batching remain production hardening work.
+The current runtime executes one CPU sequence at a time. The Go adapter opens
+one connection per generation and signs with the Go-held private key. On
+cancellation it sends a higher-nonce signed cancellation on the same full-duplex
+stream before closing; a Rust watcher treats that command, disconnect, malformed
+follow-up, or mismatched cancellation as request-local cancellation while the
+CPU loop is active. Go validates request IDs/event schemas/usage and exposes
+canonical platform responses. It has no HTTP fallback. Fair multi-sequence
+scheduling and batching remain production hardening work.
 
 ## Resource ceilings
 

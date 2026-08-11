@@ -457,12 +457,20 @@ mod tests {
         assert_eq!(decoded.nonce(), 1);
         assert_eq!(decoded.request(), &request);
 
-        let mut tampered = payload;
-        tampered[GENERATION_REQUEST_FIXED_BYTES] ^= 1;
-        assert!(matches!(
-            GenerationRequestEnvelope::decode(&tampered, &trusted),
-            Err(EngineError::AuthenticationFailure(_))
-        ));
+        for index in 0..payload.len() {
+            let mut tampered = payload.clone();
+            tampered[index] ^= 1;
+            assert!(
+                GenerationRequestEnvelope::decode(&tampered, &trusted).is_err(),
+                "single-byte mutation at offset {index} was accepted"
+            );
+        }
+        for end in 0..payload.len() {
+            assert!(
+                GenerationRequestEnvelope::decode(&payload[..end], &trusted).is_err(),
+                "truncation at offset {end} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -472,13 +480,25 @@ mod tests {
         let trusted =
             TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
                 .expect("control key must validate");
-        let request_id = RequestId::new(9).expect("request id must validate");
+        let mut request_id_bytes = [0_u8; 16];
+        request_id_bytes[15] = 1;
+        let request_id = RequestId::from_bytes(request_id_bytes).expect("request id must validate");
         let unsigned = CancellationEnvelope::unsigned_bytes(request_id, 2, key_id)
             .expect("cancellation must encode");
         let message = control_plane_signature_message(&unsigned).expect("transcript must build");
         let signature = signing_key.sign(&message).to_bytes();
         let payload =
             attach_cancellation_signature(&unsigned, &signature).expect("signature must attach");
+        assert_eq!(
+            lower_hex(&payload),
+            concat!(
+                "50414943414e303101000000020000000000000000000000000000000000000000",
+                "0000014444444444444444444444444444444490923a735da7b1b52650a0e1c20",
+                "d20bdf0a0ad2bca109bce219bd1bdbabb71972355c5a9ba6eb00c305c99013030",
+                "bf01d0b2759d93d7d66851b4766e44fd060d"
+            ),
+            "Rust cancellation bytes diverged from the Go v1 vector"
+        );
         let decoded = CancellationEnvelope::decode(&payload, &trusted)
             .expect("cancellation must authenticate");
         assert_eq!(decoded.nonce(), 2);
@@ -504,5 +524,15 @@ mod tests {
             ResourceBudget::new(1 << 20, 1 << 18, 1).expect("budget must validate"),
         )
         .expect("request must validate")
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        output
     }
 }

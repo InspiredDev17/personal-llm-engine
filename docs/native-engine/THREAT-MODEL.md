@@ -32,14 +32,14 @@ token data, generated text, and engine events are untrusted.
 | Symlink/replacement/non-file package | non-symlink root/file, no group/other write, `O_NOFOLLOW`, regular-file, device/inode/length equality, exact read | privileged/owner compromise remains out of process scope |
 | Package tamper/downgrade | exact SHA-384 identity, canonical V1 ranges/records, domain-separated strict Ed25519, key ID and active/revoked trust state | key rotation/rollback operational tooling is Stage 9 |
 | Model-supplied code or kernels | flat data-only fixed architecture; no plugins, graph executor, dynamic libraries, Metal/PTX, paths, or kernel selectors | each future backend needs separate code review |
-| Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer | parser fuzzing remains required before production |
+| Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, exhaustive fixture truncation/single-byte mutation tests | coverage-guided fuzzing and production-size corpora remain required |
 | Memory/CPU denial | aggregate memory reservations, fallible allocation, queue count/bytes, tensor/context/token ceilings, CPU operation caps, finite socket deadlines | production long-context/soak and multi-client fairness remain |
 | UDS impersonation/injection | owner-private runtime directory, mode-0600 inode-owned socket, strict frame directions, Ed25519 request auth, key ID, nonce | bind peer-credential policy and key rotation need operational qualification |
 | Replay/reordering | monotonically increasing nonzero nonce inside each authenticated connection | Go currently uses one request per connection; cross-connection replay journal is not implemented |
 | Event spoofing/confusion | Go validates frame kind, request ID, UTF-8, exact event lengths, usage arithmetic and closed error codes | add fuzz/conformance corpus shared across languages |
 | Secret leakage in errors/logs | bounded control-free diagnostics; static/sanitized error guidance; no host path/package/prompt in protocol failures | review daemon operational logging before release |
-| Cancellation failure | Go closes the socket on context cancellation; CPU loop checks cancellation flag; scheduler has typed cancellation | concurrent active cancellation over a second connection is not yet implemented |
-| Dependency compromise | minimal exact lock, source/checksum boundary tests, no AI stack, advisory scan, no build-time fetch | vendor release graph, SBOM, reproducible offline build |
+| Cancellation failure | Go sends a higher-nonce signed same-stream cancellation before close; Rust watches concurrently; disconnect/malformed follow-up cancels fail-closed; CPU loop checks the request-local flag | multi-worker cancellation and long-running production-model latency qualification remain |
+| Dependency compromise | minimal exact lock, checked-in source-replacement vendor graph, SPDX checksums/licenses, exact boundary tests, no AI stack or build-time fetch | reproduce the release archive/offline build and renew advisory review for each release |
 | Unsafe/FFI memory error | workspace currently forbids unsafe Rust; Metal/CUDA absent | isolate and document any future backend unsafe invariants |
 | Agent Green spoofing/control | engine has no Agent Green client/key; model cannot emit authoritative decision; Go maps allowlisted telemetry | live mapping/delivery belongs to Go integration tests |
 
@@ -61,9 +61,10 @@ is not controlled by the model or Rust service.
 
 ## Production stop conditions
 
-Do not enable mandatory production routing if any parser or protocol fuzzing is
-missing; a real package lacks provenance/license/signature evidence; a release
-is not vendored/SBOM-recorded; resource/soak tests fail; a backend differs from
+Do not enable mandatory production routing if coverage-guided parser/protocol
+fuzzing is missing; a real package lacks provenance/license/signature evidence;
+the vendored/SBOM-recorded release cannot reproduce offline; resource/soak
+tests fail; a backend differs from
 CPU beyond documented tolerance; active cancellation is required but not
 implemented; a client path, TCP/outbound network, dynamic loading, Python,
 TypeScript, model code, tool, memory, approval, or Agent Green authority appears;

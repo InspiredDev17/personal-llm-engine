@@ -1,0 +1,261 @@
+SPDXVersion: SPDX-2.3
+DataLicense: CC0-1.0
+SPDXID: SPDXRef-DOCUMENT
+DocumentName: personalai-native-engine-0.1.0
+DocumentNamespace: https://github.com/InspiredDev17/personal-llm-engine/spdx/native-engine/0.1.0/2026-08-11
+Creator: Organization: InspiredDev17
+Creator: Tool: Cargo.lock plus reviewed dependency inventory
+Created: 2026-08-11T00:00:00Z
+
+PackageName: personalai-native-engine
+SPDXID: SPDXRef-Package-personalai-native-engine
+PackageVersion: 0.1.0
+PackageDownloadLocation: NOASSERTION
+FilesAnalyzed: false
+PackageLicenseConcluded: NOASSERTION
+PackageLicenseDeclared: NOASSERTION
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-DOCUMENT DESCRIBES SPDXRef-Package-personalai-native-engine
+
+PackageName: block-buffer
+SPDXID: SPDXRef-Package-block-buffer
+PackageVersion: 0.12.1
+PackageDownloadLocation: https://crates.io/crates/block-buffer/0.12.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-block-buffer
+
+PackageName: cfg-if
+SPDXID: SPDXRef-Package-cfg-if
+PackageVersion: 1.0.4
+PackageDownloadLocation: https://crates.io/crates/cfg-if/1.0.4
+FilesAnalyzed: false
+PackageChecksum: SHA256: 9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-cfg-if
+
+PackageName: cpufeatures
+SPDXID: SPDXRef-Package-cpufeatures
+PackageVersion: 0.3.0
+PackageDownloadLocation: https://crates.io/crates/cpufeatures/0.3.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-cpufeatures
+
+PackageName: crypto-common
+SPDXID: SPDXRef-Package-crypto-common
+PackageVersion: 0.2.2
+PackageDownloadLocation: https://crates.io/crates/crypto-common/0.2.2
+FilesAnalyzed: false
+PackageChecksum: SHA256: ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-crypto-common
+
+PackageName: curve25519-dalek
+SPDXID: SPDXRef-Package-curve25519-dalek
+PackageVersion: 5.0.0
+PackageDownloadLocation: https://crates.io/crates/curve25519-dalek/5.0.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23
+PackageLicenseConcluded: BSD-3-Clause
+PackageLicenseDeclared: BSD-3-Clause
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-curve25519-dalek
+
+PackageName: curve25519-dalek-derive
+SPDXID: SPDXRef-Package-curve25519-dalek-derive
+PackageVersion: 0.1.1
+PackageDownloadLocation: https://crates.io/crates/curve25519-dalek-derive/0.1.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-curve25519-dalek-derive
+
+PackageName: digest
+SPDXID: SPDXRef-Package-digest
+PackageVersion: 0.11.3
+PackageDownloadLocation: https://crates.io/crates/digest/0.11.3
+FilesAnalyzed: false
+PackageChecksum: SHA256: f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-digest
+
+PackageName: ed25519
+SPDXID: SPDXRef-Package-ed25519
+PackageVersion: 3.0.0
+PackageDownloadLocation: https://crates.io/crates/ed25519/3.0.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a
+PackageLicenseConcluded: Apache-2.0 OR MIT
+PackageLicenseDeclared: Apache-2.0 OR MIT
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-ed25519
+
+PackageName: ed25519-dalek
+SPDXID: SPDXRef-Package-ed25519-dalek
+PackageVersion: 3.0.0
+PackageDownloadLocation: https://crates.io/crates/ed25519-dalek/3.0.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de
+PackageLicenseConcluded: BSD-3-Clause
+PackageLicenseDeclared: BSD-3-Clause
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-ed25519-dalek
+
+PackageName: fiat-crypto
+SPDXID: SPDXRef-Package-fiat-crypto
+PackageVersion: 0.3.0
+PackageDownloadLocation: https://crates.io/crates/fiat-crypto/0.3.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24
+PackageLicenseConcluded: MIT OR Apache-2.0 OR BSD-1-Clause
+PackageLicenseDeclared: MIT OR Apache-2.0 OR BSD-1-Clause
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-fiat-crypto
+
+PackageName: hybrid-array
+SPDXID: SPDXRef-Package-hybrid-array
+PackageVersion: 0.4.14
+PackageDownloadLocation: https://crates.io/crates/hybrid-array/0.4.14
+FilesAnalyzed: false
+PackageChecksum: SHA256: 707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-hybrid-array
+
+PackageName: libc
+SPDXID: SPDXRef-Package-libc
+PackageVersion: 0.2.189
+PackageDownloadLocation: https://crates.io/crates/libc/0.2.189
+FilesAnalyzed: false
+PackageChecksum: SHA256: 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+PackageComment: Unused Python maintenance helper pruned from the vendored release tree; archive checksum remains recorded and Cargo file checksums cover retained files.
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-libc
+
+PackageName: proc-macro2
+SPDXID: SPDXRef-Package-proc-macro2
+PackageVersion: 1.0.107
+PackageDownloadLocation: https://crates.io/crates/proc-macro2/1.0.107
+FilesAnalyzed: false
+PackageChecksum: SHA256: 985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-proc-macro2
+
+PackageName: quote
+SPDXID: SPDXRef-Package-quote
+PackageVersion: 1.0.47
+PackageDownloadLocation: https://crates.io/crates/quote/1.0.47
+FilesAnalyzed: false
+PackageChecksum: SHA256: 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-quote
+
+PackageName: rustc_version
+SPDXID: SPDXRef-Package-rustc-version
+PackageVersion: 0.4.1
+PackageDownloadLocation: https://crates.io/crates/rustc_version/0.4.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-rustc-version
+
+PackageName: semver
+SPDXID: SPDXRef-Package-semver
+PackageVersion: 1.0.28
+PackageDownloadLocation: https://crates.io/crates/semver/1.0.28
+FilesAnalyzed: false
+PackageChecksum: SHA256: 8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-semver
+
+PackageName: sha2
+SPDXID: SPDXRef-Package-sha2
+PackageVersion: 0.11.0
+PackageDownloadLocation: https://crates.io/crates/sha2/0.11.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-sha2
+
+PackageName: signature
+SPDXID: SPDXRef-Package-signature
+PackageVersion: 3.0.0
+PackageDownloadLocation: https://crates.io/crates/signature/3.0.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5
+PackageLicenseConcluded: Apache-2.0 OR MIT
+PackageLicenseDeclared: Apache-2.0 OR MIT
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-signature
+
+PackageName: subtle
+SPDXID: SPDXRef-Package-subtle
+PackageVersion: 2.6.1
+PackageDownloadLocation: https://crates.io/crates/subtle/2.6.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: 13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292
+PackageLicenseConcluded: BSD-3-Clause
+PackageLicenseDeclared: BSD-3-Clause
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-subtle
+
+PackageName: syn
+SPDXID: SPDXRef-Package-syn
+PackageVersion: 2.0.119
+PackageDownloadLocation: https://crates.io/crates/syn/2.0.119
+FilesAnalyzed: false
+PackageChecksum: SHA256: 872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-syn
+
+PackageName: typenum
+SPDXID: SPDXRef-Package-typenum
+PackageVersion: 1.20.1
+PackageDownloadLocation: https://crates.io/crates/typenum/1.20.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-typenum
+
+PackageName: unicode-ident
+SPDXID: SPDXRef-Package-unicode-ident
+PackageVersion: 1.0.24
+PackageDownloadLocation: https://crates.io/crates/unicode-ident/1.0.24
+FilesAnalyzed: false
+PackageChecksum: SHA256: e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75
+PackageLicenseConcluded: (MIT OR Apache-2.0) AND Unicode-3.0
+PackageLicenseDeclared: (MIT OR Apache-2.0) AND Unicode-3.0
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-unicode-ident
