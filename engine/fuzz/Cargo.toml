@@ -1,0 +1,59 @@
+[package]
+name = "personalai-engine-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "=0.4.13", default-features = false, features = ["link_libfuzzer"] }
+personalai-engine-memory = { path = "../crates/engine-memory" }
+personalai-engine-model-format = { path = "../crates/engine-model-format" }
+personalai-engine-protocol = { path = "../crates/engine-protocol" }
+personalai-engine-testkit = { path = "../crates/engine-testkit" }
+personalai-engine-tokenizer = { path = "../crates/engine-tokenizer" }
+personalai-engine-types = { path = "../crates/engine-types" }
+
+[[bin]]
+name = "model_package"
+path = "fuzz_targets/model_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_data"
+path = "fuzz_targets/tokenizer_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "generate-corpus"
+path = "src/bin/generate-corpus.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }

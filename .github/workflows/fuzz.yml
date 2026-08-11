@@ -1,0 +1,63 @@
+name: defensive-fuzz
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: defensive-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parser-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+      - name: Install pinned fuzz orchestrator
+        run: cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
+      - name: Verify isolated lock and deterministic seeds
+        working-directory: /tmp
+        run: |
+          cargo +1.85.0 metadata --manifest-path "$GITHUB_WORKSPACE/engine/fuzz/Cargo.toml" --locked --no-deps --format-version 1 >/dev/null
+          cargo +1.85.0 run --manifest-path "$GITHUB_WORKSPACE/engine/fuzz/Cargo.toml" --locked --bin generate-corpus
+          git -C "$GITHUB_WORKSPACE" diff --exit-code -- engine/fuzz/corpus
+          mkdir -p "$RUNNER_TEMP/personalai-fuzz-corpus"
+          cp -R "$GITHUB_WORKSPACE/engine/fuzz/corpus/." "$RUNNER_TEMP/personalai-fuzz-corpus/"
+      - name: Fuzz model package parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          model_package "$RUNNER_TEMP/personalai-fuzz-corpus/model_package"
+          -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz tokenizer parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          tokenizer_data "$RUNNER_TEMP/personalai-fuzz-corpus/tokenizer_data"
+          -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz protocol frame parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          protocol_frame "$RUNNER_TEMP/personalai-fuzz-corpus/protocol_frame"
+          -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Preserve crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-engine-fuzz-artifacts
+          path: engine/fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

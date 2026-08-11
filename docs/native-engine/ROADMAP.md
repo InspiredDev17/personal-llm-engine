@@ -27,7 +27,7 @@ memory, tool, approval, or Agent Green behavior.
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, operated key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, and scheduled bounded package/tokenizer/frame and authenticated-event fuzzing are complete; soak/performance, operated key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -51,6 +51,9 @@ memory, tool, approval, or Agent Green behavior.
   journal and command streams cannot switch identities.
 - Exhaustive canonical-fixture and signed-event truncation/single-byte mutation suites, signed
   active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
+- Isolated coverage-guided Rust fuzz targets for package, tokenizer, and frame
+  parsers plus bounded Go fuzz targets for unsigned and authenticated response
+  events, with deterministic Rust-generated seeds and scheduled CI campaigns.
 
 ## Next software release gate: production model operations
 
@@ -78,8 +81,8 @@ performance evidence. Model metadata cannot select code or kernels.
 
 Before the native runtime becomes mandatory:
 
-- run continuous coverage-guided fuzzing in addition to the deterministic
-  package/tokenizer/frame mutation and partial-transport fault suites;
+- retain scheduled coverage-guided fuzzing, triage every reproducible finding,
+  and grow production-size corpora without placing production model data in CI;
 - add fair multi-sequence scheduling (active same-stream cancellation is done);
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and

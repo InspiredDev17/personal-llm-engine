@@ -1,4 +1,6 @@
 /engine/target/
+/engine/fuzz/target/
+/engine/fuzz/artifacts/
 **/*.profraw
 **/*.profdata
 .DS_Store

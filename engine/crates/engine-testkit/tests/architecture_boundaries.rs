@@ -87,6 +87,52 @@ fn workspace_external_dependencies_match_the_cryptography_allowlist() {
 }
 
 #[test]
+fn fuzz_tooling_is_isolated_from_the_production_release_graph() {
+    let root = engine_root();
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
+    assert!(
+        workspace_manifest.contains("exclude = [\"fuzz\"]"),
+        "the fuzz project must remain outside the production workspace"
+    );
+
+    let production_lock =
+        fs::read_to_string(root.join("Cargo.lock")).expect("production lock must exist");
+    assert!(
+        !production_lock.contains("name = \"libfuzzer-sys\""),
+        "the fuzz runtime must never enter the production lockfile"
+    );
+
+    let fuzz_root = root.join("fuzz");
+    let fuzz_manifest =
+        fs::read_to_string(fuzz_root.join("Cargo.toml")).expect("fuzz manifest must exist");
+    assert!(fuzz_manifest.contains("[workspace]"));
+    assert!(fuzz_manifest.contains("cargo-fuzz = true"));
+    assert!(fuzz_manifest.contains("version = \"=0.4.13\""));
+
+    let fuzz_lock = fs::read_to_string(fuzz_root.join("Cargo.lock")).expect("fuzz lock must exist");
+    let production_packages = locked_external_packages(&production_lock);
+    let fuzz_only = locked_external_packages(&fuzz_lock)
+        .difference(&production_packages)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        "arbitrary@1.4.2",
+        "cc@1.4.2",
+        "find-msvc-tools@0.1.10",
+        "getrandom@0.4.3",
+        "jobserver@0.1.35",
+        "libfuzzer-sys@0.4.13",
+        "r-efi@6.0.0",
+        "shlex@2.0.1",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(fuzz_only, expected, "the reviewed fuzz-only dependency set changed");
+}
+
+#[test]
 fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
     let root = engine_root();
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");
@@ -428,6 +474,23 @@ fn lock_value<'a>(package: &'a str, key: &str) -> Option<&'a str> {
         }
         Some(value.trim().trim_matches('"'))
     })
+}
+
+fn locked_external_packages(lock: &str) -> BTreeSet<String> {
+    lock.split("[[package]]")
+        .skip(1)
+        .filter(|package| lock_value(package, "source").is_some())
+        .map(|package| {
+            let name = lock_value(package, "name").expect("locked package must have a name");
+            let version =
+                lock_value(package, "version").expect("locked package must have a version");
+            assert!(
+                lock_value(package, "checksum").is_some(),
+                "external dependency must have a locked checksum: {name}"
+            );
+            format!("{name}@{version}")
+        })
+        .collect()
 }
 
 #[test]

@@ -17,6 +17,7 @@ members = [
     "crates/engine-cli",
     "crates/engine-testkit",
 ]
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]

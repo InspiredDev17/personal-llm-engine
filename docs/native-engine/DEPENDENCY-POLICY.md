@@ -53,6 +53,16 @@ is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact
 versions and registry checksums. Architecture tests fail on any unrecorded
 external package or internal crate edge.
 
+Coverage-guided parser testing is isolated in `engine/fuzz`, which is excluded
+from the production workspace and has its own lockfile. Its only new direct
+crate is `libfuzzer-sys 0.4.13`; the exact direct and transitive review is
+recorded in `engine/fuzz/DEPENDENCIES.md`. The external libFuzzer runtime,
+bundled C++, compiler-launching build script, and unsafe implementation are
+test-only and are never linked into an engine binary, included in the release
+SBOM, or made available at runtime. CI installs the separately pinned
+`cargo-fuzz 0.13.2` orchestrator and Rust nightly, runs bounded campaigns, and
+does not execute Python, Node, TypeScript, downloaded scripts, or model code.
+
 ## Feature and build controls
 
 - Disable unnecessary direct default features.
@@ -83,6 +93,8 @@ cargo test --workspace --all-targets --all-features --locked
 
 Review source/checksums, licenses, feature unification, build scripts, native
 links, unsafe use, network/process/file capabilities, and advisory status.
+The production checks above run only against `engine/Cargo.lock`; fuzz checks
+and their separate lock are specified in [FUZZING.md](FUZZING.md).
 
 ## Release requirements
 
