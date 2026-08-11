@@ -9,7 +9,7 @@ networking, dynamic loading, or GPU kernels.
 | `sha2 0.11.0` | MIT OR Apache-2.0 | Direct mature SHA-384 implementation; pure digest surface |
 | `ed25519-dalek 3.0.0` | BSD-3-Clause | Direct strict Ed25519 verification and engine-response signing; only the `zeroize` feature is enabled |
 | `zeroize 1.8.2` | Apache-2.0 OR MIT | Direct audited clearing of the owner-provided response-key seed and Ed25519 signing state; no derive feature |
-| `libc 0.2.189` | MIT OR Apache-2.0 | Direct Unix constants `O_NOFOLLOW`/`O_CLOEXEC`; no direct FFI or unsafe block |
+| `libc 0.2.189` | MIT OR Apache-2.0 | Direct Unix constants `O_NOFOLLOW`/`O_CLOEXEC` for safe package and replay-journal opens; no direct FFI or unsafe block |
 | `digest 0.11.3` | MIT OR Apache-2.0 | SHA-2 trait/internal support |
 | `block-buffer 0.12.1` | MIT OR Apache-2.0 | SHA-2 fixed-block buffering |
 | `crypto-common 0.2.2` | MIT OR Apache-2.0 | RustCrypto shared types |

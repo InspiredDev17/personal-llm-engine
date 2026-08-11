@@ -209,6 +209,7 @@ name = "personalai-engine-server"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "libc",
  "personalai-engine-crypto",
  "personalai-engine-loader",
  "personalai-engine-memory",

@@ -35,7 +35,7 @@ token data, generated text, and engine events are untrusted.
 | Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, exhaustive fixture truncation/single-byte mutation tests | coverage-guided fuzzing and production-size corpora remain required |
 | Memory/CPU denial | aggregate memory reservations, fallible allocation, queue count/bytes, tensor/context/token ceilings, CPU operation caps, finite socket deadlines | production long-context/soak and multi-client fairness remain |
 | UDS impersonation/injection | owner-private runtime directory, mode-0600 inode-owned socket, strict frame directions, separate pinned Ed25519 request and response identities | bind peer-credential policy and key rotation need operational qualification |
-| Replay/reordering | monotonically increasing nonzero control nonce; every signed event binds the random request nonce and a strictly increasing ordinal | cross-connection request replay journal is not implemented |
+| Replay/reordering | connection-order checks plus a bounded mode-0600 per-control-key journal that synchronizes each authenticated nonce before execution and rejects duplicate/corrupt/truncated/exhausted/write-uncertain state; every signed event binds the request nonce and a strictly increasing ordinal | production key rotation, journal lifecycle/recovery, and multi-process exclusion need operational qualification |
 | Event spoofing/confusion | strict engine signature verified before parse; signed key ID/request nonce/event ordinal; Go validates frame kind, request ID, UTF-8, exact lengths, usage arithmetic and closed errors | add continuous fuzz corpus shared across languages |
 | Response-key exposure | seed enters only as exact stdin bytes, is never argv/config/model data, and is zeroized after signer construction; signing state zeroizes on drop | production secret injection, rotation, process memory and crash-dump policy need operational qualification |
 | Secret leakage in errors/logs | bounded control-free diagnostics; static/sanitized error guidance; no host path/package/prompt in protocol failures | review daemon operational logging before release |
@@ -51,7 +51,8 @@ tensors, rank 8, dimension `1<<30`, elements `1<<40`, 4,194,304 vocabulary
 entries, 1,048,576-token collections, 262,144 context tokens, 4 MiB requests,
 8 MiB complete frames, 64 MiB tokenizer data, 4,096 sequences, 64 MiB queued
 request bytes, 100 million CPU operations per bounded operation, and 100-byte
-portable UDS path.
+portable UDS path. Each control-key replay journal retains at most 1,048,576
+nonces before fail-closed key rotation is required.
 
 ## Security events and Agent Green
 

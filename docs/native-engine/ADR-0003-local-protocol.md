@@ -15,6 +15,17 @@ public key and verifies authentication before event parsing.
 Cancellation uses a higher-nonce signed command on the active full-duplex
 stream; disconnect or invalid follow-up control data cancels fail-closed.
 
+Before generation or cancellation execution, the engine appends the verified
+command nonce to a configuration-derived journal for that control key and
+synchronizes it to disk. The journal is a non-symlink mode-0600 regular file in
+the owner-private runtime root, with a fixed key-bound header, flat 8-byte nonce
+records, and a 1,048,576-entry maximum. Startup reconstructs a bounded in-memory
+index and rejects zero/duplicate records, wrong key identity, corruption,
+truncation, unsafe modes, exhaustion, or uncertain writes. A journal write
+failure poisons that runtime instance so no later command can execute. Control
+key rotation creates a separate journal; production rotation and retirement
+remain operator-owned release work.
+
 Reject TCP, HTTP fallback, arbitrary serialization, recursive messages,
 client-supplied paths, model installation, tools, approvals, memory mutation,
 and Agent Green commands. The Go adapter owns canonical request translation and

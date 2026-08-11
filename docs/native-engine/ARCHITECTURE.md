@@ -38,8 +38,9 @@ Green authority.
 
 Internal dependencies are checked against an explicit DAG. The only external
 dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
-constants used by the Unix no-follow opener. There is no third-party AI,
-tensor, tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
+constants used by the Unix no-follow package and replay-journal openers. There
+is no third-party AI, tensor, tokenizer, model-loader, scheduler, server, or
+GPU-kernel dependency.
 
 ## Package and loading flow
 
@@ -69,11 +70,19 @@ runtime directory. The socket path is a direct `.sock` child, length bounded,
 created mode 0600, and removed only when its device/inode still match the
 listener that created it. There is no TCP listener or network client.
 
-Protocol v2 frames use a fixed 16-byte little-endian header, 8 MiB complete-frame cap,
-closed directional kinds, and message-specific bounds. Generation and
-cancellation commands use fixed schemas and strict Ed25519 signatures over a
-domain-separated SHA-384 transcript. A connection session accepts strictly
-increasing nonzero nonces. Rust stores only the configured Go public key.
+Protocol v2 frames use a fixed 16-byte little-endian header, 8 MiB
+complete-frame cap, closed directional kinds, and message-specific bounds.
+Generation and cancellation commands use fixed schemas and strict Ed25519
+signatures over a domain-separated SHA-384 transcript. A connection session
+accepts strictly increasing nonzero nonces. Before any authenticated command
+executes, Rust appends its nonce to the mode-0600 journal derived from the
+configured control key ID and synchronizes the record to disk. The flat journal
+has a fixed header, 8-byte records, and a 1,048,576-entry ceiling. Duplicate,
+zero, corrupt, truncated, identity-mismatched, exhausted, symlinked, or
+write-uncertain state fails closed. Reopening reconstructs the bounded replay
+index, so a valid signed
+command cannot be replayed on a later connection or after restart. Rust stores
+only the configured Go public key.
 Every event has a separate domain-separated Ed25519 signature over its exact
 bytes plus the originating request nonce, a strictly increasing event ordinal,
 and the configured engine response-key ID. Go pins the engine public key and
@@ -98,7 +107,8 @@ budget), tensors (262,144), rank (8), dimensions (`1<<30`), elements (`1<<40`),
 token collections (1,048,576), vocabulary (4,194,304), context (262,144),
 request (4 MiB), complete frame (8 MiB), tokenizer data (64 MiB), sequences
 (4,096), aggregate queued bytes (64 MiB), CPU work (100 million operations per
-bounded operation), and portable socket path (100 bytes).
+bounded operation), durable nonces per control key (1,048,576), and portable
+socket path (100 bytes).
 
 ## Backend features
 

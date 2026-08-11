@@ -3,11 +3,17 @@
 //! This crate validates Unix-domain-socket configuration, admits requests for
 //! locally registered model IDs, and can execute the deterministic CPU
 //! reference path. It contains no TCP or outbound network capability, tool
-//! path, approval authority, arbitrary model path, or persistence authority.
+//! path, approval authority, arbitrary model path, or platform/model persistence
+//! authority. Its only mutable disk state is the bounded, configuration-derived
+//! replay journal required before authenticated command execution.
 
+#[cfg(unix)]
+mod replay;
 #[cfg(unix)]
 mod transport;
 
+#[cfg(unix)]
+pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener};
 
@@ -41,6 +47,8 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "cpu-reference")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(unix, feature = "cpu-reference"))]
+use std::sync::{Arc, Mutex};
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::thread;
 
 /// Maximum configured Unix socket path bytes for conservative portability.
@@ -57,7 +65,7 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    /// Validates configuration-owned model and future socket paths.
+    /// Validates configuration-owned model, runtime-state, and socket paths.
     pub fn new(
         model_root: impl Into<PathBuf>,
         runtime_root: impl Into<PathBuf>,
@@ -95,12 +103,12 @@ impl ServiceConfig {
         &self.model_root
     }
 
-    /// Returns the future protected runtime directory.
+    /// Returns the protected runtime directory.
     pub fn runtime_root(&self) -> &Path {
         &self.runtime_root
     }
 
-    /// Returns the future Unix-domain-socket path without opening it.
+    /// Returns the Unix-domain-socket path without opening it.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -354,6 +362,7 @@ pub struct CpuEngineRuntime {
     service: EngineService,
     trusted_control_key: TrustedControlPlaneKey,
     response_signer: EngineResponseSigner,
+    replay_journal: Arc<Mutex<DurableReplayJournal>>,
     models: BTreeMap<String, LoadedCpuModel>,
     next_sequence: u64,
 }
@@ -373,10 +382,15 @@ impl CpuEngineRuntime {
                 "control and response signing identities must be distinct",
             ));
         }
+        let replay_journal = DurableReplayJournal::open(
+            service.config().runtime_root(),
+            trusted_control_key.key_id(),
+        )?;
         Ok(Self {
             service,
             trusted_control_key,
             response_signer,
+            replay_journal: Arc::new(Mutex::new(replay_journal)),
             models: BTreeMap::new(),
             next_sequence: 1,
         })
@@ -418,7 +432,9 @@ impl CpuEngineRuntime {
         let mut connection = listener.accept()?;
         let frame = connection.read_inbound_frame()?;
         let mut session = AuthenticatedControlSession::new(self.trusted_control_key.clone());
-        match session.decode_command(&frame)? {
+        let command = session.decode_command(&frame)?;
+        admit_durable_nonce(&self.replay_journal, session.last_nonce())?;
+        match command {
             InboundCommand::Cancel(request_id) => {
                 let outcome = self.service.scheduler.cancel(&request_id)?;
                 Ok(match outcome {
@@ -457,6 +473,7 @@ impl CpuEngineRuntime {
                 let cancellation_connection = connection.try_clone()?;
                 let cancelled = AtomicBool::new(false);
                 let watcher_done = AtomicBool::new(false);
+                let replay_journal = Arc::clone(&self.replay_journal);
                 let mut event_ordinal = 1_u32;
                 let response_signer = &self.response_signer;
                 let generation_result = thread::scope(|scope| {
@@ -467,6 +484,7 @@ impl CpuEngineRuntime {
                             request_id,
                             &cancelled,
                             &watcher_done,
+                            &replay_journal,
                         );
                     });
                     let result =
@@ -514,8 +532,15 @@ fn watch_generation_cancellation(
     active_request_id: RequestId,
     cancelled: &AtomicBool,
     watcher_done: &AtomicBool,
+    replay_journal: &Mutex<DurableReplayJournal>,
 ) {
-    let command = connection.read_inbound_frame().and_then(|frame| session.decode_command(&frame));
+    let command = connection
+        .read_inbound_frame()
+        .and_then(|frame| session.decode_command(&frame))
+        .and_then(|command| {
+            admit_durable_nonce(replay_journal, session.last_nonce())?;
+            Ok(command)
+        });
     if watcher_done.load(Ordering::Acquire) {
         return;
     }
@@ -527,6 +552,17 @@ fn watch_generation_cancellation(
     // A disconnect, malformed follow-up, mismatched cancellation, or second
     // generation command makes the active stream untrustworthy. Fail closed.
     cancelled.store(true, Ordering::Release);
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn admit_durable_nonce(
+    replay_journal: &Mutex<DurableReplayJournal>,
+    nonce: u64,
+) -> Result<(), EngineError> {
+    replay_journal
+        .lock()
+        .map_err(|_| EngineError::internal_invariant("durable replay lock is poisoned"))?
+        .admit(nonce)
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -842,6 +878,11 @@ mod tests {
         let trusted_key =
             TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
                 .expect("control key must validate");
+        let mut replay =
+            DurableReplayJournal::open(&runtime_root, key_id).expect("replay journal must open");
+        replay.admit(1).expect("generation nonce must persist");
+        let replay_path = replay.path().to_path_buf();
+        let replay = Mutex::new(replay);
         let request = request(505, ModelId::new("decoder-cancel").expect("model ID must validate"));
         let generation = signed_generation_frame(&request, 1, key_id, &signing_key);
         let unsigned_cancel = CancellationEnvelope::unsigned_bytes(request.request_id(), 2, key_id)
@@ -873,11 +914,20 @@ mod tests {
         ));
         let cancelled = AtomicBool::new(false);
         let done = AtomicBool::new(false);
-        watch_generation_cancellation(connection, session, request.request_id(), &cancelled, &done);
+        watch_generation_cancellation(
+            connection,
+            session,
+            request.request_id(),
+            &cancelled,
+            &done,
+            &replay,
+        );
         assert!(cancelled.load(Ordering::Acquire));
         release_client.send(()).expect("client must be released");
         client.join().expect("client must finish");
+        drop(replay);
         drop(listener);
+        fs::remove_file(replay_path).expect("replay journal must clean");
         fs::remove_dir(&runtime_root).expect("runtime root must clean");
     }
 
@@ -992,6 +1042,7 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::AtomicU64;
+        use std::sync::mpsc;
         use std::thread;
 
         static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1055,6 +1106,7 @@ mod tests {
             .expect("request frame must construct")
             .encode()
             .expect("request frame must encode");
+        let replay_encoded = encoded.clone();
         let client_path = socket_path.clone();
         let client =
             thread::spawn(move || runtime_test_client(client_path, &encoded, response_public_key));
@@ -1066,7 +1118,30 @@ mod tests {
         assert_eq!(event_kinds.first(), Some(&1));
         assert_eq!(event_kinds.last(), Some(&3));
         assert!(event_kinds.iter().any(|kind| *kind == 2));
+
+        let replay_client_path = socket_path.clone();
+        let (release_replay_client, hold_replay_client) = mpsc::sync_channel(0);
+        let replay_client = thread::spawn(move || {
+            use std::io::Write;
+            use std::os::unix::net::UnixStream;
+
+            let mut stream =
+                UnixStream::connect(replay_client_path).expect("replay client must connect");
+            stream.write_all(&replay_encoded).expect("replayed request must write");
+            hold_replay_client.recv().expect("server must release replay client");
+        });
+        let replay_outcome = runtime.serve_one(&listener);
+        assert!(
+            matches!(replay_outcome, Err(EngineError::AuthenticationFailure(_))),
+            "replayed command must fail authentication: {replay_outcome:?}"
+        );
+        release_replay_client.send(()).expect("replay client must be released");
+        replay_client.join().expect("replay client must finish");
+
+        let replay_path = runtime_root.join(format!("control-replay-{key_id}.bin"));
         drop(listener);
+        drop(runtime);
+        fs::remove_file(replay_path).expect("replay journal must clean");
         fs::remove_dir(&runtime_root).expect("runtime root must clean");
     }
 

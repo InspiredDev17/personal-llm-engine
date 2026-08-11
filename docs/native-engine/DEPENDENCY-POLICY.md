@@ -37,7 +37,8 @@ SHA-384 and strict Ed25519 are package/control-message/response integrity
 mechanisms. The narrowly enabled Ed25519 `zeroize` feature plus the direct
 `zeroize` crate clear response-key seed material and signing state; no derive
 feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
-constants to safe `std::fs::OpenOptions`; the workspace contains no unsafe code.
+constants to safe `std::fs::OpenOptions` for package and durable replay state;
+the workspace contains no unsafe code.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact

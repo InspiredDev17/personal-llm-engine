@@ -13,8 +13,9 @@ package opening, a first-party bounded byte/BPE tokenizer, safe aggregate-
 accounted tensors, one fixed decoder architecture, scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
 mutually authenticated binary protocol, protected Unix-domain socket runtime,
-and an owner CLI. The Go repository contains the corresponding `NATIVE_ENGINE`
-provider adapter; it has no HTTP or remote-network fallback.
+a bounded per-control-key durable replay journal, and an owner CLI. The Go
+repository contains the corresponding `NATIVE_ENGINE` provider adapter; it has
+no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only
@@ -54,6 +55,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   increasing event ordinal, response key ID, and exact event bytes;
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
+- every authenticated command nonce is appended and synchronized to a bounded,
+  mode-0600 per-control-key journal before the command can execute;
 - packages are fixed-format data, exact-hash pinned, and signer verified;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
 - the engine cannot execute tools, approve actions, mutate platform memory, or

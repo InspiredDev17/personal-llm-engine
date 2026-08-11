@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Non-listening service composition boundary for the PersonalAI native engine"
+description = "Authenticated local service composition for the PersonalAI native engine"
 
 [features]
 default = ["cpu-reference"]
@@ -14,6 +14,7 @@ metal = ["personalai-engine-transformer/metal"]
 cuda = ["personalai-engine-transformer/cuda"]
 
 [dependencies]
+libc.workspace = true
 personalai-engine-crypto.workspace = true
 personalai-engine-loader.workspace = true
 personalai-engine-memory.workspace = true
