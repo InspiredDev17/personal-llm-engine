@@ -51,13 +51,17 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - Go signs control requests; Rust signs every response with a separate
   owner-provisioned response identity whose seed enters only through stdin and
   is zeroized after construction;
+- each verifier accepts at most an explicit current/previous public-key pair
+  during staged rotation; unknown, duplicate, partial, or model-selected keys
+  are rejected and one command stream cannot switch identities;
 - response signatures bind the request nonce, exact request ID, strictly
   increasing event ordinal, response key ID, and exact event bytes;
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
 - every authenticated command nonce is appended and synchronized to a bounded,
   mode-0600 per-control-key journal before the command can execute; an exclusive
-  lifetime lock prevents a second process from using the same key journal;
+  lifetime lock prevents a second process from using the same key journal, and
+  retiring a key does not delete its replay history;
 - packages are fixed-format data, exact-hash pinned, and signer verified;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
 - the engine cannot execute tools, approve actions, mutate platform memory, or

@@ -19,7 +19,9 @@ pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener};
 
-use personalai_engine_crypto::{EngineResponseSigner, TrustedControlPlaneKey, TrustedSigner};
+use personalai_engine_crypto::{
+    EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
+};
 use personalai_engine_loader::ModelRegistry;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::MemoryPool;
@@ -166,28 +168,42 @@ pub enum InboundCommand {
 /// Per-connection authentication and strict monotonic anti-replay state.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedControlSession {
-    trusted_key: TrustedControlPlaneKey,
+    trusted_keys: TrustedControlPlaneKeys,
     last_nonce: u64,
+    authenticated_key_id: Option<personalai_engine_types::SignerKeyId>,
 }
 
 impl AuthenticatedControlSession {
     /// Creates a fresh connection session with no accepted nonce.
-    pub const fn new(trusted_key: TrustedControlPlaneKey) -> Self {
-        Self { trusted_key, last_nonce: 0 }
+    pub fn new(trusted_key: TrustedControlPlaneKey) -> Result<Self, EngineError> {
+        Ok(Self::new_with_keys(TrustedControlPlaneKeys::single(trusted_key)?))
+    }
+
+    /// Creates a fresh connection session with a bounded rotation key ring.
+    pub const fn new_with_keys(trusted_keys: TrustedControlPlaneKeys) -> Self {
+        Self { trusted_keys, last_nonce: 0, authenticated_key_id: None }
     }
 
     /// Authenticates, decodes, and replay-checks one inbound command frame.
     pub fn decode_command(&mut self, frame: &Frame) -> Result<InboundCommand, EngineError> {
-        let (nonce, command) = match frame.kind() {
+        let (nonce, control_key_id, command) = match frame.kind() {
             FrameKind::GenerationRequest => {
                 let envelope =
-                    GenerationRequestEnvelope::decode(frame.payload(), &self.trusted_key)?;
+                    GenerationRequestEnvelope::decode(frame.payload(), &self.trusted_keys)?;
                 let nonce = envelope.nonce();
-                (nonce, InboundCommand::Generate { request: envelope.into_request(), nonce })
+                (
+                    nonce,
+                    envelope.control_key_id(),
+                    InboundCommand::Generate { request: envelope.into_request(), nonce },
+                )
             }
             FrameKind::Cancellation => {
-                let envelope = CancellationEnvelope::decode(frame.payload(), &self.trusted_key)?;
-                (envelope.nonce(), InboundCommand::Cancel(envelope.request_id()))
+                let envelope = CancellationEnvelope::decode(frame.payload(), &self.trusted_keys)?;
+                (
+                    envelope.nonce(),
+                    envelope.control_key_id(),
+                    InboundCommand::Cancel(envelope.request_id()),
+                )
             }
             _ => {
                 return Err(EngineError::protocol_violation(
@@ -195,11 +211,20 @@ impl AuthenticatedControlSession {
                 ));
             }
         };
+        if self
+            .authenticated_key_id
+            .is_some_and(|authenticated_key_id| authenticated_key_id != control_key_id)
+        {
+            return Err(EngineError::authentication_failure(
+                "control-plane key changed within one command stream",
+            ));
+        }
         if nonce <= self.last_nonce {
             return Err(EngineError::authentication_failure(
                 "control-plane request nonce was replayed or reordered",
             ));
         }
+        self.authenticated_key_id = Some(control_key_id);
         self.last_nonce = nonce;
         Ok(command)
     }
@@ -207,6 +232,11 @@ impl AuthenticatedControlSession {
     /// Returns the last accepted nonce.
     pub const fn last_nonce(&self) -> u64 {
         self.last_nonce
+    }
+
+    /// Returns the key identity bound to this command stream, if any.
+    pub const fn authenticated_key_id(&self) -> Option<personalai_engine_types::SignerKeyId> {
+        self.authenticated_key_id
     }
 }
 
@@ -362,9 +392,10 @@ pub enum ServeOutcome {
 #[cfg(all(unix, feature = "cpu-reference"))]
 pub struct CpuEngineRuntime {
     service: EngineService,
-    trusted_control_key: TrustedControlPlaneKey,
+    trusted_control_keys: TrustedControlPlaneKeys,
     response_signer: EngineResponseSigner,
-    replay_journal: Arc<Mutex<DurableReplayJournal>>,
+    replay_journals:
+        BTreeMap<personalai_engine_types::SignerKeyId, Arc<Mutex<DurableReplayJournal>>>,
     models: BTreeMap<String, LoadedCpuModel>,
     next_sequence: u64,
 }
@@ -377,22 +408,41 @@ impl CpuEngineRuntime {
         trusted_control_key: TrustedControlPlaneKey,
         response_signer: EngineResponseSigner,
     ) -> Result<Self, EngineError> {
-        if trusted_control_key.key_id() == response_signer.key_id()
-            || trusted_control_key.public_key() == response_signer.public_key()
-        {
-            return Err(EngineError::invalid_input(
-                "control and response signing identities must be distinct",
-            ));
+        Self::new_with_control_keys(
+            service,
+            TrustedControlPlaneKeys::single(trusted_control_key)?,
+            response_signer,
+        )
+    }
+
+    /// Creates an unloaded runtime with a bounded control-key overlap window.
+    pub fn new_with_control_keys(
+        service: EngineService,
+        trusted_control_keys: TrustedControlPlaneKeys,
+        response_signer: EngineResponseSigner,
+    ) -> Result<Self, EngineError> {
+        for trusted_control_key in trusted_control_keys.configured_keys() {
+            if trusted_control_key.key_id() == response_signer.key_id()
+                || trusted_control_key.public_key() == response_signer.public_key()
+            {
+                return Err(EngineError::invalid_input(
+                    "control and response signing identities must be distinct",
+                ));
+            }
         }
-        let replay_journal = DurableReplayJournal::open(
-            service.config().runtime_root(),
-            trusted_control_key.key_id(),
-        )?;
+        let mut replay_journals = BTreeMap::new();
+        for trusted_control_key in trusted_control_keys.active_keys() {
+            let journal = DurableReplayJournal::open(
+                service.config().runtime_root(),
+                trusted_control_key.key_id(),
+            )?;
+            replay_journals.insert(trusted_control_key.key_id(), Arc::new(Mutex::new(journal)));
+        }
         Ok(Self {
             service,
-            trusted_control_key,
+            trusted_control_keys,
             response_signer,
-            replay_journal: Arc::new(Mutex::new(replay_journal)),
+            replay_journals,
             models: BTreeMap::new(),
             next_sequence: 1,
         })
@@ -433,9 +483,16 @@ impl CpuEngineRuntime {
     pub fn serve_one(&mut self, listener: &UnixFrameListener) -> Result<ServeOutcome, EngineError> {
         let mut connection = listener.accept()?;
         let frame = connection.read_inbound_frame()?;
-        let mut session = AuthenticatedControlSession::new(self.trusted_control_key.clone());
+        let mut session =
+            AuthenticatedControlSession::new_with_keys(self.trusted_control_keys.clone());
         let command = session.decode_command(&frame)?;
-        admit_durable_nonce(&self.replay_journal, session.last_nonce())?;
+        let authenticated_key_id = session.authenticated_key_id().ok_or_else(|| {
+            EngineError::internal_invariant("authenticated command omitted its control key ID")
+        })?;
+        let replay_journal = self.replay_journals.get(&authenticated_key_id).ok_or_else(|| {
+            EngineError::internal_invariant("active control key omitted its replay journal")
+        })?;
+        admit_durable_nonce(replay_journal, session.last_nonce())?;
         match command {
             InboundCommand::Cancel(request_id) => {
                 let outcome = self.service.scheduler.cancel(&request_id)?;
@@ -475,7 +532,7 @@ impl CpuEngineRuntime {
                 let cancellation_connection = connection.try_clone()?;
                 let cancelled = AtomicBool::new(false);
                 let watcher_done = AtomicBool::new(false);
-                let replay_journal = Arc::clone(&self.replay_journal);
+                let replay_journal = Arc::clone(replay_journal);
                 let mut event_ordinal = 1_u32;
                 let response_signer = &self.response_signer;
                 let generation_result = thread::scope(|scope| {
@@ -823,7 +880,8 @@ mod tests {
         let payload =
             attach_generation_signature(&unsigned, &signature).expect("signature must attach");
         let frame = Frame::new(FrameKind::GenerationRequest, payload).expect("frame must validate");
-        let mut session = AuthenticatedControlSession::new(trusted);
+        let mut session =
+            AuthenticatedControlSession::new(trusted).expect("session key must validate");
         assert!(matches!(
             session.decode_command(&frame),
             Ok(InboundCommand::Generate { nonce: 1, .. })
@@ -833,6 +891,46 @@ mod tests {
             session.decode_command(&frame),
             Err(EngineError::AuthenticationFailure(_))
         ));
+    }
+
+    #[test]
+    fn authenticated_control_session_accepts_rotation_but_binds_each_stream_to_one_key() {
+        let first_signing_key = SigningKey::from_bytes(&[0x25; 32]);
+        let second_signing_key = SigningKey::from_bytes(&[0x26; 32]);
+        let first_id = SignerKeyId::from_bytes([0x27; 16]).expect("key ID must validate");
+        let second_id = SignerKeyId::from_bytes([0x28; 16]).expect("key ID must validate");
+        let trusted_keys = TrustedControlPlaneKeys::new([
+            TrustedControlPlaneKey::active(first_id, first_signing_key.verifying_key().to_bytes())
+                .expect("first control key must validate"),
+            TrustedControlPlaneKey::active(
+                second_id,
+                second_signing_key.verifying_key().to_bytes(),
+            )
+            .expect("second control key must validate"),
+        ])
+        .expect("rotation key ring must validate");
+        let generation = request(56, ModelId::new("model-a").expect("model ID must validate"));
+        let encoded = signed_generation_frame(&generation, 1, first_id, &first_signing_key);
+        let frame = Frame::decode_inbound_exact(&encoded).expect("request frame must decode");
+        let mut session = AuthenticatedControlSession::new_with_keys(trusted_keys);
+        session.decode_command(&frame).expect("first key must authenticate");
+        assert_eq!(session.authenticated_key_id(), Some(first_id));
+
+        let unsigned = CancellationEnvelope::unsigned_bytes(generation.request_id(), 2, second_id)
+            .expect("cancellation must encode");
+        let transcript =
+            control_plane_signature_message(&unsigned).expect("transcript must construct");
+        let signature = second_signing_key.sign(&transcript).to_bytes();
+        let payload =
+            attach_cancellation_signature(&unsigned, &signature).expect("signature must attach");
+        let cancellation =
+            Frame::new(FrameKind::Cancellation, payload).expect("frame must validate");
+        assert!(matches!(
+            session.decode_command(&cancellation),
+            Err(EngineError::AuthenticationFailure(_))
+        ));
+        assert_eq!(session.authenticated_key_id(), Some(first_id));
+        assert_eq!(session.last_nonce(), 1);
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
@@ -850,6 +948,114 @@ mod tests {
             CpuEngineRuntime::new(service(), trusted, response),
             Err(EngineError::InvalidInput(_))
         ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn runtime_opens_one_exclusive_replay_journal_per_active_rotation_key() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicU64;
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let runtime_root = PathBuf::from("/tmp")
+            .join(format!("personalai-engine-key-rotation-{}-{sequence}", std::process::id()));
+        fs::create_dir(&runtime_root).expect("runtime root must create");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+            .expect("runtime root permissions must set");
+        let config = ServiceConfig::new("/models", &runtime_root, runtime_root.join("engine.sock"))
+            .expect("service config must validate");
+        let service = EngineService::new(
+            config.clone(),
+            SchedulerLimits::new(8, 1, 1 << 20).expect("limits must validate"),
+        )
+        .expect("service must construct");
+        let first_signing_key = SigningKey::from_bytes(&[0x71; 32]);
+        let second_signing_key = SigningKey::from_bytes(&[0x72; 32]);
+        let first_id = SignerKeyId::from_bytes([0x73; 16]).expect("key ID must validate");
+        let second_id = SignerKeyId::from_bytes([0x74; 16]).expect("key ID must validate");
+        let trusted_keys = TrustedControlPlaneKeys::new([
+            TrustedControlPlaneKey::active(first_id, first_signing_key.verifying_key().to_bytes())
+                .expect("first key must validate"),
+            TrustedControlPlaneKey::active(
+                second_id,
+                second_signing_key.verifying_key().to_bytes(),
+            )
+            .expect("second key must validate"),
+        ])
+        .expect("key ring must validate");
+        let runtime =
+            CpuEngineRuntime::new_with_control_keys(service, trusted_keys, test_response_signer())
+                .expect("rotating runtime must construct");
+        assert_eq!(runtime.replay_journals.len(), 2);
+        runtime
+            .replay_journals
+            .get(&first_id)
+            .expect("first journal must exist")
+            .lock()
+            .expect("journal lock must be available")
+            .admit(99)
+            .expect("nonce must persist before rotation");
+        let paths: Vec<_> = runtime
+            .replay_journals
+            .values()
+            .map(|journal| {
+                journal.lock().expect("journal lock must be available").path().to_path_buf()
+            })
+            .collect();
+        assert!(paths.iter().all(|path| path.is_file()));
+        drop(runtime);
+
+        let second_only = TrustedControlPlaneKey::active(
+            second_id,
+            second_signing_key.verifying_key().to_bytes(),
+        )
+        .expect("remaining key must validate");
+        let service = EngineService::new(
+            config.clone(),
+            SchedulerLimits::new(8, 1, 1 << 20).expect("limits must validate"),
+        )
+        .expect("service must reconstruct");
+        let retired_runtime = CpuEngineRuntime::new(service, second_only, test_response_signer())
+            .expect("runtime must allow first-key retirement");
+        assert_eq!(retired_runtime.replay_journals.len(), 1);
+        assert!(paths.iter().all(|path| path.is_file()));
+        drop(retired_runtime);
+
+        let restored_keys = TrustedControlPlaneKeys::new([
+            TrustedControlPlaneKey::active(first_id, first_signing_key.verifying_key().to_bytes())
+                .expect("first key must validate"),
+            TrustedControlPlaneKey::active(
+                second_id,
+                second_signing_key.verifying_key().to_bytes(),
+            )
+            .expect("second key must validate"),
+        ])
+        .expect("restored overlap must validate");
+        let service = EngineService::new(
+            config,
+            SchedulerLimits::new(8, 1, 1 << 20).expect("limits must validate"),
+        )
+        .expect("service must reconstruct");
+        let restored_runtime =
+            CpuEngineRuntime::new_with_control_keys(service, restored_keys, test_response_signer())
+                .expect("retired key must reopen its retained journal");
+        assert!(matches!(
+            restored_runtime
+                .replay_journals
+                .get(&first_id)
+                .expect("first journal must reopen")
+                .lock()
+                .expect("journal lock must be available")
+                .admit(99),
+            Err(EngineError::AuthenticationFailure(_))
+        ));
+        drop(restored_runtime);
+        for path in paths {
+            fs::remove_file(path).expect("journal must clean");
+        }
+        fs::remove_dir(runtime_root).expect("runtime root must clean");
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
@@ -909,7 +1115,8 @@ mod tests {
         });
         let mut connection = listener.accept().expect("connection must accept");
         let first = connection.read_inbound_frame().expect("generation frame must read");
-        let mut session = AuthenticatedControlSession::new(trusted_key);
+        let mut session =
+            AuthenticatedControlSession::new(trusted_key).expect("session key must validate");
         assert!(matches!(
             session.decode_command(&first),
             Ok(InboundCommand::Generate { nonce: 1, .. })

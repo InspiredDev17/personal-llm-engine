@@ -84,11 +84,15 @@ index, so a valid signed command cannot be replayed on a later connection or
 after restart. A nonblocking exclusive advisory lock is held by the journal's
 sole owned file descriptor for its complete lifetime; another process using the
 same control-key journal fails before it can serve commands. Rust stores only
-the configured Go public key.
+the configured Go public keys and accepts at most an explicit current/previous
+pair. It rejects duplicate identities, binds one stream to one authenticated
+key, and keeps a separate locked journal for each accepted key. Removing a key
+from configuration does not delete its replay history.
 Every event has a separate domain-separated Ed25519 signature over its exact
 bytes plus the originating request nonce, a strictly increasing event ordinal,
-and the configured engine response-key ID. Go pins the engine public key and
-verifies the binding before parsing or exposing event data.
+and the configured engine response-key ID. Go pins at most an explicit
+current/previous response public-key pair and verifies the selected binding
+before parsing or exposing event data.
 
 The current runtime executes one CPU sequence at a time. The Go adapter opens
 one connection per generation and signs with the Go-held private key. On
@@ -100,7 +104,9 @@ stdin before model or socket startup, cleared after signer construction, never
 accepted through argv/model/client data, and never logged. Go validates the
 signature, nonce, ordinal, request ID, event schema, and usage before exposing
 canonical platform responses. It has no HTTP fallback. Fair multi-sequence
-scheduling and batching remain production hardening work.
+scheduling and batching remain production hardening work. ADR-0005 defines the
+overlap, cutover, drain, rollback, and retirement order for both identities;
+production secret injection and journal recovery still require operated proof.
 
 ## Resource ceilings
 

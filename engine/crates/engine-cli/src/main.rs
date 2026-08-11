@@ -1,6 +1,8 @@
 //! Owner-facing CLI for diagnostics and the local CPU-reference service.
 
-use personalai_engine_crypto::{EngineResponseSigner, TrustedControlPlaneKey, TrustedSigner};
+use personalai_engine_crypto::{
+    EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
+};
 use personalai_engine_scheduler::SchedulerLimits;
 #[cfg(unix)]
 use personalai_engine_server::{CpuEngineRuntime, UnixFrameListener};
@@ -23,6 +25,7 @@ const USAGE: &str = "usage:
     --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
     --signer-key-id HEX32 --signer-public-key HEX64 \
     --control-key-id HEX32 --control-public-key HEX64 \
+    [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64
   serve reads exactly 32 binary response-key seed bytes from stdin";
@@ -45,6 +48,7 @@ struct ServeConfig {
     signer_public_key: [u8; 32],
     control_key_id: SignerKeyId,
     control_public_key: [u8; 32],
+    previous_control_key: Option<(SignerKeyId, [u8; 32])>,
     response_key_id: SignerKeyId,
     budget: ResourceBudget,
 }
@@ -134,6 +138,8 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
     let mut signer_public_key = None;
     let mut control_key_id = None;
     let mut control_public_key = None;
+    let mut previous_control_key_id = None;
+    let mut previous_control_public_key = None;
     let mut response_key_id = None;
     let mut max_memory_bytes = None;
     let mut max_kv_cache_bytes = None;
@@ -146,9 +152,7 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
             value.to_str().ok_or(CliError::InvalidArguments("serve value must be valid UTF-8"))?;
         match flag {
             "--model-root" if model_root.is_none() => model_root = Some(PathBuf::from(value)),
-            "--runtime-root" if runtime_root.is_none() => {
-                runtime_root = Some(PathBuf::from(value));
-            }
+            "--runtime-root" if runtime_root.is_none() => runtime_root = Some(PathBuf::from(value)),
             "--socket" if socket_path.is_none() => socket_path = Some(PathBuf::from(value)),
             "--model-id" if model_id.is_none() => model_id = Some(ModelId::new(text)?),
             "--package" if package_name.is_none() => package_name = Some(PathBuf::from(value)),
@@ -166,6 +170,12 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
             }
             "--control-public-key" if control_public_key.is_none() => {
                 control_public_key = Some(parse_hex(text)?);
+            }
+            "--previous-control-key-id" if previous_control_key_id.is_none() => {
+                previous_control_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
+            }
+            "--previous-control-public-key" if previous_control_public_key.is_none() => {
+                previous_control_public_key = Some(parse_hex(text)?);
             }
             "--response-key-id" if response_key_id.is_none() => {
                 response_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
@@ -186,6 +196,8 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
             | "--signer-public-key"
             | "--control-key-id"
             | "--control-public-key"
+            | "--previous-control-key-id"
+            | "--previous-control-public-key"
             | "--response-key-id"
             | "--max-memory-bytes"
             | "--max-kv-cache-bytes" => {
@@ -199,11 +211,9 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
         required(runtime_root, "--runtime-root is required")?,
         required(socket_path, "--socket is required")?,
     )?;
-    let budget = ResourceBudget::new(
-        required(max_memory_bytes, "--max-memory-bytes is required")?,
-        required(max_kv_cache_bytes, "--max-kv-cache-bytes is required")?,
-        1,
-    )?;
+    let budget = serve_budget(max_memory_bytes, max_kv_cache_bytes)?;
+    let previous_control_key =
+        rotation_key_pair(previous_control_key_id, previous_control_public_key)?;
     Ok(ServeConfig {
         service,
         model_id: required(model_id, "--model-id is required")?,
@@ -213,9 +223,35 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
         signer_public_key: required(signer_public_key, "--signer-public-key is required")?,
         control_key_id: required(control_key_id, "--control-key-id is required")?,
         control_public_key: required(control_public_key, "--control-public-key is required")?,
+        previous_control_key,
         response_key_id: required(response_key_id, "--response-key-id is required")?,
         budget,
     })
+}
+
+fn serve_budget(
+    max_memory_bytes: Option<u64>,
+    max_kv_cache_bytes: Option<u64>,
+) -> Result<ResourceBudget, CliError> {
+    ResourceBudget::new(
+        required(max_memory_bytes, "--max-memory-bytes is required")?,
+        required(max_kv_cache_bytes, "--max-kv-cache-bytes is required")?,
+        1,
+    )
+    .map_err(CliError::Engine)
+}
+
+fn rotation_key_pair(
+    key_id: Option<SignerKeyId>,
+    public_key: Option<[u8; 32]>,
+) -> Result<Option<(SignerKeyId, [u8; 32])>, CliError> {
+    match (key_id, public_key) {
+        (None, None) => Ok(None),
+        (Some(key_id), Some(public_key)) => Ok(Some((key_id, public_key))),
+        _ => Err(CliError::InvalidArguments(
+            "previous control key ID and public key must be configured together",
+        )),
+    }
 }
 
 fn required<T>(value: Option<T>, message: &'static str) -> Result<T, CliError> {
@@ -261,6 +297,11 @@ fn serve(
     let signer = TrustedSigner::active(config.signer_key_id, config.signer_public_key)?;
     let control_key =
         TrustedControlPlaneKey::active(config.control_key_id, config.control_public_key)?;
+    let mut control_keys = vec![control_key];
+    if let Some((key_id, public_key)) = config.previous_control_key {
+        control_keys.push(TrustedControlPlaneKey::active(key_id, public_key)?);
+    }
+    let control_keys = TrustedControlPlaneKeys::new(control_keys)?;
     let mut response_seed = [0_u8; 32];
     secrets.read_exact(&mut response_seed).map_err(|_| CliError::Io)?;
     let response_signer =
@@ -272,7 +313,8 @@ fn serve(
         config.package_hash,
         signer,
     )?;
-    let mut runtime = CpuEngineRuntime::new(service, control_key, response_signer)?;
+    let mut runtime =
+        CpuEngineRuntime::new_with_control_keys(service, control_keys, response_signer)?;
     runtime.load_registered_model(&config.model_id, &config.budget)?;
     let listener = UnixFrameListener::bind(runtime.service().config())?;
     loop {
@@ -408,5 +450,69 @@ mod tests {
             Err(CliError::InvalidArguments("--model-root is required"))
         ));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn serve_previous_control_identity_is_an_atomic_pair() {
+        let mut incomplete = complete_serve_arguments();
+        incomplete.extend([
+            OsString::from("--previous-control-key-id"),
+            OsString::from("05050505050505050505050505050505"),
+        ]);
+        assert!(matches!(
+            parse_command(incomplete.into_iter()),
+            Err(CliError::InvalidArguments(
+                "previous control key ID and public key must be configured together"
+            ))
+        ));
+
+        let mut complete = complete_serve_arguments();
+        complete.extend([
+            OsString::from("--previous-control-key-id"),
+            OsString::from("05050505050505050505050505050505"),
+            OsString::from("--previous-control-public-key"),
+            OsString::from("06".repeat(32)),
+        ]);
+        let Command::Serve(config) =
+            parse_command(complete.into_iter()).expect("complete rotation pair must parse")
+        else {
+            panic!("serve command must parse as serve");
+        };
+        assert!(config.previous_control_key.is_some());
+    }
+
+    fn complete_serve_arguments() -> Vec<OsString> {
+        vec![
+            "serve".to_owned(),
+            "--model-root".to_owned(),
+            "/models".to_owned(),
+            "--runtime-root".to_owned(),
+            "/run/personalai-engine".to_owned(),
+            "--socket".to_owned(),
+            "/run/personalai-engine/engine.sock".to_owned(),
+            "--model-id".to_owned(),
+            "decoder-v1".to_owned(),
+            "--package".to_owned(),
+            "decoder-v1.paimodel".to_owned(),
+            "--package-sha384".to_owned(),
+            "03".repeat(48),
+            "--signer-key-id".to_owned(),
+            "01010101010101010101010101010101".to_owned(),
+            "--signer-public-key".to_owned(),
+            "02".repeat(32),
+            "--control-key-id".to_owned(),
+            "03030303030303030303030303030303".to_owned(),
+            "--control-public-key".to_owned(),
+            "04".repeat(32),
+            "--response-key-id".to_owned(),
+            "07070707070707070707070707070707".to_owned(),
+            "--max-memory-bytes".to_owned(),
+            "1048576".to_owned(),
+            "--max-kv-cache-bytes".to_owned(),
+            "524288".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
     }
 }

@@ -23,8 +23,11 @@ records, and a 1,048,576-entry maximum. Startup reconstructs a bounded in-memory
 index and rejects zero/duplicate records, wrong key identity, corruption,
 truncation, unsafe modes, exhaustion, or uncertain writes. A journal write
 failure poisons that runtime instance so no later command can execute. Control
-key rotation creates a separate journal; production rotation and retirement
-remain operator-owned release work.
+key rotation creates a separate journal. Rust accepts only an explicit
+current/previous public-key pair, binds each command stream to one key, and
+keeps the prior key's journal after retirement so later reactivation cannot
+reset replay history. The staged procedure and remaining operator-owned
+recovery evidence are recorded in ADR-0005.
 
 The journal also holds a nonblocking exclusive advisory file lock for its full
 lifetime. A second process using the same control-key journal fails during

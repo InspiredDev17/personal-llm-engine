@@ -9,6 +9,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use personalai_engine_types::{EngineError, ModelPackageHash, SignerKeyId};
 use sha2::{Digest, Sha384};
+use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
 /// Domain separator for version-one model-package content signatures.
@@ -22,6 +23,8 @@ pub const ENGINE_RESPONSE_SIGNATURE_DOMAIN_V2: &[u8] = b"PersonalAI.Engine.Respo
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 /// Ed25519 signature length.
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
+/// Maximum simultaneously accepted Go control-plane verification identities.
+pub const MAX_TRUSTED_CONTROL_PLANE_KEYS: usize = 2;
 
 /// Operator-configured Ed25519 verification key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +40,15 @@ pub struct TrustedControlPlaneKey {
     key_id: SignerKeyId,
     public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
     active: bool,
+}
+
+/// Bounded, owner-configured control-plane verification key ring.
+///
+/// The two-entry ceiling supports a staged current/previous overlap without
+/// allowing unbounded trust expansion or runtime key discovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedControlPlaneKeys {
+    keys: BTreeMap<SignerKeyId, TrustedControlPlaneKey>,
 }
 
 /// Owner-provisioned Ed25519 identity used only to sign engine responses.
@@ -90,6 +102,15 @@ impl TrustedControlPlaneKey {
         Ok(Self { key_id, public_key, active: true })
     }
 
+    /// Creates one explicitly revoked control-plane key.
+    pub fn revoked(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: false })
+    }
+
     /// Returns the configured key identifier.
     pub const fn key_id(&self) -> SignerKeyId {
         self.key_id
@@ -98,6 +119,77 @@ impl TrustedControlPlaneKey {
     /// Returns the configured public verification key.
     pub const fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
         self.public_key
+    }
+
+    /// Returns whether this control-plane key currently accepts signatures.
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+impl TrustedControlPlaneKeys {
+    /// Constructs a bounded key ring from explicit local configuration.
+    pub fn new(
+        keys: impl IntoIterator<Item = TrustedControlPlaneKey>,
+    ) -> Result<Self, EngineError> {
+        let mut configured = BTreeMap::new();
+        for key in keys {
+            if configured.len() == MAX_TRUSTED_CONTROL_PLANE_KEYS {
+                return Err(EngineError::invalid_input(
+                    "control-plane key ring exceeds its hard bound",
+                ));
+            }
+            if configured
+                .values()
+                .any(|existing: &TrustedControlPlaneKey| existing.public_key() == key.public_key())
+            {
+                return Err(EngineError::invalid_input(
+                    "control-plane key ring contains a duplicate public key",
+                ));
+            }
+            if configured.insert(key.key_id(), key).is_some() {
+                return Err(EngineError::invalid_input(
+                    "control-plane key ring contains a duplicate key ID",
+                ));
+            }
+        }
+        if configured.is_empty() {
+            return Err(EngineError::invalid_input("control-plane key ring is empty"));
+        }
+        if !configured.values().any(TrustedControlPlaneKey::is_active) {
+            return Err(EngineError::invalid_input("control-plane key ring has no active key"));
+        }
+        Ok(Self { keys: configured })
+    }
+
+    /// Constructs a one-key ring for non-rotating deployments.
+    pub fn single(key: TrustedControlPlaneKey) -> Result<Self, EngineError> {
+        Self::new([key])
+    }
+
+    /// Resolves an explicitly configured active key without fallback.
+    pub fn resolve(&self, key_id: SignerKeyId) -> Result<&TrustedControlPlaneKey, EngineError> {
+        let key = self.keys.get(&key_id).ok_or_else(|| {
+            EngineError::authentication_failure(
+                "control-plane key does not match local configuration",
+            )
+        })?;
+        if !key.is_active() {
+            return Err(EngineError::authentication_failure(
+                "control-plane authentication key is revoked",
+            ));
+        }
+        Ok(key)
+    }
+
+    /// Iterates over active configured keys in deterministic key-ID order.
+    pub fn active_keys(&self) -> impl Iterator<Item = &TrustedControlPlaneKey> {
+        self.keys.values().filter(|key| key.is_active())
+    }
+
+    /// Iterates over every configured key in deterministic key-ID order.
+    pub fn configured_keys(&self) -> impl Iterator<Item = &TrustedControlPlaneKey> {
+        self.keys.values()
     }
 }
 
@@ -222,6 +314,17 @@ pub fn verify_control_plane_signature(
         .map_err(|_| EngineError::authentication_failure("control-plane signature is invalid"))
 }
 
+/// Resolves and strictly verifies one request against a bounded key ring.
+pub fn verify_control_plane_signature_with_keys(
+    trusted_keys: &TrustedControlPlaneKeys,
+    envelope_key_id: SignerKeyId,
+    request_bytes: &[u8],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    let trusted_key = trusted_keys.resolve(envelope_key_id)?;
+    verify_control_plane_signature(trusted_key, envelope_key_id, request_bytes, signature_bytes)
+}
+
 fn domain_separated_message(
     domain: &[u8],
     digest: &[u8; ModelPackageHash::BYTE_LEN],
@@ -307,5 +410,80 @@ mod tests {
         let tampered = engine_response_signature_message(b"tampered")
             .expect("tampered transcript must construct");
         assert!(signer.signing_key.verifying_key().verify_strict(&tampered, &signature).is_err());
+    }
+
+    #[test]
+    fn control_key_ring_is_bounded_unique_and_fail_closed() {
+        let first_signing_key = SigningKey::from_bytes(&[0x31; 32]);
+        let second_signing_key = SigningKey::from_bytes(&[0x32; 32]);
+        let third_signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let first_id = SignerKeyId::from_bytes([0x41; 16]).expect("key ID must validate");
+        let second_id = SignerKeyId::from_bytes([0x42; 16]).expect("key ID must validate");
+        let third_id = SignerKeyId::from_bytes([0x43; 16]).expect("key ID must validate");
+        let first =
+            TrustedControlPlaneKey::active(first_id, first_signing_key.verifying_key().to_bytes())
+                .expect("first key must validate");
+        let second = TrustedControlPlaneKey::active(
+            second_id,
+            second_signing_key.verifying_key().to_bytes(),
+        )
+        .expect("second key must validate");
+        let ring = TrustedControlPlaneKeys::new([first.clone(), second.clone()])
+            .expect("overlap ring must validate");
+        assert_eq!(ring.resolve(first_id), Ok(&first));
+        assert_eq!(ring.resolve(second_id), Ok(&second));
+        assert!(ring.resolve(third_id).is_err());
+
+        assert!(TrustedControlPlaneKeys::new(Vec::new()).is_err());
+        assert!(TrustedControlPlaneKeys::new([first.clone(), first]).is_err());
+        let duplicate_public_key =
+            TrustedControlPlaneKey::active(third_id, first_signing_key.verifying_key().to_bytes())
+                .expect("duplicate material is individually valid");
+        assert!(TrustedControlPlaneKeys::new([second.clone(), duplicate_public_key]).is_ok());
+        let duplicate_public_key =
+            TrustedControlPlaneKey::active(third_id, second_signing_key.verifying_key().to_bytes())
+                .expect("duplicate material is individually valid");
+        assert!(TrustedControlPlaneKeys::new([second, duplicate_public_key]).is_err());
+
+        let third =
+            TrustedControlPlaneKey::active(third_id, third_signing_key.verifying_key().to_bytes())
+                .expect("third key must validate");
+        assert!(
+            TrustedControlPlaneKeys::new([
+                TrustedControlPlaneKey::active(
+                    first_id,
+                    first_signing_key.verifying_key().to_bytes(),
+                )
+                .expect("first key must validate"),
+                TrustedControlPlaneKey::active(
+                    second_id,
+                    second_signing_key.verifying_key().to_bytes(),
+                )
+                .expect("second key must validate"),
+                third,
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn revoked_control_key_is_retained_but_never_resolved() {
+        let signing_key = SigningKey::from_bytes(&[0x61; 32]);
+        let key_id = SignerKeyId::from_bytes([0x62; 16]).expect("key ID must validate");
+        let revoked =
+            TrustedControlPlaneKey::revoked(key_id, signing_key.verifying_key().to_bytes())
+                .expect("revoked key must validate");
+        assert!(TrustedControlPlaneKeys::single(revoked.clone()).is_err());
+        let active_signing_key = SigningKey::from_bytes(&[0x63; 32]);
+        let active_id = SignerKeyId::from_bytes([0x64; 16]).expect("key ID must validate");
+        let active = TrustedControlPlaneKey::active(
+            active_id,
+            active_signing_key.verifying_key().to_bytes(),
+        )
+        .expect("active key must validate");
+        let ring = TrustedControlPlaneKeys::new([revoked, active])
+            .expect("ring with an active key must validate");
+        assert!(ring.resolve(key_id).is_err());
+        assert!(ring.resolve(active_id).is_ok());
     }
 }

@@ -1,8 +1,8 @@
 //! Fixed binary generation-request message and authentication envelope.
 
 use personalai_engine_crypto::{
-    ED25519_SIGNATURE_BYTES, EngineResponseSigner, TrustedControlPlaneKey,
-    verify_control_plane_signature,
+    ED25519_SIGNATURE_BYTES, EngineResponseSigner, TrustedControlPlaneKeys,
+    verify_control_plane_signature_with_keys,
 };
 use personalai_engine_types::{
     ContextLimit, EngineError, EngineErrorKind, GenerationEvent, GenerationRequest,
@@ -33,7 +33,7 @@ impl GenerationRequestEnvelope {
     /// Decodes and strictly authenticates one exact payload.
     pub fn decode(
         payload: &[u8],
-        trusted_key: &TrustedControlPlaneKey,
+        trusted_keys: &TrustedControlPlaneKeys,
     ) -> Result<Self, EngineError> {
         let minimum = GENERATION_REQUEST_FIXED_BYTES
             .checked_add(ED25519_SIGNATURE_BYTES)
@@ -65,7 +65,12 @@ impl GenerationRequestEnvelope {
             .checked_sub(ED25519_SIGNATURE_BYTES)
             .ok_or_else(|| EngineError::protocol_violation("request signature is truncated"))?;
         let signature = read_exact::<ED25519_SIGNATURE_BYTES>(payload, signed_length)?;
-        verify_control_plane_signature(trusted_key, key_id, &payload[..signed_length], &signature)?;
+        verify_control_plane_signature_with_keys(
+            trusted_keys,
+            key_id,
+            &payload[..signed_length],
+            &signature,
+        )?;
 
         let model_length = usize::from(read_u16(payload, 80)?);
         let input_length = usize::try_from(read_u32(payload, 84)?)
@@ -217,7 +222,7 @@ impl CancellationEnvelope {
     /// Decodes and strictly authenticates one cancellation payload.
     pub fn decode(
         payload: &[u8],
-        trusted_key: &TrustedControlPlaneKey,
+        trusted_keys: &TrustedControlPlaneKeys,
     ) -> Result<Self, EngineError> {
         let exact_length = CANCELLATION_UNSIGNED_BYTES
             .checked_add(ED25519_SIGNATURE_BYTES)
@@ -241,8 +246,8 @@ impl CancellationEnvelope {
             .map_err(|_| EngineError::protocol_violation("control-plane key ID is invalid"))?;
         let signature =
             read_exact::<ED25519_SIGNATURE_BYTES>(payload, CANCELLATION_UNSIGNED_BYTES)?;
-        verify_control_plane_signature(
-            trusted_key,
+        verify_control_plane_signature_with_keys(
+            trusted_keys,
             key_id,
             &payload[..CANCELLATION_UNSIGNED_BYTES],
             &signature,
@@ -470,7 +475,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     use personalai_engine_crypto::{
-        EngineResponseSigner, control_plane_signature_message, engine_response_signature_message,
+        EngineResponseSigner, TrustedControlPlaneKey, control_plane_signature_message,
+        engine_response_signature_message,
     };
 
     #[test]
@@ -480,6 +486,7 @@ mod tests {
         let trusted =
             TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
                 .expect("control key must validate");
+        let trusted = TrustedControlPlaneKeys::single(trusted).expect("key ring must validate");
         let request = request();
         let unsigned = GenerationRequestEnvelope::unsigned_bytes(&request, 1, key_id)
             .expect("unsigned message must encode");
@@ -515,6 +522,7 @@ mod tests {
         let trusted =
             TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
                 .expect("control key must validate");
+        let trusted = TrustedControlPlaneKeys::single(trusted).expect("key ring must validate");
         let mut request_id_bytes = [0_u8; 16];
         request_id_bytes[15] = 1;
         let request_id = RequestId::from_bytes(request_id_bytes).expect("request id must validate");
