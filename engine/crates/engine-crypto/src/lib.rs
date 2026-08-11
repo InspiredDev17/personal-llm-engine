@@ -1,0 +1,232 @@
+//! Cryptographic identity and signature verification for model packages.
+//!
+//! This crate performs SHA-384 hashing and strict Ed25519 verification through
+//! reviewed general-purpose cryptographic dependencies. It never generates or
+//! stores production signing keys.
+
+use ed25519_dalek::{Signature, VerifyingKey};
+use personalai_engine_types::{EngineError, ModelPackageHash, SignerKeyId};
+use sha2::{Digest, Sha384};
+
+/// Domain separator for version-one model-package content signatures.
+pub const MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] = b"PersonalAI.ModelPackage.Signature.v1\0";
+/// Domain separator for Go control-plane request signatures.
+pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
+    b"PersonalAI.ControlPlane.Request.Signature.v1\0";
+/// Ed25519 public-key length.
+pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
+/// Ed25519 signature length.
+pub const ED25519_SIGNATURE_BYTES: usize = 64;
+
+/// Operator-configured Ed25519 verification key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedSigner {
+    key_id: SignerKeyId,
+    public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    active: bool,
+}
+
+/// Operator-configured Go control-plane request-verification key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedControlPlaneKey {
+    key_id: SignerKeyId,
+    public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    active: bool,
+}
+
+impl TrustedControlPlaneKey {
+    /// Creates one active trusted control-plane key.
+    pub fn active(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: true })
+    }
+
+    /// Returns the configured key identifier.
+    pub const fn key_id(&self) -> SignerKeyId {
+        self.key_id
+    }
+}
+
+impl TrustedSigner {
+    /// Creates one active trusted signer from exact public-key bytes.
+    pub fn active(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: true })
+    }
+
+    /// Creates one explicitly revoked signer for denial-path tests and state.
+    pub fn revoked(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: false })
+    }
+
+    /// Returns the configured key identifier.
+    pub const fn key_id(&self) -> SignerKeyId {
+        self.key_id
+    }
+
+    /// Returns whether this signer is currently active.
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+/// Computes the canonical SHA-384 identity of complete package bytes.
+pub fn hash_package(package_bytes: &[u8]) -> ModelPackageHash {
+    let digest = Sha384::digest(package_bytes);
+    let mut bytes = [0_u8; ModelPackageHash::BYTE_LEN];
+    bytes.copy_from_slice(&digest);
+    ModelPackageHash::from_sha384_bytes(bytes)
+}
+
+/// Computes the SHA-384 content digest used by the signature transcript.
+pub fn hash_signed_content(content_bytes: &[u8]) -> [u8; ModelPackageHash::BYTE_LEN] {
+    let digest = Sha384::digest(content_bytes);
+    let mut bytes = [0_u8; ModelPackageHash::BYTE_LEN];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+/// Builds the bounded, domain-separated message signed by package tooling.
+pub fn signature_message(
+    content_digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    domain_separated_message(MODEL_PACKAGE_SIGNATURE_DOMAIN_V1, content_digest)
+}
+
+/// Builds the bounded message signed by the Go control plane.
+pub fn control_plane_signature_message(request_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+    let digest = hash_signed_content(request_bytes);
+    domain_separated_message(CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1, &digest)
+}
+
+/// Verifies one strict Ed25519 package signature against operator trust state.
+pub fn verify_package_signature(
+    signer: &TrustedSigner,
+    envelope_key_id: SignerKeyId,
+    content_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("model package signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "model package signer does not match local configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured Ed25519 key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured Ed25519 key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = signature_message(content_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::signature_failure("model package signature is invalid"))
+}
+
+/// Strictly verifies one authenticated Go control-plane request body.
+pub fn verify_control_plane_signature(
+    trusted_key: &TrustedControlPlaneKey,
+    envelope_key_id: SignerKeyId,
+    request_bytes: &[u8],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !trusted_key.active {
+        return Err(EngineError::authentication_failure(
+            "control-plane authentication key is revoked",
+        ));
+    }
+    if trusted_key.key_id() != envelope_key_id {
+        return Err(EngineError::authentication_failure(
+            "control-plane key does not match local configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&trusted_key.public_key)
+        .map_err(|_| EngineError::authentication_failure("control-plane key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::authentication_failure("control-plane key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = control_plane_signature_message(request_bytes)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::authentication_failure("control-plane signature is invalid"))
+}
+
+fn domain_separated_message(
+    domain: &[u8],
+    digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    let message_length = domain
+        .len()
+        .checked_add(digest.len())
+        .ok_or_else(|| EngineError::internal_invariant("signature transcript length overflows"))?;
+    let mut message = Vec::new();
+    message
+        .try_reserve_exact(message_length)
+        .map_err(|_| EngineError::resource_exhaustion("signature transcript allocation failed"))?;
+    message.extend_from_slice(domain);
+    message.extend_from_slice(digest);
+    Ok(message)
+}
+
+fn validate_public_key(public_key: &[u8; ED25519_PUBLIC_KEY_BYTES]) -> Result<(), EngineError> {
+    let key = VerifyingKey::from_bytes(public_key)
+        .map_err(|_| EngineError::invalid_input("trusted Ed25519 public key is invalid"))?;
+    if key.is_weak() {
+        return Err(EngineError::invalid_input("trusted Ed25519 public key is weak"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const TEST_SECRET: [u8; 32] = [7_u8; 32];
+
+    #[test]
+    fn sha384_known_answer_matches_nist_vector() {
+        let hash = hash_package(b"abc");
+        assert_eq!(
+            hash.to_string(),
+            concat!(
+                "sha384:cb00753f45a35e8bb5a03d699ac65007272c32ab0eded163",
+                "1a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+            )
+        );
+    }
+
+    #[test]
+    fn strict_signature_accepts_exact_transcript_and_rejects_tampering() {
+        let signing_key = SigningKey::from_bytes(&TEST_SECRET);
+        let key_id = SignerKeyId::from_bytes([1_u8; 16]).expect("key id must validate");
+        let signer = TrustedSigner::active(key_id, signing_key.verifying_key().to_bytes())
+            .expect("public key must validate");
+        let digest = hash_signed_content(b"signed package content");
+        let message = signature_message(&digest).expect("message must construct");
+        let signature = signing_key.sign(&message).to_bytes();
+        verify_package_signature(&signer, key_id, &digest, &signature)
+            .expect("exact signature must verify");
+
+        let mut tampered = digest;
+        tampered[0] ^= 1;
+        assert!(verify_package_signature(&signer, key_id, &tampered, &signature).is_err());
+        let revoked = TrustedSigner::revoked(key_id, signing_key.verifying_key().to_bytes())
+            .expect("public key must validate");
+        assert!(verify_package_signature(&revoked, key_id, &digest, &signature).is_err());
+    }
+}

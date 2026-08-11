@@ -1,0 +1,13 @@
+[package]
+name = "personalai-engine-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Checked memory accounting for the PersonalAI native engine"
+
+[dependencies]
+personalai-engine-types.workspace = true
+
+[lints]
+workspace = true

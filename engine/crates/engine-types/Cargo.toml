@@ -1,0 +1,12 @@
+[package]
+name = "personalai-engine-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Validated foundational types and hard limits for the PersonalAI native engine"
+
+[dependencies]
+
+[lints]
+workspace = true

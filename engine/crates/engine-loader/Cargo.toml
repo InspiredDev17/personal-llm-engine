@@ -1,0 +1,23 @@
+[package]
+name = "personalai-engine-loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Fail-closed registered-model resolution for the PersonalAI native engine"
+
+[dependencies]
+personalai-engine-crypto.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-memory.workspace = true
+personalai-engine-tensor.workspace = true
+personalai-engine-types.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+personalai-engine-testkit.workspace = true
+
+[lints]
+workspace = true

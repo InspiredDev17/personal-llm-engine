@@ -1,0 +1,20 @@
+[package]
+name = "personalai-engine-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Owner-facing diagnostic CLI for the PersonalAI native engine foundation"
+
+[[bin]]
+name = "personalai-engine"
+path = "src/main.rs"
+
+[dependencies]
+personalai-engine-crypto.workspace = true
+personalai-engine-scheduler.workspace = true
+personalai-engine-server.workspace = true
+personalai-engine-types.workspace = true
+
+[lints]
+workspace = true

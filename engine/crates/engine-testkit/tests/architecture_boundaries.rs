@@ -1,0 +1,337 @@
+//! Workspace architecture and supply-chain boundary tests.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[test]
+fn workspace_external_dependencies_match_the_cryptography_allowlist() {
+    let root = engine_root();
+    let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");
+    let expected = [
+        "block-buffer@0.12.1",
+        "cfg-if@1.0.4",
+        "cpufeatures@0.3.0",
+        "crypto-common@0.2.2",
+        "curve25519-dalek-derive@0.1.1",
+        "curve25519-dalek@5.0.0",
+        "digest@0.11.3",
+        "ed25519-dalek@3.0.0",
+        "ed25519@3.0.0",
+        "fiat-crypto@0.3.0",
+        "hybrid-array@0.4.14",
+        "libc@0.2.189",
+        "proc-macro2@1.0.107",
+        "quote@1.0.47",
+        "rustc_version@0.4.1",
+        "semver@1.0.28",
+        "sha2@0.11.0",
+        "signature@3.0.0",
+        "subtle@2.6.1",
+        "syn@2.0.119",
+        "typenum@1.20.1",
+        "unicode-ident@1.0.24",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for package in lock.split("[[package]]").skip(1) {
+        let name = lock_value(package, "name").expect("locked package must have a name");
+        let version = lock_value(package, "version").expect("locked package must have a version");
+        if let Some(source) = lock_value(package, "source") {
+            assert_eq!(
+                source, "registry+https://github.com/rust-lang/crates.io-index",
+                "external dependency must use the approved registry"
+            );
+            assert!(
+                lock_value(package, "checksum").is_some(),
+                "external dependency must have a locked checksum: {name}"
+            );
+            observed.insert(format!("{name}@{version}"));
+        }
+    }
+    assert_eq!(observed, expected, "resolved external dependency allowlist changed");
+
+    let prohibited = [
+        "ollama",
+        "llama",
+        "mlx",
+        "vllm",
+        "ggml",
+        "pytorch",
+        "tensorflow",
+        "jax",
+        "onnx",
+        "candle",
+        "burn",
+        "ndarray",
+        "tokenizers",
+        "libloading",
+        "reqwest",
+        "hyper",
+        "curl",
+    ];
+    for path in collect_files(&root, "Cargo.toml") {
+        let manifest = fs::read_to_string(&path).expect("manifest must be readable");
+        let lowercase = manifest.to_ascii_lowercase();
+        for dependency in prohibited {
+            assert!(
+                !lowercase.contains(dependency),
+                "prohibited dependency marker {dependency:?} found in {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn workspace_contains_no_python_or_typescript() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    for path in collect_all_files(repository) {
+        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+        assert!(
+            !matches!(extension, "py" | "pyi" | "ts" | "tsx"),
+            "prohibited language file found: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn internal_crate_dependencies_match_the_approved_dag() {
+    let allowed: [(&str, &[&str]); 16] = [
+        ("engine-types", &[]),
+        ("engine-crypto", &["personalai-engine-types"]),
+        ("engine-model-format", &["personalai-engine-types"]),
+        (
+            "engine-loader",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-memory",
+                "personalai-engine-model-format",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
+        ("engine-tokenizer", &["personalai-engine-memory", "personalai-engine-types"]),
+        ("engine-tensor", &["personalai-engine-memory", "personalai-engine-types"]),
+        (
+            "engine-cpu-reference",
+            &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
+        ),
+        ("engine-memory", &["personalai-engine-types"]),
+        ("engine-kv-cache", &["personalai-engine-memory", "personalai-engine-types"]),
+        (
+            "engine-transformer",
+            &[
+                "personalai-engine-cpu-reference",
+                "personalai-engine-kv-cache",
+                "personalai-engine-memory",
+                "personalai-engine-model-format",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
+        ("engine-sampling", &["personalai-engine-tensor", "personalai-engine-types"]),
+        ("engine-scheduler", &["personalai-engine-types"]),
+        ("engine-protocol", &["personalai-engine-crypto", "personalai-engine-types"]),
+        (
+            "engine-server",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-loader",
+                "personalai-engine-memory",
+                "personalai-engine-protocol",
+                "personalai-engine-sampling",
+                "personalai-engine-scheduler",
+                "personalai-engine-tokenizer",
+                "personalai-engine-transformer",
+                "personalai-engine-types",
+            ],
+        ),
+        (
+            "engine-cli",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-scheduler",
+                "personalai-engine-server",
+                "personalai-engine-types",
+            ],
+        ),
+        (
+            "engine-testkit",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-model-format",
+                "personalai-engine-types",
+            ],
+        ),
+    ];
+    let crates = engine_root().join("crates");
+    for (crate_directory, expected) in allowed {
+        let manifest_path = crates.join(crate_directory).join("Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest must be readable");
+        let observed = internal_dependencies(&manifest);
+        let expected = expected.iter().copied().map(str::to_owned).collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed,
+            expected,
+            "internal dependency boundary changed for {}",
+            manifest_path.display()
+        );
+    }
+}
+
+#[test]
+fn crate_manifests_cannot_add_native_links_or_weaken_workspace_lints() {
+    let crates = engine_root().join("crates");
+    for manifest_path in collect_files(&crates, "Cargo.toml") {
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest must be readable");
+        assert!(
+            !manifest.lines().any(|line| line.trim_start().starts_with("links =")),
+            "native link discovery is prohibited in {}",
+            manifest_path.display()
+        );
+        assert!(
+            manifest.contains("[lints]\nworkspace = true"),
+            "crate must inherit the workspace unsafe and warning policy: {}",
+            manifest_path.display()
+        );
+        assert!(
+            !manifest.contains("unsafe_code"),
+            "crate manifest cannot override the workspace unsafe policy: {}",
+            manifest_path.display()
+        );
+    }
+}
+
+#[test]
+fn rust_sources_have_no_listener_dynamic_loading_or_unsafe_block() {
+    let root = engine_root();
+    let listener_marker = ["Tcp", "Listener"].concat();
+    let unix_listener_marker = ["Unix", "Listener"].concat();
+    let unix_datagram_marker = ["Unix", "Datagram"].concat();
+    let network_module_marker = ["std::", "net"].concat();
+    let unsafe_block_marker = ["unsafe", " {"].concat();
+    let dynamic_open_marker = ["dl", "open"].concat();
+    let source_path = PathBuf::from(file!());
+    let source_path = if source_path.is_absolute() { source_path } else { root.join(source_path) };
+    let this_file = source_path.canonicalize().expect("test path must canonicalize");
+    let approved_unix_transport = root
+        .join("crates/engine-server/src/transport.rs")
+        .canonicalize()
+        .expect("approved Unix transport must exist");
+
+    for path in collect_files(&root, ".rs") {
+        let canonical = path.canonicalize().expect("source path must canonicalize");
+        if canonical == this_file {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("Rust source must be readable");
+        for marker in [
+            listener_marker.as_str(),
+            unix_listener_marker.as_str(),
+            unix_datagram_marker.as_str(),
+            network_module_marker.as_str(),
+            unsafe_block_marker.as_str(),
+            dynamic_open_marker.as_str(),
+        ] {
+            if canonical == approved_unix_transport && marker == unix_listener_marker {
+                continue;
+            }
+            assert!(
+                !source.contains(marker),
+                "prohibited Rust source marker {marker:?} found in {}",
+                path.display()
+            );
+        }
+    }
+    assert!(collect_files(&root, "build.rs").is_empty());
+}
+
+fn internal_dependencies(manifest: &str) -> BTreeSet<String> {
+    let mut dependencies = BTreeSet::new();
+    let mut in_dependencies = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_dependencies = line == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, _value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim().strip_suffix(".workspace").unwrap_or(name.trim());
+        if name.starts_with("personalai-engine-") {
+            dependencies.insert(name.to_owned());
+        }
+    }
+    dependencies
+}
+
+fn lock_value<'a>(package: &'a str, key: &str) -> Option<&'a str> {
+    package.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        if candidate.trim() != key {
+            return None;
+        }
+        Some(value.trim().trim_matches('"'))
+    })
+}
+
+#[test]
+fn backend_features_are_explicit_and_cpu_is_default() {
+    let manifest = fs::read_to_string(engine_root().join("crates/engine-transformer/Cargo.toml"))
+        .expect("transformer manifest must be readable");
+    assert!(manifest.contains("default = [\"cpu-reference\"]"));
+    for feature in ["cpu-reference", "arm64", "metal", "cuda"] {
+        assert!(
+            manifest.lines().any(|line| line.trim_start().starts_with(feature)),
+            "missing backend feature {feature}"
+        );
+    }
+}
+
+fn engine_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("testkit must be nested under engine/crates")
+        .to_path_buf()
+}
+
+fn collect_files(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    collect_all_files(root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some(suffix)
+                || path.to_string_lossy().ends_with(suffix)
+        })
+        .collect()
+}
+
+fn collect_all_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("workspace directory must be readable") {
+            let entry = entry.expect("workspace entry must be readable");
+            let path = entry.path();
+            let name = entry.file_name();
+            if entry.file_type().expect("entry type must be readable").is_dir() {
+                if name != "target" && name != ".git" {
+                    pending.push(path);
+                }
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}

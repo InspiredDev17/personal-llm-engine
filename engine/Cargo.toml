@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/engine-types",
+    "crates/engine-crypto",
+    "crates/engine-model-format",
+    "crates/engine-loader",
+    "crates/engine-tokenizer",
+    "crates/engine-tensor",
+    "crates/engine-cpu-reference",
+    "crates/engine-memory",
+    "crates/engine-kv-cache",
+    "crates/engine-transformer",
+    "crates/engine-sampling",
+    "crates/engine-scheduler",
+    "crates/engine-protocol",
+    "crates/engine-server",
+    "crates/engine-cli",
+    "crates/engine-testkit",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+personalai-engine-types = { path = "crates/engine-types" }
+personalai-engine-crypto = { path = "crates/engine-crypto" }
+personalai-engine-model-format = { path = "crates/engine-model-format" }
+personalai-engine-loader = { path = "crates/engine-loader" }
+personalai-engine-tokenizer = { path = "crates/engine-tokenizer" }
+personalai-engine-tensor = { path = "crates/engine-tensor" }
+personalai-engine-cpu-reference = { path = "crates/engine-cpu-reference" }
+personalai-engine-memory = { path = "crates/engine-memory" }
+personalai-engine-kv-cache = { path = "crates/engine-kv-cache" }
+personalai-engine-transformer = { path = "crates/engine-transformer", default-features = false }
+personalai-engine-sampling = { path = "crates/engine-sampling" }
+personalai-engine-scheduler = { path = "crates/engine-scheduler" }
+personalai-engine-protocol = { path = "crates/engine-protocol" }
+personalai-engine-server = { path = "crates/engine-server" }
+personalai-engine-testkit = { path = "crates/engine-testkit" }
+ed25519-dalek = { version = "=3.0.0", default-features = false }
+sha2 = { version = "=0.11.0", default-features = false }
+libc = { version = "=0.2.189", default-features = false }
+
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -2 }
+unsafe_code = "forbid"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+struct_field_names = "allow"
+doc_markdown = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+overflow-checks = true
+panic = "abort"
+strip = "symbols"
+
+[workspace.metadata.native-engine]
+dependency-policy = "../docs/native-engine/DEPENDENCY-POLICY.md"
+model-package-policy = "../docs/native-engine/MODEL-SUPPLY-CHAIN.md"

@@ -1,0 +1,16 @@
+[package]
+name = "personalai-engine-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Deterministic Rust-only fixtures and architecture tests for the PersonalAI native engine"
+
+[dependencies]
+ed25519-dalek.workspace = true
+personalai-engine-crypto.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-types.workspace = true
+
+[lints]
+workspace = true

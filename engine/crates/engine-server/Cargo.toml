@@ -1,0 +1,32 @@
+[package]
+name = "personalai-engine-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Non-listening service composition boundary for the PersonalAI native engine"
+
+[features]
+default = ["cpu-reference"]
+cpu-reference = ["personalai-engine-transformer/cpu-reference"]
+arm64 = ["personalai-engine-transformer/arm64"]
+metal = ["personalai-engine-transformer/metal"]
+cuda = ["personalai-engine-transformer/cuda"]
+
+[dependencies]
+personalai-engine-crypto.workspace = true
+personalai-engine-loader.workspace = true
+personalai-engine-memory.workspace = true
+personalai-engine-protocol.workspace = true
+personalai-engine-sampling.workspace = true
+personalai-engine-scheduler.workspace = true
+personalai-engine-tokenizer.workspace = true
+personalai-engine-transformer = { workspace = true, default-features = false }
+personalai-engine-types.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+personalai-engine-testkit.workspace = true
+
+[lints]
+workspace = true
