@@ -11,7 +11,7 @@ mod transport;
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener};
 
-use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedSigner};
+use personalai_engine_crypto::{EngineResponseSigner, TrustedControlPlaneKey, TrustedSigner};
 use personalai_engine_loader::ModelRegistry;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::MemoryPool;
@@ -143,7 +143,12 @@ pub struct AdmissionReceipt {
 #[non_exhaustive]
 pub enum InboundCommand {
     /// One fully validated generation request.
-    Generate(GenerationRequest),
+    Generate {
+        /// Authenticated request body.
+        request: GenerationRequest,
+        /// Nonzero request nonce bound into every response signature.
+        nonce: u64,
+    },
     /// Cancellation of one previously submitted request.
     Cancel(RequestId),
 }
@@ -167,7 +172,8 @@ impl AuthenticatedControlSession {
             FrameKind::GenerationRequest => {
                 let envelope =
                     GenerationRequestEnvelope::decode(frame.payload(), &self.trusted_key)?;
-                (envelope.nonce(), InboundCommand::Generate(envelope.into_request()))
+                let nonce = envelope.nonce();
+                (nonce, InboundCommand::Generate { request: envelope.into_request(), nonce })
             }
             FrameKind::Cancellation => {
                 let envelope = CancellationEnvelope::decode(frame.payload(), &self.trusted_key)?;
@@ -347,15 +353,33 @@ pub enum ServeOutcome {
 pub struct CpuEngineRuntime {
     service: EngineService,
     trusted_control_key: TrustedControlPlaneKey,
+    response_signer: EngineResponseSigner,
     models: BTreeMap<String, LoadedCpuModel>,
     next_sequence: u64,
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
 impl CpuEngineRuntime {
-    /// Creates an unloaded runtime around the Go-authorized control key.
-    pub const fn new(service: EngineService, trusted_control_key: TrustedControlPlaneKey) -> Self {
-        Self { service, trusted_control_key, models: BTreeMap::new(), next_sequence: 1 }
+    /// Creates an unloaded runtime with distinct control and response identities.
+    pub fn new(
+        service: EngineService,
+        trusted_control_key: TrustedControlPlaneKey,
+        response_signer: EngineResponseSigner,
+    ) -> Result<Self, EngineError> {
+        if trusted_control_key.key_id() == response_signer.key_id()
+            || trusted_control_key.public_key() == response_signer.public_key()
+        {
+            return Err(EngineError::invalid_input(
+                "control and response signing identities must be distinct",
+            ));
+        }
+        Ok(Self {
+            service,
+            trusted_control_key,
+            response_signer,
+            models: BTreeMap::new(),
+            next_sequence: 1,
+        })
     }
 
     /// Verifies and installs one already bounded registered package in memory.
@@ -403,7 +427,7 @@ impl CpuEngineRuntime {
                     CancellationOutcome::NotFound => ServeOutcome::CancellationNotFound(request_id),
                 })
             }
-            InboundCommand::Generate(request) => {
+            InboundCommand::Generate { request, nonce } => {
                 let request_id = request.request_id();
                 let model_key = request.model_id().as_str().to_owned();
                 if !self.models.contains_key(&model_key) {
@@ -415,6 +439,9 @@ impl CpuEngineRuntime {
                             sequence_id: None,
                             error: error.clone(),
                         },
+                        nonce,
+                        1,
+                        &self.response_signer,
                     )?;
                     return Err(error);
                 }
@@ -430,6 +457,8 @@ impl CpuEngineRuntime {
                 let cancellation_connection = connection.try_clone()?;
                 let cancelled = AtomicBool::new(false);
                 let watcher_done = AtomicBool::new(false);
+                let mut event_ordinal = 1_u32;
+                let response_signer = &self.response_signer;
                 let generation_result = thread::scope(|scope| {
                     let watcher = scope.spawn(|| {
                         watch_generation_cancellation(
@@ -442,7 +471,19 @@ impl CpuEngineRuntime {
                     });
                     let result =
                         self.service.run_next_greedy(model, sequence_id, &cancelled, |event| {
-                            write_generation_event(&mut connection, &event)
+                            let ordinal = event_ordinal;
+                            event_ordinal = event_ordinal.checked_add(1).ok_or_else(|| {
+                                EngineError::resource_exhaustion(
+                                    "generation event ordinal exhausted",
+                                )
+                            })?;
+                            write_generation_event(
+                                &mut connection,
+                                &event,
+                                nonce,
+                                ordinal,
+                                response_signer,
+                            )
                         });
                     watcher_done.store(true, Ordering::Release);
                     let shutdown_result = connection.shutdown_inbound();
@@ -492,8 +533,16 @@ fn watch_generation_cancellation(
 fn write_generation_event(
     connection: &mut UnixFrameConnection,
     event: &GenerationEvent,
+    request_nonce: u64,
+    event_ordinal: u32,
+    signer: &EngineResponseSigner,
 ) -> Result<(), EngineError> {
-    let payload = personalai_engine_protocol::encode_generation_event(event)?;
+    let payload = personalai_engine_protocol::encode_signed_generation_event(
+        event,
+        request_nonce,
+        event_ordinal,
+        signer,
+    )?;
     let frame = Frame::new(FrameKind::GenerationEvent, payload)?;
     connection.write_outbound_frame(&frame)
 }
@@ -665,8 +714,10 @@ fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use personalai_engine_crypto::control_plane_signature_message;
+    use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+    use personalai_engine_crypto::{
+        control_plane_signature_message, engine_response_signature_message,
+    };
     use personalai_engine_protocol::{
         CancellationEnvelope, GenerationRequestEnvelope, attach_cancellation_signature,
         attach_generation_signature,
@@ -735,11 +786,31 @@ mod tests {
             attach_generation_signature(&unsigned, &signature).expect("signature must attach");
         let frame = Frame::new(FrameKind::GenerationRequest, payload).expect("frame must validate");
         let mut session = AuthenticatedControlSession::new(trusted);
-        assert!(matches!(session.decode_command(&frame), Ok(InboundCommand::Generate(_))));
+        assert!(matches!(
+            session.decode_command(&frame),
+            Ok(InboundCommand::Generate { nonce: 1, .. })
+        ));
         assert_eq!(session.last_nonce(), 1);
         assert!(matches!(
             session.decode_command(&frame),
             Err(EngineError::AuthenticationFailure(_))
+        ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn runtime_rejects_shared_control_and_response_identity() {
+        let mut seed = [0x31; 32];
+        let key_id = SignerKeyId::from_bytes([0x32; 16]).expect("key ID must validate");
+        let signing_key = SigningKey::from_bytes(&seed);
+        let trusted =
+            TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
+                .expect("control identity must validate");
+        let response = EngineResponseSigner::from_seed(key_id, &mut seed)
+            .expect("response identity must validate");
+        assert!(matches!(
+            CpuEngineRuntime::new(service(), trusted, response),
+            Err(EngineError::InvalidInput(_))
         ));
     }
 
@@ -796,7 +867,10 @@ mod tests {
         let mut connection = listener.accept().expect("connection must accept");
         let first = connection.read_inbound_frame().expect("generation frame must read");
         let mut session = AuthenticatedControlSession::new(trusted_key);
-        assert!(matches!(session.decode_command(&first), Ok(InboundCommand::Generate(_))));
+        assert!(matches!(
+            session.decode_command(&first),
+            Ok(InboundCommand::Generate { nonce: 1, .. })
+        ));
         let cancelled = AtomicBool::new(false);
         let done = AtomicBool::new(false);
         watch_generation_cancellation(connection, session, request.request_id(), &cancelled, &done);
@@ -810,7 +884,7 @@ mod tests {
     #[test]
     fn protocol_truthfully_reports_platform_listener_support() {
         let descriptor = service().protocol_descriptor();
-        assert_eq!(descriptor.major, 1);
+        assert_eq!(descriptor.major, 2);
         assert_eq!(descriptor.listener_implemented, cfg!(unix));
     }
 
@@ -951,7 +1025,10 @@ mod tests {
             TrustedControlPlaneKey::active(key_id, signing_key.verifying_key().to_bytes())
                 .expect("control key must validate");
         let budget = ResourceBudget::new(1 << 24, 1 << 20, 1).expect("budget must validate");
-        let mut runtime = CpuEngineRuntime::new(service, trusted_key);
+        let response_signer = test_response_signer();
+        let response_public_key = response_signer.public_key();
+        let mut runtime = CpuEngineRuntime::new(service, trusted_key, response_signer)
+            .expect("distinct runtime identities must validate");
         runtime
             .load_registered_model_bytes(&model_id, fixture.bytes(), &budget)
             .expect("model must load");
@@ -979,7 +1056,8 @@ mod tests {
             .encode()
             .expect("request frame must encode");
         let client_path = socket_path.clone();
-        let client = thread::spawn(move || runtime_test_client(client_path, &encoded));
+        let client =
+            thread::spawn(move || runtime_test_client(client_path, &encoded, response_public_key));
         let outcome = runtime.serve_one(&listener).expect("runtime must serve generation");
         assert!(
             matches!(outcome, ServeOutcome::Generated { request_id, .. } if request_id.get() == 404)
@@ -993,14 +1071,22 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
-    fn runtime_test_client(socket_path: PathBuf, encoded: &[u8]) -> Vec<u8> {
-        use personalai_engine_protocol::FRAME_HEADER_BYTES;
+    fn runtime_test_client(
+        socket_path: PathBuf,
+        encoded: &[u8],
+        response_public_key: [u8; 32],
+    ) -> Vec<u8> {
+        use personalai_engine_protocol::{FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
         let mut stream = UnixStream::connect(socket_path).expect("client must connect");
         stream.write_all(encoded).expect("request must write");
         let mut event_kinds = Vec::new();
+        let response_key =
+            VerifyingKey::from_bytes(&response_public_key).expect("response key must parse");
+        let expected_key_id = [0x62; 16];
+        let mut expected_ordinal = 1_u32;
         loop {
             let mut header = [0_u8; FRAME_HEADER_BYTES];
             stream.read_exact(&mut header).expect("event header must read");
@@ -1012,6 +1098,21 @@ mod tests {
             frame.resize(FRAME_HEADER_BYTES + length, 0);
             stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("event payload must read");
             let event = Frame::decode_outbound_exact(&frame).expect("event must decode");
+            let payload = event.payload();
+            let unsigned_end = payload.len() - personalai_engine_crypto::ED25519_SIGNATURE_BYTES;
+            let auth_start = unsigned_end - GENERATION_EVENT_AUTH_BYTES;
+            assert_eq!(&payload[auth_start..auth_start + 8], &1_u64.to_le_bytes());
+            assert_eq!(&payload[auth_start + 8..auth_start + 12], &expected_ordinal.to_le_bytes());
+            assert_eq!(&payload[auth_start + 16..unsigned_end], &expected_key_id);
+            let signature = Signature::from_bytes(
+                &payload[unsigned_end..].try_into().expect("event signature must exist"),
+            );
+            let transcript = engine_response_signature_message(&payload[..unsigned_end])
+                .expect("event transcript must construct");
+            response_key
+                .verify_strict(&transcript, &signature)
+                .expect("runtime event signature must verify");
+            expected_ordinal = expected_ordinal.checked_add(1).expect("ordinal must fit");
             event_kinds.push(event.payload()[10]);
             if event.payload()[10] == 3 {
                 break;
@@ -1037,6 +1138,12 @@ mod tests {
             .expect("request frame must construct")
             .encode()
             .expect("request frame must encode")
+    }
+
+    fn test_response_signer() -> EngineResponseSigner {
+        let mut seed = [0x61; 32];
+        let key_id = SignerKeyId::from_bytes([0x62; 16]).expect("key ID must validate");
+        EngineResponseSigner::from_seed(key_id, &mut seed).expect("response signer must validate")
     }
 
     fn service() -> EngineService {

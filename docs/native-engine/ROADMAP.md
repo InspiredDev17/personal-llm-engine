@@ -23,26 +23,27 @@ memory, tool, approval, or Agent Green behavior.
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
 | 7. Scheduler | COMPLETE for current single-worker runtime | Count/byte admission, FIFO lifecycle and queued cancellation |
-| 8. UDS/Go adapter | COMPLETE for local reference path | Ed25519-authenticated requests/cancellation, active same-stream cancellation/disconnect watcher, nonce checks, UDS runtime, Go `NATIVE_ENGINE` adapter and real socket tests |
+| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, signed ordered events, active same-stream cancellation/disconnect watcher, nonce checks, UDS runtime, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, mutual response trust, durable replay and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, durable request replay, production key lifecycle and reversible live canary remain |
 
 ## Completed host-independent implementation
 
 - Foundational types and error taxonomy with checked arithmetic and hard bounds.
 - Exact, non-recursive, data-only package structures with no arbitrary
   deserialization, compression, plugins, paths, code, or kernel selection.
-- Mature audited cryptographic primitives only; production private keys are
-  outside Rust.
+- Mature audited cryptographic primitives only; package/control private keys
+  stay outside Rust, while the distinct response-only key is stdin-provisioned
+  and zeroized.
 - Secure local file admission for configuration-owned direct-child packages.
 - Deterministic fixture generation entirely in Rust.
 - First-party tokenizer, tensor, memory, KV, decoder, greedy sampling,
-  scheduler, authenticated protocol, UDS transport, daemon composition, CLI,
+  scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.
-- Exhaustive canonical-fixture truncation/single-byte mutation suites, signed
+- Exhaustive canonical-fixture and signed-event truncation/single-byte mutation suites, signed
   active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
 
 ## Next software release gate: production model operations

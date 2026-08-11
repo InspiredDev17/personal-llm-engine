@@ -31,6 +31,7 @@ fn workspace_external_dependencies_match_the_cryptography_allowlist() {
         "syn@2.0.119",
         "typenum@1.20.1",
         "unicode-ident@1.0.24",
+        "zeroize@1.8.2",
     ]
     .into_iter()
     .map(str::to_owned)

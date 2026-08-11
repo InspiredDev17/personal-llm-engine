@@ -1,18 +1,23 @@
 //! Cryptographic identity and signature verification for model packages.
 //!
-//! This crate performs SHA-384 hashing and strict Ed25519 verification through
-//! reviewed general-purpose cryptographic dependencies. It never generates or
-//! stores production signing keys.
+//! This crate performs SHA-384 hashing and strict Ed25519 operations through
+//! reviewed general-purpose cryptographic dependencies. Model-package signing
+//! keys remain outside the engine. The one private key accepted here is the
+//! owner-provisioned engine response identity; its seed is zeroized after
+//! construction and the underlying signing key zeroizes on drop.
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use personalai_engine_types::{EngineError, ModelPackageHash, SignerKeyId};
 use sha2::{Digest, Sha384};
+use zeroize::Zeroize;
 
 /// Domain separator for version-one model-package content signatures.
 pub const MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] = b"PersonalAI.ModelPackage.Signature.v1\0";
 /// Domain separator for Go control-plane request signatures.
 pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.ControlPlane.Request.Signature.v1\0";
+/// Domain separator for version-two engine response signatures.
+pub const ENGINE_RESPONSE_SIGNATURE_DOMAIN_V2: &[u8] = b"PersonalAI.Engine.Response.Signature.v2\0";
 /// Ed25519 public-key length.
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 /// Ed25519 signature length.
@@ -34,6 +39,47 @@ pub struct TrustedControlPlaneKey {
     active: bool,
 }
 
+/// Owner-provisioned Ed25519 identity used only to sign engine responses.
+///
+/// The value is intentionally neither cloneable nor printable. It confers no
+/// model, tool, filesystem, network, approval, or control-plane authority.
+pub struct EngineResponseSigner {
+    key_id: SignerKeyId,
+    signing_key: SigningKey,
+}
+
+impl EngineResponseSigner {
+    /// Constructs a response signer and clears the caller's seed in place.
+    pub fn from_seed(
+        key_id: SignerKeyId,
+        seed: &mut [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        let signing_key = SigningKey::from_bytes(seed);
+        seed.zeroize();
+        validate_public_key(&signing_key.verifying_key().to_bytes())?;
+        Ok(Self { key_id, signing_key })
+    }
+
+    /// Returns the configured response-key identifier.
+    pub const fn key_id(&self) -> SignerKeyId {
+        self.key_id
+    }
+
+    /// Returns the public verification key for configuration and tests.
+    pub fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Signs one exact unsigned response using the v2 domain transcript.
+    pub fn sign_response(
+        &self,
+        unsigned_response: &[u8],
+    ) -> Result<[u8; ED25519_SIGNATURE_BYTES], EngineError> {
+        let message = engine_response_signature_message(unsigned_response)?;
+        Ok(self.signing_key.sign(&message).to_bytes())
+    }
+}
+
 impl TrustedControlPlaneKey {
     /// Creates one active trusted control-plane key.
     pub fn active(
@@ -47,6 +93,11 @@ impl TrustedControlPlaneKey {
     /// Returns the configured key identifier.
     pub const fn key_id(&self) -> SignerKeyId {
         self.key_id
+    }
+
+    /// Returns the configured public verification key.
+    pub const fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.public_key
     }
 }
 
@@ -107,6 +158,12 @@ pub fn signature_message(
 pub fn control_plane_signature_message(request_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
     let digest = hash_signed_content(request_bytes);
     domain_separated_message(CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1, &digest)
+}
+
+/// Builds the bounded message signed by the native engine for Go.
+pub fn engine_response_signature_message(response_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+    let digest = hash_signed_content(response_bytes);
+    domain_separated_message(ENGINE_RESPONSE_SIGNATURE_DOMAIN_V2, &digest)
 }
 
 /// Verifies one strict Ed25519 package signature against operator trust state.
@@ -228,5 +285,27 @@ mod tests {
         let revoked = TrustedSigner::revoked(key_id, signing_key.verifying_key().to_bytes())
             .expect("public key must validate");
         assert!(verify_package_signature(&revoked, key_id, &digest, &signature).is_err());
+    }
+
+    #[test]
+    fn response_signer_zeroizes_seed_and_produces_strict_v2_signature() {
+        let mut seed = [0x5a; 32];
+        let key_id = SignerKeyId::from_bytes([2_u8; 16]).expect("key id must validate");
+        let signer = EngineResponseSigner::from_seed(key_id, &mut seed)
+            .expect("response signer must validate");
+        assert_eq!(seed, [0_u8; 32]);
+        let unsigned = b"bounded response";
+        let signature =
+            Signature::from_bytes(&signer.sign_response(unsigned).expect("response must sign"));
+        let transcript = engine_response_signature_message(unsigned)
+            .expect("response transcript must construct");
+        signer
+            .signing_key
+            .verifying_key()
+            .verify_strict(&transcript, &signature)
+            .expect("exact response signature must verify");
+        let tampered = engine_response_signature_message(b"tampered")
+            .expect("tampered transcript must construct");
+        assert!(signer.signing_key.verifying_key().verify_strict(&tampered, &signature).is_err());
     }
 }

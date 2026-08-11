@@ -10,6 +10,7 @@ description = "Audited cryptographic admission primitives for PersonalAI model p
 ed25519-dalek.workspace = true
 personalai-engine-types.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

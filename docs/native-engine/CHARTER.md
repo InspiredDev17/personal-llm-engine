@@ -22,6 +22,9 @@ The engine:
   kernel choices;
 - cannot accept an arbitrary client model path;
 - cannot hold Go request-signing private keys or package-signing private keys;
+- may hold only the separate owner-provisioned engine response-signing key,
+  which confers no control-plane, model, tool, file, network, or Agent Green
+  authority;
 - cannot connect directly to Agent Green or interpret its decisions.
 
 The engine returns tokens, usage, failures, capabilities, and sanitized
@@ -45,8 +48,12 @@ numeric vectors, and production-size resource tests pass.
 The service is local-only over a protected Unix-domain socket. TCP, HTTP,
 outbound sockets, peer-selected endpoints, and network fallback are prohibited.
 Go authenticates commands with a strict Ed25519 signature and nonzero nonce.
-Rust holds the public verification identity only. The Go adapter is
-consumer-owned and preserves canonical platform privacy/routing validation.
+Rust holds that public verification identity only. Rust authenticates every
+response with a separate strict Ed25519 identity provisioned through stdin;
+the seed is zeroized after construction. Go pins its public key and rejects
+tampered, replayed, reordered, wrong-request, wrong-nonce, and wrong-key events.
+The Go adapter is consumer-owned and preserves canonical platform
+privacy/routing validation.
 
 ## Agent Green policy
 
@@ -86,8 +93,10 @@ an isolated FFI/backend module after a separate invariant and review record.
 
 ## Current completion boundary
 
-The software foundation through signed-package CPU-reference UDS generation is
-implemented and tested. Remaining release work is a production converter and
-package, fuzz/fault/performance hardening, vendoring/SBOM, concurrent runtime
-hardening, and hardware-specific accelerator implementation/validation. These
-limits prohibit claiming complete production replacement today.
+The software foundation through mutually authenticated, signed-package
+CPU-reference UDS generation is implemented and tested. Remaining release work
+is a production converter/package, continuous fuzzing, soak/performance and
+concurrent-runtime hardening, durable replay, production response-key lifecycle,
+repeatable vendor/SBOM release renewal, and hardware-specific accelerator
+implementation/validation. These limits prohibit claiming complete production
+replacement today.

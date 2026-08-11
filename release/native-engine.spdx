@@ -259,3 +259,14 @@ PackageLicenseConcluded: (MIT OR Apache-2.0) AND Unicode-3.0
 PackageLicenseDeclared: (MIT OR Apache-2.0) AND Unicode-3.0
 PackageCopyrightText: NOASSERTION
 Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-unicode-ident
+
+PackageName: zeroize
+SPDXID: SPDXRef-Package-zeroize
+PackageVersion: 1.8.2
+PackageDownloadLocation: https://crates.io/crates/zeroize/1.8.2
+FilesAnalyzed: false
+PackageChecksum: SHA256: b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0
+PackageLicenseConcluded: Apache-2.0 OR MIT
+PackageLicenseDeclared: Apache-2.0 OR MIT
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-zeroize

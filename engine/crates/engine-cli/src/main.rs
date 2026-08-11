@@ -1,6 +1,6 @@
 //! Owner-facing CLI for diagnostics and the local CPU-reference service.
 
-use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedSigner};
+use personalai_engine_crypto::{EngineResponseSigner, TrustedControlPlaneKey, TrustedSigner};
 use personalai_engine_scheduler::SchedulerLimits;
 #[cfg(unix)]
 use personalai_engine_server::{CpuEngineRuntime, UnixFrameListener};
@@ -11,7 +11,7 @@ use personalai_engine_types::{
     EngineError, EngineErrorKind, ModelId, ModelPackageHash, ResourceBudget, SignerKeyId,
 };
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -23,7 +23,9 @@ const USAGE: &str = "usage:
     --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
     --signer-key-id HEX32 --signer-public-key HEX64 \
     --control-key-id HEX32 --control-public-key HEX64 \
-    --max-memory-bytes U64 --max-kv-cache-bytes U64";
+    --response-key-id HEX32 \
+    --max-memory-bytes U64 --max-kv-cache-bytes U64
+  serve reads exactly 32 binary response-key seed bytes from stdin";
 
 #[derive(Debug)]
 enum Command {
@@ -43,6 +45,7 @@ struct ServeConfig {
     signer_public_key: [u8; 32],
     control_key_id: SignerKeyId,
     control_public_key: [u8; 32],
+    response_key_id: SignerKeyId,
     budget: ResourceBudget,
 }
 
@@ -60,9 +63,10 @@ impl From<EngineError> for CliError {
 }
 
 fn main() -> ExitCode {
+    let mut secrets = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut errors = io::stderr().lock();
-    match run(std::env::args_os().skip(1), &mut output, &mut errors) {
+    match run(std::env::args_os().skip(1), &mut secrets, &mut output, &mut errors) {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError::InvalidArguments(message)) => {
             let _write_result = writeln!(errors, "{message}\n{USAGE}");
@@ -78,6 +82,7 @@ fn main() -> ExitCode {
 
 fn run(
     arguments: impl Iterator<Item = OsString>,
+    secrets: &mut impl Read,
     output: &mut impl Write,
     errors: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -98,7 +103,7 @@ fn run(
             cfg!(unix),
         )
         .map_err(|_| CliError::Io),
-        Command::Serve(config) => serve(*config, errors),
+        Command::Serve(config) => serve(*config, secrets, errors),
     }
 }
 
@@ -129,6 +134,7 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
     let mut signer_public_key = None;
     let mut control_key_id = None;
     let mut control_public_key = None;
+    let mut response_key_id = None;
     let mut max_memory_bytes = None;
     let mut max_kv_cache_bytes = None;
     while let Some(flag) = arguments.next() {
@@ -161,6 +167,9 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
             "--control-public-key" if control_public_key.is_none() => {
                 control_public_key = Some(parse_hex(text)?);
             }
+            "--response-key-id" if response_key_id.is_none() => {
+                response_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
+            }
             "--max-memory-bytes" if max_memory_bytes.is_none() => {
                 max_memory_bytes = Some(parse_u64(text)?);
             }
@@ -177,6 +186,7 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
             | "--signer-public-key"
             | "--control-key-id"
             | "--control-public-key"
+            | "--response-key-id"
             | "--max-memory-bytes"
             | "--max-kv-cache-bytes" => {
                 return Err(CliError::InvalidArguments("serve flag may appear only once"));
@@ -203,6 +213,7 @@ fn parse_serve(mut arguments: impl Iterator<Item = OsString>) -> Result<ServeCon
         signer_public_key: required(signer_public_key, "--signer-public-key is required")?,
         control_key_id: required(control_key_id, "--control-key-id is required")?,
         control_public_key: required(control_public_key, "--control-public-key is required")?,
+        response_key_id: required(response_key_id, "--response-key-id is required")?,
         budget,
     })
 }
@@ -242,10 +253,18 @@ const fn hex_nibble(value: u8) -> Option<u8> {
 }
 
 #[cfg(unix)]
-fn serve(config: ServeConfig, errors: &mut impl Write) -> Result<(), CliError> {
+fn serve(
+    config: ServeConfig,
+    secrets: &mut impl Read,
+    errors: &mut impl Write,
+) -> Result<(), CliError> {
     let signer = TrustedSigner::active(config.signer_key_id, config.signer_public_key)?;
     let control_key =
         TrustedControlPlaneKey::active(config.control_key_id, config.control_public_key)?;
+    let mut response_seed = [0_u8; 32];
+    secrets.read_exact(&mut response_seed).map_err(|_| CliError::Io)?;
+    let response_signer =
+        EngineResponseSigner::from_seed(config.response_key_id, &mut response_seed)?;
     let mut service = EngineService::new(config.service, SchedulerLimits::new(128, 1, 64 << 20)?)?;
     service.register_configured_model(
         config.model_id.clone(),
@@ -253,7 +272,7 @@ fn serve(config: ServeConfig, errors: &mut impl Write) -> Result<(), CliError> {
         config.package_hash,
         signer,
     )?;
-    let mut runtime = CpuEngineRuntime::new(service, control_key);
+    let mut runtime = CpuEngineRuntime::new(service, control_key, response_signer)?;
     runtime.load_registered_model(&config.model_id, &config.budget)?;
     let listener = UnixFrameListener::bind(runtime.service().config())?;
     loop {
@@ -273,7 +292,11 @@ fn serve(config: ServeConfig, errors: &mut impl Write) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-fn serve(_config: ServeConfig, _errors: &mut impl Write) -> Result<(), CliError> {
+fn serve(
+    _config: ServeConfig,
+    _secrets: &mut impl Read,
+    _errors: &mut impl Write,
+) -> Result<(), CliError> {
     Err(CliError::Engine(EngineError::not_implemented(
         "native engine serving requires a Unix platform",
     )))
@@ -328,13 +351,19 @@ fn write_capabilities(output: &mut impl Write) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn version_and_capabilities_are_read_only() {
         let mut output = Vec::new();
         let mut errors = Vec::new();
-        run([OsString::from("version")].into_iter(), &mut output, &mut errors)
-            .expect("version must work");
+        run(
+            [OsString::from("version")].into_iter(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut output,
+            &mut errors,
+        )
+        .expect("version must work");
         assert!(
             String::from_utf8(output).expect("output must be UTF-8").contains(FOUNDATION_STATUS)
         );
@@ -356,7 +385,8 @@ mod tests {
         .map(OsString::from);
         let mut output = Vec::new();
         let mut errors = Vec::new();
-        run(arguments, &mut output, &mut errors).expect("valid config must pass");
+        run(arguments, &mut Cursor::new(Vec::<u8>::new()), &mut output, &mut errors)
+            .expect("valid config must pass");
         assert!(
             String::from_utf8(output)
                 .expect("output must be UTF-8")
@@ -369,7 +399,12 @@ mod tests {
         let mut output = Vec::new();
         let mut errors = Vec::new();
         assert!(matches!(
-            run([OsString::from("serve")].into_iter(), &mut output, &mut errors),
+            run(
+                [OsString::from("serve")].into_iter(),
+                &mut Cursor::new(Vec::<u8>::new()),
+                &mut output,
+                &mut errors,
+            ),
             Err(CliError::InvalidArguments("--model-root is required"))
         ));
         assert!(errors.is_empty());

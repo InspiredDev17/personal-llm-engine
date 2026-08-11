@@ -41,9 +41,10 @@ personalai-engine-scheduler = { path = "crates/engine-scheduler" }
 personalai-engine-protocol = { path = "crates/engine-protocol" }
 personalai-engine-server = { path = "crates/engine-server" }
 personalai-engine-testkit = { path = "crates/engine-testkit" }
-ed25519-dalek = { version = "=3.0.0", default-features = false }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 sha2 = { version = "=0.11.0", default-features = false }
 libc = { version = "=0.2.189", default-features = false }
+zeroize = { version = "=1.8.2", default-features = false }
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }

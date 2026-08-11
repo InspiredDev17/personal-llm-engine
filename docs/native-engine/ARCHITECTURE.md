@@ -31,7 +31,7 @@ Green authority.
 | `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
 | `engine-sampling` | deterministic tensor-direct greedy selection |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
-| `engine-protocol` | directional frames, signed request/cancel envelopes and event encoding |
+| `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
 | `engine-server` | service composition, protected UDS and CPU runtime |
 | `engine-cli` | owner configuration and daemon entrypoint |
 | `engine-testkit` | deterministic non-production signed fixtures and boundary tests |
@@ -69,18 +69,25 @@ runtime directory. The socket path is a direct `.sock` child, length bounded,
 created mode 0600, and removed only when its device/inode still match the
 listener that created it. There is no TCP listener or network client.
 
-Frames use a fixed 16-byte little-endian header, 8 MiB complete-frame cap,
+Protocol v2 frames use a fixed 16-byte little-endian header, 8 MiB complete-frame cap,
 closed directional kinds, and message-specific bounds. Generation and
 cancellation commands use fixed schemas and strict Ed25519 signatures over a
 domain-separated SHA-384 transcript. A connection session accepts strictly
 increasing nonzero nonces. Rust stores only the configured Go public key.
+Every event has a separate domain-separated Ed25519 signature over its exact
+bytes plus the originating request nonce, a strictly increasing event ordinal,
+and the configured engine response-key ID. Go pins the engine public key and
+verifies the binding before parsing or exposing event data.
 
 The current runtime executes one CPU sequence at a time. The Go adapter opens
 one connection per generation and signs with the Go-held private key. On
 cancellation it sends a higher-nonce signed cancellation on the same full-duplex
 stream before closing; a Rust watcher treats that command, disconnect, malformed
 follow-up, or mismatched cancellation as request-local cancellation while the
-CPU loop is active. Go validates request IDs/event schemas/usage and exposes
+CPU loop is active. The response-signing seed is read as exactly 32 bytes from
+stdin before model or socket startup, cleared after signer construction, never
+accepted through argv/model/client data, and never logged. Go validates the
+signature, nonce, ordinal, request ID, event schema, and usage before exposing
 canonical platform responses. It has no HTTP fallback. Fair multi-sequence
 scheduling and batching remain production hardening work.
 

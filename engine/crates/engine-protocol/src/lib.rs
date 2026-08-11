@@ -7,9 +7,9 @@
 mod messages;
 
 pub use messages::{
-    CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_REQUEST_FIXED_BYTES,
-    GenerationRequestEnvelope, attach_cancellation_signature, attach_generation_signature,
-    encode_generation_event,
+    CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_EVENT_AUTH_BYTES,
+    GENERATION_REQUEST_FIXED_BYTES, GenerationRequestEnvelope, attach_cancellation_signature,
+    attach_generation_signature, encode_signed_generation_event,
 };
 
 use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};
@@ -17,7 +17,7 @@ use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};
 /// Protocol magic for native-engine frames.
 pub const FRAME_MAGIC: [u8; 4] = *b"PAIE";
 /// Supported protocol major version.
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 /// Supported protocol minor version.
 pub const PROTOCOL_MINOR: u16 = 0;
 /// Fixed header byte length.

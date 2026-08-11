@@ -12,8 +12,8 @@ strict Ed25519 admission, a configuration-only model registry, no-follow local
 package opening, a first-party bounded byte/BPE tokenizer, safe aggregate-
 accounted tensors, one fixed decoder architecture, scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
-authenticated binary protocol, protected Unix-domain socket runtime, and an
-owner CLI. The Go repository contains the corresponding `NATIVE_ENGINE`
+mutually authenticated binary protocol, protected Unix-domain socket runtime,
+and an owner CLI. The Go repository contains the corresponding `NATIVE_ENGINE`
 provider adapter; it has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
@@ -47,7 +47,11 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - no model training, Python, TypeScript, TCP listener, outbound connection,
   download, updater, dynamic-library discovery, or model-supplied code;
 - clients send a registered `ModelId`, never a path;
-- Rust holds only public verification keys; Go signs control requests;
+- Go signs control requests; Rust signs every response with a separate
+  owner-provisioned response identity whose seed enters only through stdin and
+  is zeroized after construction;
+- response signatures bind the request nonce, exact request ID, strictly
+  increasing event ordinal, response key ID, and exact event bytes;
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
 - packages are fixed-format data, exact-hash pinned, and signer verified;

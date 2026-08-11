@@ -1,7 +1,8 @@
 //! Fixed binary generation-request message and authentication envelope.
 
 use personalai_engine_crypto::{
-    ED25519_SIGNATURE_BYTES, TrustedControlPlaneKey, verify_control_plane_signature,
+    ED25519_SIGNATURE_BYTES, EngineResponseSigner, TrustedControlPlaneKey,
+    verify_control_plane_signature,
 };
 use personalai_engine_types::{
     ContextLimit, EngineError, EngineErrorKind, GenerationEvent, GenerationRequest,
@@ -15,7 +16,10 @@ pub const GENERATION_REQUEST_FIXED_BYTES: usize = 88;
 const CANCELLATION_MAGIC: [u8; 8] = *b"PAICAN01";
 /// Exact cancellation bytes before its signature.
 pub const CANCELLATION_UNSIGNED_BYTES: usize = 52;
-const GENERATION_EVENT_MAGIC: [u8; 8] = *b"PAIEVT01";
+const GENERATION_EVENT_MAGIC: [u8; 8] = *b"PAIEVT02";
+const GENERATION_EVENT_VERSION: u16 = 2;
+/// Non-signature authentication fields appended after the event body.
+pub const GENERATION_EVENT_AUTH_BYTES: usize = 32;
 
 /// Authenticated generation request plus its strictly increasing connection nonce.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,8 +301,37 @@ pub fn attach_cancellation_signature(
     Ok(payload)
 }
 
-/// Encodes one engine event into the fixed binary protocol schema.
-pub fn encode_generation_event(event: &GenerationEvent) -> Result<Vec<u8>, EngineError> {
+/// Encodes and authenticates one engine event for an exact request stream.
+pub fn encode_signed_generation_event(
+    event: &GenerationEvent,
+    request_nonce: u64,
+    event_ordinal: u32,
+    signer: &EngineResponseSigner,
+) -> Result<Vec<u8>, EngineError> {
+    if request_nonce == 0 || event_ordinal == 0 {
+        return Err(EngineError::invalid_input(
+            "response request nonce and event ordinal must be nonzero",
+        ));
+    }
+    let body = encode_generation_event_body(event)?;
+    let unsigned_length = body
+        .len()
+        .checked_add(GENERATION_EVENT_AUTH_BYTES)
+        .ok_or_else(|| EngineError::resource_exhaustion("event authentication length overflows"))?;
+    let signed_length = unsigned_length
+        .checked_add(ED25519_SIGNATURE_BYTES)
+        .ok_or_else(|| EngineError::resource_exhaustion("signed event length overflows"))?;
+    let mut bytes = zeroed(signed_length)?;
+    bytes[..body.len()].copy_from_slice(&body);
+    write_u64(&mut bytes, body.len(), request_nonce)?;
+    write_u32(&mut bytes, body.len() + 8, event_ordinal)?;
+    write_exact(&mut bytes, body.len() + 16, signer.key_id().as_bytes())?;
+    let signature = signer.sign_response(&bytes[..unsigned_length])?;
+    bytes[unsigned_length..].copy_from_slice(&signature);
+    Ok(bytes)
+}
+
+fn encode_generation_event_body(event: &GenerationEvent) -> Result<Vec<u8>, EngineError> {
     let (kind, sequence, dynamic_length) = match event {
         GenerationEvent::Started { sequence_id, .. } => (1_u8, Some(*sequence_id), 0_usize),
         GenerationEvent::Token { sequence_id, text, .. } => {
@@ -324,7 +357,7 @@ pub fn encode_generation_event(event: &GenerationEvent) -> Result<Vec<u8>, Engin
         .ok_or_else(|| EngineError::resource_exhaustion("event length overflows"))?;
     let mut bytes = zeroed(length)?;
     bytes[..8].copy_from_slice(&GENERATION_EVENT_MAGIC);
-    write_u16(&mut bytes, 8, 1)?;
+    write_u16(&mut bytes, 8, GENERATION_EVENT_VERSION)?;
     bytes[10] = kind;
     bytes[11] = u8::from(sequence.is_some());
     write_exact(&mut bytes, 12, &event.request_id().to_bytes())?;
@@ -435,8 +468,10 @@ fn write_exact(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<(), Engi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use personalai_engine_crypto::control_plane_signature_message;
+    use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+    use personalai_engine_crypto::{
+        EngineResponseSigner, control_plane_signature_message, engine_response_signature_message,
+    };
 
     #[test]
     fn exact_authenticated_request_round_trips_and_tampering_fails() {
@@ -509,9 +544,45 @@ mod tests {
             sequence_id: personalai_engine_types::SequenceId::new(3)
                 .expect("sequence ID must validate"),
         };
-        let encoded = encode_generation_event(&event).expect("event must encode");
-        assert_eq!(&encoded[..8], b"PAIEVT01");
-        assert_eq!(encoded.len(), 36);
+        let mut response_seed = [0x55; 32];
+        let response_key_id =
+            SignerKeyId::from_bytes([0x66; 16]).expect("response key id must validate");
+        let response_signer = EngineResponseSigner::from_seed(response_key_id, &mut response_seed)
+            .expect("response signer must validate");
+        let encoded = encode_signed_generation_event(&event, 1, 1, &response_signer)
+            .expect("event must encode and sign");
+        assert_eq!(&encoded[..8], b"PAIEVT02");
+        assert_eq!(encoded.len(), 36 + GENERATION_EVENT_AUTH_BYTES + ED25519_SIGNATURE_BYTES);
+        assert_eq!(&encoded[36..44], &1_u64.to_le_bytes());
+        assert_eq!(&encoded[44..48], &1_u32.to_le_bytes());
+        assert_eq!(&encoded[52..68], response_key_id.as_bytes());
+        assert_eq!(
+            lower_hex(&encoded),
+            concat!(
+                "5041494556543032020001010000000000000000000000000000000103000000",
+                "0000000001000000000000000100000000000000666666666666666666666666",
+                "6666666641bfbd9dfc49fa77e35c1faf4d5d07c5a1f8d19b7b2ce07b98e444d",
+                "00adbe753b702dfe4ca5900c41eec6bce414bd274a35f350bde6ab0788c809e8",
+                "87ede720e"
+            ),
+            "Rust signed response bytes diverged from the Go v2 vector"
+        );
+        let response_public = VerifyingKey::from_bytes(&response_signer.public_key())
+            .expect("response public key must parse");
+        for index in 0..encoded.len() {
+            let mut tampered = encoded.clone();
+            tampered[index] ^= 1;
+            let unsigned_end = tampered.len() - ED25519_SIGNATURE_BYTES;
+            let signature = Signature::from_bytes(
+                &tampered[unsigned_end..].try_into().expect("signature bytes must exist"),
+            );
+            let transcript = engine_response_signature_message(&tampered[..unsigned_end])
+                .expect("response transcript must construct");
+            assert!(
+                response_public.verify_strict(&transcript, &signature).is_err(),
+                "single-byte signed response mutation at offset {index} was accepted"
+            );
+        }
     }
 
     fn request() -> GenerationRequest {

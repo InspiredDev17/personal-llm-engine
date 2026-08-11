@@ -31,10 +31,12 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 
 ## Current allowlist
 
-Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`
-with default features disabled, and `libc 0.2.189` with default features
-disabled on Unix. SHA-384 and strict Ed25519 are package/control-message
-integrity mechanisms. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
+Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
+`zeroize 1.8.2`, and `libc 0.2.189`, all with default features disabled.
+SHA-384 and strict Ed25519 are package/control-message/response integrity
+mechanisms. The narrowly enabled Ed25519 `zeroize` feature plus the direct
+`zeroize` crate clear response-key seed material and signing state; no derive
+feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
 constants to safe `std::fs::OpenOptions`; the workspace contains no unsafe code.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
