@@ -27,7 +27,7 @@ memory, tool, approval, or Agent Green behavior.
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, durable request replay, fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, production key lifecycle and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, exclusively owned durable request replay, fixture mutation/transport faults, vendored offline graph and SPDX complete; coverage fuzz, soak/performance, production key lifecycle and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -44,7 +44,8 @@ memory, tool, approval, or Agent Green behavior.
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.
 - Bounded per-control-key durable nonce journal rejects cross-connection and
-  post-restart replay before execution and fails closed on corrupt state.
+  post-restart replay before execution, excludes a second live process, and
+  fails closed on corrupt or contended state.
 - Exhaustive canonical-fixture and signed-event truncation/single-byte mutation suites, signed
   active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
 

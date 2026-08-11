@@ -21,7 +21,8 @@ token data, generated text, and engine events are untrusted.
 5. Go to protected UDS and authenticated message decoder.
 6. Engine events back to Go.
 7. Go to its separate authenticated Agent Green liaison.
-8. Future safe Rust backend to isolated Metal/CUDA FFI.
+8. Safe Rust replay journal to the isolated Unix file-lock FFI.
+9. Future safe Rust backend to isolated Metal/CUDA FFI.
 
 ## Threats and controls
 
@@ -35,13 +36,13 @@ token data, generated text, and engine events are untrusted.
 | Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, exhaustive fixture truncation/single-byte mutation tests | coverage-guided fuzzing and production-size corpora remain required |
 | Memory/CPU denial | aggregate memory reservations, fallible allocation, queue count/bytes, tensor/context/token ceilings, CPU operation caps, finite socket deadlines | production long-context/soak and multi-client fairness remain |
 | UDS impersonation/injection | owner-private runtime directory, mode-0600 inode-owned socket, strict frame directions, separate pinned Ed25519 request and response identities | bind peer-credential policy and key rotation need operational qualification |
-| Replay/reordering | connection-order checks plus a bounded mode-0600 per-control-key journal that synchronizes each authenticated nonce before execution and rejects duplicate/corrupt/truncated/exhausted/write-uncertain state; every signed event binds the request nonce and a strictly increasing ordinal | production key rotation, journal lifecycle/recovery, and multi-process exclusion need operational qualification |
+| Replay/reordering | connection-order checks plus a bounded mode-0600 per-control-key journal that synchronizes each authenticated nonce before execution, holds an exclusive lifetime lock, and rejects duplicate/corrupt/truncated/exhausted/write-uncertain/contended state; every signed event binds the request nonce and a strictly increasing ordinal | production key rotation and journal lifecycle/recovery need operational qualification |
 | Event spoofing/confusion | strict engine signature verified before parse; signed key ID/request nonce/event ordinal; Go validates frame kind, request ID, UTF-8, exact lengths, usage arithmetic and closed errors | add continuous fuzz corpus shared across languages |
 | Response-key exposure | seed enters only as exact stdin bytes, is never argv/config/model data, and is zeroized after signer construction; signing state zeroizes on drop | production secret injection, rotation, process memory and crash-dump policy need operational qualification |
 | Secret leakage in errors/logs | bounded control-free diagnostics; static/sanitized error guidance; no host path/package/prompt in protocol failures | review daemon operational logging before release |
 | Cancellation failure | Go sends a higher-nonce signed same-stream cancellation before close; Rust watches concurrently; disconnect/malformed follow-up cancels fail-closed; CPU loop checks the request-local flag | multi-worker cancellation and long-running production-model latency qualification remain |
 | Dependency compromise | minimal exact lock, checked-in source-replacement vendor graph, SPDX checksums/licenses, exact boundary tests, no AI stack or build-time fetch | reproduce the release archive/offline build and renew advisory review for each release |
-| Unsafe/FFI memory error | workspace currently forbids unsafe Rust; Metal/CUDA absent | isolate and document any future backend unsafe invariants |
+| Unsafe/FFI memory error | unsafe is denied by default; one architecture-tested Unix module calls `flock` with a live owned descriptor, checks the result, exposes no raw descriptor/clone, and contains no pointer operation | independently review each target OS; isolate and document any future backend unsafe invariants separately |
 | Agent Green spoofing/control | engine has no Agent Green client/key; model cannot emit authoritative decision; Go maps allowlisted telemetry | live mapping/delivery belongs to Go integration tests |
 
 ## Hard limits

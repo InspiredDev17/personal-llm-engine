@@ -1,9 +1,10 @@
 //! Durable bounded replay rejection for authenticated control commands.
 
+use crate::os_lock::ExclusiveFile;
 use personalai_engine_types::{EngineError, SignerKeyId};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ pub const MAX_DURABLE_REPLAY_ENTRIES: usize = 1_048_576;
 
 /// Configuration-derived, append-only replay state for one control identity.
 pub struct DurableReplayJournal {
-    file: File,
+    file: ExclusiveFile,
     path: PathBuf,
     seen: HashSet<u64>,
     maximum_entries: usize,
@@ -195,22 +196,28 @@ fn validate_runtime_root(runtime_root: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn open_existing(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
+fn open_existing(path: &Path) -> std::io::Result<ExclusiveFile> {
+    let file = OpenOptions::new()
         .read(true)
         .append(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
+        .open(path)?;
+    ExclusiveFile::try_acquire(file)
 }
 
-fn create_new(runtime_root: &Path, path: &Path, key_id: SignerKeyId) -> std::io::Result<File> {
-    let mut file = OpenOptions::new()
+fn create_new(
+    runtime_root: &Path,
+    path: &Path,
+    key_id: SignerKeyId,
+) -> std::io::Result<ExclusiveFile> {
+    let file = OpenOptions::new()
         .read(true)
         .append(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
+    let mut file = ExclusiveFile::try_acquire(file)?;
     let mut header = [0_u8; REPLAY_HEADER_BYTES];
     header[..8].copy_from_slice(&REPLAY_MAGIC);
     header[8..10].copy_from_slice(&REPLAY_VERSION.to_le_bytes());
@@ -224,6 +231,7 @@ fn create_new(runtime_root: &Path, path: &Path, key_id: SignerKeyId) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -281,6 +289,38 @@ mod tests {
             DurableReplayJournal::open_with_limit(&root, key_id, 3),
             Err(EngineError::AuthenticationFailure(_))
         ));
+        fs::remove_file(path).expect("journal must remove");
+        fs::remove_dir(root).expect("runtime root must remove");
+    }
+
+    #[test]
+    fn one_control_key_journal_has_exactly_one_live_process_owner() {
+        const CHILD_ROOT: &str = "PERSONALAI_TEST_REPLAY_LOCK_ROOT";
+        let key_id = SignerKeyId::from_bytes([0x77; 16]).expect("key ID must validate");
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            assert!(matches!(
+                DurableReplayJournal::open(Path::new(&root), key_id),
+                Err(EngineError::AuthenticationFailure(_))
+            ));
+            return;
+        }
+
+        let root = temporary_directory();
+        let journal = DurableReplayJournal::open(&root, key_id).expect("journal must create");
+        let path = journal.path().to_path_buf();
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("test executable must be available"),
+        )
+        .arg("replay::tests::one_control_key_journal_has_exactly_one_live_process_owner")
+        .arg("--exact")
+        .env(CHILD_ROOT, &root)
+        .status()
+        .expect("lock competitor must run");
+        assert!(child.success(), "competitor must observe fail-closed exclusion");
+        drop(journal);
+        let reopened =
+            DurableReplayJournal::open(&root, key_id).expect("released lock must be reusable");
+        drop(reopened);
         fs::remove_file(path).expect("journal must remove");
         fs::remove_dir(root).expect("runtime root must remove");
     }

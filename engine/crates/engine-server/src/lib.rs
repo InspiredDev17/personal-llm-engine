@@ -8,6 +8,8 @@
 //! replay journal required before authenticated command execution.
 
 #[cfg(unix)]
+mod os_lock;
+#[cfg(unix)]
 mod replay;
 #[cfg(unix)]
 mod transport;

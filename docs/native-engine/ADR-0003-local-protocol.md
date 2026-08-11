@@ -26,6 +26,11 @@ failure poisons that runtime instance so no later command can execute. Control
 key rotation creates a separate journal; production rotation and retirement
 remain operator-owned release work.
 
+The journal also holds a nonblocking exclusive advisory file lock for its full
+lifetime. A second process using the same control-key journal fails during
+runtime construction. The isolated Unix FFI and its invariants are recorded in
+ADR-0004.
+
 Reject TCP, HTTP fallback, arbitrary serialization, recursive messages,
 client-supplied paths, model installation, tools, approvals, memory mutation,
 and Agent Green commands. The Go adapter owns canonical request translation and

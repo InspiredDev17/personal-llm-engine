@@ -37,8 +37,8 @@ SHA-384 and strict Ed25519 are package/control-message/response integrity
 mechanisms. The narrowly enabled Ed25519 `zeroize` feature plus the direct
 `zeroize` crate clear response-key seed material and signing state; no derive
 feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
-constants to safe `std::fs::OpenOptions` for package and durable replay state;
-the workspace contains no unsafe code.
+constants to safe `std::fs::OpenOptions` for package and durable replay state,
+plus the isolated nonblocking `flock` call recorded in ADR-0004.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact
@@ -55,9 +55,12 @@ external package or internal crate edge.
 - No runtime dynamic-library lookup by arbitrary/configured name.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
-- Unsafe Rust is forbidden today. A future FFI/backend exception requires an
-  isolated module, `deny(unsafe_op_in_unsafe_fn)`, written invariants, safe
-  wrappers, platform tests, and separate approval.
+- Unsafe Rust is denied by default. The only approved exception is the exact
+  Unix lock module in ADR-0004: one checked `flock` call, no pointer operation,
+  and a safe owned non-cloneable wrapper. Architecture tests reject unsafe code
+  and unsafe-lint allowances everywhere else. A future FFI/backend exception
+  requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written
+  invariants, safe wrappers, platform tests, and separate approval.
 
 ## Required checks
 

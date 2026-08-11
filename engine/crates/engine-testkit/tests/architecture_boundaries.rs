@@ -286,13 +286,14 @@ fn crate_manifests_cannot_add_native_links_or_weaken_workspace_lints() {
 }
 
 #[test]
-fn rust_sources_have_no_listener_dynamic_loading_or_unsafe_block() {
+fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
     let root = engine_root();
     let listener_marker = ["Tcp", "Listener"].concat();
     let unix_listener_marker = ["Unix", "Listener"].concat();
     let unix_datagram_marker = ["Unix", "Datagram"].concat();
     let network_module_marker = ["std::", "net"].concat();
     let unsafe_block_marker = ["unsafe", " {"].concat();
+    let unsafe_allow_marker = ["allow", "(unsafe_code)"].concat();
     let dynamic_open_marker = ["dl", "open"].concat();
     let source_path = PathBuf::from(file!());
     let source_path = if source_path.is_absolute() { source_path } else { root.join(source_path) };
@@ -301,6 +302,10 @@ fn rust_sources_have_no_listener_dynamic_loading_or_unsafe_block() {
         .join("crates/engine-server/src/transport.rs")
         .canonicalize()
         .expect("approved Unix transport must exist");
+    let approved_unix_lock = root
+        .join("crates/engine-server/src/os_lock.rs")
+        .canonicalize()
+        .expect("approved Unix lock FFI must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -308,16 +313,34 @@ fn rust_sources_have_no_listener_dynamic_loading_or_unsafe_block() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("Rust source must be readable");
+        if canonical == approved_unix_lock {
+            assert_eq!(
+                source.matches(unsafe_block_marker.as_str()).count(),
+                1,
+                "approved Unix lock FFI must contain exactly one unsafe block"
+            );
+            assert_eq!(
+                source.matches(unsafe_allow_marker.as_str()).count(),
+                1,
+                "approved Unix lock FFI must contain exactly one unsafe allowance"
+            );
+        }
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
             unix_datagram_marker.as_str(),
             network_module_marker.as_str(),
             unsafe_block_marker.as_str(),
+            unsafe_allow_marker.as_str(),
             dynamic_open_marker.as_str(),
         ] {
             if canonical == approved_unix_transport
                 && (marker == unix_listener_marker || marker == network_module_marker)
+            {
+                continue;
+            }
+            if canonical == approved_unix_lock
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
             {
                 continue;
             }

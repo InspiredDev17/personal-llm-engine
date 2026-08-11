@@ -38,9 +38,9 @@ Green authority.
 
 Internal dependencies are checked against an explicit DAG. The only external
 dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
-constants used by the Unix no-follow package and replay-journal openers. There
-is no third-party AI, tensor, tokenizer, model-loader, scheduler, server, or
-GPU-kernel dependency.
+constants used by the Unix no-follow package/replay-journal openers and the one
+isolated nonblocking `flock` call. There is no third-party AI, tensor,
+tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 ## Package and loading flow
 
@@ -80,9 +80,11 @@ configured control key ID and synchronizes the record to disk. The flat journal
 has a fixed header, 8-byte records, and a 1,048,576-entry ceiling. Duplicate,
 zero, corrupt, truncated, identity-mismatched, exhausted, symlinked, or
 write-uncertain state fails closed. Reopening reconstructs the bounded replay
-index, so a valid signed
-command cannot be replayed on a later connection or after restart. Rust stores
-only the configured Go public key.
+index, so a valid signed command cannot be replayed on a later connection or
+after restart. A nonblocking exclusive advisory lock is held by the journal's
+sole owned file descriptor for its complete lifetime; another process using the
+same control-key journal fails before it can serve commands. Rust stores only
+the configured Go public key.
 Every event has a separate domain-separated Ed25519 signature over its exact
 bytes plus the originating request nonce, a strictly increasing event ordinal,
 and the configured engine response-key ID. Go pins the engine public key and
@@ -117,6 +119,15 @@ socket path (100 bytes).
 not-implemented. Native directories contain no kernels. A future backend must
 be selected by trusted engine configuration and architecture code, never by
 model data, and must pass CPU differential and isolated unsafe/FFI review.
+
+## Unsafe and FFI boundary
+
+Workspace policy denies unsafe Rust by default. The exact exception is
+`engine-server/src/os_lock.rs`, which makes one checked `libc::flock` call using
+an owned valid file descriptor and exposes only a safe non-cloneable wrapper.
+Closing the descriptor releases the advisory lock. Architecture tests reject
+an unsafe block or unsafe-lint allowance in every other Rust source. ADR-0004
+records the invariants and rejected alternatives.
 
 ## Agent Green
 

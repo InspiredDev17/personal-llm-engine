@@ -75,8 +75,11 @@ implementations; custom cryptography is prohibited. Exact versions are locked,
 unnecessary default features are disabled at direct dependency declarations,
 and releases must be vendored with an SBOM.
 
-Unsafe Rust is forbidden workspace-wide today. Future unsafe may exist only in
-an isolated FFI/backend module after a separate invariant and review record.
+Unsafe Rust is denied workspace-wide by default. The only current exception is
+the isolated Unix replay-journal lock FFI module recorded by ADR-0004; its one
+`flock` call is hidden behind a safe owned-file wrapper and enforced by an
+architecture-boundary test. Any other unsafe code requires its own invariant
+and review record in an isolated FFI/backend module.
 
 ## Engineering rules
 

@@ -48,7 +48,8 @@ zeroize = { version = "=1.8.2", default-features = false }
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unused_lifetimes = "deny"

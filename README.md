@@ -56,7 +56,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
 - every authenticated command nonce is appended and synchronized to a bounded,
-  mode-0600 per-control-key journal before the command can execute;
+  mode-0600 per-control-key journal before the command can execute; an exclusive
+  lifetime lock prevents a second process from using the same key journal;
 - packages are fixed-format data, exact-hash pinned, and signer verified;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
 - the engine cannot execute tools, approve actions, mutate platform memory, or
