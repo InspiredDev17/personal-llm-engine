@@ -940,6 +940,69 @@ mod tests {
         )
         .expect("second import must succeed");
         assert_eq!(first, second);
+        assert_eq!(
+            first.package_hash(),
+            ModelPackageHash::from_sha384_hex(
+                "5b97582279ce8e9dc1ed114b0b46b243fd1f6655f9ed694def28c1e52cbfeffd\
+                 f1eb5e27f19fab5c7529b91d6471b329",
+            )
+            .expect("fixture package hash must parse"),
+        );
+        assert_eq!(
+            first.signer_public_key(),
+            [
+                0x20, 0x12, 0xcb, 0x90, 0xca, 0x60, 0xe8, 0xe5, 0xd8, 0xda, 0xf6, 0x6e, 0x22, 0x72,
+                0xd2, 0x23, 0x3e, 0x04, 0x86, 0xd5, 0x57, 0xe8, 0xc6, 0x61, 0x41, 0xed, 0x89, 0x20,
+                0x17, 0x7d, 0x7e, 0xb7,
+            ],
+        );
+        let expected_files = [
+            (
+                "hashes.aiph",
+                528,
+                "5b97582279ce8e9dc1ed114b0b46b243fd1f6655f9ed694def28c1e52cbfeffd\
+                 f1eb5e27f19fab5c7529b91d6471b329",
+            ),
+            (
+                "manifest.aipm",
+                2_880,
+                "6e417bdfd2682c1e0c06a324670797b462089b2e0bff06f20615b543497f664d\
+                 8509e0a8cb4e7f5ed7049cd8b3c42115",
+            ),
+            (
+                "provenance.json",
+                471,
+                "b10362b19f93ea9ecfbc721af0635835ecc319ca71134608eca7dcff047c480d3\
+                 7e2349b53681b317654f3130cf4bdd5",
+            ),
+            (
+                "signature.ed25519",
+                96,
+                "1fd392c088ac1c2a22d18307f0f909743b76a27595cbdb9e12e8f99a58dbe31\
+                 f76e883d726ec8a6347f44704621fb3b0",
+            ),
+            (
+                "tensors-0000.aipt",
+                9_120,
+                "3f283f50f5c5937ad8625da6c692c31bdf5833733589520842ea946921c17eb2\
+                 842aa31c2b09c0310baec907d3ff1d72",
+            ),
+            (
+                "tokenizer.aiptok",
+                1_328,
+                "1c6de2b8090bc7b45683292075d18ea846361269e57f98d2d158eb38731eb8c2\
+                 a342e58eeb15d6632520fd01ac40d194",
+            ),
+        ];
+        for (name, expected_length, expected_hash) in expected_files {
+            let bytes = first.files().get(name).expect("fixture file must exist");
+            assert_eq!(bytes.len(), expected_length);
+            assert_eq!(
+                hash_package(bytes),
+                ModelPackageHash::from_sha384_hex(expected_hash)
+                    .expect("fixture file hash must parse"),
+            );
+        }
         assert_eq!(first_seed, [0; 32]);
         assert_eq!(second_seed, [0; 32]);
         assert_eq!(

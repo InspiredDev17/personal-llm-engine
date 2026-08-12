@@ -137,3 +137,7 @@ its license/use review, provenance and source hashes, reproducible package,
 signer status, independent tokenizer/logit/generation vectors, resource and
 corruption evidence, target-hardware results, SBOM/advisory records, and a
 rollback drill. The synthetic fixture proves mechanics only, not model quality.
+
+Model Foundry registry consumption is not implemented. ADR-0020 freezes the
+future registry V2 and directory-package boundary; Model Foundry flat V1 is not
+compatible with this loader and must not be translated or used as fallback.
