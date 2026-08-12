@@ -161,6 +161,55 @@ fn continuous_soak_workflow_is_pinned_bounded_and_fail_closed() {
 }
 
 #[test]
+fn cross_platform_verification_is_pinned_offline_and_fail_closed() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let workflow = fs::read_to_string(repository.join(".github/workflows/verify.yml"))
+        .expect("cross-platform verification workflow must exist");
+    for required in [
+        "push:\n    branches:\n      - main\n      - agent/native-inference-engine",
+        "pull_request:",
+        "workflow_dispatch:",
+        "permissions:\n  contents: read",
+        "fail-fast: false",
+        "timeout-minutes: 30",
+        "ubuntu-24.04",
+        "macos-14",
+        "actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955",
+        "rustup toolchain install 1.85.0 --profile minimal",
+        "cargo +1.85.0 fmt --all --check",
+        "cargo +1.85.0 metadata --format-version 1 --locked --offline --no-deps",
+        "cargo +1.85.0 tree --workspace --all-features --locked --offline -e features",
+        "cargo +1.85.0 check --workspace --all-targets --all-features --locked --offline",
+        "cargo +1.85.0 build --workspace --all-targets --all-features --locked --offline",
+        "cargo +1.85.0 clippy --workspace --all-targets --all-features",
+        "--locked --offline -- -D warnings",
+        "cargo +1.85.0 test --workspace --all-targets --all-features --locked --offline",
+        "cargo +1.85.0 test --workspace --doc --all-features --locked --offline",
+        "cargo +1.85.0 doc --workspace --all-features --no-deps --locked --offline",
+        "cargo +1.85.0 check --workspace --all-targets --no-default-features",
+        "git diff --exit-code",
+    ] {
+        assert!(workflow.contains(required), "verification workflow omitted {required:?}");
+    }
+    for prohibited in [
+        "continue-on-error",
+        "pull_request_target",
+        "permissions: write",
+        "sudo ",
+        "curl ",
+        "wget ",
+        "cargo install",
+    ] {
+        assert!(
+            !workflow.contains(prohibited),
+            "verification workflow contains prohibited capability {prohibited:?}"
+        );
+    }
+    assert_eq!(workflow.matches("uses:").count(), 1, "only pinned checkout is allowed");
+}
+
+#[test]
 fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
     let root = engine_root();
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");

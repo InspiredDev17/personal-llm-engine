@@ -215,7 +215,9 @@ ABI storage and borrowed live descriptors. Architecture tests enforce the exact
 block and allowance counts and reject an unsafe block or unsafe-lint allowance
 in every other first-party Rust source. ADR-0004 records the lock invariants;
 ADR-0011 records signal invariants; ADR-0013 records peer-credential invariants
-and portability scope.
+and portability scope. ADR-0014 pins an offline Linux/macOS workflow that
+compiles and tests both credential implementations without expanding runtime
+capability or dependency authority.
 
 ## Agent Green
 

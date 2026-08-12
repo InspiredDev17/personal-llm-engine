@@ -1,7 +1,7 @@
 # Native Engine Roadmap
 
 - Version: 0.2.0
-- Updated: 2026-08-11
+- Updated: 2026-08-12
 - Scope: inference only
 
 ## Delivery rule
@@ -15,7 +15,7 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
-| 0. Boundaries/workspace | COMPLETE | 16-crate workspace, docs, limits, feature and DAG tests |
+| 0. Boundaries/workspace | COMPLETE | 16-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
 | 1. Package/cryptography | COMPLETE for V1 | Canonical flat package, SHA-384, strict Ed25519, revocation/tamper tests |
 | 2. Registry/loader | COMPLETE for V1 | ID-only registry, direct-child no-follow opener, inode/size/mode checks, bounded tensor materialization |
 | 3. Tokenizer | COMPLETE for V1 | First-party `PAIBPE01`, byte fallback, bounded declarative merges, encode/decode tests |
@@ -27,7 +27,7 @@ memory, tool, approval, or Agent Green behavior.
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and its pinned scheduled-workflow definition are complete; hosted cron evidence awaits default-branch integration, while production-size operated soak/performance, key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -47,6 +47,10 @@ memory, tool, approval, or Agent Green behavior.
   user ID equals the engine process user. Mismatches are rejected before frame
   parsing and do not stop the continuous service; signature and replay checks
   remain independent mandatory layers.
+- A read-only, finite Linux/macOS workflow runs the complete Rust workspace gate
+  from the locked vendored graph with Cargo offline. Architecture tests pin its
+  triggers, operating systems, toolchain, commands, permissions, and denial of
+  privileged or download steps. Hosted success remains commit-specific evidence.
 - Bounded per-control-key durable nonce journal rejects cross-connection and
   post-restart replay before execution, excludes a second live process, and
   fails closed on corrupt or contended state.

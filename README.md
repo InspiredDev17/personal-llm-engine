@@ -21,9 +21,11 @@ bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
 stop-admit, cancel, and drain path. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
 a pinned weekly/manual workflow is configured to repeat that bounded test eight
-times once integrated onto the default branch. The Go repository
-contains the corresponding `NATIVE_ENGINE` provider adapter; it has no HTTP or
-remote-network fallback.
+times once integrated onto the default branch. A separate pinned, read-only
+push/pull-request workflow runs the complete locked and offline workspace gate
+on Linux and macOS, compiling both kernel peer-credential implementations. The
+Go repository contains the corresponding `NATIVE_ENGINE` provider adapter; it
+has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only

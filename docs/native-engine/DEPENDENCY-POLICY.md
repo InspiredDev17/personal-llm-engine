@@ -98,6 +98,14 @@ links, unsafe use, network/process/file capabilities, and advisory status.
 The production checks above run only against `engine/Cargo.lock`; fuzz checks
 and their separate lock are specified in [FUZZING.md](FUZZING.md).
 
+The pinned `native-engine-verify` workflow runs the locked production metadata,
+feature graph, formatting, build/check, Clippy, tests, docs, and disabled-backend
+profile on Linux and macOS with Cargo explicitly offline. It has read-only
+repository permission and no production secrets. Advisory review remains a
+separate operator-owned `cargo audit --no-fetch` release check because neither
+the audit executable nor advisory database belongs to the vendored runtime
+dependency graph.
+
 ## Release requirements
 
 The reviewed Cargo graph is checked in under `engine/vendor`, and Cargo replaces
