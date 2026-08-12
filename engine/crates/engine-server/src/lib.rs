@@ -33,7 +33,7 @@ use personalai_engine_protocol::{
 use personalai_engine_sampling::{SamplingConfig, select_next_token_tensor};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::CancellationOutcome;
-use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
+use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, SchedulerLimits};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{MAX_TOKEN_PIECE_BYTES, Tokenizer, build_tokenizer};
 use personalai_engine_transformer::{BackendStatus, backend_status};
@@ -53,14 +53,20 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "cpu-reference")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 #[cfg(all(unix, feature = "cpu-reference"))]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+#[cfg(feature = "cpu-reference")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::thread;
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
+/// Hard ceiling for the bounded multi-connection reference batch.
+pub const MAX_CONCURRENT_CONNECTION_BATCH: u32 = 64;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const CANCELLATION_WATCHER_STACK_BYTES: usize = 256 * 1_024;
 /// Human-readable status for the current reference runtime.
 pub const FOUNDATION_STATUS: &str = "signed-package-cpu-reference-uds";
 
@@ -296,7 +302,7 @@ impl LoadedCpuModel {
     /// without sharing their KV caches or cancellation state.
     pub fn start_greedy<'a>(
         &'a self,
-        request: &'a GenerationRequest,
+        request: &GenerationRequest,
         sequence_id: SequenceId,
     ) -> Result<GreedyGeneration<'a>, EngineError> {
         if request.model_id() != &self.model_id {
@@ -314,7 +320,7 @@ impl LoadedCpuModel {
             .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
         request.validate_tokenized_input(input_count)?;
         Ok(GreedyGeneration {
-            request,
+            request: request.clone(),
             sequence_id,
             model: &self.model,
             tokenizer: self.tokenizer.as_ref(),
@@ -389,7 +395,7 @@ enum TerminalState {
 /// among active sequences.
 #[cfg(feature = "cpu-reference")]
 pub struct GreedyGeneration<'a> {
-    request: &'a GenerationRequest,
+    request: GenerationRequest,
     sequence_id: SequenceId,
     model: &'a CpuDecoderModel,
     tokenizer: &'a dyn Tokenizer,
@@ -430,7 +436,7 @@ impl GreedyGeneration<'_> {
                 TerminalState::Complete => {}
             }
             let usage =
-                GenerationUsage::for_request(self.request, self.input_count, self.generated)?;
+                GenerationUsage::for_request(&self.request, self.input_count, self.generated)?;
             self.usage = Some(usage);
             return Ok(GreedyAdvance::Event(GenerationEvent::Completed {
                 request_id: self.request.request_id(),
@@ -529,6 +535,28 @@ impl GreedyGeneration<'_> {
     }
 }
 
+#[cfg(feature = "cpu-reference")]
+fn generation_retained_bytes(request: &GenerationRequest) -> Result<usize, EngineError> {
+    const TOKENIZER_SPECIAL_TOKENS: usize = 2;
+    const COORDINATOR_OVERHEAD_BYTES: usize = 4 * 1_024;
+
+    let request_copies = request.estimated_size_bytes().checked_mul(3).ok_or_else(|| {
+        EngineError::resource_exhaustion("active generation request bytes overflow")
+    })?;
+    let token_slots = request
+        .input_text()
+        .len()
+        .checked_add(TOKENIZER_SPECIAL_TOKENS)
+        .ok_or_else(|| EngineError::resource_exhaustion("active token slots overflow"))?;
+    let token_bytes = token_slots
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| EngineError::resource_exhaustion("active input token bytes overflow"))?;
+    request_copies
+        .checked_add(token_bytes)
+        .and_then(|bytes| bytes.checked_add(COORDINATOR_OVERHEAD_BYTES))
+        .ok_or_else(|| EngineError::resource_exhaustion("active retained bytes overflow"))
+}
+
 /// One bounded turn completed by [`GenerationRoundRobin`].
 #[cfg(feature = "cpu-reference")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -570,7 +598,8 @@ impl ScheduledGenerationAdvance {
 #[cfg(feature = "cpu-reference")]
 struct ScheduledGeneration<'a> {
     generation: GreedyGeneration<'a>,
-    cancelled: &'a AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    retained_bytes: usize,
 }
 
 /// Bounded deterministic round-robin coordinator for active CPU sequences.
@@ -582,6 +611,8 @@ struct ScheduledGeneration<'a> {
 #[cfg(feature = "cpu-reference")]
 pub struct GenerationRoundRobin<'a> {
     maximum_active: u32,
+    maximum_retained_bytes: usize,
+    retained_bytes: usize,
     ready: VecDeque<ScheduledGeneration<'a>>,
 }
 
@@ -589,21 +620,39 @@ pub struct GenerationRoundRobin<'a> {
 impl<'a> GenerationRoundRobin<'a> {
     /// Creates an empty coordinator with a hard active-sequence ceiling.
     pub fn new(maximum_active: u32) -> Result<Self, EngineError> {
+        Self::with_limits(maximum_active, MAX_QUEUED_REQUEST_BYTES)
+    }
+
+    /// Creates an empty coordinator with active-count and retained-byte ceilings.
+    pub fn with_limits(
+        maximum_active: u32,
+        maximum_retained_bytes: usize,
+    ) -> Result<Self, EngineError> {
         if maximum_active == 0 || maximum_active > MAX_CONCURRENT_SEQUENCES {
             return Err(EngineError::invalid_input(
                 "round-robin active limit is outside hard bounds",
             ));
         }
-        Ok(Self { maximum_active, ready: VecDeque::new() })
+        if maximum_retained_bytes == 0 || maximum_retained_bytes > MAX_QUEUED_REQUEST_BYTES {
+            return Err(EngineError::invalid_input(
+                "round-robin retained-byte limit is outside hard bounds",
+            ));
+        }
+        Ok(Self {
+            maximum_active,
+            maximum_retained_bytes,
+            retained_bytes: 0,
+            ready: VecDeque::new(),
+        })
     }
 
     /// Admits one request and creates its cursor only after capacity checks.
     pub fn submit(
         &mut self,
         model: &'a LoadedCpuModel,
-        request: &'a GenerationRequest,
+        request: &GenerationRequest,
         sequence_id: SequenceId,
-        cancelled: &'a AtomicBool,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<(), EngineError> {
         if self.ready.iter().any(|scheduled| {
             scheduled.generation.request_id() == request.request_id()
@@ -637,11 +686,22 @@ impl<'a> GenerationRoundRobin<'a> {
                 "request concurrency budget does not admit another active sequence",
             ));
         }
+        let retained_bytes = generation_retained_bytes(request)?;
+        let next_retained_bytes =
+            self.retained_bytes.checked_add(retained_bytes).ok_or_else(|| {
+                EngineError::resource_exhaustion("round-robin retained bytes overflow")
+            })?;
+        if next_retained_bytes > self.maximum_retained_bytes {
+            return Err(EngineError::resource_exhaustion(
+                "round-robin retained-byte limit is reached",
+            ));
+        }
         self.ready
             .try_reserve(1)
             .map_err(|_| EngineError::resource_exhaustion("round-robin queue allocation failed"))?;
         let generation = model.start_greedy(request, sequence_id)?;
-        self.ready.push_back(ScheduledGeneration { generation, cancelled });
+        self.ready.push_back(ScheduledGeneration { generation, cancelled, retained_bytes });
+        self.retained_bytes = next_retained_bytes;
         Ok(())
     }
 
@@ -653,10 +713,14 @@ impl<'a> GenerationRoundRobin<'a> {
         let Some(mut scheduled) = self.ready.pop_front() else {
             return Ok(None);
         };
+        self.retained_bytes =
+            self.retained_bytes.checked_sub(scheduled.retained_bytes).ok_or_else(|| {
+                EngineError::internal_invariant("round-robin retained bytes underflow")
+            })?;
         let request_id = scheduled.generation.request_id();
         let sequence_id = scheduled.generation.sequence_id();
         let before = scheduled.generation.processed_tokens();
-        let advance = scheduled.generation.advance(scheduled.cancelled);
+        let advance = scheduled.generation.advance(&scheduled.cancelled);
         let after = scheduled.generation.processed_tokens();
         let decoder_tokens_advanced = after.checked_sub(before).ok_or_else(|| {
             EngineError::internal_invariant("round-robin decoder token count decreased")
@@ -678,6 +742,10 @@ impl<'a> GenerationRoundRobin<'a> {
             ),
         };
         if retain {
+            self.retained_bytes =
+                self.retained_bytes.checked_add(scheduled.retained_bytes).ok_or_else(|| {
+                    EngineError::internal_invariant("round-robin retained bytes overflow")
+                })?;
             self.ready.push_back(scheduled);
         }
         Ok(Some(ScheduledGenerationAdvance {
@@ -696,6 +764,11 @@ impl<'a> GenerationRoundRobin<'a> {
     /// Returns whether no cursor remains active.
     pub fn is_empty(&self) -> bool {
         self.ready.is_empty()
+    }
+
+    /// Returns conservative bytes retained for active requests and token buffers.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -719,6 +792,71 @@ pub enum ServeOutcome {
     CancelledActive(RequestId),
     /// Cancellation named no queued or active request.
     CancellationNotFound(RequestId),
+}
+
+/// Per-connection result returned by one bounded concurrent serving batch.
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub type ConnectionServeResult = Result<ServeOutcome, EngineError>;
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct AuthenticatedConnection {
+    input_index: usize,
+    connection: UnixFrameConnection,
+    session: AuthenticatedControlSession,
+    replay_journal: Arc<Mutex<DurableReplayJournal>>,
+    command: InboundCommand,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct ActiveGenerationConnection {
+    input_index: usize,
+    request_id: RequestId,
+    connection: UnixFrameConnection,
+    session: Option<AuthenticatedControlSession>,
+    replay_journal: Arc<Mutex<DurableReplayJournal>>,
+    request_nonce: u64,
+    sequence_id: SequenceId,
+    next_event_ordinal: u32,
+    cancelled: Arc<AtomicBool>,
+    watcher_done: Arc<AtomicBool>,
+    stream_error: Option<EngineError>,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+impl ActiveGenerationConnection {
+    const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct CancellationWatcherInput {
+    connection: UnixFrameConnection,
+    session: AuthenticatedControlSession,
+    request_id: RequestId,
+    cancelled: Arc<AtomicBool>,
+    watcher_done: Arc<AtomicBool>,
+    replay_journal: Arc<Mutex<DurableReplayJournal>>,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct GenerationConnection {
+    input_index: usize,
+    connection: UnixFrameConnection,
+    session: AuthenticatedControlSession,
+    replay_journal: Arc<Mutex<DurableReplayJournal>>,
+    request: GenerationRequest,
+    request_nonce: u64,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct ConnectionBatchState<'a> {
+    service: &'a mut EngineService,
+    models: &'a BTreeMap<String, LoadedCpuModel>,
+    response_signer: &'a EngineResponseSigner,
+    next_sequence: &'a mut u64,
+    active: &'a mut Vec<ActiveGenerationConnection>,
+    results: &'a mut [Option<ConnectionServeResult>],
 }
 
 /// CPU-reference runtime joining authenticated UDS transport to loaded models.
@@ -811,6 +949,46 @@ impl CpuEngineRuntime {
     ) -> Result<(), EngineError> {
         let bytes = self.service.registry.read_registered_package(model_id, budget)?;
         self.load_registered_model_bytes(model_id, &bytes, budget)
+    }
+
+    /// Accepts and fairly executes an exact bounded batch of local connections.
+    ///
+    /// Every connection is authenticated and durably replay-checked before its
+    /// command is considered. Generation cursors are interleaved one decoder
+    /// token at a time, events remain signed and ordered per stream, and a
+    /// cancellation or event-stream failure after admission is isolated to its
+    /// request. This bounded reference path does not implement a continuous
+    /// accept loop.
+    pub fn serve_batch(
+        &mut self,
+        listener: &UnixFrameListener,
+        connection_count: u32,
+    ) -> Result<Vec<ConnectionServeResult>, EngineError> {
+        let maximum_active = self.service.scheduler.limits().maximum_active();
+        if connection_count == 0
+            || connection_count > maximum_active
+            || connection_count > MAX_CONCURRENT_CONNECTION_BATCH
+        {
+            return Err(EngineError::invalid_input(
+                "concurrent connection batch is outside scheduler bounds",
+            ));
+        }
+        if self.service.scheduler.queued_len() != 0 || self.service.scheduler.active_len() != 0 {
+            return Err(EngineError::protocol_violation(
+                "concurrent connection batch requires an idle scheduler",
+            ));
+        }
+        let connection_count = usize::try_from(connection_count).map_err(|_| {
+            EngineError::resource_exhaustion("concurrent connection count is not addressable")
+        })?;
+        let mut connections = Vec::new();
+        connections.try_reserve_exact(connection_count).map_err(|_| {
+            EngineError::resource_exhaustion("concurrent connection allocation failed")
+        })?;
+        for _index in 0..connection_count {
+            connections.push(listener.accept()?);
+        }
+        self.serve_connections(connections, maximum_active)
     }
 
     /// Accepts and processes exactly one authenticated local connection.
@@ -919,6 +1097,580 @@ impl CpuEngineRuntime {
     /// Returns the service configuration and registry composition.
     pub const fn service(&self) -> &EngineService {
         &self.service
+    }
+
+    fn serve_connections(
+        &mut self,
+        connections: Vec<UnixFrameConnection>,
+        maximum_active: u32,
+    ) -> Result<Vec<ConnectionServeResult>, EngineError> {
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(connections.len())
+            .map_err(|_| EngineError::resource_exhaustion("connection result allocation failed"))?;
+        results.resize_with(connections.len(), || None);
+        let mut authenticated = Vec::new();
+        authenticated.try_reserve_exact(connections.len()).map_err(|_| {
+            EngineError::resource_exhaustion("authenticated connection allocation failed")
+        })?;
+        for (input_index, connection) in connections.into_iter().enumerate() {
+            match self.authenticate_connection(input_index, connection) {
+                Ok(connection) => authenticated.push(connection),
+                Err(error) => store_connection_result(&mut results, input_index, Err(error))?,
+            }
+        }
+
+        let mut coordinator = GenerationRoundRobin::with_limits(
+            maximum_active,
+            self.service.scheduler.limits().maximum_queued_bytes(),
+        )?;
+        let mut active = Vec::new();
+        active
+            .try_reserve_exact(authenticated.len())
+            .map_err(|_| EngineError::resource_exhaustion("active connection allocation failed"))?;
+        let mut batch = ConnectionBatchState {
+            service: &mut self.service,
+            models: &self.models,
+            response_signer: &self.response_signer,
+            next_sequence: &mut self.next_sequence,
+            active: &mut active,
+            results: &mut results,
+        };
+        for authenticated_connection in authenticated {
+            if let Err(error) = Self::prepare_authenticated_connection(
+                &mut batch,
+                authenticated_connection,
+                &mut coordinator,
+            ) {
+                cleanup_active_scheduler(batch.service, batch.active)?;
+                return Err(error);
+            }
+        }
+        Self::run_connection_coordinator(
+            batch.service,
+            batch.response_signer,
+            &mut coordinator,
+            batch.active,
+            batch.results,
+        )?;
+        collect_connection_results(results)
+    }
+
+    fn authenticate_connection(
+        &self,
+        input_index: usize,
+        mut connection: UnixFrameConnection,
+    ) -> Result<AuthenticatedConnection, EngineError> {
+        let frame = connection.read_inbound_frame()?;
+        let mut session =
+            AuthenticatedControlSession::new_with_keys(self.trusted_control_keys.clone());
+        let command = session.decode_command(&frame)?;
+        let authenticated_key_id = session.authenticated_key_id().ok_or_else(|| {
+            EngineError::internal_invariant("authenticated command omitted its control key ID")
+        })?;
+        let replay_journal =
+            Arc::clone(self.replay_journals.get(&authenticated_key_id).ok_or_else(|| {
+                EngineError::internal_invariant("active control key omitted its replay journal")
+            })?);
+        admit_durable_nonce(&replay_journal, session.last_nonce())?;
+        Ok(AuthenticatedConnection { input_index, connection, session, replay_journal, command })
+    }
+
+    fn prepare_authenticated_connection<'a>(
+        batch: &mut ConnectionBatchState<'a>,
+        authenticated: AuthenticatedConnection,
+        coordinator: &mut GenerationRoundRobin<'a>,
+    ) -> Result<(), EngineError> {
+        let AuthenticatedConnection { input_index, connection, session, replay_journal, command } =
+            authenticated;
+        let InboundCommand::Generate { request, nonce } = command else {
+            let InboundCommand::Cancel(request_id) = command else {
+                return Err(EngineError::internal_invariant(
+                    "authenticated command variant disappeared",
+                ));
+            };
+            let outcome = if let Some(connection) =
+                batch.active.iter().find(|connection| connection.request_id == request_id)
+            {
+                connection.cancelled.store(true, Ordering::Release);
+                ServeOutcome::CancelledActive(request_id)
+            } else {
+                match batch.service.scheduler.cancel(&request_id)? {
+                    CancellationOutcome::Queued => ServeOutcome::CancelledQueued(request_id),
+                    CancellationOutcome::Active => ServeOutcome::CancelledActive(request_id),
+                    CancellationOutcome::NotFound => ServeOutcome::CancellationNotFound(request_id),
+                }
+            };
+            return store_connection_result(batch.results, input_index, Ok(outcome));
+        };
+        prepare_generation_connection(
+            batch,
+            coordinator,
+            GenerationConnection {
+                input_index,
+                connection,
+                session,
+                replay_journal,
+                request,
+                request_nonce: nonce,
+            },
+        )
+    }
+
+    fn run_connection_coordinator(
+        service: &mut EngineService,
+        response_signer: &EngineResponseSigner,
+        coordinator: &mut GenerationRoundRobin<'_>,
+        active: &mut Vec<ActiveGenerationConnection>,
+        results: &mut [Option<ConnectionServeResult>],
+    ) -> Result<(), EngineError> {
+        let watcher_inputs = match prepare_cancellation_watchers(active) {
+            Ok(watcher_inputs) => watcher_inputs,
+            Err(error) => {
+                cleanup_active_scheduler(service, active)?;
+                return Err(error);
+            }
+        };
+        thread::scope(|scope| {
+            let mut watchers = Vec::new();
+            watchers.try_reserve_exact(watcher_inputs.len()).map_err(|_| {
+                EngineError::resource_exhaustion("cancellation watcher allocation failed")
+            })?;
+            let mut spawn_error = None;
+            for watcher_input in watcher_inputs {
+                let spawn = thread::Builder::new()
+                    .name("personalai-cancel-watch".to_owned())
+                    .stack_size(CANCELLATION_WATCHER_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        watch_generation_cancellation(
+                            watcher_input.connection,
+                            watcher_input.session,
+                            watcher_input.request_id,
+                            &watcher_input.cancelled,
+                            &watcher_input.watcher_done,
+                            &watcher_input.replay_journal,
+                        );
+                    });
+                if let Ok(watcher) = spawn {
+                    watchers.push(watcher);
+                } else {
+                    spawn_error = Some(EngineError::backend_failure(
+                        "cancellation watcher thread creation failed",
+                    ));
+                    break;
+                }
+            }
+            if let Some(error) = spawn_error {
+                stop_active_watchers(active);
+                join_cancellation_watchers(watchers)?;
+                cleanup_active_scheduler(service, active)?;
+                return Err(error);
+            }
+
+            let run_result = drive_generation_connections(
+                service,
+                response_signer,
+                coordinator,
+                active,
+                results,
+            );
+            stop_active_watchers(active);
+            let join_result = join_cancellation_watchers(watchers);
+            if run_result.is_err() {
+                cleanup_active_scheduler(service, active)?;
+            }
+            run_result?;
+            join_result?;
+            if !active.is_empty() {
+                cleanup_active_scheduler(service, active)?;
+                return Err(EngineError::internal_invariant(
+                    "round-robin coordinator stopped with active connections",
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn prepare_generation_connection<'a>(
+    batch: &mut ConnectionBatchState<'a>,
+    coordinator: &mut GenerationRoundRobin<'a>,
+    generation: GenerationConnection,
+) -> Result<(), EngineError> {
+    let GenerationConnection {
+        input_index,
+        mut connection,
+        session,
+        replay_journal,
+        request,
+        request_nonce,
+    } = generation;
+    let request_id = request.request_id();
+    let model_key = request.model_id().as_str().to_owned();
+    let Some(model) = batch.models.get(&model_key) else {
+        return reject_generation_connection(
+            batch,
+            input_index,
+            &mut connection,
+            request_id,
+            None,
+            request_nonce,
+            EngineError::invalid_input("model is not loaded"),
+        );
+    };
+    if let Err(error) = batch.service.admit(request.clone()) {
+        return reject_generation_connection(
+            batch,
+            input_index,
+            &mut connection,
+            request_id,
+            None,
+            request_nonce,
+            error,
+        );
+    }
+    let (sequence_id, scheduled, following_sequence) =
+        match activate_queued_request(batch.service, *batch.next_sequence, request_id) {
+            Ok(activated) => activated,
+            Err(error) => {
+                return reject_generation_connection(
+                    batch,
+                    input_index,
+                    &mut connection,
+                    request_id,
+                    None,
+                    request_nonce,
+                    error,
+                );
+            }
+        };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    if let Err(error) = coordinator.submit(model, &scheduled, sequence_id, Arc::clone(&cancelled)) {
+        batch.service.scheduler.finish(&request_id)?;
+        return reject_generation_connection(
+            batch,
+            input_index,
+            &mut connection,
+            request_id,
+            Some(sequence_id),
+            request_nonce,
+            error,
+        );
+    }
+    if batch.active.iter().any(|connection| connection.request_id() == request_id) {
+        return Err(EngineError::internal_invariant("active connection identifier is duplicated"));
+    }
+    batch.active.push(ActiveGenerationConnection {
+        input_index,
+        request_id,
+        connection,
+        session: Some(session),
+        replay_journal,
+        request_nonce,
+        sequence_id,
+        next_event_ordinal: 1,
+        cancelled,
+        watcher_done: Arc::new(AtomicBool::new(false)),
+        stream_error: None,
+    });
+    *batch.next_sequence = following_sequence;
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn activate_queued_request(
+    service: &mut EngineService,
+    next_sequence: u64,
+    request_id: RequestId,
+) -> Result<(SequenceId, GenerationRequest, u64), EngineError> {
+    let activation = (|| {
+        let sequence_id = SequenceId::new(next_sequence)?;
+        let following_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+            EngineError::resource_exhaustion("runtime sequence identifier exhausted")
+        })?;
+        let scheduled = service.scheduler.start_next(sequence_id)?.cloned().ok_or_else(|| {
+            EngineError::internal_invariant("admitted concurrent request was not scheduled")
+        })?;
+        Ok((sequence_id, scheduled.request().clone(), following_sequence))
+    })();
+    if activation.is_err() {
+        cancel_queued_after_admission(service, request_id)?;
+    }
+    activation
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn reject_generation_connection(
+    batch: &mut ConnectionBatchState<'_>,
+    input_index: usize,
+    connection: &mut UnixFrameConnection,
+    request_id: RequestId,
+    sequence_id: Option<SequenceId>,
+    request_nonce: u64,
+    error: EngineError,
+) -> Result<(), EngineError> {
+    let error = write_failed_or_transport_error(
+        connection,
+        request_id,
+        sequence_id,
+        request_nonce,
+        batch.response_signer,
+        error,
+    );
+    store_connection_result(batch.results, input_index, Err(error))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn prepare_cancellation_watchers(
+    active: &mut [ActiveGenerationConnection],
+) -> Result<Vec<CancellationWatcherInput>, EngineError> {
+    if active.iter().any(|connection| connection.session.is_none()) {
+        return Err(EngineError::internal_invariant(
+            "active connection authentication session is missing",
+        ));
+    }
+    let mut cloned_connections = Vec::new();
+    cloned_connections.try_reserve_exact(active.len()).map_err(|_| {
+        EngineError::resource_exhaustion("cancellation connection allocation failed")
+    })?;
+    for connection in active.iter() {
+        cloned_connections.push(connection.connection.try_clone()?);
+    }
+    let mut watchers = Vec::new();
+    watchers.try_reserve_exact(active.len()).map_err(|_| {
+        EngineError::resource_exhaustion("cancellation watcher input allocation failed")
+    })?;
+    for (connection, cloned_connection) in active.iter_mut().zip(cloned_connections) {
+        let session = connection.session.take().ok_or_else(|| {
+            EngineError::internal_invariant("active authentication session disappeared")
+        })?;
+        watchers.push(CancellationWatcherInput {
+            connection: cloned_connection,
+            session,
+            request_id: connection.request_id,
+            cancelled: Arc::clone(&connection.cancelled),
+            watcher_done: Arc::clone(&connection.watcher_done),
+            replay_journal: Arc::clone(&connection.replay_journal),
+        });
+    }
+    Ok(watchers)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn drive_generation_connections(
+    service: &mut EngineService,
+    response_signer: &EngineResponseSigner,
+    coordinator: &mut GenerationRoundRobin<'_>,
+    active: &mut Vec<ActiveGenerationConnection>,
+    results: &mut [Option<ConnectionServeResult>],
+) -> Result<(), EngineError> {
+    while let Some(turn) = coordinator.advance_next()? {
+        let request_id = turn.request_id();
+        let position = active
+            .iter()
+            .position(|connection| connection.request_id == request_id)
+            .ok_or_else(|| {
+                EngineError::internal_invariant("round-robin turn omitted its active connection")
+            })?;
+        let Some(event) = turn.into_event() else {
+            continue;
+        };
+        if event.request_id() != request_id {
+            return Err(EngineError::internal_invariant(
+                "round-robin event request identifier changed",
+            ));
+        }
+        let terminal = terminal_connection_result(&event, active[position].sequence_id)?;
+        let write_result =
+            write_active_generation_event(&mut active[position], &event, response_signer);
+        if let Err(error) = write_result {
+            if active[position].stream_error.is_none() {
+                active[position].stream_error = Some(error);
+            }
+            if terminal.is_none() {
+                active[position].cancelled.store(true, Ordering::Release);
+                continue;
+            }
+        }
+        if let Some(terminal_result) = terminal {
+            let result = match active[position].stream_error.take() {
+                Some(error) => Err(error),
+                None => terminal_result,
+            };
+            finish_active_connection(service, active, position, results, result)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn write_active_generation_event(
+    connection: &mut ActiveGenerationConnection,
+    event: &GenerationEvent,
+    response_signer: &EngineResponseSigner,
+) -> Result<(), EngineError> {
+    if let Some(error) = &connection.stream_error {
+        return Err(error.clone());
+    }
+    let ordinal = connection.next_event_ordinal;
+    connection.next_event_ordinal = ordinal
+        .checked_add(1)
+        .ok_or_else(|| EngineError::resource_exhaustion("generation event ordinal exhausted"))?;
+    write_generation_event(
+        &mut connection.connection,
+        event,
+        connection.request_nonce,
+        ordinal,
+        response_signer,
+    )
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn terminal_connection_result(
+    event: &GenerationEvent,
+    expected_sequence_id: SequenceId,
+) -> Result<Option<ConnectionServeResult>, EngineError> {
+    match event {
+        GenerationEvent::Completed { request_id, sequence_id, usage } => {
+            if *sequence_id != expected_sequence_id {
+                return Err(EngineError::internal_invariant(
+                    "completed event sequence identifier changed",
+                ));
+            }
+            Ok(Some(Ok(ServeOutcome::Generated {
+                request_id: *request_id,
+                sequence_id: *sequence_id,
+                usage: *usage,
+            })))
+        }
+        GenerationEvent::Failed { sequence_id, error, .. } => {
+            if sequence_id.is_some_and(|sequence_id| sequence_id != expected_sequence_id) {
+                return Err(EngineError::internal_invariant(
+                    "failed event sequence identifier changed",
+                ));
+            }
+            Ok(Some(Err(error.clone())))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn finish_active_connection(
+    service: &mut EngineService,
+    active: &mut Vec<ActiveGenerationConnection>,
+    position: usize,
+    results: &mut [Option<ConnectionServeResult>],
+    result: ConnectionServeResult,
+) -> Result<(), EngineError> {
+    if position >= active.len() {
+        return Err(EngineError::internal_invariant(
+            "active connection removal position is invalid",
+        ));
+    }
+    let connection = active.remove(position);
+    connection.watcher_done.store(true, Ordering::Release);
+    let shutdown_result = connection.connection.shutdown_inbound();
+    service.scheduler.finish(&connection.request_id)?;
+    let result = match shutdown_result {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    };
+    store_connection_result(results, connection.input_index, result)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn stop_active_watchers(active: &[ActiveGenerationConnection]) {
+    for connection in active {
+        connection.watcher_done.store(true, Ordering::Release);
+        let _shutdown_result = connection.connection.shutdown_inbound();
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn join_cancellation_watchers(
+    watchers: Vec<thread::ScopedJoinHandle<'_, ()>>,
+) -> Result<(), EngineError> {
+    for watcher in watchers {
+        watcher
+            .join()
+            .map_err(|_| EngineError::internal_invariant("cancellation watcher panicked"))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn cleanup_active_scheduler(
+    service: &mut EngineService,
+    active: &mut Vec<ActiveGenerationConnection>,
+) -> Result<(), EngineError> {
+    for connection in active.drain(..) {
+        connection.watcher_done.store(true, Ordering::Release);
+        let _shutdown_result = connection.connection.shutdown_inbound();
+        service.scheduler.finish(&connection.request_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn cancel_queued_after_admission(
+    service: &mut EngineService,
+    request_id: RequestId,
+) -> Result<(), EngineError> {
+    match service.scheduler.cancel(&request_id)? {
+        CancellationOutcome::Queued => Ok(()),
+        CancellationOutcome::Active | CancellationOutcome::NotFound => {
+            Err(EngineError::internal_invariant("failed concurrent admission was not queued"))
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn store_connection_result(
+    results: &mut [Option<ConnectionServeResult>],
+    input_index: usize,
+    result: ConnectionServeResult,
+) -> Result<(), EngineError> {
+    let slot = results.get_mut(input_index).ok_or_else(|| {
+        EngineError::internal_invariant("connection result index is outside its allocation")
+    })?;
+    if slot.is_some() {
+        return Err(EngineError::internal_invariant("connection result was recorded twice"));
+    }
+    *slot = Some(result);
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn collect_connection_results(
+    results: Vec<Option<ConnectionServeResult>>,
+) -> Result<Vec<ConnectionServeResult>, EngineError> {
+    let mut collected = Vec::new();
+    collected.try_reserve_exact(results.len()).map_err(|_| {
+        EngineError::resource_exhaustion("collected connection result allocation failed")
+    })?;
+    for result in results {
+        collected.push(result.ok_or_else(|| {
+            EngineError::internal_invariant("connection completed without a result")
+        })?);
+    }
+    Ok(collected)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn write_failed_or_transport_error(
+    connection: &mut UnixFrameConnection,
+    request_id: RequestId,
+    sequence_id: Option<SequenceId>,
+    request_nonce: u64,
+    response_signer: &EngineResponseSigner,
+    error: EngineError,
+) -> EngineError {
+    let failed = GenerationEvent::Failed { request_id, sequence_id, error: error.clone() };
+    match write_generation_event(connection, &failed, request_nonce, 1, response_signer) {
+        Ok(()) => error,
+        Err(transport_error) => transport_error,
     }
 }
 
@@ -1621,18 +2373,19 @@ mod tests {
         .expect("second request must validate");
         let first_sequence = SequenceId::new(21).expect("sequence must validate");
         let second_sequence = SequenceId::new(22).expect("sequence must validate");
-        let first_cancelled = AtomicBool::new(false);
-        let second_cancelled = AtomicBool::new(false);
+        let first_cancelled = Arc::new(AtomicBool::new(false));
+        let second_cancelled = Arc::new(AtomicBool::new(false));
         let mut first_events = Vec::new();
         let mut second_events = Vec::new();
         let mut completion_order = Vec::new();
         let mut coordinator = GenerationRoundRobin::new(2).expect("coordinator must validate");
         coordinator
-            .submit(&loaded, &first_request, first_sequence, &first_cancelled)
+            .submit(&loaded, &first_request, first_sequence, Arc::clone(&first_cancelled))
             .expect("first cursor must admit");
         coordinator
-            .submit(&loaded, &second_request, second_sequence, &second_cancelled)
+            .submit(&loaded, &second_request, second_sequence, Arc::clone(&second_cancelled))
             .expect("second cursor must admit");
+        assert!(coordinator.retained_bytes() > 0);
 
         for _turn in 0..64 {
             let turn = coordinator
@@ -1658,6 +2411,7 @@ mod tests {
 
         assert!(coordinator.is_empty());
         assert_eq!(coordinator.active_len(), 0);
+        assert_eq!(coordinator.retained_bytes(), 0);
         assert_eq!(
             completion_order,
             [second_request.request_id(), first_request.request_id()],
@@ -1706,13 +2460,24 @@ mod tests {
             budget_two,
         )
         .expect("request must validate");
-        let first_cancelled = AtomicBool::new(false);
-        let second_cancelled = AtomicBool::new(false);
+        let first_cancelled = Arc::new(AtomicBool::new(false));
+        let second_cancelled = Arc::new(AtomicBool::new(false));
 
         assert!(matches!(GenerationRoundRobin::new(0), Err(EngineError::InvalidInput(_))));
         assert!(matches!(
             GenerationRoundRobin::new(MAX_CONCURRENT_SEQUENCES + 1),
             Err(EngineError::InvalidInput(_))
+        ));
+        let mut byte_limited =
+            GenerationRoundRobin::with_limits(2, 1).expect("byte limit must validate");
+        assert!(matches!(
+            byte_limited.submit(
+                &loaded,
+                &first_request,
+                SequenceId::new(30).expect("sequence must validate"),
+                Arc::clone(&first_cancelled),
+            ),
+            Err(EngineError::ResourceExhaustion(_))
         ));
         let mut capacity_one = GenerationRoundRobin::new(1).expect("limit must validate");
         capacity_one
@@ -1720,7 +2485,7 @@ mod tests {
                 &loaded,
                 &first_request,
                 SequenceId::new(31).expect("sequence must validate"),
-                &first_cancelled,
+                Arc::clone(&first_cancelled),
             )
             .expect("first cursor must admit");
         assert!(matches!(
@@ -1728,7 +2493,7 @@ mod tests {
                 &loaded,
                 &second_request,
                 SequenceId::new(32).expect("sequence must validate"),
-                &second_cancelled,
+                Arc::clone(&second_cancelled),
             ),
             Err(EngineError::ResourceExhaustion(_))
         ));
@@ -1743,14 +2508,14 @@ mod tests {
             budget_one,
         )
         .expect("request must validate");
-        let budget_cancelled = AtomicBool::new(false);
+        let budget_cancelled = Arc::new(AtomicBool::new(false));
         let mut budget_limited = GenerationRoundRobin::new(2).expect("limit must validate");
         budget_limited
             .submit(
                 &loaded,
                 &budgeted_request,
                 SequenceId::new(33).expect("sequence must validate"),
-                &budget_cancelled,
+                Arc::clone(&budget_cancelled),
             )
             .expect("budgeted cursor must admit");
         assert!(matches!(
@@ -1758,7 +2523,7 @@ mod tests {
                 &loaded,
                 &second_request,
                 SequenceId::new(34).expect("sequence must validate"),
-                &second_cancelled,
+                Arc::clone(&second_cancelled),
             ),
             Err(EngineError::ResourceExhaustion(_))
         ));
@@ -1809,25 +2574,30 @@ mod tests {
             budget,
         )
         .expect("duplicate-ID request must otherwise validate");
-        let first_cancelled = AtomicBool::new(false);
-        let second_cancelled = AtomicBool::new(false);
-        let duplicate_cancelled = AtomicBool::new(false);
+        let first_cancelled = Arc::new(AtomicBool::new(false));
+        let second_cancelled = Arc::new(AtomicBool::new(false));
+        let duplicate_cancelled = Arc::new(AtomicBool::new(false));
         let duplicate_sequence = SequenceId::new(35).expect("sequence must validate");
         let mut coordinator = GenerationRoundRobin::new(2).expect("limit must validate");
         coordinator
-            .submit(&loaded, &first_request, duplicate_sequence, &first_cancelled)
+            .submit(&loaded, &first_request, duplicate_sequence, Arc::clone(&first_cancelled))
             .expect("first identity must admit");
         assert!(matches!(
             coordinator.submit(
                 &loaded,
                 &duplicate_request,
                 SequenceId::new(36).expect("sequence must validate"),
-                &duplicate_cancelled,
+                Arc::clone(&duplicate_cancelled),
             ),
             Err(EngineError::ProtocolViolation(_))
         ));
         assert!(matches!(
-            coordinator.submit(&loaded, &second_request, duplicate_sequence, &second_cancelled,),
+            coordinator.submit(
+                &loaded,
+                &second_request,
+                duplicate_sequence,
+                Arc::clone(&second_cancelled),
+            ),
             Err(EngineError::ProtocolViolation(_))
         ));
     }
@@ -1868,15 +2638,15 @@ mod tests {
             budget,
         )
         .expect("request must validate");
-        let cancelled = AtomicBool::new(false);
-        let neighbor_cancelled = AtomicBool::new(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let neighbor_cancelled = Arc::new(AtomicBool::new(false));
         let mut coordinator = GenerationRoundRobin::new(2).expect("limit must validate");
         coordinator
             .submit(
                 &loaded,
                 &cancelled_request,
                 SequenceId::new(41).expect("sequence must validate"),
-                &cancelled,
+                Arc::clone(&cancelled),
             )
             .expect("cancelled cursor must admit");
         coordinator
@@ -1884,7 +2654,7 @@ mod tests {
                 &loaded,
                 &neighbor_request,
                 SequenceId::new(42).expect("sequence must validate"),
-                &neighbor_cancelled,
+                Arc::clone(&neighbor_cancelled),
             )
             .expect("neighbor cursor must admit");
 
@@ -1997,8 +2767,9 @@ mod tests {
             .expect("request frame must encode");
         let replay_encoded = encoded.clone();
         let client_path = socket_path.clone();
-        let client =
-            thread::spawn(move || runtime_test_client(client_path, &encoded, response_public_key));
+        let client = thread::spawn(move || {
+            runtime_test_client(client_path, &encoded, response_public_key, 1, 3)
+        });
         let outcome = runtime.serve_one(&listener).expect("runtime must serve generation");
         assert!(
             matches!(outcome, ServeOutcome::Generated { request_id, .. } if request_id.get() == 404)
@@ -2035,16 +2806,436 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_batch_serves_two_signed_streams_and_cleans_scheduler_state() {
+        let mut fixture = BatchRuntimeFixture::new("success", 2);
+        assert!(matches!(
+            fixture.runtime.serve_batch(&fixture.listener, 0),
+            Err(EngineError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            fixture.runtime.serve_batch(&fixture.listener, 3),
+            Err(EngineError::InvalidInput(_))
+        ));
+        let first_request = fixture.request(601, "AAA", 2);
+        let second_request = fixture.request(602, "B", 2);
+        let first = signed_generation_frame(
+            &first_request,
+            1,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let second = signed_generation_frame(
+            &second_request,
+            2,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let first_socket = fixture.socket_path();
+        let second_socket = fixture.socket_path();
+        let response_key = fixture.response_public_key;
+        let first_client =
+            spawn_ordered_runtime_test_client(first_socket, first, response_key, 1, 3);
+        let second_client =
+            spawn_ordered_runtime_test_client(second_socket, second, response_key, 2, 3);
+
+        let results =
+            fixture.runtime.serve_batch(&fixture.listener, 2).expect("bounded batch must run");
+        assert_eq!(results.len(), 2);
+        let mut completed_ids: Vec<_> = results
+            .into_iter()
+            .map(|result| match result.expect("both generations must complete") {
+                ServeOutcome::Generated { request_id, .. } => request_id.get(),
+                other => panic!("unexpected batch outcome: {other:?}"),
+            })
+            .collect();
+        completed_ids.sort_unstable();
+        assert_eq!(completed_ids, [601, 602]);
+        assert_eq!(first_client.join().expect("first client must finish").last(), Some(&3));
+        assert_eq!(second_client.join().expect("second client must finish").last(), Some(&3));
+        assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_batch_isolates_cancellation_and_completes_neighbor() {
+        let mut fixture = BatchRuntimeFixture::new("cancel", 3);
+        let cancelled_request = fixture.request(611, "AAA", 4);
+        let neighbor_request = fixture.request(612, "B", 2);
+        let cancelled_stream = signed_generation_frame(
+            &cancelled_request,
+            10,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let cancellation = signed_cancellation_frame(
+            cancelled_request.request_id(),
+            11,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let neighbor_stream = signed_generation_frame(
+            &neighbor_request,
+            12,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let cancelled_socket = fixture.socket_path();
+        let cancellation_socket = fixture.socket_path();
+        let neighbor_socket = fixture.socket_path();
+        let response_key = fixture.response_public_key;
+        let cancelled_client = spawn_ordered_runtime_test_client(
+            cancelled_socket,
+            cancelled_stream,
+            response_key,
+            10,
+            4,
+        );
+        let cancellation_client =
+            spawn_ordered_write_only_client(cancellation_socket, cancellation);
+        let neighbor_client = spawn_ordered_runtime_test_client(
+            neighbor_socket,
+            neighbor_stream,
+            response_key,
+            12,
+            3,
+        );
+
+        let results =
+            fixture.runtime.serve_batch(&fixture.listener, 3).expect("cancellation batch must run");
+        assert!(
+            results.iter().any(|result| matches!(result, Err(EngineError::Cancellation(_)))),
+            "cancelled stream must fail locally: {results:?}"
+        );
+        assert!(results.iter().any(|result| {
+            matches!(result, Ok(ServeOutcome::CancelledActive(request_id)) if request_id.get() == 611)
+        }));
+        assert!(results.iter().any(|result| {
+            matches!(result, Ok(ServeOutcome::Generated { request_id, .. }) if request_id.get() == 612)
+        }));
+        assert_eq!(cancelled_client.join().expect("cancelled client must finish").last(), Some(&4));
+        assert!(cancellation_client.join().expect("cancellation client must finish").is_empty());
+        assert_eq!(neighbor_client.join().expect("neighbor client must finish").last(), Some(&3));
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn malformed_batch_peer_does_not_block_authenticated_neighbor() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let mut fixture = BatchRuntimeFixture::new("malformed", 2);
+        let malformed_request = fixture.request(621, "A", 2);
+        let valid_request = fixture.request(622, "B", 2);
+        let mut malformed = signed_generation_frame(
+            &malformed_request,
+            20,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let final_byte = malformed.last_mut().expect("signed frame must not be empty");
+        *final_byte ^= 0x01;
+        let valid = signed_generation_frame(
+            &valid_request,
+            21,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let malformed_socket = fixture.socket_path();
+        let valid_socket = fixture.socket_path();
+        let response_key = fixture.response_public_key;
+        let (malformed_connected, wait_for_malformed) = mpsc::sync_channel(0);
+        let malformed_client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(malformed_socket).expect("client must connect");
+            malformed_connected.send(()).expect("connection order must synchronize");
+            stream.write_all(&malformed).expect("malformed frame must write");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("server close must be observable");
+            response
+        });
+        wait_for_malformed.recv().expect("malformed client must connect first");
+        let valid_client =
+            spawn_ordered_runtime_test_client(valid_socket, valid, response_key, 21, 3);
+
+        let results = fixture
+            .runtime
+            .serve_batch(&fixture.listener, 2)
+            .expect("malformed peer must remain request-local");
+        assert!(
+            results
+                .iter()
+                .any(|result| { matches!(result, Err(EngineError::AuthenticationFailure(_))) })
+        );
+        assert!(results.iter().any(|result| {
+            matches!(result, Ok(ServeOutcome::Generated { request_id, .. }) if request_id.get() == 622)
+        }));
+        assert!(malformed_client.join().expect("malformed client must finish").is_empty());
+        assert_eq!(valid_client.join().expect("valid client must finish").last(), Some(&3));
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn disconnected_batch_peer_does_not_abort_authenticated_neighbor() {
+        let mut fixture = BatchRuntimeFixture::new("disconnect", 2);
+        let disconnected_request = fixture.request(631, "AAA", 4);
+        let neighbor_request = fixture.request(632, "B", 2);
+        let disconnected = signed_generation_frame(
+            &disconnected_request,
+            30,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let neighbor = signed_generation_frame(
+            &neighbor_request,
+            31,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let disconnected_client =
+            spawn_ordered_disconnecting_client(fixture.socket_path(), disconnected);
+        let neighbor_client = spawn_ordered_runtime_test_client(
+            fixture.socket_path(),
+            neighbor,
+            fixture.response_public_key,
+            31,
+            3,
+        );
+
+        let results = fixture
+            .runtime
+            .serve_batch(&fixture.listener, 2)
+            .expect("disconnect must remain request-local");
+        assert!(results.iter().any(|result| {
+            matches!(result, Err(EngineError::Cancellation(_) | EngineError::BackendFailure(_)))
+        }));
+        assert!(results.iter().any(|result| {
+            matches!(result, Ok(ServeOutcome::Generated { request_id, .. }) if request_id.get() == 632)
+        }));
+        disconnected_client.join().expect("disconnected client must finish");
+        assert_eq!(neighbor_client.join().expect("neighbor client must finish").last(), Some(&3));
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    struct BatchRuntimeFixture {
+        runtime: CpuEngineRuntime,
+        listener: UnixFrameListener,
+        runtime_root: PathBuf,
+        model_id: ModelId,
+        budget: ResourceBudget,
+        control_signing_key: SigningKey,
+        control_key_id: SignerKeyId,
+        response_public_key: [u8; 32],
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    impl BatchRuntimeFixture {
+        fn new(label: &str, maximum_active: u32) -> Self {
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::atomic::AtomicU64;
+
+            static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let runtime_root = PathBuf::from("/tmp")
+                .join(format!("personalai-engine-batch-{label}-{}-{sequence}", std::process::id()));
+            fs::create_dir(&runtime_root).expect("runtime root must create");
+            fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))
+                .expect("runtime root permissions must set");
+            let socket_path = runtime_root.join("engine.sock");
+            let config = ServiceConfig::new("/models", &runtime_root, &socket_path)
+                .expect("runtime config must validate");
+            let mut service = EngineService::new(
+                config,
+                SchedulerLimits::new(8, maximum_active, 1 << 20).expect("limits must validate"),
+            )
+            .expect("service must construct");
+            let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+            let model_id = ModelId::new("decoder-batch").expect("model ID must validate");
+            service
+                .register_configured_model(
+                    model_id.clone(),
+                    "decoder-batch.paimodel",
+                    fixture.package_hash(),
+                    fixture.trusted_signer().clone(),
+                )
+                .expect("model must register");
+            let control_signing_key = SigningKey::from_bytes(&[0x81; 32]);
+            let control_key_id = SignerKeyId::from_bytes([0x82; 16]).expect("key ID must validate");
+            let trusted_key = TrustedControlPlaneKey::active(
+                control_key_id,
+                control_signing_key.verifying_key().to_bytes(),
+            )
+            .expect("control key must validate");
+            let budget = ResourceBudget::new(1 << 24, 1 << 20, maximum_active)
+                .expect("budget must validate");
+            let response_signer = test_response_signer();
+            let response_public_key = response_signer.public_key();
+            let mut runtime = CpuEngineRuntime::new(service, trusted_key, response_signer)
+                .expect("runtime must construct");
+            runtime
+                .load_registered_model_bytes(&model_id, fixture.bytes(), &budget)
+                .expect("model must load");
+            let listener =
+                UnixFrameListener::bind(runtime.service().config()).expect("socket must bind");
+            Self {
+                runtime,
+                listener,
+                runtime_root,
+                model_id,
+                budget,
+                control_signing_key,
+                control_key_id,
+                response_public_key,
+            }
+        }
+
+        fn request(&self, id: u128, prompt: &str, maximum_output_tokens: u32) -> GenerationRequest {
+            GenerationRequest::new(
+                RequestId::new(id).expect("request ID must validate"),
+                self.model_id.clone(),
+                prompt,
+                maximum_output_tokens,
+                ContextLimit::new(8).expect("context must validate"),
+                self.budget,
+            )
+            .expect("request must validate")
+        }
+
+        fn socket_path(&self) -> PathBuf {
+            self.listener.socket_path().to_path_buf()
+        }
+
+        fn cleanup(self) {
+            use std::fs;
+
+            let replay_path =
+                self.runtime_root.join(format!("control-replay-{}.bin", self.control_key_id));
+            drop(self.listener);
+            drop(self.runtime);
+            fs::remove_file(replay_path).expect("replay journal must clean");
+            fs::remove_dir(self.runtime_root).expect("runtime root must clean");
+        }
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn spawn_ordered_runtime_test_client(
+        socket_path: PathBuf,
+        encoded: Vec<u8>,
+        response_public_key: [u8; 32],
+        expected_nonce: u64,
+        terminal_kind: u8,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let stream = UnixStream::connect(socket_path).expect("client must connect");
+            connected.send(()).expect("connection order must synchronize");
+            runtime_test_stream(
+                stream,
+                &encoded,
+                response_public_key,
+                expected_nonce,
+                terminal_kind,
+            )
+        });
+        wait_for_connection.recv().expect("client must connect before the next peer");
+        client
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn spawn_ordered_write_only_client(
+        socket_path: PathBuf,
+        encoded: Vec<u8>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            connected.send(()).expect("connection order must synchronize");
+            stream.write_all(&encoded).expect("command must write");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("server close must be observable");
+            response
+        });
+        wait_for_connection.recv().expect("client must connect before the next peer");
+        client
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn spawn_ordered_disconnecting_client(
+        socket_path: PathBuf,
+        encoded: Vec<u8>,
+    ) -> std::thread::JoinHandle<()> {
+        use personalai_engine_protocol::FRAME_HEADER_BYTES;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            connected.send(()).expect("connection order must synchronize");
+            stream.write_all(&encoded).expect("request must write before disconnect");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("first event header must read");
+            let length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("length field must exist"),
+            ))
+            .expect("event length must address");
+            let mut frame = Vec::from(header);
+            frame.resize(FRAME_HEADER_BYTES + length, 0);
+            stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("first event must read");
+            let event = Frame::decode_outbound_exact(&frame).expect("first event must decode");
+            assert_eq!(event.payload()[10], 1);
+            drop(stream);
+        });
+        wait_for_connection.recv().expect("client must connect before the next peer");
+        client
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
     fn runtime_test_client(
         socket_path: PathBuf,
         encoded: &[u8],
         response_public_key: [u8; 32],
+        expected_nonce: u64,
+        terminal_kind: u8,
+    ) -> Vec<u8> {
+        use std::os::unix::net::UnixStream;
+
+        let stream = UnixStream::connect(socket_path).expect("client must connect");
+        runtime_test_stream(stream, encoded, response_public_key, expected_nonce, terminal_kind)
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn runtime_test_stream(
+        mut stream: std::os::unix::net::UnixStream,
+        encoded: &[u8],
+        response_public_key: [u8; 32],
+        expected_nonce: u64,
+        terminal_kind: u8,
     ) -> Vec<u8> {
         use personalai_engine_protocol::{FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES};
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
 
-        let mut stream = UnixStream::connect(socket_path).expect("client must connect");
         stream.write_all(encoded).expect("request must write");
         let mut event_kinds = Vec::new();
         let response_key =
@@ -2065,7 +3256,7 @@ mod tests {
             let payload = event.payload();
             let unsigned_end = payload.len() - personalai_engine_crypto::ED25519_SIGNATURE_BYTES;
             let auth_start = unsigned_end - GENERATION_EVENT_AUTH_BYTES;
-            assert_eq!(&payload[auth_start..auth_start + 8], &1_u64.to_le_bytes());
+            assert_eq!(&payload[auth_start..auth_start + 8], &expected_nonce.to_le_bytes());
             assert_eq!(&payload[auth_start + 8..auth_start + 12], &expected_ordinal.to_le_bytes());
             assert_eq!(&payload[auth_start + 16..unsigned_end], &expected_key_id);
             let signature = Signature::from_bytes(
@@ -2078,7 +3269,7 @@ mod tests {
                 .expect("runtime event signature must verify");
             expected_ordinal = expected_ordinal.checked_add(1).expect("ordinal must fit");
             event_kinds.push(event.payload()[10]);
-            if event.payload()[10] == 3 {
+            if event.payload()[10] == terminal_kind {
                 break;
             }
         }
@@ -2102,6 +3293,25 @@ mod tests {
             .expect("request frame must construct")
             .encode()
             .expect("request frame must encode")
+    }
+
+    fn signed_cancellation_frame(
+        request_id: RequestId,
+        nonce: u64,
+        key_id: SignerKeyId,
+        signing_key: &SigningKey,
+    ) -> Vec<u8> {
+        let unsigned = CancellationEnvelope::unsigned_bytes(request_id, nonce, key_id)
+            .expect("cancellation must encode");
+        let transcript =
+            control_plane_signature_message(&unsigned).expect("transcript must construct");
+        let signature = signing_key.sign(&transcript).to_bytes();
+        let payload =
+            attach_cancellation_signature(&unsigned, &signature).expect("signature must attach");
+        Frame::new(FrameKind::Cancellation, payload)
+            .expect("cancellation frame must construct")
+            .encode()
+            .expect("cancellation frame must encode")
     }
 
     fn test_response_signer() -> EngineResponseSigner {

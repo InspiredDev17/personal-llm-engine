@@ -12,8 +12,11 @@ strict Ed25519 admission, a configuration-only model registry, no-follow local
 package opening, a first-party bounded byte/BPE tokenizer, safe aggregate-
 accounted tensors, one fixed decoder architecture, scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
-mutually authenticated binary protocol, protected Unix-domain socket runtime,
-a bounded per-control-key durable replay journal, and an owner CLI. The Go
+resumable one-token round-robin coordination, mutually authenticated binary
+protocol, protected Unix-domain socket runtime, a bounded authenticated
+multi-stream reference batch, a bounded per-control-key durable replay journal,
+and an owner CLI. The continuous CLI path remains intentionally single-worker
+until ingress and slow-consumer hardening is complete. The Go
 repository contains the corresponding `NATIVE_ENGINE` provider adapter; it has
 no HTTP or remote-network fallback.
 
@@ -58,6 +61,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   increasing event ordinal, response key ID, and exact event bytes;
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
+- the multi-stream reference path caps connection count, cancellation-watcher
+  stack size, and aggregate active request/token/cursor retention before work;
 - every authenticated command nonce is appended and synchronized to a bounded,
   mode-0600 per-control-key journal before the command can execute; an exclusive
   lifetime lock prevents a second process from using the same key journal, and

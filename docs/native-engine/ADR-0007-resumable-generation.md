@@ -34,8 +34,10 @@ advances the front cursor once, returns at most one unbuffered event, removes a
 completed or failed cursor, and rotates an unfinished cursor to the back.
 Request or sequence identifiers cannot be active twice.
 
-The current UDS daemon continues to process one sequence at a time; this ADR
-does not claim that the multi-connection runtime or batching is complete.
+The CLI's continuous UDS daemon continues to process one sequence at a time.
+ADR-0008 adds a bounded authenticated multi-connection reference batch without
+claiming that continuous concurrent admission or production batching is
+complete.
 
 ## Invariants
 
@@ -49,7 +51,10 @@ does not claim that the multi-connection runtime or batching is complete.
 5. Scheduling is engine-owned. Model packages and clients cannot set quantum,
    priority, batching, memory location, or kernel choice.
 6. Coordinator admission enforces its hard active ceiling and every active
-   request's concurrency budget. Its queue uses fallible bounded allocation.
+   request's concurrency budget. It conservatively charges activation,
+   scheduler-owned, and cursor-owned request copies, worst-case byte-token
+   storage, and fixed cursor overhead against an aggregate retained-byte ceiling
+   before tokenization. Its queue uses fallible bounded allocation.
 7. A cursor error becomes that request's typed failed event and cannot stop a
    neighboring sequence. The coordinator stores no event queue, so the caller
    must deliver or reject the returned event before requesting another turn.
@@ -68,11 +73,13 @@ bounded per-turn work, active and request-budget admission, unique active
 identities, request-local cancellation/failure, and completion of an unaffected
 neighbor.
 
-The next slice must connect multiple authenticated UDS connections to this
-coordinator while preserving durable request admission, request-local
+The bounded reference integration now connects multiple authenticated UDS
+connections while preserving durable request admission, request-local
 cancellation, signed per-stream event ordinals, bounded writes, and connection
-lifetime cleanup. Until that integration passes socket and failure tests, the
-daemon remains intentionally single-worker.
+lifetime cleanup. The next slice must replace exact-batch admission with a
+bounded continuous ingress/output driver and qualify slow consumers and
+shutdown. Until that passes integration and soak tests, the CLI remains
+intentionally single-worker.
 
 ## Rejected alternatives
 

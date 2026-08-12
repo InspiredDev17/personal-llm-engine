@@ -107,6 +107,11 @@ impl Scheduler {
         Self { limits, queued: VecDeque::new(), queued_bytes: 0, active: Vec::new() }
     }
 
+    /// Returns the configured hard scheduler limits.
+    pub const fn limits(&self) -> SchedulerLimits {
+        self.limits
+    }
+
     /// Admits a unique validated request to the FIFO queue.
     pub fn submit(&mut self, request: GenerationRequest) -> Result<(), EngineError> {
         if self.queued.len() >= self.limits.maximum_queued() {
