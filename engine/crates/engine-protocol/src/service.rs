@@ -12,6 +12,8 @@ use personalai_engine_crypto::{
 };
 use personalai_engine_types::{EngineError, MAX_REQUEST_BYTES, RequestId, SignerKeyId};
 
+use crate::{ServiceRequestBody, ServiceResponseBody};
+
 const SERVICE_REQUEST_MAGIC: [u8; 8] = *b"PAISVC01";
 const SERVICE_RESPONSE_MAGIC: [u8; 8] = *b"PAISVR01";
 const SERVICE_VERSION: u16 = 1;
@@ -123,24 +125,22 @@ pub struct AuthenticatedServiceRequest {
     request_id: RequestId,
     nonce: u64,
     control_key_id: SignerKeyId,
-    payload: Vec<u8>,
+    body: ServiceRequestBody,
 }
 
 impl AuthenticatedServiceRequest {
     /// Constructs the exact request bytes that the Go control plane signs.
     pub fn unsigned_bytes(
-        kind: ServiceMessageKind,
         request_id: RequestId,
         nonce: u64,
         control_key_id: SignerKeyId,
-        payload: &[u8],
+        body: &ServiceRequestBody,
     ) -> Result<Vec<u8>, EngineError> {
-        if !kind.accepted_request() {
-            return Err(EngineError::invalid_input("message type is not a service request"));
-        }
         if nonce == 0 {
             return Err(EngineError::invalid_input("service request nonce must be nonzero"));
         }
+        let kind = body.kind();
+        let payload = body.encode()?;
         let total = SERVICE_REQUEST_FIXED_BYTES
             .checked_add(payload.len())
             .filter(|total| *total <= MAX_REQUEST_BYTES - ED25519_SIGNATURE_BYTES)
@@ -155,7 +155,7 @@ impl AuthenticatedServiceRequest {
         bytes[20..36].copy_from_slice(&request_id.to_bytes());
         bytes[36..52].copy_from_slice(control_key_id.as_bytes());
         bytes[52..56].copy_from_slice(&payload_length.to_le_bytes());
-        bytes[SERVICE_REQUEST_FIXED_BYTES..].copy_from_slice(payload);
+        bytes[SERVICE_REQUEST_FIXED_BYTES..].copy_from_slice(&payload);
         Ok(bytes)
     }
 
@@ -206,8 +206,9 @@ impl AuthenticatedServiceRequest {
             &bytes[..signed_length],
             &signature,
         )?;
-        let payload = bytes[SERVICE_REQUEST_FIXED_BYTES..signed_length].to_vec();
-        Ok(Self { kind, request_id, nonce, control_key_id, payload })
+        let body =
+            ServiceRequestBody::decode(kind, &bytes[SERVICE_REQUEST_FIXED_BYTES..signed_length])?;
+        Ok(Self { kind, request_id, nonce, control_key_id, body })
     }
 
     /// Returns the closed message type.
@@ -230,9 +231,9 @@ impl AuthenticatedServiceRequest {
         self.control_key_id
     }
 
-    /// Returns the bounded message-specific bytes.
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    /// Returns the fully validated, closed message-specific body.
+    pub const fn body(&self) -> &ServiceRequestBody {
+        &self.body
     }
 }
 
@@ -257,18 +258,16 @@ pub fn attach_service_signature(
 
 /// Encodes and signs one exact service response.
 pub fn encode_signed_service_response(
-    kind: ServiceMessageKind,
     request_id: RequestId,
     request_nonce: u64,
-    payload: &[u8],
+    body: &ServiceResponseBody,
     signer: &EngineResponseSigner,
 ) -> Result<Vec<u8>, EngineError> {
-    if !kind.accepted_response() {
-        return Err(EngineError::invalid_input("message type is not a service response"));
-    }
     if request_nonce == 0 {
         return Err(EngineError::invalid_input("service response nonce must be nonzero"));
     }
+    let kind = body.kind();
+    let payload = body.encode()?;
     let total = SERVICE_REQUEST_FIXED_BYTES
         .checked_add(payload.len())
         .filter(|total| *total <= MAX_REQUEST_BYTES - ED25519_SIGNATURE_BYTES)
@@ -283,7 +282,7 @@ pub fn encode_signed_service_response(
     bytes[20..36].copy_from_slice(&request_id.to_bytes());
     bytes[36..52].copy_from_slice(signer.key_id().as_bytes());
     bytes[52..56].copy_from_slice(&payload_length.to_le_bytes());
-    bytes[SERVICE_REQUEST_FIXED_BYTES..].copy_from_slice(payload);
+    bytes[SERVICE_REQUEST_FIXED_BYTES..].copy_from_slice(&payload);
     let signature = signer.sign_response(&bytes)?;
     bytes.extend_from_slice(&signature);
     Ok(bytes)
@@ -296,7 +295,7 @@ pub struct AuthenticatedServiceResponse {
     request_id: RequestId,
     request_nonce: u64,
     engine_key_id: SignerKeyId,
-    payload: Vec<u8>,
+    body: ServiceResponseBody,
 }
 
 impl AuthenticatedServiceResponse {
@@ -361,8 +360,9 @@ impl AuthenticatedServiceResponse {
             &bytes[..signed_length],
             &signature,
         )?;
-        let payload = bytes[SERVICE_REQUEST_FIXED_BYTES..signed_length].to_vec();
-        Ok(Self { kind, request_id, request_nonce, engine_key_id, payload })
+        let body =
+            ServiceResponseBody::decode(kind, &bytes[SERVICE_REQUEST_FIXED_BYTES..signed_length])?;
+        Ok(Self { kind, request_id, request_nonce, engine_key_id, body })
     }
 
     /// Returns the closed response category.
@@ -385,9 +385,9 @@ impl AuthenticatedServiceResponse {
         self.engine_key_id
     }
 
-    /// Returns bounded message-specific response bytes.
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    /// Returns the fully validated, closed message-specific response body.
+    pub const fn body(&self) -> &ServiceResponseBody {
+        &self.body
     }
 }
 
@@ -416,6 +416,7 @@ fn read_exact<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], En
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SERVICE_METRIC_COUNT, ServiceHealthStatus, ServiceMetrics};
     use ed25519_dalek::{Signer, SigningKey};
     use personalai_engine_crypto::{TrustedControlPlaneKey, control_plane_signature_message};
 
@@ -430,11 +431,10 @@ mod tests {
         .expect("key ring");
         let request_id = RequestId::new(7).expect("request ID");
         let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
-            ServiceMessageKind::Health,
             request_id,
             9,
             key_id,
-            &[],
+            &ServiceRequestBody::Health,
         )
         .expect("unsigned request");
         let transcript = control_plane_signature_message(&unsigned).expect("transcript");
@@ -445,11 +445,24 @@ mod tests {
         assert_eq!(decoded.kind(), ServiceMessageKind::Health);
         assert_eq!(decoded.request_id(), request_id);
         assert_eq!(decoded.nonce(), 9);
-        assert!(decoded.payload().is_empty());
+        assert_eq!(decoded.body(), &ServiceRequestBody::Health);
 
         let mut tampered = signed;
         tampered[10] = ServiceMessageKind::Metrics as u8;
         assert!(AuthenticatedServiceRequest::decode(&tampered, &trusted).is_err());
+
+        let invalid_body = ServiceRequestBody::Tokenize {
+            model_id: personalai_engine_types::ModelId::new("tiny").expect("model ID"),
+            text: "x".to_owned(),
+        };
+        let mut unsigned =
+            AuthenticatedServiceRequest::unsigned_bytes(request_id, 10, key_id, &invalid_body)
+                .expect("unsigned tokenize request");
+        *unsigned.last_mut().expect("text byte") = 0;
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signed = attach_service_signature(&unsigned, &signing.sign(&transcript).to_bytes())
+            .expect("signed malformed request");
+        assert!(AuthenticatedServiceRequest::decode(&signed, &trusted).is_err());
     }
 
     #[test]
@@ -458,21 +471,10 @@ mod tests {
         let key_id = SignerKeyId::from_bytes([1; 16]).expect("key ID");
         assert!(
             AuthenticatedServiceRequest::unsigned_bytes(
-                ServiceMessageKind::HelloAccepted,
-                request_id,
-                1,
-                key_id,
-                &[],
-            )
-            .is_err()
-        );
-        assert!(
-            AuthenticatedServiceRequest::unsigned_bytes(
-                ServiceMessageKind::Health,
                 request_id,
                 0,
                 key_id,
-                &[],
+                &ServiceRequestBody::Health,
             )
             .is_err()
         );
@@ -486,10 +488,9 @@ mod tests {
         let signer = EngineResponseSigner::from_seed(engine_key_id, &mut seed).expect("signer");
         let public_key = signer.public_key();
         let encoded = encode_signed_service_response(
-            ServiceMessageKind::Health,
             request_id,
             11,
-            &[1],
+            &ServiceResponseBody::Health(ServiceHealthStatus::Ready),
             &signer,
         )
         .expect("response must encode");
@@ -505,7 +506,7 @@ mod tests {
         assert_eq!(response.request_id(), request_id);
         assert_eq!(response.request_nonce(), 11);
         assert_eq!(response.engine_key_id(), engine_key_id);
-        assert_eq!(response.payload(), &[1]);
+        assert_eq!(response.body(), &ServiceResponseBody::Health(ServiceHealthStatus::Ready));
 
         assert!(
             AuthenticatedServiceResponse::decode(
@@ -549,10 +550,9 @@ mod tests {
         let signer = EngineResponseSigner::from_seed(engine_key_id, &mut seed).expect("signer");
         let public_key = signer.public_key();
         let encoded = encode_signed_service_response(
-            ServiceMessageKind::Metrics,
             request_id,
             3,
-            &[0; 16],
+            &ServiceResponseBody::Metrics(ServiceMetrics::new([0; SERVICE_METRIC_COUNT])),
             &signer,
         )
         .expect("response must encode");
@@ -592,6 +592,29 @@ mod tests {
                 &trailing,
                 request_id,
                 3,
+                engine_key_id,
+                &public_key,
+            )
+            .is_err()
+        );
+
+        let mut invalid_body = encode_signed_service_response(
+            request_id,
+            4,
+            &ServiceResponseBody::Health(ServiceHealthStatus::Ready),
+            &signer,
+        )
+        .expect("health response");
+        let signed_length = invalid_body.len() - ED25519_SIGNATURE_BYTES;
+        invalid_body[SERVICE_REQUEST_FIXED_BYTES] = 9;
+        let signature =
+            signer.sign_response(&invalid_body[..signed_length]).expect("replacement signature");
+        invalid_body[signed_length..].copy_from_slice(&signature);
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &invalid_body,
+                request_id,
+                4,
                 engine_key_id,
                 &public_key,
             )

@@ -333,7 +333,11 @@ catalog is limited to negotiation, capability/model listing, registered-ID
 load/unload, tokenize, health, metrics, and shutdown response types. Normal
 data-plane sessions cannot authorize shutdown. Package paths, signer
 configuration, model budgets, and administrative authority never cross this
-protocol. The exact single-command driver serves these control requests;
+protocol. Each message uses a closed, bounded first-party body codec; signing
+derives the message kind from that body, and authenticated decoders reject
+unknown values, duplicate model IDs, malformed lengths, invalid token IDs,
+truncation, and trailing data before exposing a typed body. The exact
+single-command driver serves these control requests;
 continuous generation/cancellation streams retain their bounded path.
 ADR-0020 defines the format and deterministic 4:2:1 scheduler.
 

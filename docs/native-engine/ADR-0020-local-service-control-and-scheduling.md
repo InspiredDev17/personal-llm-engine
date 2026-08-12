@@ -19,8 +19,22 @@ closed message type, reserved byte, nonzero nonce, 128-bit request ID,
 signature under the existing control-plane domain; responses carry the engine
 response signature. The first-party response decoder additionally requires the
 expected request ID, originating nonce, pinned response-key ID, and pinned
-public key before exposing payload bytes. Exact lengths, direction, flags,
+public key before exposing a typed body. Exact lengths, direction, flags,
 type, version, correlation, identity, and signature are mandatory.
+
+Message bodies are closed first-party Rust types, not caller-defined byte
+blobs. The message kind is derived from the body when signing and the body is
+decoded only after envelope authentication. Fixed schemas are: two little-
+endian `u16` values for hello negotiation; an empty body for queries and
+lifecycle acknowledgements; validated `ModelId` text for load/unload; a
+`u16` model-ID length plus bounded UTF-8 text for tokenize; a reviewed `u64`
+capability mask; at most 1,024 length-prefixed unique model IDs; a `u32` token
+count followed by validated `u32` token IDs; one closed byte for health,
+errors, and shutdown rejection; and exactly 17 little-endian `u64` metrics.
+Unknown capability bits, enum values, token IDs, duplicate models, truncation,
+trailing data, invalid UTF-8, NUL prompt text, and kind/body mismatches fail
+closed. This tightens parsing without changing the PAISVC01/PAISVR01 wire
+representation.
 
 The closed service catalog is `Hello`, `HelloAccepted`, `HelloRejected`,
 `ListCapabilities`, `ListRegisteredModels`, `LoadModel`, `UnloadModel`,

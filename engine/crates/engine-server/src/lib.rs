@@ -42,7 +42,9 @@ use personalai_engine_model_format::ParsedModelPackage;
 use personalai_engine_protocol::{
     AuthenticatedServiceRequest, CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind,
     GENERATION_EVENT_AUTH_BYTES, GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-    ServiceMessageKind, encode_signed_service_response,
+    ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind,
+    ServiceMetrics, ServiceRequestBody, ServiceResponseBody, ShutdownRejectionReason,
+    encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -1478,79 +1480,42 @@ impl CpuEngineRuntime {
         Ok(())
     }
 
-    #[expect(clippy::too_many_lines, reason = "closed protocol catalog stays visibly exhaustive")]
     fn handle_service_request(
         &mut self,
         request: &AuthenticatedServiceRequest,
-    ) -> Result<(ServiceMessageKind, Vec<u8>), EngineError> {
-        match request.kind() {
-            ServiceMessageKind::Hello => {
-                if request.payload().len() != 4 {
-                    return Err(EngineError::protocol_violation(
-                        "hello payload must contain exact major and minor versions",
-                    ));
-                }
-                let major =
-                    u16::from_le_bytes(request.payload()[..2].try_into().map_err(|_| {
-                        EngineError::protocol_violation("hello major is truncated")
-                    })?);
-                let minor =
-                    u16::from_le_bytes(request.payload()[2..].try_into().map_err(|_| {
-                        EngineError::protocol_violation("hello minor is truncated")
-                    })?);
-                let kind = if major == PROTOCOL_MAJOR && minor == PROTOCOL_MINOR {
-                    ServiceMessageKind::HelloAccepted
+    ) -> Result<ServiceResponseBody, EngineError> {
+        match request.body() {
+            ServiceRequestBody::Hello { major, minor } => {
+                if *major == PROTOCOL_MAJOR && *minor == PROTOCOL_MINOR {
+                    Ok(ServiceResponseBody::HelloAccepted {
+                        major: PROTOCOL_MAJOR,
+                        minor: PROTOCOL_MINOR,
+                    })
                 } else {
-                    ServiceMessageKind::HelloRejected
-                };
-                Ok((kind, [PROTOCOL_MAJOR.to_le_bytes(), PROTOCOL_MINOR.to_le_bytes()].concat()))
+                    Ok(ServiceResponseBody::HelloRejected {
+                        major: PROTOCOL_MAJOR,
+                        minor: PROTOCOL_MINOR,
+                    })
+                }
             }
-            ServiceMessageKind::ListCapabilities => {
-                require_empty_service_payload(request.payload())?;
-                let capabilities = [
+            ServiceRequestBody::ListCapabilities => {
+                let capabilities = ServiceCapabilitySet::from_capabilities([
                     EngineCapability::CpuReference,
                     EngineCapability::StreamingGeneration,
                     EngineCapability::UnixDomainSocket,
-                ];
-                let mut mask = 0_u64;
-                for capability in capabilities {
-                    let bit = match capability {
-                        EngineCapability::CpuReference => 0,
-                        EngineCapability::Arm64 => 1,
-                        EngineCapability::Metal => 2,
-                        EngineCapability::Cuda => 3,
-                        EngineCapability::StreamingGeneration => 4,
-                        EngineCapability::UnixDomainSocket => 5,
-                        _ => {
-                            return Err(EngineError::internal_invariant(
-                                "unknown engine capability reached service encoding",
-                            ));
-                        }
-                    };
-                    mask |= 1_u64 << bit;
-                }
-                Ok((request.kind(), mask.to_le_bytes().to_vec()))
+                ])?;
+                Ok(ServiceResponseBody::Capabilities(capabilities))
             }
-            ServiceMessageKind::ListRegisteredModels => {
-                require_empty_service_payload(request.payload())?;
-                let registrations = self.service.registry.registrations();
-                let count = u16::try_from(registrations.len()).map_err(|_| {
-                    EngineError::internal_invariant("registered model count exceeds u16")
-                })?;
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&count.to_le_bytes());
-                for registration in registrations {
-                    let model = registration.model_id().as_str().as_bytes();
-                    let length = u16::try_from(model.len()).map_err(|_| {
-                        EngineError::internal_invariant("registered model ID exceeds u16")
-                    })?;
-                    payload.extend_from_slice(&length.to_le_bytes());
-                    payload.extend_from_slice(model);
-                }
-                Ok((request.kind(), payload))
+            ServiceRequestBody::ListRegisteredModels => {
+                let models = self
+                    .service
+                    .registry
+                    .registrations()
+                    .map(|registration| registration.model_id().clone())
+                    .collect();
+                Ok(ServiceResponseBody::RegisteredModels(models))
             }
-            ServiceMessageKind::LoadModel => {
-                let model_id = decode_service_model_id(request.payload())?;
+            ServiceRequestBody::LoadModel(model_id) => {
                 let budget =
                     self.model_load_budgets.get(model_id.as_str()).copied().ok_or_else(|| {
                         EngineError::authentication_failure(
@@ -1558,64 +1523,42 @@ impl CpuEngineRuntime {
                         )
                     })?;
                 let mut emitted = Vec::new();
-                let result = self.load_registered_model(&model_id, &budget, &mut |event| {
+                let result = self.load_registered_model(model_id, &budget, &mut |event| {
                     emitted.push(event);
                 });
                 for event in emitted {
                     self.record_security_event(event);
                 }
                 result?;
-                Ok((request.kind(), Vec::new()))
+                Ok(ServiceResponseBody::ModelLoaded)
             }
-            ServiceMessageKind::UnloadModel => {
-                let model_id = decode_service_model_id(request.payload())?;
-                self.unload_model(&model_id)?;
-                Ok((request.kind(), Vec::new()))
+            ServiceRequestBody::UnloadModel(model_id) => {
+                self.unload_model(model_id)?;
+                Ok(ServiceResponseBody::ModelUnloaded)
             }
-            ServiceMessageKind::Tokenize => {
-                let (model_id, text) = decode_tokenize_payload(request.payload())?;
+            ServiceRequestBody::Tokenize { model_id, text } => {
                 let model = self
                     .models
                     .get(model_id.as_str())
                     .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
                 let tokens = model.tokenizer().encode(text)?;
-                let count = u32::try_from(tokens.len())
-                    .map_err(|_| EngineError::resource_exhaustion("token count exceeds u32"))?;
-                let capacity = 4_usize
-                    .checked_add(tokens.len().checked_mul(4).ok_or_else(|| {
-                        EngineError::resource_exhaustion("token response length overflows")
-                    })?)
-                    .ok_or_else(|| {
-                        EngineError::resource_exhaustion("token response length overflows")
-                    })?;
-                let mut payload = Vec::new();
-                payload.try_reserve_exact(capacity).map_err(|_| {
-                    EngineError::resource_exhaustion("token response allocation failed")
-                })?;
-                payload.extend_from_slice(&count.to_le_bytes());
-                for token in tokens {
-                    payload.extend_from_slice(&token.to_le_bytes());
-                }
-                Ok((request.kind(), payload))
+                let tokens = tokens.into_iter().map(TokenId::new).collect::<Result<Vec<_>, _>>()?;
+                Ok(ServiceResponseBody::Tokenized(tokens))
             }
-            ServiceMessageKind::Health => {
-                require_empty_service_payload(request.payload())?;
+            ServiceRequestBody::Health => {
                 let state = match self.health() {
-                    ServiceHealth::Ready => 1,
-                    ServiceHealth::Degraded => 2,
-                    ServiceHealth::Draining => 3,
+                    ServiceHealth::Ready => ServiceHealthStatus::Ready,
+                    ServiceHealth::Degraded => ServiceHealthStatus::Degraded,
+                    ServiceHealth::Draining => ServiceHealthStatus::Draining,
                 };
-                Ok((request.kind(), vec![state]))
+                Ok(ServiceResponseBody::Health(state))
             }
-            ServiceMessageKind::Metrics => {
-                require_empty_service_payload(request.payload())?;
-                Ok((request.kind(), encode_metrics(self.metrics()?)))
+            ServiceRequestBody::Metrics => {
+                Ok(ServiceResponseBody::Metrics(service_metrics(self.metrics()?)))
             }
-            ServiceMessageKind::ShutdownRequest => {
-                require_empty_service_payload(request.payload())?;
-                Ok((ServiceMessageKind::ShutdownRejected, vec![1]))
-            }
-            _ => Err(EngineError::protocol_violation("message type is not a service request")),
+            ServiceRequestBody::ShutdownRequest => Ok(ServiceResponseBody::ShutdownRejected(
+                ShutdownRejectionReason::AdministrativeAuthorizationRequired,
+            )),
         }
     }
 
@@ -1729,20 +1672,16 @@ impl CpuEngineRuntime {
             InboundCommand::Service(request) => {
                 let request_id = request.request_id();
                 let nonce = request.nonce();
-                let (kind, payload) = match self.handle_service_request(&request) {
+                let body = match self.handle_service_request(&request) {
                     Ok(response) => response,
                     Err(error) => {
                         self.record_runtime_error(request_id, &error)?;
-                        (ServiceMessageKind::Error, vec![engine_error_code(&error)])
+                        ServiceResponseBody::Error(service_error_code(&error))
                     }
                 };
-                let frame = service_response_frame(
-                    kind,
-                    request_id,
-                    nonce,
-                    &payload,
-                    &self.response_signer,
-                )?;
+                let kind = body.kind();
+                let frame =
+                    service_response_frame(request_id, nonce, &body, &self.response_signer)?;
                 connection.write_outbound_frame(&frame)?;
                 Ok(ServeOutcome::ServiceResponded { request_id, kind })
             }
@@ -2682,55 +2621,18 @@ fn generation_event_frame(
 
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn service_response_frame(
-    kind: ServiceMessageKind,
     request_id: RequestId,
     request_nonce: u64,
-    payload: &[u8],
+    body: &ServiceResponseBody,
     signer: &EngineResponseSigner,
 ) -> Result<Frame, EngineError> {
-    let payload = encode_signed_service_response(kind, request_id, request_nonce, payload, signer)?;
+    let payload = encode_signed_service_response(request_id, request_nonce, body, signer)?;
     Frame::new(FrameKind::ServiceResponse, payload)
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-fn require_empty_service_payload(payload: &[u8]) -> Result<(), EngineError> {
-    if payload.is_empty() {
-        Ok(())
-    } else {
-        Err(EngineError::protocol_violation("service request contains trailing fields"))
-    }
-}
-
-#[cfg(all(unix, feature = "cpu-reference"))]
-fn decode_service_model_id(payload: &[u8]) -> Result<ModelId, EngineError> {
-    let text = std::str::from_utf8(payload)
-        .map_err(|_| EngineError::protocol_violation("model ID is not UTF-8"))?;
-    ModelId::new(text).map_err(|_| EngineError::protocol_violation("model ID is invalid"))
-}
-
-#[cfg(all(unix, feature = "cpu-reference"))]
-fn decode_tokenize_payload(payload: &[u8]) -> Result<(ModelId, &str), EngineError> {
-    if payload.len() < 2 {
-        return Err(EngineError::protocol_violation("tokenize payload is truncated"));
-    }
-    let model_length = usize::from(u16::from_le_bytes(
-        payload[..2]
-            .try_into()
-            .map_err(|_| EngineError::protocol_violation("model length is truncated"))?,
-    ));
-    let model_end = 2_usize
-        .checked_add(model_length)
-        .filter(|end| *end <= payload.len())
-        .ok_or_else(|| EngineError::protocol_violation("tokenize model range is invalid"))?;
-    let model_id = decode_service_model_id(&payload[2..model_end])?;
-    let text = std::str::from_utf8(&payload[model_end..])
-        .map_err(|_| EngineError::protocol_violation("tokenize text is not UTF-8"))?;
-    Ok((model_id, text))
-}
-
-#[cfg(all(unix, feature = "cpu-reference"))]
-fn encode_metrics(metrics: RuntimeMetrics) -> Vec<u8> {
-    let values = [
+fn service_metrics(metrics: RuntimeMetrics) -> ServiceMetrics {
+    ServiceMetrics::new([
         metrics.loaded_models,
         metrics.active_requests,
         metrics.queued_requests,
@@ -2748,30 +2650,25 @@ fn encode_metrics(metrics: RuntimeMetrics) -> Vec<u8> {
         metrics.authentication_failures,
         metrics.protocol_violations,
         metrics.backend_failures,
-    ];
-    let mut encoded = Vec::with_capacity(values.len() * 8);
-    for value in values {
-        encoded.extend_from_slice(&value.to_le_bytes());
-    }
-    encoded
+    ])
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-const fn engine_error_code(error: &EngineError) -> u8 {
+const fn service_error_code(error: &EngineError) -> ServiceErrorCode {
     match error {
-        EngineError::InvalidInput(_) => 1,
-        EngineError::UnsupportedArchitecture(_) => 2,
-        EngineError::UnsupportedTokenizer(_) => 3,
-        EngineError::CorruptModelPackage(_) => 4,
-        EngineError::SignatureFailure(_) => 5,
-        EngineError::ResourceExhaustion(_) => 6,
-        EngineError::Cancellation(_) => 7,
-        EngineError::BackendFailure(_) => 8,
-        EngineError::InternalInvariantViolation(_) => 9,
-        EngineError::AuthenticationFailure(_) => 10,
-        EngineError::ProtocolViolation(_) => 11,
-        EngineError::NotImplemented(_) => 12,
-        _ => 255,
+        EngineError::InvalidInput(_) => ServiceErrorCode::InvalidInput,
+        EngineError::UnsupportedArchitecture(_) => ServiceErrorCode::UnsupportedArchitecture,
+        EngineError::UnsupportedTokenizer(_) => ServiceErrorCode::UnsupportedTokenizer,
+        EngineError::CorruptModelPackage(_) => ServiceErrorCode::CorruptModelPackage,
+        EngineError::SignatureFailure(_) => ServiceErrorCode::SignatureFailure,
+        EngineError::ResourceExhaustion(_) => ServiceErrorCode::ResourceExhaustion,
+        EngineError::Cancellation(_) => ServiceErrorCode::Cancellation,
+        EngineError::BackendFailure(_) => ServiceErrorCode::BackendFailure,
+        EngineError::InternalInvariantViolation(_) => ServiceErrorCode::InternalInvariantViolation,
+        EngineError::AuthenticationFailure(_) => ServiceErrorCode::AuthenticationFailure,
+        EngineError::ProtocolViolation(_) => ServiceErrorCode::ProtocolViolation,
+        EngineError::NotImplemented(_) => ServiceErrorCode::NotImplemented,
+        _ => ServiceErrorCode::Unclassified,
     }
 }
 
@@ -4678,11 +4575,10 @@ mod tests {
         let mut fixture = BatchRuntimeFixture::new("service-health", 1);
         let request_id = RequestId::new(0x5151).expect("request ID");
         let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
-            ServiceMessageKind::Health,
             request_id,
             1,
             fixture.control_key_id,
-            &[],
+            &ServiceRequestBody::Health,
         )
         .expect("service request must encode");
         let transcript = control_plane_signature_message(&unsigned).expect("transcript");
@@ -4718,7 +4614,7 @@ mod tests {
             )
             .expect("service response must verify");
             assert_eq!(verified.kind(), ServiceMessageKind::Health);
-            assert_eq!(verified.payload(), &[1]);
+            assert_eq!(verified.body(), &ServiceResponseBody::Health(ServiceHealthStatus::Ready));
         });
         assert!(matches!(
             fixture.runtime.serve_one(&fixture.listener),

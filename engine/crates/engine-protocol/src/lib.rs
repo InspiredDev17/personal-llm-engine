@@ -6,6 +6,7 @@
 
 mod messages;
 mod service;
+mod service_payload;
 
 pub use messages::{
     CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_EVENT_AUTH_BYTES,
@@ -15,6 +16,11 @@ pub use messages::{
 pub use service::{
     AuthenticatedServiceRequest, AuthenticatedServiceResponse, SERVICE_REQUEST_FIXED_BYTES,
     ServiceMessageKind, attach_service_signature, encode_signed_service_response,
+};
+pub use service_payload::{
+    MAX_SERVICE_REGISTERED_MODELS, SERVICE_METRIC_COUNT, ServiceCapabilitySet, ServiceErrorCode,
+    ServiceHealthStatus, ServiceMetrics, ServiceRequestBody, ServiceResponseBody,
+    ShutdownRejectionReason,
 };
 
 use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};
