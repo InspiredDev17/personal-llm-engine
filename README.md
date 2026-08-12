@@ -16,10 +16,10 @@ resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
-and an owner CLI. The CLI remains intentionally single-worker until the new
-driver receives operated soak and a reviewed external shutdown integration. The Go
-repository contains the corresponding `NATIVE_ENGINE` provider adapter; it has
-no HTTP or remote-network fallback.
+and an owner CLI. The CLI exposes the continuous driver only through an explicit
+bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
+stop-admit, cancel, and drain path. The Go repository contains the corresponding
+`NATIVE_ENGINE` provider adapter; it has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only
@@ -69,7 +69,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - the continuous reference path applies one 64-connection ceiling across
   authenticating, queued, active, and draining streams; graceful shutdown stops
   admission, interrupts incomplete handshakes, cancels work, and joins every
-  bounded worker before returning;
+  bounded worker before returning; the CLI requires explicit connection and
+  active-sequence limits and accepts shutdown only from owner-process signals;
 - every authenticated command nonce is appended and synchronized to a bounded,
   mode-0600 per-control-key journal before the command can execute; an exclusive
   lifetime lock prevents a second process from using the same key journal, and

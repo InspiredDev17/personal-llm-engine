@@ -73,10 +73,11 @@ does not execute Python, Node, TypeScript, downloaded scripts, or model code.
 - No runtime dynamic-library lookup by arbitrary/configured name.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
-- Unsafe Rust is denied by default. The only approved exception is the exact
-  Unix lock module in ADR-0004: one checked `flock` call, no pointer operation,
-  and a safe owned non-cloneable wrapper. Architecture tests reject unsafe code
-  and unsafe-lint allowances everywhere else. A future FFI/backend exception
+- Unsafe Rust is denied by default. The approved exceptions are the exact Unix
+  lock module in ADR-0004 and process-signal module in ADR-0011. They expose
+  safe owned guards, perform no pointer arithmetic, and have exact unsafe-block
+  counts enforced by architecture tests. Tests reject unsafe code and
+  unsafe-lint allowances everywhere else. A future FFI/backend exception
   requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written
   invariants, safe wrappers, platform tests, and separate approval.
 

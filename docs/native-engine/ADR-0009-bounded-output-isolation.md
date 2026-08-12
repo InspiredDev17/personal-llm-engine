@@ -65,8 +65,9 @@ retention is charged before cursor creation, real signed multi-stream delivery
 still completes, and a disconnected peer does not abort its neighbor.
 
 ADR-0010 reuses this output isolation in a bounded continuous reference driver.
-The CLI remains single-worker until external shutdown integration and operated
-continuous/slow-reader soak qualify that reference path.
+ADR-0011 exposes that driver through an explicit bounded CLI mode with
+owner-process signal shutdown. Operated continuous/slow-reader soak remains a
+production cutover gate.
 
 ## Rejected alternatives
 

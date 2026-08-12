@@ -80,14 +80,15 @@ The exact-batch reference still has deliberate production limitations. Accept
 waits for the declared count and initial command reads are sequential with
 finite timeouts. ADR-0009 adds bounded per-stream output isolation without
 changing this decision, and ADR-0010 adds a separate continuous reference
-driver with graceful drain. Operated multi-client and slow-reader soak plus a
-reviewed external shutdown integration remain required before the CLI switches
-from `serve_one`.
+driver with graceful drain. ADR-0011 adds explicit bounded CLI activation and a
+reviewed owner-process signal bridge. Operated multi-client and slow-reader soak
+remains required before production cutover.
 
 ## Rejected alternatives
 
-- **Immediately replace the CLI loop:** lacks continuous-ingress, shutdown, and
-  slow-consumer qualification.
+- **Immediately replace the CLI loop:** at this decision point it lacked
+  continuous ingress, shutdown, and slow-consumer qualification; ADR-0011 later
+  added an explicit separate continuous mode without removing `serve_one`.
 - **One unbounded worker thread per client:** defeats deterministic scheduling
   and hard resource ceilings.
 - **Buffer unbounded events per stream:** transfers memory-denial control to a

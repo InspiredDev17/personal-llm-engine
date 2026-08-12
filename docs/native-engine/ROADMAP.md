@@ -27,7 +27,7 @@ memory, tool, approval, or Agent Green behavior.
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, and continuous graceful-drain reference serving are complete; CLI activation, soak/performance, operated key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, and signal-drained continuous CLI serving are complete; soak/performance, operated key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -65,8 +65,9 @@ memory, tool, approval, or Agent Green behavior.
   cancellation isolation. The UDS batch and continuous reference paths now
   prove authenticated multi-stream execution, bounded ownership,
   incomplete-handshake interruption, caller-owned graceful drain, and cleanup
-  on every exit. The CLI remains single-worker until external shutdown
-  integration and operated continuous/slow-reader soak pass.
+  on every exit. The owner CLI selects that path only through explicit bounded
+  limits; isolated `SIGINT`/`SIGTERM` handling drives the same tested graceful
+  drain. Operated continuous/slow-reader soak remains required.
 
 ## Next software release gate: production model operations
 
@@ -96,9 +97,8 @@ Before the native runtime becomes mandatory:
 
 - retain scheduled coverage-guided fuzzing, triage every reproducible finding,
   and grow production-size corpora without placing production model data in CI;
-- connect the bounded continuous reference driver to the owner CLI only after a
-  reviewed external shutdown mechanism and operated multi-client/slow-reader
-  soak preserve cancellation, signed ordering, cleanup, and round-robin fairness;
+- preserve cancellation, signed ordering, cleanup, and round-robin fairness in
+  operated multi-client/slow-reader soak of the signal-drained continuous CLI;
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;

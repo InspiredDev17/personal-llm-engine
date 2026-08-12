@@ -75,9 +75,10 @@ implementations; custom cryptography is prohibited. Exact versions are locked,
 unnecessary default features are disabled at direct dependency declarations,
 and releases must be vendored with an SBOM.
 
-Unsafe Rust is denied workspace-wide by default. The only current exception is
-the isolated Unix replay-journal lock FFI module recorded by ADR-0004; its one
-`flock` call is hidden behind a safe owned-file wrapper and enforced by an
+Unsafe Rust is denied workspace-wide by default. The current exceptions are the
+isolated Unix replay-journal lock FFI module recorded by ADR-0004 and the
+process-signal install/restore module recorded by ADR-0011. Their exact unsafe
+blocks are hidden behind safe owned guards and enforced by an
 architecture-boundary test. Any other unsafe code requires its own invariant
 and review record in an isolated FFI/backend module.
 
@@ -99,8 +100,8 @@ and review record in an isolated FFI/backend module.
 The software foundation through mutually authenticated, signed-package
 CPU-reference UDS generation and bounded continuous graceful-drain reference
 serving is implemented and tested. Remaining release work is a production
-converter/package, production-size fuzz/soak/performance evidence, external CLI
-shutdown integration, operated request/response-key injection, rotation/recovery
-evidence, repeatable vendor/SBOM release renewal, and hardware-specific
+converter/package, production-size fuzz/soak/performance evidence, operated
+request/response-key injection, rotation/recovery evidence, repeatable
+vendor/SBOM release renewal, and hardware-specific
 accelerator implementation/validation. These limits prohibit claiming complete
 production replacement today.

@@ -78,10 +78,11 @@ stays within its exact limit, caller shutdown returns an empty scheduler, and an
 incomplete handshake is interrupted rather than waiting for the normal socket
 deadline.
 
-This is not yet the owner CLI's daemon loop. A reviewed external process-shutdown
-bridge, peer-credential qualification, operated continuous/slow-reader soak,
+ADR-0011 subsequently exposes this driver through an explicit bounded owner-CLI
+mode and translates `SIGINT`/`SIGTERM` into the caller-owned shutdown signal.
+Peer-credential qualification, operated continuous/slow-reader soak,
 production-model latency evidence, and reversible Go-provider canary remain
-required before activation.
+required before production cutover.
 
 ## Rejected alternatives
 
@@ -93,5 +94,5 @@ required before activation.
   lifetime uncertain.
 - **Inherit listener nonblocking mode on streams:** turns a temporary
   `WouldBlock` into false disconnect/cancellation.
-- **Activate the CLI immediately:** lacks operated shutdown and slow-reader
-  evidence.
+- **Activate the CLI implicitly:** would replace the established single-worker
+  behavior without an explicit owner choice or reviewed shutdown bridge.

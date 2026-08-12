@@ -352,6 +352,10 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         .join("crates/engine-server/src/os_lock.rs")
         .canonicalize()
         .expect("approved Unix lock FFI must exist");
+    let approved_process_signal = root
+        .join("crates/engine-cli/src/os_signal.rs")
+        .canonicalize()
+        .expect("approved process signal FFI must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -374,6 +378,18 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 "approved Unix lock FFI must contain exactly one unsafe allowance"
             );
         }
+        if canonical == approved_process_signal {
+            assert_eq!(
+                source.matches(unsafe_block_marker.as_str()).count(),
+                2,
+                "approved process signal FFI must contain exactly two unsafe blocks"
+            );
+            assert_eq!(
+                source.matches(unsafe_allow_marker.as_str()).count(),
+                1,
+                "approved process signal FFI must contain exactly one unsafe allowance"
+            );
+        }
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
@@ -389,6 +405,11 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 continue;
             }
             if canonical == approved_unix_lock
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+            {
+                continue;
+            }
+            if canonical == approved_process_signal
                 && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
             {
                 continue;

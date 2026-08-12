@@ -146,7 +146,11 @@ other cursors execute. A caller-owned atomic shutdown signal stops admission,
 interrupts incomplete reads, rejects queued requests, cancels active cursors,
 drains signed terminal output, joins all workers on success or error, and
 restores blocking listener mode before return. It is a tested reference path but
-is not selected by the CLI. The Go adapter
+the owner CLI selects it only through `serve-continuous`, which requires
+explicit active-sequence and total-connection limits. The CLI installs isolated
+`SIGINT`/`SIGTERM` handlers whose only signal-context action is an atomic store;
+a bounded watcher translates that store into the existing caller-owned shutdown
+signal. Handler state is restored after the server drains. The Go adapter
 opens one connection per generation and signs with the Go-held private key. On
 cancellation it sends a higher-nonce signed cancellation on the same full-duplex
 stream before closing; a Rust watcher treats that command, disconnect, malformed
@@ -155,10 +159,10 @@ CPU loop is active. The response-signing seed is read as exactly 32 bytes from
 stdin before model or socket startup, cleared after signer construction, never
 accepted through argv/model/client data, and never logged. Go validates the
 signature, nonce, ordinal, request ID, event schema, and usage before exposing
-canonical platform responses. It has no HTTP fallback. External owner-process
-shutdown integration, operated continuous/slow-reader soak, peer-credential
-qualification, and optional architecture-owned batching remain production
-hardening work. ADR-0010 defines continuous admission and graceful drain;
+canonical platform responses. It has no HTTP fallback. Operated
+continuous/slow-reader soak, peer-credential qualification, and optional
+architecture-owned batching remain production hardening work. ADR-0011 defines
+CLI signal integration; ADR-0010 defines continuous admission and graceful drain;
 ADR-0009 defines bounded output isolation; ADR-0008 defines the bounded
 multi-connection reference path; ADR-0007 defines the resumable generation and
 round-robin coordination boundary; ADR-0005
@@ -189,12 +193,15 @@ model data, and must pass CPU differential and isolated unsafe/FFI review.
 
 ## Unsafe and FFI boundary
 
-Workspace policy denies unsafe Rust by default. The exact exception is
+Workspace policy denies unsafe Rust by default. The approved exceptions are
 `engine-server/src/os_lock.rs`, which makes one checked `libc::flock` call using
-an owned valid file descriptor and exposes only a safe non-cloneable wrapper.
-Closing the descriptor releases the advisory lock. Architecture tests reject
-an unsafe block or unsafe-lint allowance in every other Rust source. ADR-0004
-records the invariants and rejected alternatives.
+an owned valid descriptor, and `engine-cli/src/os_signal.rs`, which uses two
+documented `sigaction` blocks to install and restore owner-process handlers.
+The signal handler retains no pointer and performs only an atomic store.
+Architecture tests enforce the exact block and allowance counts and reject an
+unsafe block or unsafe-lint allowance in every other first-party Rust source.
+ADR-0004 records the lock invariants; ADR-0011 records the signal invariants and
+portability scope.
 
 ## Agent Green
 

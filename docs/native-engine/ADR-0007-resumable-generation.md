@@ -76,10 +76,9 @@ neighbor.
 The bounded reference integration now connects multiple authenticated UDS
 connections while preserving durable request admission, request-local
 cancellation, signed per-stream event ordinals, bounded writes, and connection
-lifetime cleanup. The next slice must replace exact-batch admission with a
-bounded continuous ingress/output driver and qualify slow consumers and
-shutdown. Until that passes integration and soak tests, the CLI remains
-intentionally single-worker.
+lifetime cleanup. ADR-0010 subsequently added bounded continuous ingress and
+graceful drain; ADR-0011 added explicit CLI selection and owner-process signal
+shutdown. Operated slow-consumer soak remains required.
 
 ## Rejected alternatives
 

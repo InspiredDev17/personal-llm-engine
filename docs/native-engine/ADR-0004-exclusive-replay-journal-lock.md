@@ -25,8 +25,10 @@ the lock after orderly exit or process death, so no stale lock artifact or
 recovery deletion protocol is required.
 
 The call is isolated in `engine-server/src/os_lock.rs`. Workspace policy denies
-unsafe code by default; that module alone permits it. Architecture tests reject
-unsafe blocks and unsafe-lint allowances in every other Rust source.
+unsafe code by default; at this decision that module alone permitted it.
+ADR-0011 later adds a separately isolated process-signal exception.
+Architecture tests enforce exact unsafe-block counts in both approved modules
+and reject unsafe blocks and unsafe-lint allowances everywhere else.
 
 ## Safety invariants
 
