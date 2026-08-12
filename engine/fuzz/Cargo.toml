@@ -11,7 +11,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = { version = "=0.4.13", default-features = false, features = ["link_libfuzzer"] }
 personalai-engine-memory = { path = "../crates/engine-memory" }
+personalai-engine-loader = { path = "../crates/engine-loader" }
 personalai-engine-model-format = { path = "../crates/engine-model-format" }
+personalai-engine-model-importer = { path = "../crates/engine-model-importer" }
 personalai-engine-protocol = { path = "../crates/engine-protocol" }
 personalai-engine-testkit = { path = "../crates/engine-testkit" }
 personalai-engine-tokenizer = { path = "../crates/engine-tokenizer" }
@@ -34,6 +36,34 @@ bench = false
 [[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_parser"
+path = "fuzz_targets/manifest_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tensor_index_parser"
+path = "fuzz_targets/tensor_index_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safetensors_import"
+path = "fuzz_targets/safetensors_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_path_resolution"
+path = "fuzz_targets/package_path_resolution.rs"
 test = false
 doc = false
 bench = false

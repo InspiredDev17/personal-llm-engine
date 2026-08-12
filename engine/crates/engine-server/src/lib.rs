@@ -30,9 +30,15 @@ pub use transport::{UnixFrameConnection, UnixFrameListener};
 use personalai_engine_crypto::{
     EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
 };
+#[cfg(all(feature = "cpu-reference", test))]
+use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::MemoryPool;
+#[cfg(all(feature = "cpu-reference", test))]
+use personalai_engine_model_format::ParsedModelPackage;
 use personalai_engine_protocol::{
     CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind, GENERATION_EVENT_AUTH_BYTES,
     GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -42,6 +48,8 @@ use personalai_engine_sampling::{SamplingConfig, select_next_token_tensor};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::CancellationOutcome;
 use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, SchedulerLimits};
+#[cfg(all(feature = "cpu-reference", test))]
+use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{MAX_TOKEN_PIECE_BYTES, Tokenizer, build_tokenizer};
 use personalai_engine_transformer::{BackendStatus, backend_status};
@@ -54,7 +62,7 @@ use personalai_engine_types::{
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_types::{
     GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES, MAX_GENERATION_CHUNK_BYTES,
-    SequenceId, TextChunk, TokenId,
+    ModelPackageRejection, SecurityEvent, SequenceId, TextChunk, TokenId,
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::collections::BTreeMap;
@@ -921,10 +929,10 @@ struct ConnectionBatchState<'a> {
 
 /// CPU-reference runtime joining authenticated UDS transport to loaded models.
 ///
-/// Package bytes enter only through [`Self::load_registered_model_bytes`]
-/// after the owner configuration has registered the model identifier, digest,
-/// signer, and relative package name. Client messages can select only a model
-/// identifier and can never install or name a filesystem path.
+/// Production packages enter only through [`Self::load_registered_model`]
+/// after owner configuration has registered the model identifier, digest,
+/// signer, and relative directory name. Client messages can select only a
+/// model identifier and can never install or name a filesystem path.
 #[cfg(all(unix, feature = "cpu-reference"))]
 pub struct CpuEngineRuntime {
     service: EngineService,
@@ -984,7 +992,11 @@ impl CpuEngineRuntime {
         })
     }
 
-    /// Verifies and installs one already bounded registered package in memory.
+    /// Verifies and installs one legacy flat fixture package in memory.
+    ///
+    /// This compatibility helper exists only in this crate's tests. Production
+    /// runtime code accepts the signed directory package profile exclusively.
+    #[cfg(test)]
     pub fn load_registered_model_bytes(
         &mut self,
         model_id: &ModelId,
@@ -1006,9 +1018,14 @@ impl CpuEngineRuntime {
         &mut self,
         model_id: &ModelId,
         budget: &personalai_engine_types::ResourceBudget,
+        events: &mut impl DirectorySecurityEventSink,
     ) -> Result<(), EngineError> {
-        let bytes = self.service.registry.read_registered_package(model_id, budget)?;
-        self.load_registered_model_bytes(model_id, &bytes, budget)
+        if self.models.contains_key(model_id.as_str()) {
+            return Err(EngineError::invalid_input("model is already loaded"));
+        }
+        let loaded = self.service.load_registered_cpu_model(model_id, budget, events)?;
+        self.models.insert(model_id.as_str().to_owned(), loaded);
+        Ok(())
     }
 
     /// Accepts and fairly executes an exact bounded batch of local connections.
@@ -2040,30 +2057,101 @@ impl EngineService {
         Ok(AdmissionReceipt { request_id, queued_requests: self.scheduler.queued_len() })
     }
 
-    /// Verifies and materializes bytes obtained for one registered model.
+    /// Verifies and materializes legacy flat bytes for unit-test compatibility.
     ///
     /// This method does not open a path. A future descriptor-safe local opener
     /// may call it only after resolving the configuration-owned registration.
-    #[cfg(feature = "cpu-reference")]
+    #[cfg(all(feature = "cpu-reference", test))]
     pub fn load_registered_cpu_model_bytes(
         &self,
         model_id: &ModelId,
         package_bytes: &[u8],
         budget: &personalai_engine_types::ResourceBudget,
     ) -> Result<LoadedCpuModel, EngineError> {
+        let registration = self.registry.resolve(model_id)?;
+        let package_length = u64::try_from(package_bytes.len()).map_err(|_| {
+            EngineError::resource_exhaustion("legacy fixture package length is not representable")
+        })?;
+        if package_length == 0 || package_length > budget.max_memory_bytes() {
+            return Err(EngineError::resource_exhaustion(
+                "legacy fixture package exceeds its test memory budget",
+            ));
+        }
+        if hash_package(package_bytes) != *registration.expected_hash() {
+            return Err(EngineError::signature_failure(
+                "legacy fixture package digest differs from test registration",
+            ));
+        }
+        let parsed = ParsedModelPackage::parse(package_bytes)?;
+        let signed_range = parsed.header().signed_content_range()?;
+        let content_digest = hash_signed_content(&package_bytes[signed_range]);
+        verify_package_signature(
+            registration.trusted_signer(),
+            parsed.signature().key_id(),
+            &content_digest,
+            parsed.signature().signature(),
+        )?;
         let pool = MemoryPool::from_budget(budget)?;
-        let verified = self.registry.verify_package_bytes(model_id, package_bytes, budget)?;
-        let config = TransformerConfig::from_manifest(verified.parsed().manifest())?;
-        let tokenizer_data = verified.parsed().tokenizer_data(package_bytes)?;
+        let config = TransformerConfig::from_manifest(parsed.manifest())?;
+        let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
         let tokenizer = build_tokenizer(tokenizer_data, &pool)?;
         if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
             ));
         }
-        let weights = verified.materialize_tensors(&pool)?.into_tensors();
+        let mut weights = BTreeMap::new();
+        for record in parsed.tensors() {
+            let bytes = parsed.tensor_data(package_bytes, record)?;
+            let tensor =
+                Tensor::copy_from_bytes(record.dtype(), record.shape().clone(), bytes, &pool)?;
+            if weights.insert(record.name().as_str().to_owned(), tensor).is_some() {
+                return Err(EngineError::internal_invariant(
+                    "legacy test fixture contains duplicate tensor names",
+                ));
+            }
+        }
         let model = CpuDecoderModel::new(config, weights, &pool)?;
         Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+    }
+
+    /// Opens, verifies, and materializes a signed directory-backed package.
+    ///
+    /// The mandatory sink receives one typed rejection event for every failed
+    /// production package admission. No package path is accepted here.
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    pub fn load_registered_cpu_model(
+        &self,
+        model_id: &ModelId,
+        budget: &personalai_engine_types::ResourceBudget,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<LoadedCpuModel, EngineError> {
+        let verified = self.registry.load_registered_directory(model_id, budget, events)?;
+        let result = (|| {
+            let pool = MemoryPool::from_budget(budget)?;
+            let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
+            let tokenizer = build_tokenizer(verified.tokenizer_bytes(), &pool)?;
+            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+                return Err(EngineError::corrupt_model_package(
+                    "manifest and tokenizer vocabulary sizes differ",
+                ));
+            }
+            let weights = verified.materialize_tensors(&pool)?.into_tensors();
+            let model = CpuDecoderModel::new(config, weights, &pool)?;
+            Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+        })();
+        if let Err(error) = &result {
+            let reason = match error {
+                EngineError::UnsupportedArchitecture(_) | EngineError::NotImplemented(_) => {
+                    ModelPackageRejection::UnsupportedArchitecture
+                }
+                EngineError::UnsupportedTokenizer(_) => ModelPackageRejection::UnsupportedTokenizer,
+                EngineError::ResourceExhaustion(_) => ModelPackageRejection::SizeLimit,
+                _ => ModelPackageRejection::Corrupt,
+            };
+            events.emit(SecurityEvent::ModelPackageRejected { model_id: model_id.clone(), reason });
+        }
+        result
     }
 
     /// Activates and runs the next queued request on an already loaded model.

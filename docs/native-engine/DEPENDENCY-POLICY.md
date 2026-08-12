@@ -46,7 +46,10 @@ mechanisms. The narrowly enabled Ed25519 `zeroize` feature plus the direct
 `zeroize` crate clear response-key seed material and signing state; no derive
 feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
 constants to safe `std::fs::OpenOptions` for package and durable replay state,
-plus the isolated nonblocking `flock` call recorded in ADR-0004.
+the isolated nonblocking `flock` call recorded in ADR-0004, and the exact
+`mmap`/`munmap` constants and calls used by the read-only, non-executable shard
+mapping wrapper recorded in ADR-0015. The offline importer reuses the same
+reviewed SHA-384, Ed25519, and zeroization dependencies; it adds no dependency.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact
@@ -75,8 +78,9 @@ does not execute Python, Node, TypeScript, downloaded scripts, or model code.
   default-off.
 - Unsafe Rust is denied by default. The approved exceptions are the exact Unix
   lock module in ADR-0004, process-signal module in ADR-0011, and read-only
-  peer-credential module in ADR-0013. They expose safe wrappers, perform no
-  pointer arithmetic, and have exact unsafe-block counts enforced by
+  peer-credential module in ADR-0013, plus the read-only shard mapping module
+  in ADR-0015. They expose safe wrappers; the mapping owns the descriptor,
+  pointer, and exact length and never exposes mutation or execution. Exact unsafe-block counts are enforced by
   architecture tests. Tests reject unsafe code and
   unsafe-lint allowances everywhere else. A future FFI/backend exception
   requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written

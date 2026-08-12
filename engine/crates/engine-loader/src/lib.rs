@@ -4,20 +4,33 @@
 //! the relative package name, expected package digest, and trusted signer. This
 //! crate verifies already-bounded bytes and performs no filesystem access.
 
-use personalai_engine_crypto::{
-    TrustedSigner, hash_package, hash_signed_content, verify_package_signature,
-};
-use personalai_engine_memory::{MemoryPool, MemoryReservation};
-use personalai_engine_model_format::{ModelPackageHeader, ParsedModelPackage};
-use personalai_engine_tensor::Tensor;
-use personalai_engine_types::{
-    EngineError, MAX_MODEL_PACKAGE_BYTES, ModelId, ModelPackageHash, ResourceBudget,
-};
-use std::collections::BTreeMap;
 #[cfg(unix)]
+mod directory_loader;
+#[cfg(unix)]
+mod read_only_map;
+
+#[cfg(unix)]
+pub use directory_loader::{
+    DirectorySecurityEventSink, LoadedDirectoryTensors, VerifiedDirectoryPackage,
+};
+
+use personalai_engine_crypto::TrustedSigner;
+#[cfg(test)]
+use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
+#[cfg(test)]
+use personalai_engine_memory::{MemoryPool, MemoryReservation};
+#[cfg(test)]
+use personalai_engine_model_format::{ModelPackageHeader, ParsedModelPackage};
+#[cfg(test)]
+use personalai_engine_tensor::Tensor;
+#[cfg(test)]
+use personalai_engine_types::MAX_MODEL_PACKAGE_BYTES;
+use personalai_engine_types::{EngineError, ModelId, ModelPackageHash, ResourceBudget};
+use std::collections::BTreeMap;
+#[cfg(all(unix, test))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use std::{fs, io::Read};
 
 /// Required extension for first-party model packages.
@@ -91,7 +104,7 @@ impl ModelRegistry {
             ));
         }
         let relative_package_path = relative_package_path.into();
-        validate_relative_package_path(&relative_package_path)?;
+        validate_registered_package_path(&relative_package_path)?;
         let key = model_id.as_str().to_owned();
         if self.registrations.contains_key(&key) {
             return Err(EngineError::invalid_input("model identifier is already registered"));
@@ -127,7 +140,7 @@ impl ModelRegistry {
     /// root that is not writable by group or other users. The opened file's
     /// device and inode must match the pre-open metadata, and its exact length
     /// is bounded before allocation. This method never accepts a client path.
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
     pub fn read_registered_package(
         &self,
         model_id: &ModelId,
@@ -196,7 +209,23 @@ impl ModelRegistry {
         Ok(bytes)
     }
 
+    /// Opens, verifies, and read-only maps one registered directory package.
+    ///
+    /// Every failure is reported to the mandatory typed event sink before the
+    /// error returns. The path remains configuration-owned and is never
+    /// supplied by a client.
+    #[cfg(unix)]
+    pub fn load_registered_directory(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<VerifiedDirectoryPackage, EngineError> {
+        directory_loader::load(self, model_id, budget, events)
+    }
+
     /// Produces a bounded metadata-only pre-load plan.
+    #[cfg(test)]
     pub fn plan(
         &self,
         model_id: &ModelId,
@@ -213,6 +242,7 @@ impl ModelRegistry {
     /// The caller must obtain `package_bytes` only from the registration-owned
     /// path through a future race-safe filesystem opener. No client path is
     /// accepted by this API.
+    #[cfg(test)]
     pub fn verify_package_bytes<'a>(
         &self,
         model_id: &ModelId,
@@ -242,13 +272,22 @@ impl ModelRegistry {
     }
 }
 
+impl ModelRegistry {
+    #[cfg(unix)]
+    pub(crate) fn model_root(&self) -> &Path {
+        &self.model_root
+    }
+}
+
 /// Validated metadata required before package-byte verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ModelLoadPlan {
     registration: RegisteredModel,
     header: ModelPackageHeader,
 }
 
+#[cfg(test)]
 impl ModelLoadPlan {
     /// Returns the local registration selected by model ID.
     pub const fn registration(&self) -> &RegisteredModel {
@@ -263,12 +302,14 @@ impl ModelLoadPlan {
 
 /// Borrowed package bytes admitted through every cryptographic gate.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct VerifiedModelPackage<'a> {
     registration: RegisteredModel,
     parsed: ParsedModelPackage,
     package_bytes: &'a [u8],
 }
 
+#[cfg(test)]
 impl VerifiedModelPackage<'_> {
     /// Returns the exact local registration used for verification.
     pub const fn registration(&self) -> &RegisteredModel {
@@ -314,11 +355,13 @@ impl VerifiedModelPackage<'_> {
 
 /// Aggregate-accounted tensors copied from one verified package.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct LoadedModelTensors {
     tensors: BTreeMap<String, Tensor>,
     _metadata_reservation: MemoryReservation,
 }
 
+#[cfg(test)]
 impl LoadedModelTensors {
     /// Returns one tensor by its canonical architecture-owned name.
     pub fn get(&self, name: &str) -> Result<&Tensor, EngineError> {
@@ -343,6 +386,7 @@ impl LoadedModelTensors {
     }
 }
 
+#[cfg(test)]
 fn validate_package_budget(
     package_length: u64,
     budget: &ResourceBudget,
@@ -375,13 +419,33 @@ fn validate_absolute_normal_path(path: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn validate_relative_package_path(path: &Path) -> Result<(), EngineError> {
+/// Validates the closed configuration-owned package-name grammar.
+///
+/// This pure parser performs no filesystem access and is suitable for bounded
+/// fuzzing. Runtime requests never contain this value.
+pub fn validate_registered_package_path(path: &Path) -> Result<(), EngineError> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(EngineError::invalid_input("registered model package path must be relative"));
     }
     if path.extension().and_then(|value| value.to_str()) != Some(MODEL_PACKAGE_EXTENSION) {
         return Err(EngineError::invalid_input(
             "registered model package must use the first-party extension",
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| EngineError::invalid_input("registered package name must be valid UTF-8"))?;
+    if !name.is_ascii()
+        || name.chars().any(char::is_control)
+        || name.starts_with('.')
+        || name.contains("..")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(EngineError::invalid_input(
+            "registered package name is outside the safe local grammar",
         ));
     }
     let mut components = path.components();

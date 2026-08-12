@@ -15,16 +15,16 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
-| 0. Boundaries/workspace | COMPLETE | 16-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
-| 1. Package/cryptography | COMPLETE for V1 | Canonical flat package, SHA-384, strict Ed25519, revocation/tamper tests |
-| 2. Registry/loader | COMPLETE for V1 | ID-only registry, direct-child no-follow opener, inode/size/mode checks, bounded tensor materialization |
+| 0. Boundaries/workspace | COMPLETE | 17-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
+| 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
+| 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for V1 | First-party `PAIBPE01`, byte fallback, bounded declarative merges, encode/decode tests |
 | 4. Tensor/CPU core | COMPLETE for target architecture | Safe owned tensors, aggregate memory pool, checked scalar work |
-| 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
+| 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `decoder-rms-rope-swiglu-gqa-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
-| 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
+| 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
@@ -39,6 +39,8 @@ memory, tool, approval, or Agent Green behavior.
   and zeroized.
 - Secure local file admission for configuration-owned direct-child packages.
 - Deterministic fixture generation entirely in Rust.
+- Strictly separated Rust-only offline importer and production directory loader;
+  source parsing/signing authority is absent from the runtime graph.
 - First-party tokenizer, tensor, memory, KV, decoder, greedy sampling,
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
@@ -59,7 +61,8 @@ memory, tool, approval, or Agent Green behavior.
   journal and command streams cannot switch identities.
 - Exhaustive canonical-fixture and signed-event truncation/single-byte mutation suites, signed
   active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
-- Isolated coverage-guided Rust fuzz targets for package, tokenizer, and frame
+- Isolated coverage-guided Rust fuzz targets for package, tokenizer, frame,
+  directory manifest, tensor-index, safetensors-import, and package-path
   parsers plus bounded Go fuzz targets for unsigned and authenticated response
   events, with deterministic Rust-generated seeds and scheduled CI campaigns.
 - Request-local greedy generation cursors yield after at most one decoder token
@@ -83,12 +86,11 @@ memory, tool, approval, or Agent Green behavior.
 
 ## Next software release gate: production model operations
 
-Implement a Rust-only offline converter for one legally approved source model.
-The converter must independently parse that source format, map only the fixed
-V1 tensor inventory, validate tokenizer semantics, emit deterministic package
-bytes, and never run generated/model code or access the network. Signing must
-use an offline operator-controlled key and emit provenance, license, source
-hash, package hash, key ID, reproducibility evidence, SBOM, and test results.
+Select and legally approve one real source model, then run the implemented
+Rust-only importer within the reviewed quarantine/signing procedure. Review the
+explicit architecture mapping and provenance, reproduce identical package
+bytes independently, and retain license, source hash, package hash, key ID,
+toolchain/source revision, SBOM, test results, and signer custody evidence.
 
 Exit evidence is a reviewed production-size package that opens through its
 registered ID, passes exact signature and tensor validation, and matches

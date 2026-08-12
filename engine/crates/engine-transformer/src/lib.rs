@@ -9,7 +9,7 @@ pub use cpu_decoder::{CpuDecoderModel, CpuDecoderSession};
 use personalai_engine_kv_cache::{
     KvCachePlan, MAX_HEAD_DIMENSION, MAX_KV_HEAD_COUNT, MAX_LAYER_COUNT,
 };
-use personalai_engine_model_format::ModelManifest;
+use personalai_engine_model_format::{DirectoryManifest, ModelManifest};
 use personalai_engine_types::{
     ArchitectureId, BackendId, ContextLimit, DType, EngineError, MAX_VOCABULARY_SIZE,
     ResourceBudget,
@@ -20,7 +20,7 @@ pub const MAX_HIDDEN_DIMENSION: u32 = 1_048_576;
 /// Maximum feed-forward intermediate dimension.
 pub const MAX_INTERMEDIATE_DIMENSION: u32 = 4_194_304;
 /// Exact first-party decoder architecture implemented by the CPU reference path.
-pub const FIRST_PARTY_DECODER_ARCHITECTURE_ID: &str = "personalai.decoder-v1";
+pub const FIRST_PARTY_DECODER_ARCHITECTURE_ID: &str = "decoder-rms-rope-swiglu-gqa-v1";
 /// ARM64 feature/backend identifier.
 pub const ARM64_BACKEND_ID: &str = "arm64";
 /// Apple Metal feature/backend identifier.
@@ -113,6 +113,28 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
+    /// Constructs the exact decoder configuration from a verified directory manifest.
+    pub fn from_directory_manifest(manifest: &DirectoryManifest) -> Result<Self, EngineError> {
+        if manifest.rope_scaling().to_bits() != 1.0_f32.to_bits() {
+            return Err(EngineError::not_implemented(
+                "directory manifest requests unsupported RoPE scaling",
+            ));
+        }
+        Self::new_decoder(
+            manifest.architecture_id().clone(),
+            manifest.layer_count(),
+            manifest.hidden_dimension(),
+            manifest.attention_head_count(),
+            manifest.kv_head_count(),
+            manifest.vocabulary_size(),
+            manifest.context_limit(),
+            manifest.storage_dtype(),
+            manifest.feed_forward_dimension(),
+            1.0e-5,
+            manifest.rope_theta(),
+        )
+    }
+
     /// Constructs the exact decoder configuration from a verified manifest.
     pub fn from_manifest(manifest: &ModelManifest) -> Result<Self, EngineError> {
         Self::new_decoder(

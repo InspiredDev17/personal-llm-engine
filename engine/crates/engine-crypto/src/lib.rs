@@ -14,6 +14,9 @@ use zeroize::Zeroize;
 
 /// Domain separator for version-one model-package content signatures.
 pub const MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] = b"PersonalAI.ModelPackage.Signature.v1\0";
+/// Domain separator for directory-backed package hash catalogs.
+pub const DIRECTORY_MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] =
+    b"PersonalAI.DirectoryModelPackage.Signature.v1\0";
 /// Domain separator for Go control-plane request signatures.
 pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.ControlPlane.Request.Signature.v1\0";
@@ -246,6 +249,13 @@ pub fn signature_message(
     domain_separated_message(MODEL_PACKAGE_SIGNATURE_DOMAIN_V1, content_digest)
 }
 
+/// Builds the bounded message signed by offline directory-package tooling.
+pub fn directory_package_signature_message(
+    catalog_digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    domain_separated_message(DIRECTORY_MODEL_PACKAGE_SIGNATURE_DOMAIN_V1, catalog_digest)
+}
+
 /// Builds the bounded message signed by the Go control plane.
 pub fn control_plane_signature_message(request_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
     let digest = hash_signed_content(request_bytes);
@@ -280,6 +290,33 @@ pub fn verify_package_signature(
     }
     let signature = Signature::from_bytes(signature_bytes);
     let message = signature_message(content_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::signature_failure("model package signature is invalid"))
+}
+
+/// Verifies one strict Ed25519 directory-package hash-catalog signature.
+pub fn verify_directory_package_signature(
+    signer: &TrustedSigner,
+    envelope_key_id: SignerKeyId,
+    catalog_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("model package signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "model package signer does not match local configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured Ed25519 key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured Ed25519 key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = directory_package_signature_message(catalog_digest)?;
     verifying_key
         .verify_strict(&message, &signature)
         .map_err(|_| EngineError::signature_failure("model package signature is invalid"))

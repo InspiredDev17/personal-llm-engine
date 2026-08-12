@@ -26,7 +26,7 @@ const FIXTURE_VOCABULARY_SIZE: u32 = 258;
 const FIXTURE_BOS_TOKEN: u32 = 256;
 const FIXTURE_EOS_TOKEN: u32 = 257;
 const FIXTURE_TENSOR_ELEMENTS: u64 = 4;
-const DECODER_ARCHITECTURE: &[u8] = b"personalai.decoder-v1";
+const DECODER_ARCHITECTURE: &[u8] = b"decoder-rms-rope-swiglu-gqa-v1";
 
 #[derive(Clone, Copy)]
 struct ManifestFixture {
@@ -612,7 +612,7 @@ mod tests {
     fn decoder_fixture_has_the_exact_first_party_weight_schema() {
         let fixture = DecoderPackageFixtureBuilder::new().build().expect("decoder must build");
         let parsed = ParsedModelPackage::parse(fixture.bytes()).expect("decoder must parse");
-        assert_eq!(parsed.manifest().architecture_id().as_str(), "personalai.decoder-v1");
+        assert_eq!(parsed.manifest().architecture_id().as_str(), "decoder-rms-rope-swiglu-gqa-v1");
         assert_eq!(parsed.manifest().vocabulary_size(), 258);
         assert_eq!(parsed.tensors().len(), 12);
         assert!(parsed.tensors().iter().any(|tensor| tensor.name().as_str() == "output.weight"));

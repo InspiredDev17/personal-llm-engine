@@ -27,7 +27,9 @@ personalai-engine-types.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+personalai-engine-model-format.workspace = true
 personalai-engine-testkit.workspace = true
+personalai-engine-tensor.workspace = true
 
 [lints]
 workspace = true

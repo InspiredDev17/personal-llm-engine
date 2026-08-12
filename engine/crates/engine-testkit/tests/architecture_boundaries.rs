@@ -133,6 +133,38 @@ fn fuzz_tooling_is_isolated_from_the_production_release_graph() {
 }
 
 #[test]
+fn defensive_fuzz_workflow_covers_directory_artifact_parsers() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let workflow = fs::read_to_string(repository.join(".github/workflows/fuzz.yml"))
+        .expect("defensive fuzz workflow must exist");
+    for required in [
+        "permissions:\n  contents: read",
+        "timeout-minutes: 20",
+        "nightly-2026-08-01",
+        "cargo-fuzz --version 0.13.2 --locked",
+        "manifest_parser",
+        "tensor_index_parser",
+        "safetensors_import",
+        "package_path_resolution",
+        "-max_total_time=60",
+        "-max_len=192",
+        "-max_len=1024",
+        "-timeout=10",
+        "-rss_limit_mb=1024",
+        "git -C \"$GITHUB_WORKSPACE\" diff --exit-code -- engine/fuzz/corpus",
+    ] {
+        assert!(workflow.contains(required), "fuzz workflow omitted invariant {required:?}");
+    }
+    for prohibited in ["continue-on-error", "pull_request_target", "sudo ", "curl ", "wget "] {
+        assert!(
+            !workflow.contains(prohibited),
+            "fuzz workflow contains prohibited capability {prohibited:?}"
+        );
+    }
+}
+
+#[test]
 fn continuous_soak_workflow_is_pinned_bounded_and_fail_closed() {
     let root = engine_root();
     let repository = root.parent().expect("engine must have repository parent");
@@ -302,7 +334,7 @@ fn workspace_contains_no_python_or_typescript() {
 
 #[test]
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 16] = [
+    let allowed: [(&str, &[&str]); 17] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-model-format", &["personalai-engine-types"]),
@@ -313,6 +345,16 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
                 "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
+        (
+            "engine-model-importer",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-memory",
+                "personalai-engine-model-format",
+                "personalai-engine-tokenizer",
                 "personalai-engine-types",
             ],
         ),
@@ -409,6 +451,7 @@ fn crate_manifests_cannot_add_native_links_or_weaken_workspace_lints() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
     let root = engine_root();
     let listener_marker = ["Tcp", "Listener"].concat();
@@ -437,6 +480,10 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         .join("crates/engine-server/src/peer_credential.rs")
         .canonicalize()
         .expect("approved peer credential FFI must exist");
+    let approved_read_only_mapping = root
+        .join("crates/engine-loader/src/read_only_map.rs")
+        .canonicalize()
+        .expect("approved read-only mapping FFI must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -474,6 +521,15 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             4,
             "peer credential FFI",
         );
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_read_only_mapping,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            3,
+            "read-only model mapping FFI",
+        );
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
@@ -499,6 +555,11 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 continue;
             }
             if canonical == approved_peer_credential
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+            {
+                continue;
+            }
+            if canonical == approved_read_only_mapping
                 && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
             {
                 continue;

@@ -33,10 +33,19 @@ security telemetry. All returned data is untrusted at the Go boundary.
 ## Model policy
 
 Production models must use the first-party signed, canonical, data-only
-`.paimodel` package. Every model must be registered by `ModelId` in local owner
+directory-backed `.paimodel` V1 package. Every model must be registered by `ModelId` in local owner
 configuration with an exact SHA-384 package hash and active Ed25519 signer
 identity. Requests contain only that ID. Packages contain no paths, scripts,
 plugins, shared libraries, Metal source, PTX, or executable configuration.
+Production activation requires a non-symlink model root, package directory,
+and trusted files with no write permission bits.
+
+The Rust-only offline importer accepts bounded local safetensors plus the
+first-party tokenizer format from an owner quarantine, converts the exact
+allowlisted architecture, emits deterministic hashes/provenance, and signs the
+closed package file set. It has no network, subprocess, plugin, pickle, Python,
+or repository-code execution capability. The production loader cannot import
+source formats; it opens only an already converted registered directory.
 
 The implemented V1 CPU path is validated by a tiny deterministic test package.
 That fixture is not a production model. No production model is bundled or
@@ -78,7 +87,8 @@ and releases must be vendored with an SBOM.
 Unsafe Rust is denied workspace-wide by default. The current exceptions are the
 isolated Unix replay-journal lock FFI module recorded by ADR-0004 and the
 process-signal install/restore module recorded by ADR-0011, plus the read-only
-peer-credential module recorded by ADR-0013. Their exact unsafe blocks are
+peer-credential module recorded by ADR-0013 and the read-only non-executable
+tensor-shard mapping module recorded by ADR-0015. Their exact unsafe blocks are
 hidden behind safe wrappers and enforced by an
 architecture-boundary test. Any other unsafe code requires its own invariant
 and review record in an isolated FFI/backend module.
@@ -98,11 +108,13 @@ and review record in an isolated FFI/backend module.
 
 ## Current completion boundary
 
-The software foundation through mutually authenticated, signed-package
+The software foundation through deterministic offline synthetic-model import,
+signed directory-package verification/mapping, mutually authenticated
 CPU-reference UDS generation and bounded continuous graceful-drain reference
 serving plus deterministic delayed-reader/restart soak is implemented and
-tested. Remaining release work is a production converter/package,
-production-size fuzz/operated-soak/performance evidence, operated
+tested. Remaining release work is selecting and licensing an approved real
+source model, producing/reviewing its production package and independent
+numeric vectors, production-size fuzz/operated-soak/performance evidence, operated
 request/response-key injection, rotation/recovery evidence, repeatable
 vendor/SBOM release renewal, and hardware-specific
 accelerator implementation/validation. These limits prohibit claiming complete

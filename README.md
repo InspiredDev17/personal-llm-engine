@@ -1,15 +1,16 @@
 # Personal LLM Engine
 
-Status: **CPU reference runtime implemented; production model conversion and accelerated backends remain gated.**
+Status: **CPU reference runtime and synthetic offline model packaging implemented; real-model approval and accelerated backends remain gated.**
 
 This repository is the first-party Rust inference data plane for the sovereign
 PersonalAI platform. The existing Go platform remains the control plane and
 sole authority for model registration, routing, policy, approvals, tools,
 memory, and audit. The engine is inference-only and is not a second AI platform.
 
-The workspace implements a signed data-only `.paimodel` format, SHA-384 and
-strict Ed25519 admission, a configuration-only model registry, no-follow local
-package opening, a first-party bounded byte/BPE tokenizer, safe aggregate-
+The workspace implements a signed directory-backed data-only `.paimodel`
+format, a Rust-only quarantine safetensors importer, deterministic provenance,
+SHA-384 and strict Ed25519 admission, a configuration-only model registry,
+no-follow direct-file opening, read-only non-executable shard mapping, a first-party bounded byte/BPE tokenizer, safe aggregate-
 accounted tensors, one fixed decoder architecture, scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary
@@ -28,8 +29,8 @@ Go repository contains the corresponding `NATIVE_ENGINE` provider adapter; it
 has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
-signed synthetic model. It is not yet a useful production model. Rust-only
-conversion/signing operations, an approved production package, stochastic
+signed synthetic model. It is not yet a useful production model. A legally
+approved real source model/package and independent numeric evidence, stochastic
 sampling, optimized ARM64, Metal, CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
 existing production runtimes. The locked dependency graph is checked in under
@@ -81,7 +82,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   mode-0600 per-control-key journal before the command can execute; an exclusive
   lifetime lock prevents a second process from using the same key journal, and
   retiring a key does not delete its replay history;
-- packages are fixed-format data, exact-hash pinned, and signer verified;
+- production packages are closed directory-backed data, exact-hash pinned,
+  signer verified, and mapped read-only without execute permission;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
 - every accepted UDS stream must have a kernel-reported effective user ID equal
   to the engine service user before any frame is read or allocated; cryptographic

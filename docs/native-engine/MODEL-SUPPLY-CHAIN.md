@@ -2,83 +2,138 @@
 
 ## Production rule
 
-The engine loads only first-party `.paimodel` packages registered by local
-owner configuration under a `ModelId`, exact SHA-384 package hash, active signer
-key ID/public key, and lower resource budget. A client can submit only the ID.
-It cannot submit a path, URL, signer, hash, architecture, tokenizer, or kernel.
+The production engine loads only first-party directory-backed `.paimodel` V1
+packages registered by local owner configuration under a `ModelId`, exact
+SHA-384 catalog identity, active signer key ID/public key, and lower resource
+budget. A client submits only the ID. It cannot submit a path, URL, signer,
+hash, architecture, tokenizer, source format, optional feature, or kernel.
 
-## V1 package
+The offline importer and production loader are separate crates and binaries.
+`engine-model-importer` is not a production runtime dependency.
+`engine-loader` has no source-model importer and no unsigned loading feature.
 
-V1 is canonical, flat, bounded, and data-only:
+## Directory-backed `.paimodel` V1
 
-- fixed 64-byte package header;
-- fixed 256-byte architecture manifest;
-- sorted fixed 128-byte tensor records;
-- bounded `PAIBPE01` tokenizer bytes;
-- aligned exact tensor payload ranges;
-- fixed 96-byte Ed25519 signature envelope;
-- exact total length, reserved-zero fields, and no trailing data.
+One package is `<model-id>.paimodel/` with exactly:
 
-It contains no executable code, scripts, plugins, shared-library names, paths,
-URLs, recursive objects, compression, general graph, arbitrary operations,
-Metal source, CUDA/PTX, or kernel selectors. Architecture and tokenizer IDs are
-closed first-party identifiers.
+```text
+manifest.aipm
+tokenizer.aiptok
+tensors-0000.aipt
+provenance.json
+hashes.aiph
+signature.ed25519
+```
+
+Additional shards, when implemented by a future importer profile, must be
+contiguous `tensors-NNNN.aipt` direct children and remain under the 1,024-shard
+ceiling. The exact-file comparison rejects every unlisted file or directory.
+Executables, scripts, dynamic libraries, object files, bytecode, shell/Python/
+JavaScript modules, WASM, device kernels, and executable templates therefore
+cannot be present in an admitted package.
+
+`manifest.aipm` uses an eight-byte magic, fixed version and endian marker,
+fixed 512-byte header, fixed 64-byte shard records, and fixed 192-byte tensor
+records. It declares only the reviewed
+`decoder-rms-rope-swiglu-gqa-v1` architecture. Records carry canonical tensor
+name, dtype, rank/dimensions, shard index, byte range, alignment,
+quantization declaration, and SHA-384 content hash. Parser rules include exact
+length, reserved-zero fields, checked arithmetic, bounded strings/counts/rank/
+dimensions, sorted unique names, nonoverlapping in-bounds ranges, valid UTF-8,
+no trailing data, no recursion, no compression, and no ambiguous integer
+encoding. Required unknown flags and unsupported optional sections fail closed.
+
+The initial importer emits one 64-byte-aligned F32 shard, quantization `None`,
+RoPE scaling `1.0`, and the first-party `PAIBPE01` tokenizer. Those restrictions
+are implementation gates, not package-controlled kernel or graph choices.
 
 ## Cryptographic profile
 
-Complete package identity is SHA-384. Signed-content identity is SHA-384 over
-the exact canonical signed range. Ed25519 verification is strict and uses the
-domain `PersonalAI.ModelPackage.Signature.v1\0`. The envelope key ID must equal
-the active local signer configuration. Revoked, weak, mismatched, malformed, or
-invalid signatures fail closed before tensor exposure.
+`hashes.aiph` is a fixed, sorted, closed catalog containing the exact byte
+length and SHA-384 hash of the manifest, tokenizer, provenance, and every shard.
+The configured package identity is SHA-384 over the exact catalog bytes. The
+signature is strict Ed25519 over SHA-384 of the catalog under domain
+`PersonalAI.DirectoryModelPackage.Signature.v1\0`. The envelope key ID must
+equal the active local signer configuration. Weak, revoked, mismatched,
+malformed, untrusted, or invalid signatures fail before package contents are
+exposed. Manifest tokenizer/shard hashes and per-tensor hashes add explicit
+cross-checks after the signed catalog verifies.
 
-The engine never generates or stores a production package-signing private key.
-The deterministic testkit key is non-production and must never appear in an
-approved package.
+The signing seed is exactly 32 bytes supplied to the offline importer through
+stdin. It is never accepted through argv, stored in the repository/package,
+printed, or logged, and is zeroized immediately after signing-key construction.
+The production engine holds only the configured public verification key.
 
-## Local admission
+## Offline importer
 
-The model root must already exist, be a non-symlink directory, and not be
-writable by group/other. V1 registrations are direct-child `.paimodel`
-basenames. The file must be a non-symlink regular file not writable by
-group/other. The loader uses `O_NOFOLLOW|O_CLOEXEC`, compares pre-open and
-opened device/inode/length, bounds length before allocation, reads exactly, and
-rejects growth/trailing bytes. Package hash, structure, signer, tokenizer,
-tensor ranges/shapes/dtypes, memory, and architecture then validate in order.
+The importer operates on owner-selected local files only. Both source and
+tokenizer must canonicalize under one absolute quarantine root. URLs and
+symlink escapes are refused. The initial source parser accepts a bounded,
+data-only F32 safetensors subset implemented in Rust: eight-byte little-endian
+header length, bounded JSON object, flat tensor records, exact `dtype`, `shape`,
+and `data_offsets`, nonoverlapping contiguous data, and no trailing bytes.
 
-## Offline conversion and signing gate
+The importer does not have code paths for pickle, `.bin`, `.pt`, `.pth`, model
+repository scripts, tokenizer scripts, `trust_remote_code`, shared libraries,
+subprocesses, Python, network sockets, downloads, registries, or dynamic
+loading. The required explicit mapping is `llama-safetensors-v1`; all unknown,
+missing, extra, duplicate, wrongly shaped, wrongly typed, non-finite, or
+out-of-range tensors are rejected against the exact internal architecture.
 
-No production converter is implemented yet. It must be Rust-only and offline,
-with no Python, third-party tokenizer/model loader, AI runtime, generated/model
-code execution, or network access. For one approved source model it must:
+Provenance records the architecture, license identifier, mapping, model ID,
+local source filename/label, source format, source SHA-384, importer identity,
+and version. Package bytes, ordering, padding, hashes, provenance, and signature
+are deterministic for identical inputs/configuration/key. A staging directory
+is durably written, sealed to read-only file/directory modes, and atomically renamed. An existing approved directory is
+never overwritten implicitly: replacement requires a bounded audit note, writes
+an append-only local audit record, and preserves the previous directory.
 
-1. record upstream artifact identity, license, redistribution/use decision,
-   architecture/tokenizer versions, and source hashes;
-2. independently parse only the required source data structures;
-3. map an exact fixed tensor inventory and reject missing/extra/ambiguous data;
-4. reproduce tokenizer and numeric vectors from independent reference evidence;
-5. emit deterministic canonical bytes twice with identical hashes;
-6. sign offline with an operator key unavailable to the engine;
-7. publish package hash, signer/key status, tool source revision, Rust/toolchain,
-   conversion parameters, SBOM, licenses, tests, and reviewer approvals.
+## Production admission and mapping
 
-Converter inputs and outputs must be treated as hostile. Limits apply before
-allocation or arithmetic. Conversion must never make a source package
-authoritative merely because it parsed.
+The production model store and package directory must already exist, be
+non-symlinks, and have no write permission bits. Registrations accept one safe
+direct-child `.paimodel` name. Each trusted file must be a non-symlink regular
+file with no write permission bits. The importer can write only while its
+separate destination root is writable; activation requires sealing that root.
+The loader uses `O_NOFOLLOW|O_CLOEXEC`, compares pre-open and opened device,
+inode, type, and length, and applies configured limits before unbounded reads or
+mapping.
 
-## Activation, update, revocation, rollback
+Admission order is catalog identity, signature, exact file set, catalog hashes,
+manifest/engine/model compatibility, fixed architecture inventory and shapes,
+tokenizer/provenance validation, shard identities/hashes, then per-tensor
+hashes. Tensor shards use private `PROT_READ` mappings without `PROT_EXEC`; only
+immutable slices are exposed, and CPU materialization remains charged to the
+aggregate memory pool. Every failed admission emits one bounded typed
+`ModelPackageRejected` event to a mandatory caller-owned sink. No arbitrary path
+or unsigned development bypass exists.
+
+## Verification evidence
+
+Rust tests convert a synthetic source fixture twice and compare identical files,
+sign and install it, load it by registered ID, and compare validated tensor
+metadata and bytes with the source. Separate tests reject bad magic/version,
+truncation, overflow, excessive count/rank/dimension, duplicates, overlap,
+out-of-bounds ranges, invalid dtype/architecture/UTF-8, wrong/missing/unexpected
+tensors, tokenizer/shard corruption, invalid/untrusted signatures, traversal,
+symlink escape, trailing data, unsupported optional features, unaudited
+overwrite, and package-budget excess.
+
+Four dedicated bounded fuzz targets cover the directory manifest, one tensor
+index record, safetensors import parser, and package-name resolution. A local
+10-second smoke campaign per target is only smoke evidence; production-size
+corpora and scheduled sustained campaigns remain release gates.
+
+## Activation, update, revocation, and remaining gate
 
 Activation is an owner configuration change in Go/service deployment, never a
-model request. Updates receive a new exact package hash and explicit review.
-Signer revocation blocks new loads. Rollback selects a previously reviewed exact
-package and disables the newer Go provider/model binding. No auto-download,
-self-update, remote registry lookup, or implicit latest-version behavior exists.
+model request. Updates receive a new exact hash and review. Signer revocation
+blocks new loads. Rollback selects a previously reviewed directory and disables
+the newer Go provider binding. There is no auto-download, self-update, remote
+registry lookup, implicit latest version, cloud fallback, or telemetry.
 
-## Release evidence
-
-A production model release must retain provenance/license review, source and
-package hashes, signer ID/status, deterministic conversion evidence, independent
-token/logit/generation vectors, corruption/resource/cancellation tests,
-dependency lock/vendor archive, SBOM, advisory scan, target hardware results,
-and rollback drill. Until that evidence exists, only the signed synthetic test
-fixture is supported and the repository makes no model-quality claim.
+No approved real production model is bundled. Before one is activated, retain
+its license/use review, provenance and source hashes, reproducible package,
+signer status, independent tokenizer/logit/generation vectors, resource and
+corruption evidence, target-hardware results, SBOM/advisory records, and a
+rollback drill. The synthetic fixture proves mechanics only, not model quality.

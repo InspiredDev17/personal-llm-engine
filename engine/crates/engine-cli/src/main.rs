@@ -431,7 +431,16 @@ fn serve(
     )?;
     let mut runtime =
         CpuEngineRuntime::new_with_control_keys(service, control_keys, response_signer)?;
-    runtime.load_registered_model(&config.model_id, &config.budget)?;
+    let mut event_write_failed = false;
+    let mut package_events = |event: personalai_engine_types::SecurityEvent| {
+        if writeln!(errors, "native-engine security event: {event:?}").is_err() {
+            event_write_failed = true;
+        }
+    };
+    runtime.load_registered_model(&config.model_id, &config.budget, &mut package_events)?;
+    if event_write_failed {
+        return Err(CliError::Io);
+    }
     let listener = UnixFrameListener::bind(runtime.service().config())?;
     match config.mode {
         ServeMode::Single => serve_single(&mut runtime, &listener, errors),

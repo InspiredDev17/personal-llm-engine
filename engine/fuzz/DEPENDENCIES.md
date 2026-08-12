@@ -1,6 +1,6 @@
 # Fuzz-only Dependency Record
 
-- Reviewed: 2026-08-11
+- Reviewed: 2026-08-12
 - Scope: `engine/fuzz` only; excluded from every production binary, lockfile,
   vendor directory, release package, and SBOM
 - Registry source: `https://crates.io`; exact archive checksums are pinned in
@@ -32,6 +32,11 @@ is removed by deleting the excluded fuzz workspace.
 All other registry packages in the fuzz lock are exact versions already
 reviewed in `docs/native-engine/DEPENDENCY-INVENTORY.md` for the production
 path crates exercised by the targets.
+
+The directory-manifest, tensor-index, safetensors-import, and package-path
+targets add only first-party path dependencies on `engine-model-format`,
+`engine-model-importer`, and `engine-loader`. They add no external package and
+do not expand the production graph.
 
 ## Orchestrator
 

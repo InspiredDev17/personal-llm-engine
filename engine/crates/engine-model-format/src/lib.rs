@@ -5,6 +5,20 @@
 //! tokenizer and tensor data, and one fixed 96-byte Ed25519 signature envelope.
 //! No package field can name code, a library, a kernel, or a filesystem path.
 
+mod directory;
+mod hash_catalog;
+
+pub use directory::{
+    DIRECTORY_DECODER_ARCHITECTURE_ID, DIRECTORY_MANIFEST_HEADER_BYTES, DIRECTORY_MANIFEST_MAGIC,
+    DIRECTORY_MANIFEST_MAX_BYTES, DIRECTORY_MANIFEST_VERSION, DIRECTORY_SHARD_RECORD_BYTES,
+    DIRECTORY_TENSOR_RECORD_BYTES, DirectoryManifest, DirectoryManifestBuilder,
+    DirectoryShardRecord, DirectoryTensorRecord, Quantization,
+};
+pub use hash_catalog::{
+    HASH_CATALOG_MAGIC, HASH_CATALOG_MAX_ENTRIES, HASH_CATALOG_RECORD_BYTES, HashCatalog,
+    HashCatalogEntry, PackageFileKind,
+};
+
 use personalai_engine_types::{
     ArchitectureId, ContextLimit, DType, EngineError, MAX_MODEL_PACKAGE_BYTES, MAX_TENSOR_COUNT,
     MAX_TENSOR_RANK, MAX_TOKENIZER_DATA_BYTES, ModelPackageHash, SignerKeyId, TensorShape,
@@ -489,7 +503,8 @@ pub struct SignatureEnvelope {
 }
 
 impl SignatureEnvelope {
-    fn parse(input: &[u8]) -> Result<Self, EngineError> {
+    /// Parses one exact canonical signature envelope.
+    pub fn parse(input: &[u8]) -> Result<Self, EngineError> {
         if input.len() != SIGNATURE_ENVELOPE_BYTES || input[..8] != SIGNATURE_ENVELOPE_MAGIC {
             return Err(corrupt("signature envelope magic or length is invalid"));
         }
@@ -510,6 +525,21 @@ impl SignatureEnvelope {
             return Err(corrupt("signature envelope reserved bytes are nonzero"));
         }
         Ok(Self { algorithm, key_id, signature })
+    }
+
+    /// Encodes one exact canonical Ed25519 signature envelope.
+    pub fn encode_ed25519(
+        key_id: SignerKeyId,
+        signature: [u8; 64],
+    ) -> Result<[u8; SIGNATURE_ENVELOPE_BYTES], EngineError> {
+        let mut bytes = [0_u8; SIGNATURE_ENVELOPE_BYTES];
+        bytes[..8].copy_from_slice(&SIGNATURE_ENVELOPE_MAGIC);
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[12..28].copy_from_slice(key_id.as_bytes());
+        bytes[28..92].copy_from_slice(&signature);
+        Self::parse(&bytes)?;
+        Ok(bytes)
     }
 
     /// Returns the signature algorithm.

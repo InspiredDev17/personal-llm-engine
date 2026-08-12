@@ -21,8 +21,9 @@ Green authority.
 | --- | --- |
 | `engine-types` | bounded IDs, shapes, budgets, requests/events, errors and security-event types |
 | `engine-crypto` | SHA-384 and strict Ed25519 verification/domain separation |
-| `engine-model-format` | exact flat `.paimodel` V1 parser and tensor index |
-| `engine-loader` | registered-ID resolution, secure local open, package verification and tensor materialization |
+| `engine-model-format` | fixed directory-manifest, hash-catalog, signature-envelope and legacy test-fixture parsers |
+| `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
+| `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-tokenizer` | first-party `PAIBPE01` parser and bounded encode/decode |
 | `engine-memory` | aggregate fallible reservations |
 | `engine-tensor` | safe owned typed storage tied to reservations |
@@ -38,27 +39,44 @@ Green authority.
 
 Internal dependencies are checked against an explicit DAG. The only external
 dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
-constants used by the Unix no-follow package/replay-journal openers and the one
-isolated nonblocking `flock` call. There is no third-party AI, tensor,
+constants used by Unix no-follow openers, the isolated nonblocking `flock`
+call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no third-party AI, tensor,
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 ## Package and loading flow
 
-1. Owner CLI configuration supplies a `ModelId`, direct-child `.paimodel`
-   basename, exact SHA-384 hash, active package signer public key/key ID, and
-   resource budget.
-2. The loader rejects absolute, nested, traversal, and non-V1 names.
-3. The model root must be a non-symlink directory not writable by group/other.
-   The package must be a non-symlink regular file not writable by group/other.
-4. `O_NOFOLLOW|O_CLOEXEC`, device/inode equality, exact prebounded length, and
-   trailing-byte checks defend the read. No client supplies this path.
-5. Complete-package SHA-384, canonical ranges/records, signed-content SHA-384,
-   key ID, and strict Ed25519 signature verify before tokenizer or tensor use.
-6. Tensor storage and tokenizer structures reserve against one aggregate
-   `MemoryPool`; shape, byte, vocabulary, context, and work calculations use
-   checked arithmetic.
+The import and production components are intentionally separate:
 
-The supported architecture is `personalai.decoder-v1`, a fixed causal decoder
+1. The offline importer accepts only local `.safetensors` and `PAIBPE01` files
+   that canonicalize beneath an owner-selected quarantine. It refuses URLs,
+   quarantine escapes, pickle/executable formats, unknown tensor names,
+   missing/extra tensors, unsupported dtypes, non-finite values, and any
+   architecture mapping other than `llama-safetensors-v1`.
+2. The importer writes a staging directory and atomically installs
+   `<model-id>.paimodel`. Replacement requires a bounded explicit audit note;
+   the previous directory is preserved. The signing seed is exact stdin data,
+   never stored or logged, and zeroized after signer construction.
+3. A production package contains exactly `manifest.aipm`, `tokenizer.aiptok`,
+   `provenance.json`, `hashes.aiph`, `signature.ed25519`, and contiguous
+   `tensors-NNNN.aipt` shards. Any extra file, directory, script, library,
+   object, bytecode, WASM, kernel, or template is rejected by the closed set.
+4. Owner configuration supplies only a `ModelId`, direct-child `.paimodel`
+   directory name, SHA-384 identity of `hashes.aiph`, trusted signer key ID and
+   public key, and a lower resource budget. Clients still submit only ModelId.
+5. The production model root, package directory, and every direct-child file
+   must be non-symlink and have no write permission bits. Each file uses
+   `O_NOFOLLOW|O_CLOEXEC` with pre/open device, inode, type, and length checks.
+6. The loader verifies the catalog identity, domain-separated strict Ed25519
+   signature, exact file set, every catalog hash, manifest compatibility,
+   tokenizer/shard/tensor hashes, architecture inventory/shapes, and aggregate
+   package budget before exposure. Each failure emits one typed event to its
+   mandatory caller-owned security-event sink.
+7. Tensor shards are privately mapped `PROT_READ` without `PROT_EXEC`; immutable
+   ranges are then copied into aggregate-accounted CPU tensors. No loader API
+   accepts source formats, an arbitrary path, or an unsigned package. The old
+   flat package remains only as deterministic unit-test compatibility data.
+
+The supported architecture is `decoder-rms-rope-swiglu-gqa-v1`, a fixed causal decoder
 with architecture-owned RMSNorm, Q/K/V projections, RoPE, grouped attention,
 output projection, residual paths, SwiGLU MLP, final norm, and logits. Model
 metadata cannot define operations, plugins, paths, executable code, or kernels.
@@ -185,6 +203,9 @@ operated proof.
 
 The code centrally bounds package bytes (1 TiB hard maximum with lower owner
 budget), tensors (262,144), rank (8), dimensions (`1<<30`), elements (`1<<40`),
+directory manifest (64 MiB), shards (1,024), tensor name (47 bytes), tensor
+alignment (2 MiB), hash-catalog entries (1,027), provenance (1 MiB), and
+safetensors import header (64 MiB),
 token collections (1,048,576), vocabulary (4,194,304), context (262,144),
 request (4 MiB), complete frame (8 MiB), tokenizer data (64 MiB), sequences
 (4,096), continuously owned/reference-batch connections (64), ingress,
@@ -211,11 +232,15 @@ documented `sigaction` blocks to install and restore owner-process handlers,
 plus `engine-server/src/peer_credential.rs`, which reads the process and peer
 effective user IDs through platform credential APIs. The signal handler retains
 no pointer and performs only an atomic store; peer outputs use exact initialized
-ABI storage and borrowed live descriptors. Architecture tests enforce the exact
+ABI storage and borrowed live descriptors. `engine-loader/src/read_only_map.rs`
+owns exactly one nonempty mapping, exposes only an immutable slice, requests
+`PROT_READ|MAP_PRIVATE` without execution, and unmaps the exact pointer/length
+once while its file remains live. Architecture tests enforce the exact
 block and allowance counts and reject an unsafe block or unsafe-lint allowance
 in every other first-party Rust source. ADR-0004 records the lock invariants;
 ADR-0011 records signal invariants; ADR-0013 records peer-credential invariants
-and portability scope. ADR-0014 pins an offline Linux/macOS workflow that
+and portability scope. ADR-0015 records directory-artifact and mapping
+invariants. ADR-0014 pins an offline Linux/macOS workflow that
 compiles and tests both credential implementations without expanding runtime
 capability or dependency authority.
 

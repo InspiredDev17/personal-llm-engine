@@ -185,11 +185,25 @@ name = "personalai-engine-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-model-importer",
  "personalai-engine-protocol",
  "personalai-engine-testkit",
  "personalai-engine-tokenizer",
+ "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-loader"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "personalai-engine-crypto",
+ "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 
@@ -208,10 +222,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-model-importer"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "libc",
+ "personalai-engine-crypto",
+ "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-tokenizer",
+ "personalai-engine-types",
+ "zeroize",
+]
+
+[[package]]
 name = "personalai-engine-protocol"
 version = "0.1.0"
 dependencies = [
  "personalai-engine-crypto",
+ "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-tensor"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-memory",
  "personalai-engine-types",
 ]
 

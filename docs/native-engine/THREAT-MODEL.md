@@ -16,24 +16,26 @@ token data, generated text, and engine events are untrusted.
 
 1. Owner configuration to CLI/service.
 2. Model root/pathname to no-follow package opener.
-3. Package bytes to format/hash/signature admission.
-4. Parsed tokenizer/tensors to memory and CPU execution.
-5. Go to protected UDS and authenticated message decoder.
-6. Engine events back to Go.
-7. Go to its separate authenticated Agent Green liaison.
-8. Safe Rust replay journal to the isolated Unix file-lock FFI.
-9. Future safe Rust backend to isolated Metal/CUDA FFI.
+3. Quarantined external data to the offline importer and signing boundary.
+4. Signed directory-package files to format/hash/signature admission.
+5. Parsed tokenizer/tensors to memory and CPU execution.
+6. Go to protected UDS and authenticated message decoder.
+7. Engine events back to Go.
+8. Go to its separate authenticated Agent Green liaison.
+9. Safe Rust to the isolated Unix lock/read-only-map FFI modules.
+10. Future safe Rust backend to isolated Metal/CUDA FFI.
 
 ## Threats and controls
 
 | Threat | Current controls | Residual/next gate |
 | --- | --- | --- |
 | Authority escalation through output | Rust has no tools, approval, memory, audit-policy, or Agent Green API; outputs are typed untrusted data | Go must retain authorization and injection defenses |
-| Arbitrary file access/path traversal | Clients send only `ModelId`; owner package is one direct normal child; absolute/nested/traversal rejected | OS sandbox should additionally restrict filesystem visibility |
-| Symlink/replacement/non-file package | non-symlink root/file, no group/other write, `O_NOFOLLOW`, regular-file, device/inode/length equality, exact read | privileged/owner compromise remains out of process scope |
-| Package tamper/downgrade | exact SHA-384 identity, canonical V1 ranges/records, domain-separated strict Ed25519, key ID and active/revoked trust state | key rotation/rollback operational tooling is Stage 9 |
-| Model-supplied code or kernels | flat data-only fixed architecture; no plugins, graph executor, dynamic libraries, Metal/PTX, paths, or kernel selectors | each future backend needs separate code review |
-| Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, exhaustive fixture mutations, scheduled bounded coverage-guided package/tokenizer/frame fuzzing | production-size corpora and sustained soak campaigns remain required |
+| Arbitrary file access/path traversal | Clients send only `ModelId`; package is one safe direct child; importer canonicalizes source under quarantine; absolute/nested/traversal and URL inputs are rejected | OS sandbox should additionally restrict filesystem visibility |
+| Symlink/replacement/non-file package | non-symlink read-only root/package/direct files, `O_NOFOLLOW`, regular-file, device/inode/length equality; importer rejects quarantine escape, seals output, and preserves replaced package | privileged/owner compromise remains out of process scope |
+| Package tamper/downgrade | SHA-384 catalog identity and per-file/tensor hashes, closed file set, domain-separated strict Ed25519, key ID and active/revoked trust state | key rotation/rollback operational qualification remains |
+| Model-supplied code or kernels | exact data-only directory contents and fixed architecture; no plugins, graph executor, dynamic libraries, scripts, WASM, Metal/PTX, paths, or kernel selectors | each future backend needs separate code review |
+| Hostile source model | offline importer accepts only its bounded safetensors subset and first-party tokenizer metadata; pickle, `.bin`, `.pt`, `.pth`, scripts and unknown mappings are not parser inputs | approved real-model license/provenance and independent numeric evidence remain |
+| Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, malformed fixtures and bounded manifest/tensor-index/safetensors/path fuzz targets | production-size corpora and sustained campaigns remain required |
 | Memory/CPU denial | aggregate tensor reservations, fallible allocation, queue count/bytes, conservative active request/token/cursor/output retained-byte charging, tensor/context/token ceilings, CPU operation caps, finite socket deadlines, one 64-connection ceiling across authenticating/queued/active/draining ownership, eight-event output queues with ten-frame reservation, explicit 256 KiB ingress/cancellation/output stacks, one-token turns, request-local saturation, explicit CLI limits, continuous multi-stream tests, bounded delayed-reader/restart soak, and a pinned finite workflow definition | hosted cron evidence awaits default-branch integration; allocator-overhead measurement plus production-size operated continuous/slow-reader and long-context soak remain |
 | UDS impersonation/injection | owner-private runtime directory, mode-0600 inode-owned socket, kernel-reported peer effective UID must equal the engine service UID before frame allocation/parsing, strict frame directions, separate Ed25519 request and response identities, explicit two-key overlap with no discovery | production supervisor must run Go and Rust under the reviewed same-user service identity; operated rotation still needs qualification |
 | Replay/reordering | connection-order checks plus a bounded mode-0600 per-control-key journal that synchronizes each authenticated nonce before execution, holds an exclusive lifetime lock, and rejects duplicate/corrupt/truncated/exhausted/write-uncertain/contended state; current/previous control keys use distinct retained journals; streams cannot switch keys; every signed event binds the request nonce and a strictly increasing ordinal | journal archival/recovery and operated rotation need qualification |
@@ -44,12 +46,14 @@ token data, generated text, and engine events are untrusted.
 | Unauthorized process shutdown | no protocol/model shutdown command; only OS-authorized local principals can deliver `SIGINT`/`SIGTERM`; handler only enters the bounded graceful-drain path | run the service under a dedicated identity and target-specific supervisor/sandbox policy |
 | Dependency compromise | minimal exact lock, checked-in source-replacement vendor graph, SPDX checksums/licenses, exact boundary tests, no AI stack or build-time fetch | reproduce the release archive/offline build and renew advisory review for each release |
 | Prompt/event egress from Rust | permanent offline data-plane boundary; no network client dependency; architecture tests reject Internet sockets, raw socket FFI, async networking, subprocess egress, and cloud telemetry; authenticated UDS is the only communications path | production service definition must independently deny outbound networking and pass an operated no-egress test on each supported OS |
-| Unsafe/FFI memory error | unsafe is denied by default; separate architecture-tested modules own replay `flock`, process `sigaction`, and read-only kernel peer-credential calls; exact unsafe blocks are counted, descriptors stay borrowed/live, output storage uses exact ABI types, and no wrapper exposes raw handles; a pinned offline Linux/macOS workflow compiles and tests both credential implementations | confirm exact hosted results for each release, independently review each target OS, and isolate/document any future backend unsafe invariants separately |
+| Unsafe/FFI memory error | unsafe is denied by default; separate architecture-tested modules own replay `flock`, process `sigaction`, read-only kernel peer credentials, and private read-only non-executable tensor mappings; exact unsafe blocks are counted, lifetimes/descriptors are owned, and no wrapper exposes raw handles | confirm exact hosted results for each release, independently review each target OS, and isolate/document future backend unsafe invariants |
 | Agent Green spoofing/control | engine has no Agent Green client/key; model cannot emit authoritative decision; Go maps allowlisted telemetry | live mapping/delivery belongs to Go integration tests |
 
 ## Hard limits
 
-Package 1 TiB hard maximum (always lowered by configured memory), 262,144
+Package 1 TiB hard maximum (always lowered by configured memory), 64 MiB
+directory manifest, 1,024 shards, 1,027 hash entries, 1 MiB provenance,
+64 MiB safetensors header, 47-byte canonical tensor names, 2 MiB alignment, 262,144
 tensors, rank 8, dimension `1<<30`, elements `1<<40`, 4,194,304 vocabulary
 entries, 1,048,576-token collections, 262,144 context tokens, 4 MiB requests,
 8 MiB complete frames, 64 MiB tokenizer data, 4,096 sequences, 64 MiB queued

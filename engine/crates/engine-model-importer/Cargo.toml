@@ -1,0 +1,28 @@
+[package]
+name = "personalai-engine-model-importer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Offline Rust-only safetensors importer for signed PersonalAI model packages"
+
+[dependencies]
+ed25519-dalek.workspace = true
+personalai-engine-crypto.workspace = true
+personalai-engine-memory.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-tokenizer.workspace = true
+personalai-engine-types.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+personalai-engine-loader.workspace = true
+personalai-engine-scheduler.workspace = true
+personalai-engine-server.workspace = true
+personalai-engine-testkit.workspace = true
+
+[lints]
+workspace = true
