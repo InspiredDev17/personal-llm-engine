@@ -15,9 +15,9 @@ inference, KV state, deterministic greedy generation, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
-per-stream bounded output queues, and an owner CLI. The continuous CLI path
-remains intentionally single-worker until continuous ingress and graceful
-shutdown hardening is complete. The Go
+per-stream bounded output queues, a caller-shutdown continuous reference driver,
+and an owner CLI. The CLI remains intentionally single-worker until the new
+driver receives operated soak and a reviewed external shutdown integration. The Go
 repository contains the corresponding `NATIVE_ENGINE` provider adapter; it has
 no HTTP or remote-network fallback.
 
@@ -66,6 +66,10 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   and output-writer stack sizes, per-stream output events, and aggregate active
   request/token/cursor/output retention before work; a saturated writer queue
   cancels only its request;
+- the continuous reference path applies one 64-connection ceiling across
+  authenticating, queued, active, and draining streams; graceful shutdown stops
+  admission, interrupts incomplete handshakes, cancels work, and joins every
+  bounded worker before returning;
 - every authenticated command nonce is appended and synchronized to a bounded,
   mode-0600 per-control-key journal before the command can execute; an exclusive
   lifetime lock prevents a second process from using the same key journal, and

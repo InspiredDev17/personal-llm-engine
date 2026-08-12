@@ -22,12 +22,12 @@ memory, tool, approval, or Agent Green behavior.
 | 4. Tensor/CPU core | COMPLETE for target architecture | Safe owned tensors, aggregate memory pool, checked scalar work |
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
-| 7. Scheduler | PARTIAL for fair runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, bounded round-robin coordination, exact-batch multi-stream execution, and bounded output isolation complete; continuous admission remains |
-| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, active cancellation/disconnect watchers, durable per-key replay rejection, single-stream daemon plus bounded multi-stream reference batch with per-stream writers, Go `NATIVE_ENGINE` adapter and real socket tests |
+| 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
+| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, and scheduled bounded package/tokenizer/frame and authenticated-event fuzzing are complete; soak/performance, operated key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, and continuous graceful-drain reference serving are complete; CLI activation, soak/performance, operated key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -61,11 +61,12 @@ memory, tool, approval, or Agent Green behavior.
   rotation, and request-local failure. The UDS batch adds fixed eight-event
   queues and bounded writer threads; their worst-case retention is charged
   before cursor creation, and saturation cancels only the affected request.
-  Deterministic tests
-  prove independent KV state, non-starvation, and cancellation isolation. The UDS
-  reference batch now proves authenticated multi-stream execution and cleanup;
-  the continuous CLI path remains single-worker until continuous ingress and
-  graceful shutdown are implemented, and operated slow-reader soak remains.
+  Deterministic tests prove independent KV state, non-starvation, and
+  cancellation isolation. The UDS batch and continuous reference paths now
+  prove authenticated multi-stream execution, bounded ownership,
+  incomplete-handshake interruption, caller-owned graceful drain, and cleanup
+  on every exit. The CLI remains single-worker until external shutdown
+  integration and operated continuous/slow-reader soak pass.
 
 ## Next software release gate: production model operations
 
@@ -95,10 +96,9 @@ Before the native runtime becomes mandatory:
 
 - retain scheduled coverage-guided fuzzing, triage every reproducible finding,
   and grow production-size corpora without placing production model data in CI;
-- replace the exact-batch reference driver with bounded continuous UDS ingress
-  and graceful shutdown using the existing per-stream output isolation while
-  preserving cancellation, signed event ordering, connection cleanup, and
-  deterministic round-robin execution;
+- connect the bounded continuous reference driver to the owner CLI only after a
+  reviewed external shutdown mechanism and operated multi-client/slow-reader
+  soak preserve cancellation, signed ordering, cleanup, and round-robin fairness;
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;

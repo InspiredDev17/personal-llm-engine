@@ -61,19 +61,47 @@ impl UnixFrameListener {
             .listener
             .accept()
             .map_err(|_| EngineError::backend_failure("Unix socket accept failed"))?;
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .map_err(|_| EngineError::backend_failure("Unix socket read timeout setup failed"))?;
-        stream
-            .set_write_timeout(Some(IO_TIMEOUT))
-            .map_err(|_| EngineError::backend_failure("Unix socket write timeout setup failed"))?;
+        configure_stream(&stream)?;
         Ok(UnixFrameConnection { stream })
+    }
+
+    /// Switches the listener between blocking and readiness-polled admission.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), EngineError> {
+        self.listener
+            .set_nonblocking(nonblocking)
+            .map_err(|_| EngineError::backend_failure("Unix listener mode setup failed"))
+    }
+
+    /// Accepts one ready local connection without waiting when none is pending.
+    ///
+    /// The listener must have been placed in nonblocking mode by its owner.
+    pub fn try_accept(&self) -> Result<Option<UnixFrameConnection>, EngineError> {
+        match self.listener.accept() {
+            Ok((stream, _address)) => {
+                configure_stream(&stream)?;
+                Ok(Some(UnixFrameConnection { stream }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(EngineError::backend_failure("Unix socket accept failed")),
+        }
     }
 
     /// Returns the exact bound socket path.
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
+}
+
+fn configure_stream(stream: &UnixStream) -> Result<(), EngineError> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| EngineError::backend_failure("Unix stream blocking mode setup failed"))?;
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|_| EngineError::backend_failure("Unix socket read timeout setup failed"))?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|_| EngineError::backend_failure("Unix socket write timeout setup failed"))
 }
 
 impl Drop for UnixFrameListener {

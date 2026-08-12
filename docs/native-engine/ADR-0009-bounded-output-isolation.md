@@ -64,9 +64,9 @@ prove queue saturation and writer disappearance fail closed, aggregate queue
 retention is charged before cursor creation, real signed multi-stream delivery
 still completes, and a disconnected peer does not abort its neighbor.
 
-The continuous CLI is still single-worker. Continuous admission, graceful
-shutdown, initial-command read isolation, and operated slow-reader soak remain
-required before the batch path can replace it.
+ADR-0010 reuses this output isolation in a bounded continuous reference driver.
+The CLI remains single-worker until external shutdown integration and operated
+continuous/slow-reader soak qualify that reference path.
 
 ## Rejected alternatives
 

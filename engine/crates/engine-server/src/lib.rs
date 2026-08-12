@@ -7,6 +7,8 @@
 //! authority. Its only mutable disk state is the bounded, configuration-derived
 //! replay journal required before authenticated command execution.
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+mod continuous;
 #[cfg(unix)]
 mod os_lock;
 #[cfg(unix)]
@@ -14,6 +16,10 @@ mod replay;
 #[cfg(unix)]
 mod transport;
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub use continuous::{
+    ContinuousServeLimits, ContinuousServeSummary, ContinuousShutdown, MAX_CONTINUOUS_CONNECTIONS,
+};
 #[cfg(unix)]
 pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 #[cfg(unix)]
@@ -1428,6 +1434,7 @@ fn prepare_generation_connection<'a>(
                 );
             }
         };
+    *batch.next_sequence = following_sequence;
     let cancelled = Arc::new(AtomicBool::new(false));
     if let Err(error) = coordinator.submit_with_retained_bytes(
         model,
@@ -1467,7 +1474,6 @@ fn prepare_generation_connection<'a>(
         writer_failed: Arc::new(AtomicBool::new(false)),
         stream_error: None,
     });
-    *batch.next_sequence = following_sequence;
     Ok(())
 }
 
@@ -3327,6 +3333,131 @@ mod tests {
         assert_eq!(neighbor_client.join().expect("neighbor client must finish").last(), Some(&3));
         assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
         fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_reference_serves_ready_peers_and_drains_on_caller_shutdown() {
+        use std::thread;
+
+        let mut fixture = BatchRuntimeFixture::new("continuous", 1);
+        let first_request = fixture.request(641, "A", 2);
+        let second_request = fixture.request(642, "B", 2);
+        let first = signed_generation_frame(
+            &first_request,
+            40,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let second = signed_generation_frame(
+            &second_request,
+            41,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let first_socket = fixture.socket_path();
+        let second_socket = fixture.socket_path();
+        let response_key = fixture.response_public_key;
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let first_client =
+            spawn_ordered_runtime_test_client(first_socket, first, response_key, 40, 3);
+        let second_client =
+            spawn_ordered_runtime_test_client(second_socket, second, response_key, 41, 3);
+        let shutdown_thread = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(200));
+            request_shutdown.request();
+        });
+
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(2).expect("continuous limits must validate"),
+                &shutdown,
+            )
+            .expect("continuous reference must drain");
+        shutdown_thread.join().expect("shutdown request must finish");
+        assert_eq!(summary.completed_generations(), 2, "continuous summary: {summary:?}");
+        let first_events = first_client.join().expect("first client must finish");
+        let second_events = second_client.join().expect("second client must finish");
+        assert_eq!(first_events.last(), Some(&3));
+        assert_eq!(second_events.last(), Some(&3));
+        assert_eq!(summary.accepted_connections(), 2);
+        assert_eq!(summary.authenticated_commands(), 2);
+        assert_eq!(summary.completed_generations(), 2);
+        assert_eq!(summary.failed_connections(), 0);
+        assert_eq!(summary.peak_owned_connections(), 2);
+        fixture
+            .listener
+            .set_nonblocking(true)
+            .expect("listener mode must be restored before reuse");
+        assert!(fixture.listener.try_accept().expect("ready check must succeed").is_none());
+        fixture.listener.set_nonblocking(false).expect("listener mode must return to blocking");
+        assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_shutdown_interrupts_an_incomplete_authenticated_ingress_read() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut fixture = BatchRuntimeFixture::new("continuous-shutdown", 1);
+        let socket = fixture.socket_path();
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket).expect("silent client must connect");
+            connected.send(()).expect("connection must synchronize");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("shutdown must close owned ingress");
+            response
+        });
+        wait_for_connection.recv().expect("silent client must be connected");
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let shutdown_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            request_shutdown.request();
+        });
+
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(1).expect("continuous limits must validate"),
+                &shutdown,
+            )
+            .expect("incomplete ingress must drain");
+        shutdown_thread.join().expect("shutdown request must finish");
+        assert!(client.join().expect("silent client must finish").is_empty());
+        assert_eq!(summary.accepted_connections(), 1);
+        assert_eq!(summary.authenticated_commands(), 0);
+        assert_eq!(summary.failed_connections(), 1);
+        assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_connection_limits_are_exact_and_bounded() {
+        assert!(matches!(ContinuousServeLimits::new(0), Err(EngineError::InvalidInput(_))));
+        assert!(matches!(
+            ContinuousServeLimits::new(MAX_CONTINUOUS_CONNECTIONS + 1),
+            Err(EngineError::InvalidInput(_))
+        ));
+        assert_eq!(
+            ContinuousServeLimits::new(MAX_CONTINUOUS_CONNECTIONS)
+                .expect("hard limit must validate")
+                .maximum_connections(),
+            MAX_CONTINUOUS_CONNECTIONS
+        );
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]

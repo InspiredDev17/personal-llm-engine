@@ -97,9 +97,10 @@ and review record in an isolated FFI/backend module.
 ## Current completion boundary
 
 The software foundation through mutually authenticated, signed-package
-CPU-reference UDS generation is implemented and tested. Remaining release work
-is a production converter/package, continuous fuzzing, soak/performance and
-concurrent-runtime hardening, operated request/response-key injection,
-rotation/recovery evidence, repeatable vendor/SBOM release renewal, and
-hardware-specific accelerator implementation/validation. These limits prohibit
-claiming complete production replacement today.
+CPU-reference UDS generation and bounded continuous graceful-drain reference
+serving is implemented and tested. Remaining release work is a production
+converter/package, production-size fuzz/soak/performance evidence, external CLI
+shutdown integration, operated request/response-key injection, rotation/recovery
+evidence, repeatable vendor/SBOM release renewal, and hardware-specific
+accelerator implementation/validation. These limits prohibit claiming complete
+production replacement today.

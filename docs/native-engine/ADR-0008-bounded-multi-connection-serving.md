@@ -79,11 +79,10 @@ scheduler is empty afterward.
 The exact-batch reference still has deliberate production limitations. Accept
 waits for the declared count and initial command reads are sequential with
 finite timeouts. ADR-0009 adds bounded per-stream output isolation without
-changing this decision. The next activation slice must implement a bounded
-continuous accept/ingress driver and graceful shutdown without weakening
-authentication, replay, ordering, memory, output-queue, or cancellation
-invariants. Operated multi-client and slow-reader soak remains required before
-the CLI switches from `serve_one`.
+changing this decision, and ADR-0010 adds a separate continuous reference
+driver with graceful drain. Operated multi-client and slow-reader soak plus a
+reviewed external shutdown integration remain required before the CLI switches
+from `serve_one`.
 
 ## Rejected alternatives
 
