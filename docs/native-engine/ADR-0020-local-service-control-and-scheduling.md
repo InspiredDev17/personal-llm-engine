@@ -36,6 +36,14 @@ trailing data, invalid UTF-8, NUL prompt text, and kind/body mismatches fail
 closed. This tightens parsing without changing the PAISVC01/PAISVR01 wire
 representation.
 
+`fixtures/go-service-health-request-v1.hex` is an exact signed health request
+emitted by the production Go encoder with deterministic test-only identity
+material. The Rust decoder verifies its signature, correlation fields, key ID,
+message kind, and empty health body. The reciprocal Rust-generated signed
+response fixture is verified in Go. These copied fixtures are transitional
+cross-repository evidence until Sovereign Contracts owns a shared canonical
+corpus.
+
 The closed service catalog is `Hello`, `HelloAccepted`, `HelloRejected`,
 `ListCapabilities`, `ListRegisteredModels`, `LoadModel`, `UnloadModel`,
 `Tokenize`, `Generate`, `Cancel`, `GenerationEvent`, `Health`, `Metrics`,

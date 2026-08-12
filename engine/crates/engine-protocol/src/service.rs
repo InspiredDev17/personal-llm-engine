@@ -466,6 +466,38 @@ mod tests {
     }
 
     #[test]
+    fn go_health_request_conformance_fixture_verifies_and_decodes() {
+        let fixture = decode_hex(include_str!(
+            "../../../../docs/native-engine/fixtures/go-service-health-request-v1.hex"
+        ));
+        let key_id_bytes = [0x32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let key_id = SignerKeyId::from_bytes(key_id_bytes).expect("Go fixture key ID");
+        let public_key = [
+            0xeb, 0xe8, 0x0b, 0x7c, 0xad, 0xea, 0x27, 0x7a, 0xc0, 0x5f, 0xb8, 0x5c, 0x71, 0x64,
+            0xfe, 0x15, 0xeb, 0xd6, 0x87, 0x3c, 0x4a, 0x74, 0xb3, 0x29, 0x6a, 0x46, 0x2a, 0x10,
+            0x26, 0xfd, 0x9b, 0x0f,
+        ];
+        let trusted = TrustedControlPlaneKeys::single(
+            TrustedControlPlaneKey::active(key_id, public_key).expect("Go fixture key"),
+        )
+        .expect("Go fixture key ring");
+        let request =
+            AuthenticatedServiceRequest::decode(&fixture, &trusted).expect("Go health request");
+
+        assert_eq!(request.kind(), ServiceMessageKind::Health);
+        assert_eq!(request.nonce(), 7);
+        assert_eq!(request.control_key_id(), key_id);
+        assert_eq!(
+            request.request_id().to_bytes(),
+            [
+                0xcf, 0x43, 0xd8, 0x8d, 0x78, 0xf2, 0x8f, 0x04, 0xf7, 0xd9, 0x06, 0x03, 0x23, 0x3e,
+                0x55, 0xf9,
+            ]
+        );
+        assert_eq!(request.body(), &ServiceRequestBody::Health);
+    }
+
+    #[test]
     fn request_direction_and_lengths_fail_closed() {
         let request_id = RequestId::new(1).expect("request ID");
         let key_id = SignerKeyId::from_bytes([1; 16]).expect("key ID");
@@ -620,5 +652,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let value = value.trim();
+        assert_eq!(value.len() % 2, 0, "hex fixture length");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = hex_nibble(pair[0]);
+                let low = hex_nibble(pair[1]);
+                (high << 4) | low
+            })
+            .collect()
+    }
+
+    fn hex_nibble(value: u8) -> u8 {
+        match value {
+            b'0'..=b'9' => value - b'0',
+            b'a'..=b'f' => value - b'a' + 10,
+            _ => panic!("fixture must use lowercase hexadecimal"),
+        }
     }
 }
