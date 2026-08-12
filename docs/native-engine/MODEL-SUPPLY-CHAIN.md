@@ -138,7 +138,14 @@ signer status, independent tokenizer/logit/generation vectors, resource and
 corruption evidence, target-hardware results, SBOM/advisory records, and a
 rollback drill. The synthetic fixture proves mechanics only, not model quality.
 
-Model Foundry registry V2 parsing and exact owner-selected signature verification
-are implemented, but registration, path derivation, activation, and loading from
-that entry are not. ADR-0020 freezes the boundary; Model Foundry flat V1 is not
-compatible with this loader and must not be translated or used as fallback.
+Model Foundry registry V2 parsing, exact owner-selected signature verification,
+explicit registry-backed registration, canonical path derivation, and terminal
+package loading are implemented. The owner must pin the exact sequence,
+envelope SHA-384, `ModelId`, `ArtifactId`, both public signer identities, and a
+nondecreasing sequence floor. The engine opens only the derived sequence file,
+verifies it before package access, and derives the approved package path from
+the signed entry. It then rechecks the signed catalog, package signer, context,
+tokenizer, provenance, and shard identities before allocation. Failure never
+falls back to owner-pinned registration. Owner CLI/Go activation remains a
+separate integration gate. Model Foundry flat V1 is not compatible with this
+loader and must not be translated or used as fallback. See ADR-0020.

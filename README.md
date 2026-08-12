@@ -10,6 +10,7 @@ memory, and audit. The engine is inference-only and is not a second AI platform.
 The workspace implements a signed directory-backed data-only `.paimodel`
 format, a Rust-only quarantine safetensors importer, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
+an explicit exact-owner-selected Model Foundry registry V2 admission mode,
 no-follow direct-file opening, read-only non-executable shard mapping, a first-party bounded byte/BPE tokenizer, safe aggregate-
 accounted tensors, one fixed decoder architecture, scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
@@ -59,6 +60,9 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - no model training, Python, TypeScript, TCP listener, outbound connection,
   download, updater, dynamic-library discovery, or model-supplied code;
 - clients send a registered `ModelId`, never a path;
+- registry-backed admission verifies the exact owner-selected signed V2 entry
+  before package access, derives the approved path from signed identities, and
+  never chooses `latest` or falls back to owner-pinned registration;
 - Go signs control requests; Rust signs every response with a separate
   owner-provisioned response identity whose seed enters only through stdin and
   is zeroized after construction;

@@ -1,6 +1,6 @@
 # ADR-0020: Model Foundry registry V2 and directory-package boundary
 
-- Status: Accepted; Phase 1 bounded parser implemented
+- Status: Accepted; Phases 1 and 2 implemented
 - Date: 2026-08-12
 - Native Engine review base: `f458c46cd7cd69e73fddd575669604f99373acce`
 - Model Foundry review base: `d6ab7b99fa083a76688ac5ef4b32b2e31480118c`
@@ -14,10 +14,11 @@ signs the catalog digest under
 `decoder-rms-rope-swiglu-gqa-v1`, its tokenizer is `PAIBPE01`, and production
 storage is F32.
 
-Model Foundry V1 currently emits a different flat `.paimodel` file, signs a
+At the review base, Model Foundry V1 emits a different flat `.paimodel` file, signs a
 different transcript, hashes the complete flat file, and records
 `personalai.decoder-v1` in registry schema V1. Sharing a suffix does not make
-the formats compatible. The engine does not parse the Model Foundry registry.
+the formats compatible. The review-base engine does not parse the Model Foundry
+registry.
 
 ## Decision
 
@@ -27,7 +28,7 @@ versioned directory writer and terminal verifier before its output can enter
 this loader. Flat Model Foundry V1 is neither translated nor treated as a
 fallback.
 
-The proposed selection contract is Model Foundry registry schema V2, signed
+The implemented selection contract is Model Foundry registry schema V2, signed
 under `PersonalAI.ModelRegistry.Entry.Signature.v2\0`. It binds SHA-384 of
 `hashes.aiph` as `package_catalog_sha384` and the exact profile
 `directory-paimodel-v1+decoder-rms-rope-swiglu-gqa-v1+paibpe01+f32-cpu-reference`.
@@ -36,13 +37,14 @@ It names distinct `registry_signer` and `package_signer` identities.
 The Go control plane and deployment owner remain authoritative for exact
 registry sequence/entry selection, both public trust roles, the nondecreasing
 external anti-rollback checkpoint, activation, and resource budgets. The engine
-will eventually derive the directory path from exact owner-selected `ModelId`
-and `ArtifactId`; it will not accept request paths, query a remote registry,
-choose `latest`, or fall back after registry verification failure.
+derives the directory path from exact owner-selected `ModelId` and `ArtifactId`;
+it does not accept request paths, query a remote registry, choose `latest`, or
+fall back after registry verification failure.
 
-This ADR does not implement a registry parser or change the loader. Those are
-Phase 1 changes requiring bounded parsing, fuzzing, shared positive/negative
-vectors, and a separately reviewed engine configuration schema.
+Phase 1 added bounded parsing, signature verification, fuzzing, and shared
+positive/negative vectors. Phase 2 adds a separate registry-backed registration
+mode and terminally binds the selected registry decision to package loading.
+It does not add owner CLI or Go activation; that remains Phase 3.
 
 ## Frozen evidence
 
@@ -62,11 +64,24 @@ model approval or a trusted production identity.
 ## Consequences
 
 Phase 1 implements both the Foundry directory writer/verifier and this engine's
-bounded registry parser/verifier. It does not connect a registry decision to
-package path derivation, registration, activation, or loading. A trusted adapter
-still cannot repair a legacy flat-package mismatch, and no cross-repository
-positive production load is claimed before Phase 2.
+bounded registry parser/verifier. Phase 2 introduces
+`RegistrationMode::ModelFoundryRegistryV2`. Owner selection binds the exact
+sequence, envelope SHA-384, `ModelId`, `ArtifactId`, distinct trusted registry
+and package signers, and a nonzero anti-rollback sequence floor. The engine
+securely opens only `registry/<sequence>.registry.json`, verifies it before
+package access, and derives
+`<approved>/<ArtifactId>/<ModelId>.paimodel` from the verified entry.
 
-Existing owner-pinned directory registration remains the only implemented
-production admission mode. Any future coexistence with registry-backed mode is
-explicit and downgrade-proof; registry failure never selects legacy mode.
+Loading rechecks the signed catalog identity, package signature, context,
+tokenizer hash, provenance hash, and complete sorted shard-hash set before model
+allocation. Existing owner-pinned registration remains a separate explicit
+mode; registry failure never selects it as fallback. A trusted adapter still
+cannot repair a legacy flat-package mismatch.
+
+Phase 2 tests reject an absent exact sequence when a differently numbered entry
+exists, a symlinked registry entry, a symlinked artifact root, wrong
+owner-selected identities, signer-role mismatch, signature corruption, and
+anti-rollback mismatch. The positive test regenerates the frozen synthetic
+package, registers it only through the exact signed V2 entry, and loads it under
+the ordinary resource budget. Owner CLI/Go activation is intentionally still
+absent, so model requests cannot select or mutate this mode.
