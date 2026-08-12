@@ -44,9 +44,13 @@ use personalai_engine_types::{
     RequestId,
 };
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_types::{GenerationEvent, GenerationUsage, SequenceId, TextChunk, TokenId};
+use personalai_engine_types::{
+    GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES, SequenceId, TextChunk, TokenId,
+};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::collections::BTreeMap;
+#[cfg(feature = "cpu-reference")]
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "cpu-reference")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -518,6 +522,180 @@ impl GreedyGeneration<'_> {
     /// Returns decoder tokens committed to this request-local KV cache.
     pub fn processed_tokens(&self) -> u32 {
         self.session.as_ref().map_or(0, CpuDecoderSession::token_count)
+    }
+
+    const fn concurrent_sequence_limit(&self) -> u32 {
+        self.request.resource_budget().max_concurrent_sequences()
+    }
+}
+
+/// One bounded turn completed by [`GenerationRoundRobin`].
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledGenerationAdvance {
+    request_id: RequestId,
+    sequence_id: SequenceId,
+    decoder_tokens_advanced: u32,
+    event: Option<GenerationEvent>,
+}
+
+#[cfg(feature = "cpu-reference")]
+impl ScheduledGenerationAdvance {
+    /// Returns the request correlation identifier for this turn.
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the engine-assigned sequence identifier for this turn.
+    pub const fn sequence_id(&self) -> SequenceId {
+        self.sequence_id
+    }
+
+    /// Returns decoder tokens committed during this turn; always zero or one.
+    pub const fn decoder_tokens_advanced(&self) -> u32 {
+        self.decoder_tokens_advanced
+    }
+
+    /// Returns the event that must be delivered before requesting another turn.
+    pub const fn event(&self) -> Option<&GenerationEvent> {
+        self.event.as_ref()
+    }
+
+    /// Consumes the turn and returns its optional event.
+    pub fn into_event(self) -> Option<GenerationEvent> {
+        self.event
+    }
+}
+
+#[cfg(feature = "cpu-reference")]
+struct ScheduledGeneration<'a> {
+    generation: GreedyGeneration<'a>,
+    cancelled: &'a AtomicBool,
+}
+
+/// Bounded deterministic round-robin coordinator for active CPU sequences.
+///
+/// The coordinator buffers no events: callers receive at most one event from
+/// each turn and must deliver or reject it before advancing again. Cursor
+/// failures become request-local `Failed` events and do not stop neighboring
+/// sequences. This type performs no socket I/O and grants no authority.
+#[cfg(feature = "cpu-reference")]
+pub struct GenerationRoundRobin<'a> {
+    maximum_active: u32,
+    ready: VecDeque<ScheduledGeneration<'a>>,
+}
+
+#[cfg(feature = "cpu-reference")]
+impl<'a> GenerationRoundRobin<'a> {
+    /// Creates an empty coordinator with a hard active-sequence ceiling.
+    pub fn new(maximum_active: u32) -> Result<Self, EngineError> {
+        if maximum_active == 0 || maximum_active > MAX_CONCURRENT_SEQUENCES {
+            return Err(EngineError::invalid_input(
+                "round-robin active limit is outside hard bounds",
+            ));
+        }
+        Ok(Self { maximum_active, ready: VecDeque::new() })
+    }
+
+    /// Admits one request and creates its cursor only after capacity checks.
+    pub fn submit(
+        &mut self,
+        model: &'a LoadedCpuModel,
+        request: &'a GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: &'a AtomicBool,
+    ) -> Result<(), EngineError> {
+        if self.ready.iter().any(|scheduled| {
+            scheduled.generation.request_id() == request.request_id()
+                || scheduled.generation.sequence_id() == sequence_id
+        }) {
+            return Err(EngineError::protocol_violation(
+                "round-robin request or sequence identifier is already active",
+            ));
+        }
+        let current = u32::try_from(self.ready.len())
+            .map_err(|_| EngineError::internal_invariant("round-robin active count exceeds u32"))?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            EngineError::resource_exhaustion("round-robin active count overflows")
+        })?;
+        if next > self.maximum_active {
+            return Err(EngineError::resource_exhaustion(
+                "round-robin active sequence limit is reached",
+            ));
+        }
+        let budget_limit = self
+            .ready
+            .iter()
+            .map(|scheduled| scheduled.generation.concurrent_sequence_limit())
+            .chain(std::iter::once(request.resource_budget().max_concurrent_sequences()))
+            .min()
+            .ok_or_else(|| {
+                EngineError::internal_invariant("round-robin admission budget disappeared")
+            })?;
+        if next > budget_limit {
+            return Err(EngineError::resource_exhaustion(
+                "request concurrency budget does not admit another active sequence",
+            ));
+        }
+        self.ready
+            .try_reserve(1)
+            .map_err(|_| EngineError::resource_exhaustion("round-robin queue allocation failed"))?;
+        let generation = model.start_greedy(request, sequence_id)?;
+        self.ready.push_back(ScheduledGeneration { generation, cancelled });
+        Ok(())
+    }
+
+    /// Advances the next active sequence once, then rotates it to the back.
+    ///
+    /// `Ok(None)` means no sequence is active. A completed or failed sequence is
+    /// removed before this method returns.
+    pub fn advance_next(&mut self) -> Result<Option<ScheduledGenerationAdvance>, EngineError> {
+        let Some(mut scheduled) = self.ready.pop_front() else {
+            return Ok(None);
+        };
+        let request_id = scheduled.generation.request_id();
+        let sequence_id = scheduled.generation.sequence_id();
+        let before = scheduled.generation.processed_tokens();
+        let advance = scheduled.generation.advance(scheduled.cancelled);
+        let after = scheduled.generation.processed_tokens();
+        let decoder_tokens_advanced = after.checked_sub(before).ok_or_else(|| {
+            EngineError::internal_invariant("round-robin decoder token count decreased")
+        })?;
+        if decoder_tokens_advanced > 1 {
+            return Err(EngineError::internal_invariant(
+                "round-robin turn advanced more than one decoder token",
+            ));
+        }
+        let (event, retain) = match advance {
+            Ok(GreedyAdvance::Progressed) => (None, true),
+            Ok(GreedyAdvance::Event(event)) => {
+                let retain = !scheduled.generation.is_complete();
+                (Some(event), retain)
+            }
+            Err(error) => (
+                Some(GenerationEvent::Failed { request_id, sequence_id: Some(sequence_id), error }),
+                false,
+            ),
+        };
+        if retain {
+            self.ready.push_back(scheduled);
+        }
+        Ok(Some(ScheduledGenerationAdvance {
+            request_id,
+            sequence_id,
+            decoder_tokens_advanced,
+            event,
+        }))
+    }
+
+    /// Returns the number of active cursors.
+    pub fn active_len(&self) -> usize {
+        self.ready.len()
+    }
+
+    /// Returns whether no cursor remains active.
+    pub fn is_empty(&self) -> bool {
+        self.ready.is_empty()
     }
 }
 
@@ -1443,57 +1621,43 @@ mod tests {
         .expect("second request must validate");
         let first_sequence = SequenceId::new(21).expect("sequence must validate");
         let second_sequence = SequenceId::new(22).expect("sequence must validate");
-        let mut first =
-            loaded.start_greedy(&first_request, first_sequence).expect("first cursor must start");
-        let mut second = loaded
-            .start_greedy(&second_request, second_sequence)
-            .expect("second cursor must start");
         let first_cancelled = AtomicBool::new(false);
         let second_cancelled = AtomicBool::new(false);
         let mut first_events = Vec::new();
         let mut second_events = Vec::new();
         let mut completion_order = Vec::new();
+        let mut coordinator = GenerationRoundRobin::new(2).expect("coordinator must validate");
+        coordinator
+            .submit(&loaded, &first_request, first_sequence, &first_cancelled)
+            .expect("first cursor must admit");
+        coordinator
+            .submit(&loaded, &second_request, second_sequence, &second_cancelled)
+            .expect("second cursor must admit");
 
-        for _round in 0..64 {
-            if !first.is_complete() {
-                let before = first.processed_tokens();
-                if let GreedyAdvance::Event(event) =
-                    first.advance(&first_cancelled).expect("first cursor must advance")
-                {
-                    if matches!(event, GenerationEvent::Completed { .. }) {
-                        completion_order.push(event.request_id());
-                    }
-                    first_events.push(event);
+        for _turn in 0..64 {
+            let turn = coordinator
+                .advance_next()
+                .expect("round-robin turn must advance")
+                .expect("an active cursor must remain");
+            assert!(turn.decoder_tokens_advanced() <= 1);
+            if let Some(event) = turn.into_event() {
+                if matches!(event, GenerationEvent::Completed { .. }) {
+                    completion_order.push(event.request_id());
                 }
-                let advanced = first
-                    .processed_tokens()
-                    .checked_sub(before)
-                    .expect("first cursor token count must not decrease");
-                assert!(advanced <= 1);
-            }
-            if !second.is_complete() {
-                let before = second.processed_tokens();
-                if let GreedyAdvance::Event(event) =
-                    second.advance(&second_cancelled).expect("second cursor must advance")
-                {
-                    if matches!(event, GenerationEvent::Completed { .. }) {
-                        completion_order.push(event.request_id());
-                    }
+                if event.request_id() == first_request.request_id() {
+                    first_events.push(event);
+                } else {
+                    assert_eq!(event.request_id(), second_request.request_id());
                     second_events.push(event);
                 }
-                let advanced = second
-                    .processed_tokens()
-                    .checked_sub(before)
-                    .expect("second cursor token count must not decrease");
-                assert!(advanced <= 1);
             }
-            if first.is_complete() && second.is_complete() {
+            if coordinator.is_empty() {
                 break;
             }
         }
 
-        assert!(first.is_complete());
-        assert!(second.is_complete());
+        assert!(coordinator.is_empty());
+        assert_eq!(coordinator.active_len(), 0);
         assert_eq!(
             completion_order,
             [second_request.request_id(), first_request.request_id()],
@@ -1503,11 +1667,262 @@ mod tests {
         assert!(matches!(first_events.last(), Some(GenerationEvent::Completed { .. })));
         assert!(matches!(second_events.first(), Some(GenerationEvent::Started { .. })));
         assert!(matches!(second_events.last(), Some(GenerationEvent::Completed { .. })));
-        assert_eq!(first.request_id(), first_request.request_id());
-        assert_eq!(second.sequence_id(), second_sequence);
-        assert!(first.usage().is_some());
-        assert!(second.usage().is_some());
-        assert!(matches!(first.advance(&first_cancelled), Err(EngineError::ProtocolViolation(_))));
+        assert!(matches!(coordinator.advance_next(), Ok(None)));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn round_robin_admission_enforces_active_and_request_limits() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-admission").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-admission.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget_two = ResourceBudget::new(1 << 24, 1 << 20, 2).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget_two)
+            .expect("decoder must load");
+        let first_request = GenerationRequest::new(
+            RequestId::new(301).expect("request ID must validate"),
+            model_id.clone(),
+            "A",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget_two,
+        )
+        .expect("request must validate");
+        let second_request = GenerationRequest::new(
+            RequestId::new(302).expect("request ID must validate"),
+            model_id.clone(),
+            "B",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget_two,
+        )
+        .expect("request must validate");
+        let first_cancelled = AtomicBool::new(false);
+        let second_cancelled = AtomicBool::new(false);
+
+        assert!(matches!(GenerationRoundRobin::new(0), Err(EngineError::InvalidInput(_))));
+        assert!(matches!(
+            GenerationRoundRobin::new(MAX_CONCURRENT_SEQUENCES + 1),
+            Err(EngineError::InvalidInput(_))
+        ));
+        let mut capacity_one = GenerationRoundRobin::new(1).expect("limit must validate");
+        capacity_one
+            .submit(
+                &loaded,
+                &first_request,
+                SequenceId::new(31).expect("sequence must validate"),
+                &first_cancelled,
+            )
+            .expect("first cursor must admit");
+        assert!(matches!(
+            capacity_one.submit(
+                &loaded,
+                &second_request,
+                SequenceId::new(32).expect("sequence must validate"),
+                &second_cancelled,
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+
+        let budget_one = ResourceBudget::new(1 << 24, 1 << 20, 1).expect("budget must validate");
+        let budgeted_request = GenerationRequest::new(
+            RequestId::new(303).expect("request ID must validate"),
+            model_id,
+            "C",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget_one,
+        )
+        .expect("request must validate");
+        let budget_cancelled = AtomicBool::new(false);
+        let mut budget_limited = GenerationRoundRobin::new(2).expect("limit must validate");
+        budget_limited
+            .submit(
+                &loaded,
+                &budgeted_request,
+                SequenceId::new(33).expect("sequence must validate"),
+                &budget_cancelled,
+            )
+            .expect("budgeted cursor must admit");
+        assert!(matches!(
+            budget_limited.submit(
+                &loaded,
+                &second_request,
+                SequenceId::new(34).expect("sequence must validate"),
+                &second_cancelled,
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn round_robin_rejects_duplicate_active_identities() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-identities").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-identities.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 2).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("decoder must load");
+        let first_request = GenerationRequest::new(
+            RequestId::new(351).expect("request ID must validate"),
+            model_id.clone(),
+            "A",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let second_request = GenerationRequest::new(
+            RequestId::new(352).expect("request ID must validate"),
+            model_id.clone(),
+            "B",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let duplicate_request = GenerationRequest::new(
+            first_request.request_id(),
+            model_id,
+            "C",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("duplicate-ID request must otherwise validate");
+        let first_cancelled = AtomicBool::new(false);
+        let second_cancelled = AtomicBool::new(false);
+        let duplicate_cancelled = AtomicBool::new(false);
+        let duplicate_sequence = SequenceId::new(35).expect("sequence must validate");
+        let mut coordinator = GenerationRoundRobin::new(2).expect("limit must validate");
+        coordinator
+            .submit(&loaded, &first_request, duplicate_sequence, &first_cancelled)
+            .expect("first identity must admit");
+        assert!(matches!(
+            coordinator.submit(
+                &loaded,
+                &duplicate_request,
+                SequenceId::new(36).expect("sequence must validate"),
+                &duplicate_cancelled,
+            ),
+            Err(EngineError::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            coordinator.submit(&loaded, &second_request, duplicate_sequence, &second_cancelled,),
+            Err(EngineError::ProtocolViolation(_))
+        ));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn round_robin_cancellation_is_request_local() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-cursor-cancel").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-cursor-cancel.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 2).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("decoder must load");
+        let cancelled_request = GenerationRequest::new(
+            RequestId::new(401).expect("request ID must validate"),
+            model_id.clone(),
+            "AAA",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let neighbor_request = GenerationRequest::new(
+            RequestId::new(402).expect("request ID must validate"),
+            model_id,
+            "B",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let cancelled = AtomicBool::new(false);
+        let neighbor_cancelled = AtomicBool::new(false);
+        let mut coordinator = GenerationRoundRobin::new(2).expect("limit must validate");
+        coordinator
+            .submit(
+                &loaded,
+                &cancelled_request,
+                SequenceId::new(41).expect("sequence must validate"),
+                &cancelled,
+            )
+            .expect("cancelled cursor must admit");
+        coordinator
+            .submit(
+                &loaded,
+                &neighbor_request,
+                SequenceId::new(42).expect("sequence must validate"),
+                &neighbor_cancelled,
+            )
+            .expect("neighbor cursor must admit");
+
+        for expected_request in [cancelled_request.request_id(), neighbor_request.request_id()] {
+            let turn = coordinator
+                .advance_next()
+                .expect("start turn must advance")
+                .expect("cursor must remain active");
+            assert_eq!(turn.request_id(), expected_request);
+            assert!(matches!(turn.event(), Some(GenerationEvent::Started { .. })));
+        }
+        cancelled.store(true, Ordering::Release);
+        let failed = coordinator
+            .advance_next()
+            .expect("cancelled turn must advance")
+            .expect("cancelled cursor must produce a turn");
+        assert_eq!(failed.request_id(), cancelled_request.request_id());
+        assert!(matches!(
+            failed.event(),
+            Some(GenerationEvent::Failed { error: EngineError::Cancellation(_), .. })
+        ));
+        assert_eq!(coordinator.active_len(), 1);
+
+        let mut neighbor_completed = false;
+        for _turn in 0..32 {
+            let turn = coordinator
+                .advance_next()
+                .expect("neighbor turn must advance")
+                .expect("neighbor cursor must remain until completion");
+            assert_eq!(turn.request_id(), neighbor_request.request_id());
+            assert!(turn.decoder_tokens_advanced() <= 1);
+            if matches!(turn.event(), Some(GenerationEvent::Completed { .. })) {
+                neighbor_completed = true;
+                break;
+            }
+        }
+        assert!(neighbor_completed);
+        assert!(coordinator.is_empty());
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]

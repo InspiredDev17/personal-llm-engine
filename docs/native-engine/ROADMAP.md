@@ -22,7 +22,7 @@ memory, tool, approval, or Agent Green behavior.
 | 4. Tensor/CPU core | COMPLETE for target architecture | Safe owned tensors, aggregate memory pool, checked scalar work |
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
-| 7. Scheduler | PARTIAL for fair runtime | Count/byte admission, FIFO lifecycle, queued cancellation, and resumable one-token generation cursors complete; multi-connection round-robin orchestration remains |
+| 7. Scheduler | PARTIAL for fair runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, and a bounded request-isolating round-robin coordinator complete; authenticated multi-connection UDS activation remains |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, active same-stream cancellation/disconnect watcher, durable per-key replay rejection, UDS runtime, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
@@ -55,9 +55,13 @@ memory, tool, approval, or Agent Green behavior.
   parsers plus bounded Go fuzz targets for unsigned and authenticated response
   events, with deterministic Rust-generated seeds and scheduled CI campaigns.
 - Request-local greedy generation cursors yield after at most one decoder token
-  step; deterministic interleaving proves independent KV state and lets a short
-  prompt complete without waiting for a longer prompt. The compatibility path
-  remains synchronous until the multi-connection runtime is implemented.
+  step. A bounded pull-based coordinator enforces active/request concurrency
+  limits and unique active identities before cursor construction, plus fallible
+  queue growth, one-turn rotation, zero event buffering, and request-local
+  failure. Deterministic tests prove
+  independent KV state, non-starvation, and cancellation isolation. The UDS
+  compatibility path remains synchronous until multi-connection integration is
+  implemented.
 
 ## Next software release gate: production model operations
 
@@ -87,8 +91,9 @@ Before the native runtime becomes mandatory:
 
 - retain scheduled coverage-guided fuzzing, triage every reproducible finding,
   and grow production-size corpora without placing production model data in CI;
-- connect the resumable generation cursor to bounded multi-connection
-  round-robin orchestration with per-stream cancellation and backpressure;
+- connect the tested round-robin coordinator to authenticated multi-connection
+  UDS handling with per-stream cancellation, signed event ordering, bounded
+  writes, and connection cleanup;
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;
