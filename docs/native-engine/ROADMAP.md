@@ -27,7 +27,7 @@ memory, tool, approval, or Agent Green behavior.
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, and signal-drained continuous CLI serving are complete; soak/performance, operated key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and its pinned scheduled-workflow definition are complete; hosted cron evidence awaits default-branch integration, while production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
@@ -67,7 +67,11 @@ memory, tool, approval, or Agent Green behavior.
   incomplete-handshake interruption, caller-owned graceful drain, and cleanup
   on every exit. The owner CLI selects that path only through explicit bounded
   limits; isolated `SIGINT`/`SIGTERM` handling drives the same tested graceful
-  drain. Operated continuous/slow-reader soak remains required.
+  drain. A non-ignored test runs eight six-client restart cycles, holds one
+  reader until five authenticated neighbors finish, validates all terminal
+  signatures/order, drains, and proves cleanup. The exact configured CI workload
+  of eight repetitions passed locally; GitHub's weekly cron begins only after
+  default-branch integration. Production-size operated soak remains required.
 
 ## Next software release gate: production model operations
 
@@ -97,8 +101,9 @@ Before the native runtime becomes mandatory:
 
 - retain scheduled coverage-guided fuzzing, triage every reproducible finding,
   and grow production-size corpora without placing production model data in CI;
-- preserve cancellation, signed ordering, cleanup, and round-robin fairness in
-  operated multi-client/slow-reader soak of the signal-drained continuous CLI;
+- reproduce cancellation, signed ordering, cleanup, and round-robin fairness in
+  production-size operated multi-client/slow-reader soak of the signal-drained
+  continuous CLI; the bounded synthetic scheduled gate is already mandatory;
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;

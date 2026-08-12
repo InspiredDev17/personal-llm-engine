@@ -80,6 +80,9 @@ Operated slow-reader/multi-client soak, production key injection and recovery,
 peer-credential policy, package conversion, performance evidence, canary, and
 rollback work remain.
 
+ADR-0012 subsequently adds scheduled bounded synthetic delayed-reader and
+restart soak. Production-size operated qualification remains distinct.
+
 ## Rejected alternatives
 
 - **Model or client shutdown command:** expands the wire protocol and grants a

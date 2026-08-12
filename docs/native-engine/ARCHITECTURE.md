@@ -162,7 +162,8 @@ signature, nonce, ordinal, request ID, event schema, and usage before exposing
 canonical platform responses. It has no HTTP fallback. Operated
 continuous/slow-reader soak, peer-credential qualification, and optional
 architecture-owned batching remain production hardening work. ADR-0011 defines
-CLI signal integration; ADR-0010 defines continuous admission and graceful drain;
+CLI signal integration. ADR-0012 defines the scheduled bounded delayed-reader
+and restart soak; ADR-0010 defines continuous admission and graceful drain;
 ADR-0009 defines bounded output isolation; ADR-0008 defines the bounded
 multi-connection reference path; ADR-0007 defines the resumable generation and
 round-robin coordination boundary; ADR-0005

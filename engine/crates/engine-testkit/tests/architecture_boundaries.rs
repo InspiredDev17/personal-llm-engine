@@ -133,6 +133,34 @@ fn fuzz_tooling_is_isolated_from_the_production_release_graph() {
 }
 
 #[test]
+fn continuous_soak_workflow_is_pinned_bounded_and_fail_closed() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let workflow = fs::read_to_string(repository.join(".github/workflows/continuous-soak.yml"))
+        .expect("bounded continuous soak workflow must exist");
+    for required in [
+        "schedule:",
+        "workflow_dispatch:",
+        "permissions:\n  contents: read",
+        "timeout-minutes: 15",
+        "actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955",
+        "rustup toolchain install 1.85.0 --profile minimal",
+        "for pass in 1 2 3 4 5 6 7 8; do",
+        "cargo +1.85.0 test --locked --all-features",
+        "tests::bounded_continuous_soak_isolates_delayed_readers_across_restarts",
+        "-- --exact",
+    ] {
+        assert!(workflow.contains(required), "soak workflow omitted invariant {required:?}");
+    }
+    for prohibited in ["continue-on-error", "pull_request_target", "sudo ", "curl ", "wget "] {
+        assert!(
+            !workflow.contains(prohibited),
+            "soak workflow contains prohibited capability {prohibited:?}"
+        );
+    }
+}
+
+#[test]
 fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
     let root = engine_root();
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");

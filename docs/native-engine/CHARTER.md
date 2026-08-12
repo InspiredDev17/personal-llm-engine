@@ -99,8 +99,9 @@ and review record in an isolated FFI/backend module.
 
 The software foundation through mutually authenticated, signed-package
 CPU-reference UDS generation and bounded continuous graceful-drain reference
-serving is implemented and tested. Remaining release work is a production
-converter/package, production-size fuzz/soak/performance evidence, operated
+serving plus deterministic delayed-reader/restart soak is implemented and
+tested. Remaining release work is a production converter/package,
+production-size fuzz/operated-soak/performance evidence, operated
 request/response-key injection, rotation/recovery evidence, repeatable
 vendor/SBOM release renewal, and hardware-specific
 accelerator implementation/validation. These limits prohibit claiming complete

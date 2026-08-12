@@ -3446,6 +3446,112 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
+    fn bounded_continuous_soak_isolates_delayed_readers_across_restarts() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        const SOAK_CYCLES: u128 = 8;
+        const FAST_CLIENTS_PER_CYCLE: u128 = 5;
+        const CONNECTIONS_PER_CYCLE: u32 = 6;
+
+        for cycle in 0..SOAK_CYCLES {
+            let mut fixture = BatchRuntimeFixture::new("continuous-soak", 3);
+            let nonce_base = 1_000_u64
+                .checked_add(u64::try_from(cycle).expect("cycle must fit") * 100)
+                .expect("soak nonce must fit");
+            let request_base =
+                10_000_u128.checked_add(cycle * 100).expect("soak request ID must fit");
+            let delayed_request = fixture.request(request_base, "S", 2);
+            let delayed_frame = signed_generation_frame(
+                &delayed_request,
+                nonce_base,
+                fixture.control_key_id,
+                &fixture.control_signing_key,
+            );
+            let (release_delayed, delayed_client) = spawn_ordered_delayed_runtime_test_client(
+                fixture.socket_path(),
+                delayed_frame,
+                fixture.response_public_key,
+                nonce_base,
+                3,
+            );
+
+            let mut fast_clients = Vec::new();
+            fast_clients
+                .try_reserve_exact(
+                    usize::try_from(FAST_CLIENTS_PER_CYCLE)
+                        .expect("fast client count must address"),
+                )
+                .expect("fast client handles must reserve");
+            for fast_index in 1..=FAST_CLIENTS_PER_CYCLE {
+                let request_id =
+                    request_base.checked_add(fast_index).expect("fast request ID must fit");
+                let nonce = nonce_base
+                    .checked_add(u64::try_from(fast_index).expect("fast index must fit"))
+                    .expect("fast nonce must fit");
+                let request = fixture.request(request_id, "fast", 2);
+                let frame = signed_generation_frame(
+                    &request,
+                    nonce,
+                    fixture.control_key_id,
+                    &fixture.control_signing_key,
+                );
+                fast_clients.push(spawn_ordered_runtime_test_client(
+                    fixture.socket_path(),
+                    frame,
+                    fixture.response_public_key,
+                    nonce,
+                    3,
+                ));
+            }
+
+            let shutdown = ContinuousShutdown::new();
+            let request_shutdown = shutdown.clone();
+            let (cycle_result_sender, cycle_result_receiver) = mpsc::sync_channel(1);
+            let coordinator = thread::spawn(move || {
+                let mut fast_completed = true;
+                for client in fast_clients {
+                    fast_completed &= client.join().is_ok_and(|events| events.last() == Some(&3));
+                }
+                let release_succeeded = release_delayed.send(()).is_ok();
+                let delayed_completed =
+                    delayed_client.join().is_ok_and(|(released_before_timeout, events)| {
+                        released_before_timeout && events.last() == Some(&3)
+                    });
+                request_shutdown.request();
+                cycle_result_sender
+                    .send((fast_completed, release_succeeded, delayed_completed))
+                    .expect("soak cycle result must send");
+            });
+
+            let summary = fixture
+                .runtime
+                .serve_continuous(
+                    &fixture.listener,
+                    ContinuousServeLimits::new(CONNECTIONS_PER_CYCLE)
+                        .expect("soak limits must validate"),
+                    &shutdown,
+                )
+                .expect("bounded soak cycle must drain");
+            let cycle_result = cycle_result_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("soak cycle must complete within its bound");
+            coordinator.join().expect("soak coordinator must join");
+            assert_eq!(cycle_result, (true, true, true));
+            assert_eq!(summary.accepted_connections(), u64::from(CONNECTIONS_PER_CYCLE));
+            assert_eq!(summary.authenticated_commands(), u64::from(CONNECTIONS_PER_CYCLE));
+            assert_eq!(summary.completed_generations(), u64::from(CONNECTIONS_PER_CYCLE));
+            assert_eq!(summary.failed_connections(), 0);
+            assert!(summary.peak_owned_connections() <= CONNECTIONS_PER_CYCLE);
+            assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
+            assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+            fixture.cleanup();
+        }
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
     fn continuous_connection_limits_are_exact_and_bounded() {
         assert!(matches!(ContinuousServeLimits::new(0), Err(EngineError::InvalidInput(_))));
         assert!(matches!(
@@ -3591,6 +3697,37 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
+    fn spawn_ordered_delayed_runtime_test_client(
+        socket_path: PathBuf,
+        encoded: Vec<u8>,
+        response_public_key: [u8; 32],
+        expected_nonce: u64,
+        terminal_kind: u8,
+    ) -> (std::sync::mpsc::SyncSender<()>, std::thread::JoinHandle<(bool, Vec<u8>)>) {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let (release, wait_for_release) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("delayed client must connect");
+            configure_runtime_test_client(&stream);
+            stream.write_all(&encoded).expect("delayed request must write");
+            connected.send(()).expect("delayed connection must synchronize");
+            let released_before_timeout =
+                wait_for_release.recv_timeout(Duration::from_secs(5)).is_ok();
+            let events =
+                runtime_test_events(stream, response_public_key, expected_nonce, terminal_kind);
+            (released_before_timeout, events)
+        });
+        wait_for_connection.recv().expect("delayed client must connect before fast peers");
+        (release, client)
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
     fn spawn_ordered_write_only_client(
         socket_path: PathBuf,
         encoded: Vec<u8>,
@@ -3668,10 +3805,35 @@ mod tests {
         expected_nonce: u64,
         terminal_kind: u8,
     ) -> Vec<u8> {
-        use personalai_engine_protocol::{FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES};
-        use std::io::{Read, Write};
+        use std::io::Write;
 
+        configure_runtime_test_client(&stream);
         stream.write_all(encoded).expect("request must write");
+        runtime_test_events(stream, response_public_key, expected_nonce, terminal_kind)
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn configure_runtime_test_client(stream: &std::os::unix::net::UnixStream) {
+        use std::time::Duration;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("test client read timeout must set");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("test client write timeout must set");
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn runtime_test_events(
+        mut stream: std::os::unix::net::UnixStream,
+        response_public_key: [u8; 32],
+        expected_nonce: u64,
+        terminal_kind: u8,
+    ) -> Vec<u8> {
+        use personalai_engine_protocol::{FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES};
+        use std::io::Read;
+
         let mut event_kinds = Vec::new();
         let response_key =
             VerifyingKey::from_bytes(&response_public_key).expect("response key must parse");

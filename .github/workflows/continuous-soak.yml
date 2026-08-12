@@ -1,0 +1,31 @@
+name: bounded-continuous-soak
+
+on:
+  schedule:
+    - cron: "41 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bounded-continuous-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  delayed-reader-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Run bounded authenticated restart soak
+        working-directory: engine
+        run: |
+          for pass in 1 2 3 4 5 6 7 8; do
+            cargo +1.85.0 test --locked --all-features \
+              -p personalai-engine-server \
+              tests::bounded_continuous_soak_isolates_delayed_readers_across_restarts \
+              -- --exact
+          done

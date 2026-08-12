@@ -18,8 +18,12 @@ multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
 and an owner CLI. The CLI exposes the continuous driver only through an explicit
 bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
-stop-admit, cancel, and drain path. The Go repository contains the corresponding
-`NATIVE_ENGINE` provider adapter; it has no HTTP or remote-network fallback.
+stop-admit, cancel, and drain path. A normal real-socket test repeats eight
+six-client restart cycles while one authenticated reader waits for five peers;
+a pinned weekly/manual workflow is configured to repeat that bounded test eight
+times once integrated onto the default branch. The Go repository
+contains the corresponding `NATIVE_ENGINE` provider adapter; it has no HTTP or
+remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only
