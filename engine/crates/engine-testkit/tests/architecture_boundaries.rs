@@ -374,7 +374,10 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
         ),
         ("engine-memory", &["personalai-engine-types"]),
-        ("engine-kv-cache", &["personalai-engine-memory", "personalai-engine-types"]),
+        (
+            "engine-kv-cache",
+            &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
+        ),
         (
             "engine-transformer",
             &[

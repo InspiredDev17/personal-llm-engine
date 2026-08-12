@@ -4,7 +4,7 @@ use crate::{ModelRegistry, RegisteredModel, read_only_map::ReadOnlyFileMap};
 use personalai_engine_crypto::{
     hash_package, hash_signed_content, verify_directory_package_signature,
 };
-use personalai_engine_memory::{MemoryPool, MemoryReservation};
+use personalai_engine_memory::{MemoryOwner, MemoryPool, MemoryReservation};
 use personalai_engine_model_format::{
     DIRECTORY_DECODER_ARCHITECTURE_ID, DirectoryManifest, DirectoryTensorRecord, HashCatalog,
     PackageFileKind, SignatureEnvelope,
@@ -45,6 +45,7 @@ where
 #[derive(Debug)]
 struct VerifiedShard {
     map: ReadOnlyFileMap,
+    expected_hash: personalai_engine_types::ModelPackageHash,
 }
 
 /// Signed, hash-verified, architecture-validated directory package.
@@ -78,6 +79,21 @@ impl VerifiedDirectoryPackage {
         &self.provenance
     }
 
+    /// Revalidates every live mapping and emits a typed event on change.
+    pub fn revalidate_mappings(
+        &self,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<(), EngineError> {
+        let result = self.validate_mapping_hashes();
+        if let Err(error) = &result {
+            events.emit(SecurityEvent::ModelPackageRejected {
+                model_id: self.registration.model_id().clone(),
+                reason: rejection_reason(error),
+            });
+        }
+        result
+    }
+
     /// Returns one immutable verified mapped tensor range.
     pub fn tensor_bytes(&self, tensor: &DirectoryTensorRecord) -> Result<&[u8], EngineError> {
         let shard = self
@@ -86,6 +102,49 @@ impl VerifiedDirectoryPackage {
                 EngineError::resource_exhaustion("tensor shard index is not addressable")
             })?)
             .ok_or_else(|| EngineError::internal_invariant("validated tensor shard is missing"))?;
+        if !shard.map.identity_is_unchanged()?
+            || hash_package(shard.map.bytes()) != shard.expected_hash
+        {
+            return Err(EngineError::signature_failure(
+                "mapped tensor shard changed after package admission",
+            ));
+        }
+        Self::tensor_bytes_from_verified_shard(shard, tensor)
+    }
+
+    /// Consumes package ownership, immediately dropping every live mapping.
+    pub fn unload(self) {
+        drop(self);
+    }
+
+    fn validate_mapping_hashes(&self) -> Result<(), EngineError> {
+        self.shards.iter().try_for_each(|shard| {
+            if shard.map.identity_is_unchanged()?
+                && hash_package(shard.map.bytes()) == shard.expected_hash
+            {
+                Ok(())
+            } else {
+                Err(EngineError::signature_failure(
+                    "mapped tensor shard changed after package admission",
+                ))
+            }
+        })
+    }
+
+    fn tensor_bytes_verified(&self, tensor: &DirectoryTensorRecord) -> Result<&[u8], EngineError> {
+        let shard = self
+            .shards
+            .get(usize::try_from(tensor.shard_index()).map_err(|_| {
+                EngineError::resource_exhaustion("tensor shard index is not addressable")
+            })?)
+            .ok_or_else(|| EngineError::internal_invariant("validated tensor shard is missing"))?;
+        Self::tensor_bytes_from_verified_shard(shard, tensor)
+    }
+
+    fn tensor_bytes_from_verified_shard<'a>(
+        shard: &'a VerifiedShard,
+        tensor: &DirectoryTensorRecord,
+    ) -> Result<&'a [u8], EngineError> {
         let start = usize::try_from(tensor.byte_offset())
             .map_err(|_| EngineError::resource_exhaustion("tensor offset is not addressable"))?;
         let length = usize::try_from(tensor.byte_length())
@@ -105,18 +164,23 @@ impl VerifiedDirectoryPackage {
         &self,
         pool: &MemoryPool,
     ) -> Result<LoadedDirectoryTensors, EngineError> {
+        self.validate_mapping_hashes()?;
         let metadata_bytes = u64::try_from(self.manifest.tensors().len())
             .ok()
             .and_then(|count| count.checked_mul(192))
             .ok_or_else(|| EngineError::resource_exhaustion("tensor metadata bound overflows"))?;
-        let metadata_reservation = pool.reserve(metadata_bytes)?;
+        let metadata_pool =
+            pool.scoped(MemoryOwner::ModelMetadata(self.registration.model_id().clone()));
+        let weight_pool =
+            pool.scoped(MemoryOwner::ModelWeights(self.registration.model_id().clone()));
+        let metadata_reservation = metadata_pool.reserve(metadata_bytes)?;
         let mut tensors = BTreeMap::new();
         for record in self.manifest.tensors() {
             let tensor = Tensor::convert_storage_to_f32(
                 record.dtype(),
                 record.shape().clone(),
-                self.tensor_bytes(record)?,
-                pool,
+                self.tensor_bytes_verified(record)?,
+                &weight_pool,
             )?;
             if tensors.insert(record.name().to_owned(), tensor).is_some() {
                 return Err(EngineError::internal_invariant(
@@ -134,8 +198,8 @@ impl VerifiedDirectoryPackage {
             let output = Tensor::convert_storage_to_f32(
                 embedding.dtype(),
                 embedding.shape().clone(),
-                self.tensor_bytes(embedding)?,
-                pool,
+                self.tensor_bytes_verified(embedding)?,
+                &weight_pool,
             )?;
             if tensors.insert("output.weight".to_owned(), output).is_some() {
                 return Err(EngineError::internal_invariant(
@@ -288,7 +352,7 @@ fn load_inner(
         if hash_package(map.bytes()) != shard.content_hash() {
             return Err(EngineError::signature_failure("tensor shard hash verification failed"));
         }
-        shards.push(VerifiedShard { map });
+        shards.push(VerifiedShard { map, expected_hash: shard.content_hash() });
     }
     let package =
         VerifiedDirectoryPackage { registration, manifest, tokenizer, provenance, shards };

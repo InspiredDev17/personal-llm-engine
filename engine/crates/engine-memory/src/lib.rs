@@ -3,28 +3,107 @@
 //! This crate accounts tensor and cache bytes only. It is unrelated to the Go
 //! platform's personal memory, conversation storage, or retrieval authority.
 
-use personalai_engine_types::{EngineError, MAX_RESOURCE_MEMORY_BYTES, ResourceBudget};
+use personalai_engine_types::{
+    BackendId, EngineError, MAX_RESOURCE_MEMORY_BYTES, ModelId, RequestId, ResourceBudget,
+    SequenceId,
+};
 use std::sync::{Arc, Mutex};
+
+mod runtime;
+
+pub use runtime::{
+    BackendResources, CpuMemoryBackend, DeviceBuffer, DeviceMemory, DeviceMemoryKind, HostBuffer,
+    MemoryAdmission, MemoryRequirements, ScratchArena, ScratchBufferId, ScratchMemoryManager,
+    ScratchMetrics,
+};
+
+const OWNER_CATEGORY_COUNT: usize = 12;
+
+/// Explicit owner for one engine inference allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryOwner {
+    /// Process-wide engine bookkeeping.
+    Engine,
+    /// Verified immutable model weight mappings or copies.
+    ModelWeights(ModelId),
+    /// Parsed immutable model metadata.
+    ModelMetadata(ModelId),
+    /// Immutable tokenizer tables.
+    Tokenizer(ModelId),
+    /// Other immutable per-model state.
+    ModelState(ModelId),
+    /// Request prompt/token state.
+    RequestPrompt(RequestId),
+    /// Sequence-owned key/value state.
+    SequenceKv(SequenceId),
+    /// Temporary request operation storage.
+    RequestScratch(RequestId),
+    /// Request output logits.
+    OutputLogits(RequestId),
+    /// Request sampling state.
+    Sampling(RequestId),
+    /// Request streaming decoder state.
+    StreamingDecoder(RequestId),
+    /// Backend-owned resources.
+    Backend(BackendId),
+}
+
+impl MemoryOwner {
+    const fn category_index(&self) -> usize {
+        match self {
+            Self::Engine => 0,
+            Self::ModelWeights(_) => 1,
+            Self::ModelMetadata(_) => 2,
+            Self::Tokenizer(_) => 3,
+            Self::ModelState(_) => 4,
+            Self::RequestPrompt(_) => 5,
+            Self::SequenceKv(_) => 6,
+            Self::RequestScratch(_) => 7,
+            Self::OutputLogits(_) => 8,
+            Self::Sampling(_) => 9,
+            Self::StreamingDecoder(_) => 10,
+            Self::Backend(_) => 11,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct MemoryState {
     used_bytes: u64,
+    peak_bytes: u64,
+    allocation_count: u64,
+    by_category: [u64; OWNER_CATEGORY_COUNT],
 }
 
 /// Thread-safe bounded memory accounting pool.
 #[derive(Debug, Clone)]
 pub struct MemoryPool {
     limit_bytes: u64,
+    default_owner: MemoryOwner,
     state: Arc<Mutex<MemoryState>>,
 }
 
 impl MemoryPool {
     /// Creates a memory pool with a positive hard-bounded limit.
     pub fn new(limit_bytes: u64) -> Result<Self, EngineError> {
+        Self::new_scoped(limit_bytes, MemoryOwner::Engine)
+    }
+
+    /// Creates a pool whose ordinary reservations have one explicit owner.
+    pub fn new_scoped(limit_bytes: u64, default_owner: MemoryOwner) -> Result<Self, EngineError> {
         if limit_bytes == 0 || limit_bytes > MAX_RESOURCE_MEMORY_BYTES {
             return Err(EngineError::invalid_input("memory pool limit is outside hard bounds"));
         }
-        Ok(Self { limit_bytes, state: Arc::new(Mutex::new(MemoryState { used_bytes: 0 })) })
+        Ok(Self {
+            limit_bytes,
+            default_owner,
+            state: Arc::new(Mutex::new(MemoryState {
+                used_bytes: 0,
+                peak_bytes: 0,
+                allocation_count: 0,
+                by_category: [0; OWNER_CATEGORY_COUNT],
+            })),
+        })
     }
 
     /// Creates an allocation pool from the request's memory budget.
@@ -32,8 +111,26 @@ impl MemoryPool {
         Self::new(budget.max_memory_bytes())
     }
 
+    /// Creates a view of this exact pool with a different default owner.
+    ///
+    /// Limits and counters remain shared; only subsequent ordinary reservations
+    /// receive the supplied ownership label.
+    #[must_use]
+    pub fn scoped(&self, default_owner: MemoryOwner) -> Self {
+        Self { limit_bytes: self.limit_bytes, default_owner, state: Arc::clone(&self.state) }
+    }
+
     /// Reserves positive bytes and returns an automatically released guard.
     pub fn reserve(&self, bytes: u64) -> Result<MemoryReservation, EngineError> {
+        self.reserve_for(bytes, self.default_owner.clone())
+    }
+
+    /// Reserves positive bytes under an explicit inference-state owner.
+    pub fn reserve_for(
+        &self,
+        bytes: u64,
+        owner: MemoryOwner,
+    ) -> Result<MemoryReservation, EngineError> {
         if bytes == 0 {
             return Err(EngineError::invalid_input(
                 "memory reservation must contain at least one byte",
@@ -51,9 +148,19 @@ impl MemoryPool {
                 "memory reservation exceeds the configured pool",
             ));
         }
+        let allocation_count = state.allocation_count.checked_add(1).ok_or_else(|| {
+            EngineError::resource_exhaustion("memory allocation counter overflows")
+        })?;
+        let category = owner.category_index();
+        let category_bytes = state.by_category[category]
+            .checked_add(bytes)
+            .ok_or_else(|| EngineError::resource_exhaustion("memory owner accounting overflows"))?;
         state.used_bytes = next;
+        state.peak_bytes = state.peak_bytes.max(next);
+        state.allocation_count = allocation_count;
+        state.by_category[category] = category_bytes;
         drop(state);
-        Ok(MemoryReservation { bytes, state: Arc::clone(&self.state), released: false })
+        Ok(MemoryReservation { bytes, owner, state: Arc::clone(&self.state), released: false })
     }
 
     /// Extends one owned reservation after an allocator reports spare capacity.
@@ -86,8 +193,81 @@ impl MemoryPool {
                 "memory reservation exceeds the configured pool",
             ));
         }
+        let category = reservation.owner.category_index();
+        let category_bytes = state.by_category[category]
+            .checked_add(additional_bytes)
+            .ok_or_else(|| EngineError::resource_exhaustion("memory owner accounting overflows"))?;
         state.used_bytes = used_bytes;
+        state.peak_bytes = state.peak_bytes.max(used_bytes);
+        state.by_category[category] = category_bytes;
         reservation.bytes = reservation_bytes;
+        Ok(())
+    }
+
+    /// Shrinks one owned reservation after an allocator releases spare capacity.
+    pub fn shrink_reservation(
+        &self,
+        reservation: &mut MemoryReservation,
+        released_bytes: u64,
+    ) -> Result<(), EngineError> {
+        if released_bytes == 0 {
+            return Ok(());
+        }
+        if !self.owns(reservation) || released_bytes >= reservation.bytes {
+            return Err(EngineError::invalid_input(
+                "memory reservation shrink is invalid for this pool",
+            ));
+        }
+        let reservation_bytes = reservation.bytes.checked_sub(released_bytes).ok_or_else(|| {
+            EngineError::internal_invariant("memory reservation shrink underflows")
+        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| EngineError::internal_invariant("memory accounting lock is poisoned"))?;
+        let used_bytes = state.used_bytes.checked_sub(released_bytes).ok_or_else(|| {
+            EngineError::internal_invariant("memory accounting shrink underflows")
+        })?;
+        let category = reservation.owner.category_index();
+        let category_bytes = state.by_category[category]
+            .checked_sub(released_bytes)
+            .ok_or_else(|| EngineError::internal_invariant("memory owner shrink underflows"))?;
+        state.used_bytes = used_bytes;
+        state.by_category[category] = category_bytes;
+        reservation.bytes = reservation_bytes;
+        Ok(())
+    }
+
+    /// Transfers an existing reservation to another explicit owner.
+    pub fn reassign_reservation(
+        &self,
+        reservation: &mut MemoryReservation,
+        owner: MemoryOwner,
+    ) -> Result<(), EngineError> {
+        if !self.owns(reservation) {
+            return Err(EngineError::invalid_input(
+                "memory reservation belongs to a different pool",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| EngineError::internal_invariant("memory accounting lock is poisoned"))?;
+        let old_category = reservation.owner.category_index();
+        let new_category = owner.category_index();
+        if old_category != new_category {
+            let old_bytes =
+                state.by_category[old_category].checked_sub(reservation.bytes).ok_or_else(
+                    || EngineError::internal_invariant("memory owner transfer underflows"),
+                )?;
+            let new_bytes =
+                state.by_category[new_category].checked_add(reservation.bytes).ok_or_else(
+                    || EngineError::resource_exhaustion("memory owner transfer overflows"),
+                )?;
+            state.by_category[old_category] = old_bytes;
+            state.by_category[new_category] = new_bytes;
+        }
+        reservation.owner = owner;
         Ok(())
     }
 
@@ -116,12 +296,65 @@ impl MemoryPool {
     pub fn owns(&self, reservation: &MemoryReservation) -> bool {
         Arc::ptr_eq(&self.state, &reservation.state)
     }
+
+    /// Returns an atomic snapshot used by admission control and metrics.
+    pub fn statistics(&self) -> Result<MemoryStatistics, EngineError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| EngineError::internal_invariant("memory accounting lock is poisoned"))?;
+        Ok(MemoryStatistics {
+            limit_bytes: self.limit_bytes,
+            reserved_bytes: state.used_bytes,
+            peak_bytes: state.peak_bytes,
+            allocation_count: state.allocation_count,
+            by_category: state.by_category,
+        })
+    }
+}
+
+/// Immutable process-local memory metrics snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryStatistics {
+    limit_bytes: u64,
+    reserved_bytes: u64,
+    peak_bytes: u64,
+    allocation_count: u64,
+    by_category: [u64; OWNER_CATEGORY_COUNT],
+}
+
+impl MemoryStatistics {
+    /// Configured hard limit.
+    pub const fn limit_bytes(self) -> u64 {
+        self.limit_bytes
+    }
+
+    /// Bytes currently reserved.
+    pub const fn reserved_bytes(self) -> u64 {
+        self.reserved_bytes
+    }
+
+    /// Maximum simultaneous reservation observed.
+    pub const fn peak_bytes(self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// Successful reservation count since pool creation.
+    pub const fn allocation_count(self) -> u64 {
+        self.allocation_count
+    }
+
+    /// Current bytes attributed to the supplied ownership category.
+    pub const fn bytes_for(self, owner: &MemoryOwner) -> u64 {
+        self.by_category[owner.category_index()]
+    }
 }
 
 /// RAII guard for an exact memory reservation.
 #[derive(Debug)]
 pub struct MemoryReservation {
     bytes: u64,
+    owner: MemoryOwner,
     state: Arc<Mutex<MemoryState>>,
     released: bool,
 }
@@ -130,6 +363,11 @@ impl MemoryReservation {
     /// Returns the exact reserved byte count.
     pub const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Returns the explicit allocation owner.
+    pub const fn owner(&self) -> &MemoryOwner {
+        &self.owner
     }
 
     /// Releases the reservation immediately.
@@ -144,9 +382,15 @@ impl MemoryReservation {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.used_bytes = state.used_bytes.checked_sub(self.bytes).ok_or_else(|| {
+        let used_bytes = state.used_bytes.checked_sub(self.bytes).ok_or_else(|| {
             EngineError::internal_invariant("memory reservation release underflows")
         })?;
+        let category = self.owner.category_index();
+        let category_bytes = state.by_category[category]
+            .checked_sub(self.bytes)
+            .ok_or_else(|| EngineError::internal_invariant("memory owner release underflows"))?;
+        state.used_bytes = used_bytes;
+        state.by_category[category] = category_bytes;
         Ok(())
     }
 }
@@ -210,5 +454,23 @@ mod tests {
         assert_eq!(reservation.bytes(), 16);
         assert!(pool.grow_reservation(&mut reservation, 1).is_err());
         assert!(other.grow_reservation(&mut reservation, 1).is_err());
+        pool.shrink_reservation(&mut reservation, 8).expect("shrink must release spare bytes");
+        assert_eq!(reservation.bytes(), 8);
+        assert_eq!(pool.used_bytes().unwrap(), 8);
+        assert!(pool.shrink_reservation(&mut reservation, 8).is_err());
+    }
+
+    #[test]
+    fn owner_transfer_preserves_totals_and_updates_categories() {
+        let request = RequestId::new(1).unwrap();
+        let sequence = SequenceId::new(1).unwrap();
+        let pool = MemoryPool::new_scoped(16, MemoryOwner::RequestScratch(request)).unwrap();
+        let mut reservation = pool.reserve(8).unwrap();
+        assert_eq!(pool.statistics().unwrap().bytes_for(reservation.owner()), 8);
+        pool.reassign_reservation(&mut reservation, MemoryOwner::SequenceKv(sequence)).unwrap();
+        let statistics = pool.statistics().unwrap();
+        assert_eq!(statistics.reserved_bytes(), 8);
+        assert_eq!(statistics.bytes_for(&MemoryOwner::RequestScratch(request)), 0);
+        assert_eq!(statistics.bytes_for(&MemoryOwner::SequenceKv(sequence)), 8);
     }
 }

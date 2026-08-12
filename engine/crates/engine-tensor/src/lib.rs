@@ -599,6 +599,11 @@ impl MutableTensor {
     pub fn set_element_bytes(&mut self, index: usize, value: &[u8]) -> Result<(), TensorError> {
         self.view_mut().set_element_bytes(index, value)
     }
+
+    /// Clears every allocated storage byte before state reuse or release.
+    pub fn clear(&mut self) {
+        self.storage.as_bytes_mut().fill(0);
+    }
 }
 
 impl TensorRead for MutableTensor {

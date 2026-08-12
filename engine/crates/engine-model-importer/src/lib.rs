@@ -814,7 +814,7 @@ fn corrupt(detail: impl AsRef<str>) -> EngineError {
 mod tests {
     use super::*;
     use personalai_engine_crypto::TrustedSigner;
-    use personalai_engine_loader::ModelRegistry;
+    use personalai_engine_loader::{ModelRegistry, VerifiedDirectoryPackage};
     use personalai_engine_model_format::{DIRECTORY_MANIFEST_HEADER_BYTES, ParsedModelPackage};
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
@@ -955,6 +955,27 @@ mod tests {
         fs::write(path, original).expect("file must restore");
         fs::set_permissions(path, fs::Permissions::from_mode(0o400))
             .expect("file must become read-only");
+    }
+
+    #[cfg(unix)]
+    fn assert_live_mapping_change_is_reported(
+        loaded: &VerifiedDirectoryPackage,
+        shard_path: &Path,
+    ) {
+        let mut events = Vec::new();
+        with_corrupted_read_only_file(shard_path, false, || {
+            assert!(loaded.revalidate_mappings(&mut |event| events.push(event)).is_err());
+        });
+        assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn remove_sealed_store(root: &Path, store: &Path, package: &Path) {
+        fs::set_permissions(store, fs::Permissions::from_mode(0o700))
+            .expect("temporary store must unseal for cleanup");
+        fs::set_permissions(package, fs::Permissions::from_mode(0o700))
+            .expect("temporary package must unseal for cleanup");
+        fs::remove_dir_all(root).expect("temporary fixture must clean up");
     }
 
     fn resign_manifest(
@@ -1257,11 +1278,12 @@ mod tests {
         assert_eq!(cpu_model.model_id(), spec().model_id());
         assert!(service_events.is_empty());
 
-        fs::set_permissions(&store, fs::Permissions::from_mode(0o700))
-            .expect("temporary store must unseal for cleanup");
-        fs::set_permissions(receipt.package_path(), fs::Permissions::from_mode(0o700))
-            .expect("temporary package must unseal for cleanup");
-        fs::remove_dir_all(&root).expect("temporary fixture must clean up");
+        assert_live_mapping_change_is_reported(
+            &loaded,
+            &receipt.package_path().join("tensors-0000.aipt"),
+        );
+
+        remove_sealed_store(&root, &store, receipt.package_path());
     }
 
     #[cfg(unix)]

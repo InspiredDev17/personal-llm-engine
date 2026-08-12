@@ -25,10 +25,10 @@ Green authority.
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
-| `engine-memory` | aggregate fallible reservations |
+| `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
-| `engine-kv-cache` | bounded sequence KV storage/accounting |
+| `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
 | `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
 | `engine-sampling` | deterministic tensor-direct greedy selection |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
@@ -118,6 +118,60 @@ softmax, SiLU, SwiGLU, RoPE, head split/merge, grouped-query attention, causal
 masking, residual addition, Q/K/V projection composition, and logit projection.
 The 100-million-iteration operation ceiling and aggregate memory pool apply
 before output allocation. ADR-0017 records these invariants.
+
+## Inference memory and KV-cache ownership
+
+Every accounted allocation has one engine-owned category: model weights,
+model metadata, tokenizer tables, immutable model state, request prompt,
+sequence KV, request scratch, output logits, sampling state, streaming decoder,
+or backend resources. Pools expose current, peak, category and allocation-count
+metrics. A scoped pool changes only the owner label; it shares the exact same
+hard ceiling and counters, so a subcomponent cannot create capacity by nesting
+pools. Loader tensor materialization labels immutable metadata and weights by
+the registered `ModelId`.
+
+The loader's signed tensor shards remain owned by a non-cloneable
+`VerifiedDirectoryPackage`. Each shard is mapped `MAP_PRIVATE|PROT_READ`, never
+`PROT_WRITE` or `PROT_EXEC`; mappings drop with the package. The loader checks
+the signed SHA-384 identity after mapping, rechecks a shard before exposing a
+tensor range, and offers full mapping revalidation with a mandatory typed
+security-event sink. Only a registered model ID reaches this path.
+
+`ScratchMemoryManager` owns one engine-wide CPU pool. Each `ScratchArena` is
+bound to one `RequestId` and a lower request ceiling. Buffers are initialized,
+exposed only through generation-checked arena-local handles, cleared on normal
+finish, cancellation, failure unwind and drop, then may enter an idle cache.
+Ownership accounting is transferred back to the engine while idle and to the
+next request on reuse. Idle bytes are separately reported and explicitly
+reclaimable. No uninitialized bytes are returned.
+
+`ContiguousKvCache` owns exactly one verified `ModelId` and multiple guarded
+sequence objects under a hard configured concurrent-sequence ceiling. One sequence allocation has canonical row-major layout
+`[K-or-V, layer, position, kv-head, head-dimension]`. Storage is F32, F16, or
+BF16 only; the CPU interface accepts finite F32 values and performs the reviewed
+first-party conversion. Callers never provide byte offsets. The engine chooses
+the next position, a token becomes readable only after every layer K/V pair is
+written, and an abandoned or failed partial write clears and cancels the whole
+sequence. Generation-tagged handles prevent an old owner from reaching a new
+sequence that reuses the numeric `SequenceId`. Reset, cancellation,
+destruction, and model unload clear storage; unload permanently invalidates the
+cache. Mutex-guarded lifecycle methods provide deterministic isolation under
+concurrent scheduler operations.
+
+The scheduler can query exact full-sequence reservation, per-token logical
+bytes, prefill bytes, current/peak/reserved/used/reclaimable cache pressure,
+scratch pressure, model-fit, request-fit, and extension capacity before work.
+CPU host/device allocation and whole-buffer transfers are real initialized
+host operations. Metal and CUDA memory requests return explicit
+not-implemented errors; this stage contains no GPU emulation.
+
+Contiguous allocation is the V1 correctness baseline. A future paged cache may
+be added only as a separate implementation behind this lifecycle/admission
+contract. It must retain generation-checked ownership, zero-on-reassignment,
+atomic token publication, checked page-table arithmetic, model-unload
+invalidation and differential tests against the contiguous cache. No package
+field may choose cache implementation or page size. ADR-0018 records the full
+decision and migration gate.
 
 ## Tokenizer boundary
 

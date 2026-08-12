@@ -150,6 +150,7 @@ name = "personalai-engine-kv-cache"
 version = "0.1.0"
 dependencies = [
  "personalai-engine-memory",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 

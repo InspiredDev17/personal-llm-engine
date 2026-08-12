@@ -488,7 +488,11 @@ impl GreedyGeneration<'_> {
         }
         check_cancelled(cancelled, self.request.request_id())?;
         if self.session.is_none() {
-            self.session = Some(self.model.start_session(&self.request.resource_budget())?);
+            self.session = Some(self.model.start_session(
+                &self.request.resource_budget(),
+                self.request.request_id(),
+                self.sequence_id,
+            )?);
             return Ok(GreedyAdvance::Progressed);
         }
         let session = self.session.as_mut().ok_or_else(|| {
@@ -2559,7 +2563,10 @@ mod tests {
             .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
             .expect("signed exact decoder must load");
         let tokens = loaded.tokenizer().encode("A").expect("prompt must tokenize");
-        let mut session = loaded.model().start_session(&budget).expect("session must start");
+        let mut session = loaded
+            .model()
+            .start_session(&budget, RequestId::new(1).unwrap(), SequenceId::new(1).unwrap())
+            .expect("session must start");
         let mut logits = None;
         for token in tokens {
             logits = Some(session.forward_token(token).expect("token must execute"));

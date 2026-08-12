@@ -2,9 +2,11 @@
 
 use crate::{FIRST_PARTY_DECODER_ARCHITECTURE_ID, TransformerConfig, TransformerPlan};
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
-use personalai_engine_memory::MemoryPool;
+use personalai_engine_memory::{MemoryOwner, MemoryPool};
 use personalai_engine_tensor::Tensor;
-use personalai_engine_types::{DType, EngineError, ResourceBudget, TensorShape};
+use personalai_engine_types::{
+    DType, EngineError, RequestId, ResourceBudget, SequenceId, TensorShape,
+};
 use std::collections::BTreeMap;
 
 const WEIGHTS_PER_LAYER: usize = 9;
@@ -58,6 +60,8 @@ impl CpuDecoderModel {
     pub fn start_session(
         &self,
         budget: &ResourceBudget,
+        request_id: RequestId,
+        sequence_id: SequenceId,
     ) -> Result<CpuDecoderSession<'_>, EngineError> {
         let plan = TransformerPlan::new(self.config.clone(), budget)?;
         plan.require_executable_architecture()?;
@@ -68,8 +72,15 @@ impl CpuDecoderModel {
             u64::from(self.config.kv_head_count()),
             u64::from(self.config.head_dimension()),
         ])?;
-        let cache = Tensor::zeros(DType::F32, cache_shape, &self.pool)?;
-        Ok(CpuDecoderSession { model: self, cache, token_count: 0 })
+        let kv_pool = self.pool.scoped(MemoryOwner::SequenceKv(sequence_id));
+        let cache = Tensor::zeros(DType::F32, cache_shape, &kv_pool)?;
+        Ok(CpuDecoderSession {
+            model: self,
+            cache,
+            scratch_pool: self.pool.scoped(MemoryOwner::RequestScratch(request_id)),
+            output_pool: self.pool.scoped(MemoryOwner::OutputLogits(request_id)),
+            token_count: 0,
+        })
     }
 
     fn weight(&self, name: &str) -> Result<&Tensor, EngineError> {
@@ -84,6 +95,8 @@ impl CpuDecoderModel {
 pub struct CpuDecoderSession<'a> {
     model: &'a CpuDecoderModel,
     cache: Tensor,
+    scratch_pool: MemoryPool,
+    output_pool: MemoryPool,
     token_count: u32,
 }
 
@@ -103,7 +116,7 @@ impl CpuDecoderSession<'_> {
         }
         check_operation_count(&self.model.config, self.token_count)?;
         let workspace_bytes = workspace_bytes(&self.model.config, self.token_count)?;
-        let _workspace = self.model.pool.reserve(workspace_bytes)?;
+        let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
         let hidden = usize_from_u32(self.model.config.hidden_dimension())?;
         let mut state = embedding_row(
             self.model.weight("token_embedding.weight")?,
@@ -129,7 +142,7 @@ impl CpuDecoderSession<'_> {
         let output = Tensor::from_f32_values(
             TensorShape::new([u64::from(self.model.config.vocabulary_size())])?,
             &logits,
-            &self.model.pool,
+            &self.output_pool,
         )?;
         self.token_count = self
             .token_count
@@ -660,7 +673,9 @@ mod tests {
         let model = CpuDecoderModel::new(config, tiny_weights(&pool), &pool)
             .expect("tiny exact architecture must construct");
         let budget = ResourceBudget::new(1 << 20, 1 << 18, 1).expect("budget must validate");
-        let mut session = model.start_session(&budget).expect("session must construct");
+        let mut session = model
+            .start_session(&budget, RequestId::new(1).unwrap(), SequenceId::new(1).unwrap())
+            .expect("session must construct");
         let first = session.forward_token(1).expect("first token must execute");
         let second = session.forward_token(2).expect("second token must execute");
         assert_eq!(first.shape().dimensions(), &[8]);

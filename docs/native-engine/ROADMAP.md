@@ -19,9 +19,9 @@ memory, tool, approval, or Agent Green behavior.
 | 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
 | 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for AIPTok V1 synthetic profile | First-party `AIPTOK01`, strict metadata conversion, content hash, byte fallback, ranked merges, explicit special policies, exact byte/UTF-8/incremental decode, property/malformed/fuzz tests and dependency-free benchmarks |
-| 4. Tensor/CPU core | COMPLETE as correctness oracle | Canonical row-major tensors, explicit checked views, F32 execution plus F16/BF16 conversion, immutable statically validated graph, complete scalar operation set, aggregate memory/compute bounds, exhaustive F16 tests and benchmarks |
+| 4. Tensor/CPU core | COMPLETE as correctness oracle | Canonical row-major tensors, explicit checked views, F32 execution plus F16/BF16 conversion, immutable statically validated graph, complete scalar operation set, explicit-owner memory, bounded cleared scratch reuse, real CPU device-memory transfers, aggregate compute bounds, exhaustive F16 tests and benchmarks |
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `decoder-rms-rope-swiglu-gqa-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
-| 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
+| 6. Generation | COMPLETE for greedy CPU; shared cache migration pending | Prefill/decode, real decoder KV tensors, plus a separately tested one-model multi-sequence contiguous cache with atomic all-layer commits, F32/F16/BF16 storage, stale-handle rejection, clear-on-lifecycle transitions and pressure metrics |
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
@@ -46,6 +46,11 @@ memory, tool, approval, or Agent Green behavior.
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.
+- A correctness-first contiguous KV-cache and bounded scratch subsystem now
+  define the backend-neutral ownership/admission contract. The existing scalar
+  decoder still owns its request-local F32 cache internally; moving that hot
+  path onto the shared multi-sequence cache is the next integration task and
+  does not weaken either implementation's bounds.
 - Every accepted Unix stream is admitted only when its kernel-reported effective
   user ID equals the engine process user. Mismatches are rejected before frame
   parsing and do not stop the continuous service; signature and replay checks
@@ -126,6 +131,13 @@ Before the native runtime becomes mandatory:
 - complete Agent Green telemetry mapping in Go, never in the model or engine;
 - canary the provider behind Go routing and preserve instant rollback;
 - retire third-party runtimes only after equivalent production evidence.
+
+Paged KV storage is deliberately deferred. It may follow only after the scalar
+decoder uses the contiguous cache end to end and real-model long-context tests
+show material pressure. The paged design must preserve zero-on-reassignment,
+generation-checked sequence ownership, atomic token visibility, unload
+invalidation and exact accounting, and must pass differential tests against
+contiguous V1. Model packages and clients will not select page layout.
 
 Hardware is not required for Stage 9 format/conversion/fuzz work. It is required
 for accepting Stages 10 and 11 and for final performance qualification.

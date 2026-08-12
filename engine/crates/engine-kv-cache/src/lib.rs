@@ -1,10 +1,13 @@
-//! Checked KV-cache planning and per-sequence occupancy state.
-//!
-//! This crate allocates no cache tensors. It proves layout arithmetic and
-//! reserves accounted bytes so later backends cannot bypass resource budgets.
+//! Checked KV-cache planning and contiguous CPU sequence storage.
 
 use personalai_engine_memory::{MemoryPool, MemoryReservation};
 use personalai_engine_types::{DType, EngineError, MAX_CONTEXT_TOKENS, ResourceBudget, SequenceId};
+
+mod contiguous;
+
+pub use contiguous::{
+    ContiguousKvCache, KvCacheMetrics, KvCacheStatus, SequenceHandle, SequenceStatus,
+};
 
 /// Maximum transformer layer count accepted by cache planning.
 pub const MAX_LAYER_COUNT: u32 = 512;
@@ -48,6 +51,11 @@ impl KvCachePlan {
         if token_capacity == 0 || token_capacity > MAX_CONTEXT_TOKENS {
             return Err(EngineError::invalid_input(
                 "KV-cache token capacity is outside hard bounds",
+            ));
+        }
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BFloat16) {
+            return Err(EngineError::not_implemented(
+                "KV-cache storage supports only F32, F16, and BF16",
             ));
         }
 
