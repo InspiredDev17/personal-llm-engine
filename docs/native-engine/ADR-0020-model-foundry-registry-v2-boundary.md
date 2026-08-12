@@ -1,6 +1,6 @@
 # ADR-0020: Model Foundry registry V2 and directory-package boundary
 
-- Status: Accepted for Phase 0 contract freeze
+- Status: Accepted; Phase 1 bounded parser implemented
 - Date: 2026-08-12
 - Native Engine review base: `f458c46cd7cd69e73fddd575669604f99373acce`
 - Model Foundry review base: `d6ab7b99fa083a76688ac5ef4b32b2e31480118c`
@@ -61,10 +61,11 @@ model approval or a trusted production identity.
 
 ## Consequences
 
-No current Model Foundry artifact is claimed loadable by this engine. A trusted
-adapter cannot repair a package-format mismatch. Phase 1 must cover both the
-Foundry directory writer/verifier and this engine's registry parser before a
-cross-repository positive load can be claimed.
+Phase 1 implements both the Foundry directory writer/verifier and this engine's
+bounded registry parser/verifier. It does not connect a registry decision to
+package path derivation, registration, activation, or loading. A trusted adapter
+still cannot repair a legacy flat-package mismatch, and no cross-repository
+positive production load is claimed before Phase 2.
 
 Existing owner-pinned directory registration remains the only implemented
 production admission mode. Any future coexistence with registry-backed mode is

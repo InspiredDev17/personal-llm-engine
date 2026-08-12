@@ -24,6 +24,7 @@ reproducible.
 | `tensor_index_parser` | one fixed directory tensor-index record | 192 bytes |
 | `safetensors_import` | offline importer's bounded safetensors parser | 8 MiB campaign input |
 | `package_path_resolution` | safe direct-child `.paimodel` name parser | 1,024 bytes |
+| `model_registry_v2` | canonical signed Model Foundry registry V2 parser | 64 KiB |
 
 The input ceiling is a campaign resource bound, not a reduction of the parser's
 documented format limit. Deterministic unit and mutation tests continue to
@@ -52,7 +53,8 @@ cargo +nightly-2026-08-01 fuzz run \
 ```
 
 Replace the target and corpus directory for any table entry and lower `max_len`
-to 192 for `tensor_index_parser` or 1,024 for `package_path_resolution`. Copy a checked-in corpus to a temporary directory when the
+to 192 for `tensor_index_parser`, 1,024 for `package_path_resolution`, or 65,536
+for `model_registry_v2`. Copy a checked-in corpus to a temporary directory when the
 run must not retain newly discovered coverage inputs.
 
 ## Continuous campaign

@@ -82,5 +82,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_seed(&corpus, "safetensors_import", "truncated-header", &[1, 0, 0])?;
     write_seed(&corpus, "package_path_resolution", "valid-package-name", b"fuzz-seed.paimodel")?;
     write_seed(&corpus, "package_path_resolution", "path-traversal", b"../x.paimodel")?;
+    let registry = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/model-foundry-registry-v2/positive-0002.registry.json"
+    ));
+    write_seed(&corpus, "model_registry_v2", "valid-entry.json", registry)?;
+    write_seed(&corpus, "model_registry_v2", "truncated-entry", b"{\"entry\":\n")?;
     Ok(())
 }

@@ -8,11 +8,13 @@
 mod directory_loader;
 #[cfg(unix)]
 mod read_only_map;
+mod registry_v2;
 
 #[cfg(unix)]
 pub use directory_loader::{
     DirectorySecurityEventSink, LoadedDirectoryTensors, VerifiedDirectoryPackage,
 };
+pub use registry_v2::{RegistrySelectionV2, verify_registry_selection_v2};
 
 use personalai_engine_crypto::TrustedSigner;
 #[cfg(test)]
