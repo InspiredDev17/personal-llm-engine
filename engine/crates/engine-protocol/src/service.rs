@@ -6,8 +6,9 @@
 //! trailing bytes, and unsupported versions fail closed.
 
 use personalai_engine_crypto::{
-    ED25519_SIGNATURE_BYTES, EngineResponseSigner, TrustedControlPlaneKeys,
-    verify_control_plane_signature_with_keys,
+    ED25519_PUBLIC_KEY_BYTES, ED25519_SIGNATURE_BYTES, EngineResponseSigner,
+    TrustedControlPlaneKeys, verify_control_plane_signature_with_keys,
+    verify_engine_response_signature,
 };
 use personalai_engine_types::{EngineError, MAX_REQUEST_BYTES, RequestId, SignerKeyId};
 
@@ -270,7 +271,8 @@ pub fn encode_signed_service_response(
     }
     let total = SERVICE_REQUEST_FIXED_BYTES
         .checked_add(payload.len())
-        .ok_or_else(|| EngineError::resource_exhaustion("service response length overflows"))?;
+        .filter(|total| *total <= MAX_REQUEST_BYTES - ED25519_SIGNATURE_BYTES)
+        .ok_or_else(|| EngineError::resource_exhaustion("service response is too large"))?;
     let payload_length = u32::try_from(payload.len())
         .map_err(|_| EngineError::resource_exhaustion("service response payload exceeds u32"))?;
     let mut bytes = vec![0_u8; total];
@@ -285,6 +287,108 @@ pub fn encode_signed_service_response(
     let signature = signer.sign_response(&bytes)?;
     bytes.extend_from_slice(&signature);
     Ok(bytes)
+}
+
+/// Strictly verified engine service response bound to one originating request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedServiceResponse {
+    kind: ServiceMessageKind,
+    request_id: RequestId,
+    request_nonce: u64,
+    engine_key_id: SignerKeyId,
+    payload: Vec<u8>,
+}
+
+impl AuthenticatedServiceResponse {
+    /// Verifies structure, correlation, pinned identity, and exact signature.
+    pub fn decode(
+        bytes: &[u8],
+        expected_request_id: RequestId,
+        expected_request_nonce: u64,
+        expected_engine_key_id: SignerKeyId,
+        expected_engine_public_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        let minimum = SERVICE_REQUEST_FIXED_BYTES + ED25519_SIGNATURE_BYTES;
+        if bytes.len() < minimum || bytes.len() > MAX_REQUEST_BYTES {
+            return Err(EngineError::protocol_violation(
+                "service response length is outside hard bounds",
+            ));
+        }
+        if bytes[..8] != SERVICE_RESPONSE_MAGIC
+            || read_u16(bytes, 8)? != SERVICE_VERSION
+            || bytes[11] != 0
+        {
+            return Err(EngineError::protocol_violation(
+                "service response magic, version, or flags are invalid",
+            ));
+        }
+        let kind = ServiceMessageKind::from_byte(bytes[10])?;
+        if !kind.accepted_response() {
+            return Err(EngineError::protocol_violation(
+                "service request type is invalid on response direction",
+            ));
+        }
+        let request_nonce = read_u64(bytes, 12)?;
+        if request_nonce == 0 || request_nonce != expected_request_nonce {
+            return Err(EngineError::authentication_failure(
+                "service response nonce does not match its request",
+            ));
+        }
+        let request_id = RequestId::from_bytes(read_exact::<16>(bytes, 20)?)
+            .map_err(|_| EngineError::protocol_violation("service response ID is invalid"))?;
+        if request_id != expected_request_id {
+            return Err(EngineError::authentication_failure(
+                "service response ID does not match its request",
+            ));
+        }
+        let engine_key_id = SignerKeyId::from_bytes(read_exact::<16>(bytes, 36)?)
+            .map_err(|_| EngineError::protocol_violation("engine response key ID is invalid"))?;
+        let signed_length = bytes.len() - ED25519_SIGNATURE_BYTES;
+        let payload_length = usize::try_from(read_u32(bytes, 52)?).map_err(|_| {
+            EngineError::protocol_violation("service response payload is not addressable")
+        })?;
+        let expected_length = SERVICE_REQUEST_FIXED_BYTES
+            .checked_add(payload_length)
+            .filter(|expected| *expected == signed_length)
+            .ok_or_else(|| {
+                EngineError::protocol_violation("service response payload length is invalid")
+            })?;
+        let signature = read_exact::<ED25519_SIGNATURE_BYTES>(bytes, expected_length)?;
+        verify_engine_response_signature(
+            expected_engine_key_id,
+            expected_engine_public_key,
+            engine_key_id,
+            &bytes[..signed_length],
+            &signature,
+        )?;
+        let payload = bytes[SERVICE_REQUEST_FIXED_BYTES..signed_length].to_vec();
+        Ok(Self { kind, request_id, request_nonce, engine_key_id, payload })
+    }
+
+    /// Returns the closed response category.
+    pub const fn kind(&self) -> ServiceMessageKind {
+        self.kind
+    }
+
+    /// Returns the authenticated request correlation identifier.
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Returns the authenticated originating request nonce.
+    pub const fn request_nonce(&self) -> u64 {
+        self.request_nonce
+    }
+
+    /// Returns the pinned engine response identity.
+    pub const fn engine_key_id(&self) -> SignerKeyId {
+        self.engine_key_id
+    }
+
+    /// Returns bounded message-specific response bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, EngineError> {
@@ -369,6 +473,127 @@ mod tests {
                 0,
                 key_id,
                 &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_response_verifies_exact_identity_correlation_and_payload() {
+        let request_id = RequestId::new(0x77).expect("request ID");
+        let engine_key_id = SignerKeyId::from_bytes([0x78; 16]).expect("engine key ID");
+        let mut seed = [0x79; 32];
+        let signer = EngineResponseSigner::from_seed(engine_key_id, &mut seed).expect("signer");
+        let public_key = signer.public_key();
+        let encoded = encode_signed_service_response(
+            ServiceMessageKind::Health,
+            request_id,
+            11,
+            &[1],
+            &signer,
+        )
+        .expect("response must encode");
+        let response = AuthenticatedServiceResponse::decode(
+            &encoded,
+            request_id,
+            11,
+            engine_key_id,
+            &public_key,
+        )
+        .expect("response must verify");
+        assert_eq!(response.kind(), ServiceMessageKind::Health);
+        assert_eq!(response.request_id(), request_id);
+        assert_eq!(response.request_nonce(), 11);
+        assert_eq!(response.engine_key_id(), engine_key_id);
+        assert_eq!(response.payload(), &[1]);
+
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &encoded,
+                RequestId::new(0x88).expect("other request ID"),
+                11,
+                engine_key_id,
+                &public_key,
+            )
+            .is_err()
+        );
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &encoded,
+                request_id,
+                12,
+                engine_key_id,
+                &public_key,
+            )
+            .is_err()
+        );
+        let mut tampered = encoded;
+        tampered[SERVICE_REQUEST_FIXED_BYTES] ^= 1;
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &tampered,
+                request_id,
+                11,
+                engine_key_id,
+                &public_key,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn response_parser_rejects_wrong_direction_version_length_and_key() {
+        let request_id = RequestId::new(5).expect("request ID");
+        let engine_key_id = SignerKeyId::from_bytes([6; 16]).expect("engine key ID");
+        let mut seed = [7; 32];
+        let signer = EngineResponseSigner::from_seed(engine_key_id, &mut seed).expect("signer");
+        let public_key = signer.public_key();
+        let encoded = encode_signed_service_response(
+            ServiceMessageKind::Metrics,
+            request_id,
+            3,
+            &[0; 16],
+            &signer,
+        )
+        .expect("response must encode");
+        for length in [0, 8, SERVICE_REQUEST_FIXED_BYTES, encoded.len() - 1] {
+            assert!(
+                AuthenticatedServiceResponse::decode(
+                    &encoded[..length],
+                    request_id,
+                    3,
+                    engine_key_id,
+                    &public_key,
+                )
+                .is_err()
+            );
+        }
+        let mut wrong_kind = encoded.clone();
+        wrong_kind[10] = ServiceMessageKind::Hello as u8;
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &wrong_kind,
+                request_id,
+                3,
+                engine_key_id,
+                &public_key,
+            )
+            .is_err()
+        );
+        let wrong_key = SignerKeyId::from_bytes([8; 16]).expect("wrong key ID");
+        assert!(
+            AuthenticatedServiceResponse::decode(&encoded, request_id, 3, wrong_key, &public_key,)
+                .is_err()
+        );
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(
+            AuthenticatedServiceResponse::decode(
+                &trailing,
+                request_id,
+                3,
+                engine_key_id,
+                &public_key,
             )
             .is_err()
         );

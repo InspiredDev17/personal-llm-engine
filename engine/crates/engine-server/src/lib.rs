@@ -2990,9 +2990,9 @@ mod tests {
         control_plane_signature_message, engine_response_signature_message,
     };
     use personalai_engine_protocol::{
-        AuthenticatedServiceRequest, CancellationEnvelope, GenerationRequestEnvelope,
-        ServiceMessageKind, attach_cancellation_signature, attach_generation_signature,
-        attach_service_signature,
+        AuthenticatedServiceRequest, AuthenticatedServiceResponse, CancellationEnvelope,
+        GenerationRequestEnvelope, ServiceMessageKind, attach_cancellation_signature,
+        attach_generation_signature, attach_service_signature,
     };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
@@ -4708,19 +4708,17 @@ mod tests {
             stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("response payload");
             let response = Frame::decode_outbound_exact(&frame).expect("response frame");
             assert_eq!(response.kind(), FrameKind::ServiceResponse);
-            let response_payload = response.payload();
-            assert_eq!(response_payload[10], ServiceMessageKind::Health as u8);
-            assert_eq!(response_payload[56], 1);
-            let signed_length = response_payload.len() - 64;
-            let signature = Signature::from_bytes(
-                response_payload[signed_length..].try_into().expect("response signature"),
-            );
-            let transcript = engine_response_signature_message(&response_payload[..signed_length])
-                .expect("response transcript");
-            VerifyingKey::from_bytes(&response_public_key)
-                .expect("response key")
-                .verify_strict(&transcript, &signature)
-                .expect("response signature must verify");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            let verified = AuthenticatedServiceResponse::decode(
+                response.payload(),
+                request_id,
+                1,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("service response must verify");
+            assert_eq!(verified.kind(), ServiceMessageKind::Health);
+            assert_eq!(verified.payload(), &[1]);
         });
         assert!(matches!(
             fixture.runtime.serve_one(&fixture.listener),

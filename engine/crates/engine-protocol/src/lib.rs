@@ -13,8 +13,8 @@ pub use messages::{
     attach_generation_signature, encode_signed_generation_event,
 };
 pub use service::{
-    AuthenticatedServiceRequest, SERVICE_REQUEST_FIXED_BYTES, ServiceMessageKind,
-    attach_service_signature, encode_signed_service_response,
+    AuthenticatedServiceRequest, AuthenticatedServiceResponse, SERVICE_REQUEST_FIXED_BYTES,
+    ServiceMessageKind, attach_service_signature, encode_signed_service_response,
 };
 
 use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};

@@ -17,8 +17,10 @@ wire formats. Frame kinds 6 and 7 carry a separate `PAISVC01` request and
 closed message type, reserved byte, nonzero nonce, 128-bit request ID,
 16-byte key ID, and 32-bit payload length. Requests carry a 64-byte Ed25519
 signature under the existing control-plane domain; responses carry the engine
-response signature. Exact lengths, direction, flags, type, version, and
-signature are mandatory.
+response signature. The first-party response decoder additionally requires the
+expected request ID, originating nonce, pinned response-key ID, and pinned
+public key before exposing payload bytes. Exact lengths, direction, flags,
+type, version, correlation, identity, and signature are mandatory.
 
 The closed service catalog is `Hello`, `HelloAccepted`, `HelloRejected`,
 `ListCapabilities`, `ListRegisteredModels`, `LoadModel`, `UnloadModel`,

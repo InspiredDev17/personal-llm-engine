@@ -362,6 +362,31 @@ pub fn verify_control_plane_signature_with_keys(
     verify_control_plane_signature(trusted_key, envelope_key_id, request_bytes, signature_bytes)
 }
 
+/// Strictly verifies one engine response against an exact pinned identity.
+pub fn verify_engine_response_signature(
+    expected_key_id: SignerKeyId,
+    expected_public_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+    envelope_key_id: SignerKeyId,
+    response_bytes: &[u8],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if expected_key_id != envelope_key_id {
+        return Err(EngineError::authentication_failure(
+            "engine response key does not match local configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(expected_public_key)
+        .map_err(|_| EngineError::authentication_failure("engine response key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::authentication_failure("engine response key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let transcript = engine_response_signature_message(response_bytes)?;
+    verifying_key
+        .verify_strict(&transcript, &signature)
+        .map_err(|_| EngineError::authentication_failure("engine response signature is invalid"))
+}
+
 fn domain_separated_message(
     domain: &[u8],
     digest: &[u8; ModelPackageHash::BYTE_LEN],
