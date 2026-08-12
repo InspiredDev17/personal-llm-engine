@@ -7,11 +7,9 @@ publish.workspace = true
 description = "Bounded deterministic sampling for the PersonalAI native engine"
 
 [dependencies]
+personalai-engine-memory.workspace = true
 personalai-engine-tensor.workspace = true
 personalai-engine-types.workspace = true
-
-[dev-dependencies]
-personalai-engine-memory.workspace = true
 
 [lints]
 workspace = true

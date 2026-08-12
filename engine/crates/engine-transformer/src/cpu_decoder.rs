@@ -2,10 +2,12 @@
 
 use crate::{FIRST_PARTY_DECODER_ARCHITECTURE_ID, TransformerConfig, TransformerPlan};
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
+use personalai_engine_kv_cache::{ContiguousKvCache, KvTokenWriter, SequenceHandle};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
-    DType, EngineError, RequestId, ResourceBudget, SequenceId, TensorShape,
+    DType, EngineError, MAX_CONCURRENT_SEQUENCES, ModelId, RequestId, ResourceBudget, SequenceId,
+    TensorShape,
 };
 use std::collections::BTreeMap;
 
@@ -18,11 +20,22 @@ pub struct CpuDecoderModel {
     config: TransformerConfig,
     weights: BTreeMap<String, Tensor>,
     pool: MemoryPool,
+    cache: ContiguousKvCache,
 }
 
 impl CpuDecoderModel {
     /// Validates the exact architecture and every required tensor shape.
     pub fn new(
+        config: TransformerConfig,
+        weights: BTreeMap<String, Tensor>,
+        pool: &MemoryPool,
+    ) -> Result<Self, EngineError> {
+        Self::new_registered(ModelId::new("unregistered-test-model")?, config, weights, pool)
+    }
+
+    /// Validates a production model under its configuration-owned identity.
+    pub fn new_registered(
+        model_id: ModelId,
         config: TransformerConfig,
         weights: BTreeMap<String, Tensor>,
         pool: &MemoryPool,
@@ -48,12 +61,29 @@ impl CpuDecoderModel {
             ));
         }
         validate_weights(&config, &weights, pool)?;
-        Ok(Self { config, weights, pool: pool.clone() })
+        let cache_budget =
+            ResourceBudget::new(pool.limit_bytes(), pool.limit_bytes(), MAX_CONCURRENT_SEQUENCES)?;
+        let cache_plan = personalai_engine_kv_cache::KvCachePlan::new(
+            config.layer_count(),
+            config.kv_head_count(),
+            config.head_dimension(),
+            config.context_limit().get(),
+            config.cache_dtype(),
+            &cache_budget,
+        )?;
+        let cache =
+            ContiguousKvCache::new(model_id, cache_plan, MAX_CONCURRENT_SEQUENCES, pool.clone())?;
+        Ok(Self { config, weights, pool: pool.clone(), cache })
     }
 
     /// Returns the validated architecture configuration.
     pub const fn config(&self) -> &TransformerConfig {
         &self.config
+    }
+
+    /// Returns the aggregate pool used for request-scoped runtime accounting.
+    pub const fn memory_pool(&self) -> &MemoryPool {
+        &self.pool
     }
 
     /// Allocates one bounded sequence cache under the model's aggregate pool.
@@ -65,18 +95,21 @@ impl CpuDecoderModel {
     ) -> Result<CpuDecoderSession<'_>, EngineError> {
         let plan = TransformerPlan::new(self.config.clone(), budget)?;
         plan.require_executable_architecture()?;
-        let cache_shape = TensorShape::new([
-            2,
-            u64::from(self.config.layer_count()),
-            u64::from(self.config.context_limit().get()),
-            u64::from(self.config.kv_head_count()),
-            u64::from(self.config.head_dimension()),
-        ])?;
-        let kv_pool = self.pool.scoped(MemoryOwner::SequenceKv(sequence_id));
-        let cache = Tensor::zeros(DType::F32, cache_shape, &kv_pool)?;
+        if plan.kv_cache() != self.cache.plan() {
+            return Err(EngineError::internal_invariant(
+                "request and model KV-cache layouts differ",
+            ));
+        }
+        if self.cache.metrics()?.active_sequence_count >= budget.max_concurrent_sequences() {
+            return Err(EngineError::resource_exhaustion(
+                "request sequence concurrency budget is exhausted",
+            ));
+        }
+        let handle = self.cache.create_sequence(request_id, sequence_id)?;
         Ok(CpuDecoderSession {
             model: self,
-            cache,
+            cache: &self.cache,
+            handle,
             scratch_pool: self.pool.scoped(MemoryOwner::RequestScratch(request_id)),
             output_pool: self.pool.scoped(MemoryOwner::OutputLogits(request_id)),
             token_count: 0,
@@ -94,7 +127,8 @@ impl CpuDecoderModel {
 #[derive(Debug)]
 pub struct CpuDecoderSession<'a> {
     model: &'a CpuDecoderModel,
-    cache: Tensor,
+    cache: &'a ContiguousKvCache,
+    handle: SequenceHandle,
     scratch_pool: MemoryPool,
     output_pool: MemoryPool,
     token_count: u32,
@@ -104,6 +138,32 @@ impl CpuDecoderSession<'_> {
     /// Returns the number of tokens already committed to this sequence.
     pub const fn token_count(&self) -> u32 {
         self.token_count
+    }
+
+    /// Processes a non-empty prompt and returns logits for its final position.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Tensor, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::invalid_input("decoder prefill requires at least one token"));
+        }
+        let additional = u32::try_from(tokens.len())
+            .map_err(|_| EngineError::resource_exhaustion("prefill token count exceeds u32"))?;
+        if self
+            .token_count
+            .checked_add(additional)
+            .is_none_or(|total| total > self.model.config.context_limit().get())
+        {
+            return Err(EngineError::resource_exhaustion("decoder prefill exceeds context"));
+        }
+        let mut final_logits = None;
+        for token in tokens {
+            final_logits = Some(self.decode(*token)?);
+        }
+        final_logits.ok_or_else(|| EngineError::internal_invariant("prefill produced no logits"))
+    }
+
+    /// Processes exactly one token at the next sequence position.
+    pub fn decode(&mut self, token: u32) -> Result<Tensor, EngineError> {
+        self.forward_token(token)
     }
 
     /// Executes one token and returns finite next-token logits.
@@ -125,8 +185,9 @@ impl CpuDecoderSession<'_> {
             hidden,
         )?;
 
+        let mut writer = self.cache.begin_token(self.handle)?;
         for layer in 0..self.model.config.layer_count() {
-            self.forward_layer(layer, &mut state)?;
+            self.forward_layer(layer, &mut writer, &mut state)?;
         }
         let normalized = rms_norm(
             &state,
@@ -144,6 +205,7 @@ impl CpuDecoderSession<'_> {
             &logits,
             &self.output_pool,
         )?;
+        writer.commit()?;
         self.token_count = self
             .token_count
             .checked_add(1)
@@ -151,7 +213,12 @@ impl CpuDecoderSession<'_> {
         Ok(output)
     }
 
-    fn forward_layer(&mut self, layer: u32, state: &mut [f32]) -> Result<(), EngineError> {
+    fn forward_layer(
+        &self,
+        layer: u32,
+        writer: &mut KvTokenWriter<'_>,
+        state: &mut [f32],
+    ) -> Result<(), EngineError> {
         let hidden = usize_from_u32(self.model.config.hidden_dimension())?;
         let kv_dimension = usize_from_u32(
             self.model
@@ -198,8 +265,8 @@ impl CpuDecoderSession<'_> {
             self.token_count,
             self.model.config.rope_theta(),
         )?;
-        self.store_kv(layer, &key, &value)?;
-        let attention = self.attention(layer, &query)?;
+        writer.write_layer(layer, &key, &value)?;
+        let attention = self.attention(layer, writer, &query)?;
         let projected = linear(
             self.model.weight(&format!("{prefix}.o_proj.weight"))?,
             &attention,
@@ -236,28 +303,12 @@ impl CpuDecoderSession<'_> {
         add_in_place(state, &down)
     }
 
-    fn store_kv(&mut self, layer: u32, key: &[f32], value: &[f32]) -> Result<(), EngineError> {
-        let kv_heads = self.model.config.kv_head_count();
-        let head_dimension = self.model.config.head_dimension();
-        for head in 0..kv_heads {
-            for dimension in 0..head_dimension {
-                let source = usize_from_u32(
-                    head.checked_mul(head_dimension)
-                        .and_then(|offset| offset.checked_add(dimension))
-                        .ok_or_else(|| {
-                            EngineError::internal_invariant("KV source index overflows")
-                        })?,
-                )?;
-                let key_index = self.cache_index(0, layer, self.token_count, head, dimension)?;
-                let value_index = self.cache_index(1, layer, self.token_count, head, dimension)?;
-                self.cache.set_f32_value(key_index, key[source])?;
-                self.cache.set_f32_value(value_index, value[source])?;
-            }
-        }
-        Ok(())
-    }
-
-    fn attention(&self, layer: u32, query: &[f32]) -> Result<Vec<f32>, EngineError> {
+    fn attention(
+        &self,
+        layer: u32,
+        writer: &KvTokenWriter<'_>,
+        query: &[f32],
+    ) -> Result<Vec<f32>, EngineError> {
         let attention_heads = usize_from_u32(self.model.config.attention_head_count())?;
         let kv_heads = usize_from_u32(self.model.config.kv_head_count())?;
         let head_dimension = usize_from_u32(self.model.config.head_dimension())?;
@@ -284,15 +335,13 @@ impl CpuDecoderSession<'_> {
                         .checked_mul(head_dimension)
                         .and_then(|offset| offset.checked_add(dimension))
                         .ok_or_else(|| EngineError::internal_invariant("query index overflows"))?;
-                    let cache_index = self.cache_index(
-                        0,
+                    let cached = writer.read_key_value(
                         layer,
                         u32_from_usize(position)?,
                         u32_from_usize(kv_head)?,
                         u32_from_usize(dimension)?,
                     )?;
-                    dot += f64::from(finite(query[query_index])?)
-                        * f64::from(finite(self.cache.f32_value(cache_index)?)?);
+                    dot += f64::from(finite(query[query_index])?) * f64::from(finite(cached)?);
                 }
                 *score = f32_from_f64(dot / scale)?;
             }
@@ -300,15 +349,13 @@ impl CpuDecoderSession<'_> {
             for dimension in 0..head_dimension {
                 let mut value = 0.0_f64;
                 for (position, probability) in scores.iter().copied().enumerate() {
-                    let cache_index = self.cache_index(
-                        1,
+                    let cached = writer.read_cached_value(
                         layer,
                         u32_from_usize(position)?,
                         u32_from_usize(kv_head)?,
                         u32_from_usize(dimension)?,
                     )?;
-                    value += f64::from(finite(probability)?)
-                        * f64::from(finite(self.cache.f32_value(cache_index)?)?);
+                    value += f64::from(finite(probability)?) * f64::from(finite(cached)?);
                 }
                 let output_index = query_head
                     .checked_mul(head_dimension)
@@ -319,30 +366,11 @@ impl CpuDecoderSession<'_> {
         }
         Ok(output)
     }
+}
 
-    fn cache_index(
-        &self,
-        kind: u32,
-        layer: u32,
-        position: u32,
-        head: u32,
-        dimension: u32,
-    ) -> Result<usize, EngineError> {
-        let dimensions = [
-            u64::from(self.model.config.layer_count()),
-            u64::from(self.model.config.context_limit().get()),
-            u64::from(self.model.config.kv_head_count()),
-            u64::from(self.model.config.head_dimension()),
-        ];
-        let mut index = u64::from(kind);
-        for (coordinate, width) in [layer, position, head, dimension].into_iter().zip(dimensions) {
-            index = index
-                .checked_mul(width)
-                .and_then(|value| value.checked_add(u64::from(coordinate)))
-                .ok_or_else(|| EngineError::internal_invariant("KV-cache index overflows"))?;
-        }
-        usize::try_from(index)
-            .map_err(|_| EngineError::resource_exhaustion("KV-cache index is not addressable"))
+impl Drop for CpuDecoderSession<'_> {
+    fn drop(&mut self) {
+        let _ = self.cache.destroy_sequence(self.handle);
     }
 }
 
@@ -685,6 +713,53 @@ mod tests {
             assert!(first.f32_value(index).expect("logit must read").is_finite());
             assert!(second.f32_value(index).expect("logit must read").is_finite());
         }
+    }
+
+    #[test]
+    fn prefill_matches_incremental_decode_and_enforces_context() {
+        let pool = MemoryPool::new(1 << 20).expect("pool must validate");
+        let model = CpuDecoderModel::new(tiny_config(), tiny_weights(&pool), &pool)
+            .expect("tiny exact architecture must construct");
+        let budget = ResourceBudget::new(1 << 20, 1 << 18, 2).expect("budget must validate");
+        let mut prefilled = model
+            .start_session(&budget, RequestId::new(1).unwrap(), SequenceId::new(1).unwrap())
+            .expect("prefill session must construct");
+        let mut incremental = model
+            .start_session(&budget, RequestId::new(2).unwrap(), SequenceId::new(2).unwrap())
+            .expect("incremental session must construct");
+        let expected = prefilled.prefill(&[1, 2, 3]).expect("prefill must execute");
+        let mut actual = None;
+        for token in [1, 2, 3] {
+            actual = Some(incremental.decode(token).expect("decode must execute"));
+        }
+        let actual = actual.expect("incremental logits must exist");
+        for index in 0..8 {
+            let difference =
+                (expected.f32_value(index).unwrap() - actual.f32_value(index).unwrap()).abs();
+            assert!(difference <= 1.0e-6);
+        }
+        assert!(prefilled.prefill(&[]).is_err());
+        assert!(prefilled.prefill(&[1; 6]).is_err());
+        let cached = incremental.decode(4).expect("cached decode must execute");
+        drop(prefilled);
+        let mut full_sequence = model
+            .start_session(&budget, RequestId::new(3).unwrap(), SequenceId::new(3).unwrap())
+            .expect("full-sequence session must construct");
+        let recomputed =
+            full_sequence.prefill(&[1, 2, 3, 4]).expect("full sequence must recompute");
+        for index in 0..8 {
+            let difference =
+                (cached.f32_value(index).unwrap() - recomputed.f32_value(index).unwrap()).abs();
+            assert!(difference <= 1.0e-6);
+        }
+        assert!(incremental.decode(8).is_err());
+        drop(full_sequence);
+        drop(incremental);
+        let mut maximum = model
+            .start_session(&budget, RequestId::new(4).unwrap(), SequenceId::new(4).unwrap())
+            .expect("maximum session must construct");
+        maximum.prefill(&[1; 8]).expect("exact context must execute");
+        assert!(maximum.decode(1).is_err());
     }
 
     #[test]

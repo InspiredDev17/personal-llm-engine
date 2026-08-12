@@ -303,7 +303,7 @@ impl DecoderPackageFixtureBuilder {
         Self
     }
 
-    /// Builds a signed one-layer f32 decoder package with byte tokenizer data.
+    /// Builds a signed two-layer GQA f32 decoder package with byte tokenizer data.
     pub fn build(self) -> Result<SignedPackageFixture, EngineError> {
         build_signed_package(decoder_manifest(), decoder_tensors()?)
     }
@@ -390,9 +390,9 @@ impl Default for PackageFixtureBuilder {
 fn decoder_manifest() -> ManifestFixture {
     ManifestFixture {
         architecture: DECODER_ARCHITECTURE,
-        layer_count: 1,
+        layer_count: 2,
         hidden_dimension: 4,
-        attention_head_count: 1,
+        attention_head_count: 2,
         kv_head_count: 1,
         context_limit: 8,
         intermediate_dimension: 8,
@@ -404,16 +404,21 @@ fn decoder_tensors() -> Result<Vec<TensorFixture>, EngineError> {
         f32_tensor("token_embedding.weight", &[259, 4], &repeated(1_036, 0.0005))?,
         f32_tensor("final_norm.weight", &[4], &[1.0; 4])?,
         f32_tensor("output.weight", &[259, 4], &repeated(1_036, 0.0003))?,
-        f32_tensor("layers.000.attn_norm.weight", &[4], &[1.0; 4])?,
-        f32_tensor("layers.000.q_proj.weight", &[4, 4], &identity(4))?,
-        f32_tensor("layers.000.k_proj.weight", &[4, 4], &identity(4))?,
-        f32_tensor("layers.000.v_proj.weight", &[4, 4], &identity(4))?,
-        f32_tensor("layers.000.o_proj.weight", &[4, 4], &identity(4))?,
-        f32_tensor("layers.000.ffn_norm.weight", &[4], &[1.0; 4])?,
-        f32_tensor("layers.000.gate_proj.weight", &[8, 4], &repeated(32, 0.002))?,
-        f32_tensor("layers.000.up_proj.weight", &[8, 4], &repeated(32, 0.001))?,
-        f32_tensor("layers.000.down_proj.weight", &[4, 8], &repeated(32, 0.001))?,
     ];
+    for layer in 0..2 {
+        let prefix = format!("layers.{layer:03}");
+        tensors.extend([
+            f32_tensor(format!("{prefix}.attn_norm.weight"), &[4], &[1.0; 4])?,
+            f32_tensor(format!("{prefix}.q_proj.weight"), &[4, 4], &identity(4))?,
+            f32_tensor(format!("{prefix}.k_proj.weight"), &[2, 4], &identity_rows(2, 4))?,
+            f32_tensor(format!("{prefix}.v_proj.weight"), &[2, 4], &identity_rows(2, 4))?,
+            f32_tensor(format!("{prefix}.o_proj.weight"), &[4, 4], &identity(4))?,
+            f32_tensor(format!("{prefix}.ffn_norm.weight"), &[4], &[1.0; 4])?,
+            f32_tensor(format!("{prefix}.gate_proj.weight"), &[8, 4], &repeated(32, 0.002))?,
+            f32_tensor(format!("{prefix}.up_proj.weight"), &[8, 4], &repeated(32, 0.001))?,
+            f32_tensor(format!("{prefix}.down_proj.weight"), &[4, 8], &repeated(32, 0.001))?,
+        ]);
+    }
     tensors.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(tensors)
 }
@@ -451,6 +456,14 @@ fn identity(dimension: usize) -> Vec<f32> {
     let mut values = vec![0.0; dimension * dimension];
     for index in 0..dimension {
         values[index * dimension + index] = 1.0;
+    }
+    values
+}
+
+fn identity_rows(rows: usize, columns: usize) -> Vec<f32> {
+    let mut values = vec![0.0; rows * columns];
+    for index in 0..rows.min(columns) {
+        values[index * columns + index] = 1.0;
     }
     values
 }
@@ -820,8 +833,17 @@ mod tests {
         let parsed = ParsedModelPackage::parse(fixture.bytes()).expect("decoder must parse");
         assert_eq!(parsed.manifest().architecture_id().as_str(), "decoder-rms-rope-swiglu-gqa-v1");
         assert_eq!(parsed.manifest().vocabulary_size(), 259);
-        assert_eq!(parsed.tensors().len(), 12);
+        assert_eq!(parsed.manifest().layer_count(), 2);
+        assert_eq!(parsed.manifest().attention_head_count(), 2);
+        assert_eq!(parsed.manifest().kv_head_count(), 1);
+        assert_eq!(parsed.tensors().len(), 21);
         assert!(parsed.tensors().iter().any(|tensor| tensor.name().as_str() == "output.weight"));
+        assert!(
+            parsed
+                .tensors()
+                .iter()
+                .any(|tensor| tensor.name().as_str() == "layers.001.down_proj.weight")
+        );
     }
 
     #[test]

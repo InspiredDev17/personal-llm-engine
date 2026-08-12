@@ -819,7 +819,9 @@ mod tests {
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
-    use personalai_engine_types::ResourceBudget;
+    use personalai_engine_types::{
+        GenerationEvent, GenerationRequest, RequestId, ResourceBudget, SequenceId,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn spec() -> ImportSpec {
@@ -829,8 +831,8 @@ mod tests {
             ContextLimit::new(8).expect("context must validate"),
             259,
             4,
-            1,
-            1,
+            2,
+            2,
             1,
             8,
             10_000.0,
@@ -919,6 +921,36 @@ mod tests {
             provenance
                 .contains(&format!("\"tokenizer_source_sha384\": \"{}\"", hash_package(metadata)))
         );
+    }
+
+    fn assert_signed_cpu_generation(
+        cpu_model: &personalai_engine_server::LoadedCpuModel,
+        budget: ResourceBudget,
+    ) {
+        let request = GenerationRequest::new(
+            RequestId::new(1).expect("request ID must validate"),
+            spec().model_id().clone(),
+            "A",
+            4,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("generation request must validate");
+        let mut events = Vec::new();
+        let usage = cpu_model
+            .generate_greedy(
+                &request,
+                SequenceId::new(1).expect("sequence ID must validate"),
+                &std::sync::atomic::AtomicBool::new(false),
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("signed directory package must generate");
+        assert!(usage.output_tokens() > 0);
+        assert!(events.iter().any(|event| matches!(event, GenerationEvent::Token { .. })));
+        assert!(matches!(events.last(), Some(GenerationEvent::Completed { .. })));
     }
 
     fn write_import_sources(quarantine: &Path, source: &[u8]) -> Vec<u8> {
@@ -1033,17 +1065,21 @@ mod tests {
             "token_embedding.weight" => "model.embed_tokens.weight".to_owned(),
             "final_norm.weight" => "model.norm.weight".to_owned(),
             "output.weight" => "lm_head.weight".to_owned(),
-            name => name
-                .replace("layers.000.", "model.layers.0.")
-                .replace("attn_norm.weight", "input_layernorm.weight")
-                .replace("ffn_norm.weight", "post_attention_layernorm.weight")
-                .replace("q_proj.weight", "self_attn.q_proj.weight")
-                .replace("k_proj.weight", "self_attn.k_proj.weight")
-                .replace("v_proj.weight", "self_attn.v_proj.weight")
-                .replace("o_proj.weight", "self_attn.o_proj.weight")
-                .replace("gate_proj.weight", "mlp.gate_proj.weight")
-                .replace("up_proj.weight", "mlp.up_proj.weight")
-                .replace("down_proj.weight", "mlp.down_proj.weight"),
+            name => {
+                let rest = name.strip_prefix("layers.").expect("canonical layer prefix");
+                let (layer, suffix) = rest.split_once('.').expect("canonical layer suffix");
+                let layer = layer.parse::<u32>().expect("canonical layer number");
+                format!("model.layers.{layer}.{suffix}")
+                    .replace("attn_norm.weight", "input_layernorm.weight")
+                    .replace("ffn_norm.weight", "post_attention_layernorm.weight")
+                    .replace("q_proj.weight", "self_attn.q_proj.weight")
+                    .replace("k_proj.weight", "self_attn.k_proj.weight")
+                    .replace("v_proj.weight", "self_attn.v_proj.weight")
+                    .replace("o_proj.weight", "self_attn.o_proj.weight")
+                    .replace("gate_proj.weight", "mlp.gate_proj.weight")
+                    .replace("up_proj.weight", "mlp.up_proj.weight")
+                    .replace("down_proj.weight", "mlp.down_proj.weight")
+            }
         }
     }
 
@@ -1277,6 +1313,7 @@ mod tests {
             .expect("production CPU composition must load the directory package");
         assert_eq!(cpu_model.model_id(), spec().model_id());
         assert!(service_events.is_empty());
+        assert_signed_cpu_generation(&cpu_model, budget);
 
         assert_live_mapping_change_is_reported(
             &loaded,

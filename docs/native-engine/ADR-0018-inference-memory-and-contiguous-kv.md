@@ -56,9 +56,9 @@ revalidation. Mappings and their file descriptors drop with package ownership.
 - Cancellation and partial backend failure cannot leave readable partial KV.
 - Scratch reuse cannot expose prior request bytes.
 - Contiguous cache memory grows by maximum context rather than current context.
-- The existing scalar decoder's private F32 cache remains until it is migrated
-  to the shared contract; both are bounded and tested, but this is the next
-  integration item.
+- The scalar decoder uses the contiguous cache directly. Each decoder session
+  owns one generation-checked handle, commits a position only after every layer
+  is written, and clears/releases the sequence on drop.
 
 ## Paged-cache transition gate
 

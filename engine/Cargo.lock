@@ -121,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "personalai-engine-crypto",
+ "personalai-engine-sampling",
  "personalai-engine-scheduler",
  "personalai-engine-server",
  "personalai-engine-types",

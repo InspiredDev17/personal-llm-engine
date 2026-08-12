@@ -15,12 +15,15 @@ AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
 tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
 storage conversion, an immutable architecture-owned graph, one fixed decoder architecture,
 scalar CPU reference
-inference, KV state, deterministic greedy generation, a bounded scheduler,
+inference, contiguous sequence-owned KV state, deterministic greedy and seeded
+temperature/top-k/top-p/min-p/repetition-penalty sampling, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
-and an owner CLI. The CLI exposes the continuous driver only through an explicit
+and an owner CLI. The CLI also exposes an explicit one-shot `generate` command
+that admits a registered signed package by model ID and never accepts a URL or
+arbitrary package path. The CLI exposes the continuous driver only through an explicit
 bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
 stop-admit, cancel, and drain path. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
@@ -33,8 +36,8 @@ has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. A legally
-approved real source model/package and independent numeric evidence, stochastic
-sampling, optimized ARM64, Metal, CUDA, performance qualification, and
+approved real source model/package and independent numeric evidence, optimized
+ARM64, Metal, CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
 existing production runtimes. Tokenizer support is intentionally limited to
 AIPTok Byte-Level BPE v1; SentencePiece, Unigram, WordPiece, tiktoken, and

@@ -30,7 +30,7 @@ Green authority.
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
 | `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
-| `engine-sampling` | deterministic tensor-direct greedy selection |
+| `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
 | `engine-server` | service composition, protected UDS and CPU runtime |
@@ -258,8 +258,8 @@ and the configured engine response-key ID. Go pins at most an explicit
 current/previous response public-key pair and verifies the selected binding
 before parsing or exposing event data.
 
-The current UDS runtime executes one CPU sequence at a time. Internally, greedy
-CPU generation uses a request-local resumable cursor that yields after at most
+The current UDS runtime executes one CPU sequence at a time. Internally, CPU
+generation uses a request-local resumable cursor that yields after at most
 one decoder token step; the existing synchronous generation API advances that
 cursor to completion. A bounded engine-owned round-robin coordinator checks
 its active ceiling, the most restrictive request concurrency budget, and
@@ -270,8 +270,12 @@ storage, and cursor overhead to an aggregate
 retained-byte ceiling. It advances one cursor once per pull and isolates cursor
 failure to that request. Deterministic tests prove that a
 shorter prompt can complete without waiting for a longer prompt and that
-cancellation does not prevent its neighbor from completing. The owner CLI still
-uses the single-worker loop. Separate reference drivers provide both an exact
+cancellation does not prevent its neighbor from completing. A separate rich
+internal lifecycle covers request acceptance, tokenization, prefill, generated
+tokens, stops, completion, cancellation, limits, model errors, and backend
+errors without changing the authenticated Go wire contract. The owner CLI can
+run this complete path for a registered signed package with explicit sampling
+and resource limits. Separate reference drivers provide both an exact
 batch and continuous admission. The batch accepts an exact configured number of
 connections no greater than the scheduler active limit or the separate
 64-connection ceiling,

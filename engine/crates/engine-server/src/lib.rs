@@ -36,7 +36,7 @@ use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package
 use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_memory::MemoryPool;
+use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_model_format::ParsedModelPackage;
 use personalai_engine_protocol::{
@@ -44,7 +44,7 @@ use personalai_engine_protocol::{
     GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_sampling::{SamplingConfig, select_next_token_tensor};
+use personalai_engine_sampling::{Sampler, SamplingConfig};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::CancellationOutcome;
 use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, SchedulerLimits};
@@ -342,6 +342,16 @@ impl LoadedCpuModel {
         request: &GenerationRequest,
         sequence_id: SequenceId,
     ) -> Result<GreedyGeneration<'a>, EngineError> {
+        self.start_generation(request, sequence_id, SamplingConfig::greedy())
+    }
+
+    /// Creates one validated, resumable generation sequence with first-party sampling.
+    pub fn start_generation<'a>(
+        &'a self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+    ) -> Result<GreedyGeneration<'a>, EngineError> {
         if request.model_id() != &self.model_id {
             return Err(EngineError::invalid_input(
                 "generation request model differs from the loaded model",
@@ -356,6 +366,8 @@ impl LoadedCpuModel {
         let input_count = u32::try_from(input_tokens.len())
             .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
         request.validate_tokenized_input(input_count)?;
+        let sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
+        let history = input_tokens.clone();
         Ok(GreedyGeneration {
             request: request.clone(),
             sequence_id,
@@ -364,6 +376,8 @@ impl LoadedCpuModel {
             session: None,
             input_tokens,
             input_count,
+            history,
+            sampler,
             next_input: 0,
             next_generated_token: None,
             generated: 0,
@@ -399,6 +413,286 @@ impl LoadedCpuModel {
             }
         }
     }
+
+    /// Runs complete first-party prefill, sampling, cached decode, and typed streaming.
+    pub fn generate(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(InferenceEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        if request.model_id() != &self.model_id {
+            let error = EngineError::invalid_input(
+                "generation request model differs from the loaded model",
+            );
+            emit(InferenceEvent::ModelError {
+                request_id: request.request_id(),
+                sequence_id,
+                error: error.clone(),
+            })?;
+            return Err(error);
+        }
+        if request.context_limit().get() > self.model.config().context_limit().get() {
+            let error = EngineError::resource_exhaustion(
+                "request context exceeds the loaded model context",
+            );
+            emit(InferenceEvent::ResourceLimitReached {
+                request_id: request.request_id(),
+                sequence_id,
+                error: error.clone(),
+            })?;
+            return Err(error);
+        }
+        emit(InferenceEvent::RequestAccepted { request_id: request.request_id(), sequence_id })?;
+        let result = self.generate_inner(request, sequence_id, sampling, cancelled, &mut emit);
+        if let Err(error) = &result {
+            let event = match error {
+                EngineError::Cancellation(_) => InferenceEvent::RequestCancelled {
+                    request_id: request.request_id(),
+                    sequence_id,
+                },
+                EngineError::ResourceExhaustion(_) => InferenceEvent::ResourceLimitReached {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+                EngineError::BackendFailure(_) => InferenceEvent::BackendError {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+                _ => InferenceEvent::ModelError {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+            };
+            emit(event)?;
+        }
+        result
+    }
+
+    fn generate_inner(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+        cancelled: &AtomicBool,
+        emit: &mut impl FnMut(InferenceEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        if request.model_id() != &self.model_id {
+            return Err(EngineError::invalid_input(
+                "generation request model differs from the loaded model",
+            ));
+        }
+        if request.context_limit().get() > self.model.config().context_limit().get() {
+            return Err(EngineError::resource_exhaustion(
+                "request context exceeds the loaded model context",
+            ));
+        }
+        check_cancelled(cancelled, request.request_id())?;
+        let input_tokens = self.tokenizer.encode(request.input_text())?;
+        let input_count = u32::try_from(input_tokens.len())
+            .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
+        request.validate_tokenized_input(input_count)?;
+        emit(InferenceEvent::PromptTokenized {
+            request_id: request.request_id(),
+            sequence_id,
+            token_count: input_count,
+        })?;
+        emit(InferenceEvent::PrefillStarted { request_id: request.request_id(), sequence_id })?;
+        let mut session = self.model.start_session(
+            &request.resource_budget(),
+            request.request_id(),
+            sequence_id,
+        )?;
+        let mut logits = session.prefill(&input_tokens)?;
+        emit(InferenceEvent::PrefillCompleted { request_id: request.request_id(), sequence_id })?;
+        let retained_tokens = input_tokens
+            .len()
+            .checked_add(usize::try_from(request.max_output_tokens()).map_err(|_| {
+                EngineError::resource_exhaustion("output token count is not addressable")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("generation history overflows"))?;
+        let retained_bytes = retained_tokens
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| EngineError::resource_exhaustion("generation history bytes overflow"))?;
+        let history_pool =
+            self.model.memory_pool().scoped(MemoryOwner::Sampling(request.request_id()));
+        let _history_reservation = history_pool.reserve(retained_bytes)?;
+        let mut history = input_tokens;
+        history
+            .try_reserve_exact(usize::try_from(request.max_output_tokens()).map_err(|_| {
+                EngineError::resource_exhaustion("output token count is not addressable")
+            })?)
+            .map_err(|_| {
+                EngineError::resource_exhaustion("generation history allocation failed")
+            })?;
+        let mut sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
+        let mut decoder = IncrementalDecoder::new(self.tokenizer.as_ref());
+        let mut generated = 0_u32;
+        loop {
+            check_cancelled(cancelled, request.request_id())?;
+            let token = sampler.sample(&logits, &history)?;
+            generated = generated
+                .checked_add(1)
+                .ok_or_else(|| EngineError::internal_invariant("generated count overflows"))?;
+            history.push(token);
+            let text = decoder.push(token)?;
+            emit(InferenceEvent::TokenGenerated {
+                request_id: request.request_id(),
+                sequence_id,
+                token_id: TokenId::new(token)?,
+                text: TextChunk::new(text)?,
+            })?;
+            let stop = if token == self.tokenizer.spec().end_of_sequence_token() {
+                Some(GenerationStopReason::EndOfSequence)
+            } else if sampler.config().is_stop_token(token) {
+                Some(GenerationStopReason::ConfiguredToken)
+            } else if generated >= request.max_output_tokens()
+                || generated >= sampler.config().maximum_generated_tokens()
+            {
+                Some(GenerationStopReason::MaximumGeneratedTokens)
+            } else {
+                None
+            };
+            if let Some(reason) = stop {
+                if decoder.has_pending_bytes() {
+                    return Err(EngineError::backend_failure(
+                        "generation ended with incomplete UTF-8",
+                    ));
+                }
+                emit(InferenceEvent::StopConditionReached {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    reason,
+                })?;
+                let usage = GenerationUsage::for_request(request, input_count, generated)?;
+                emit(InferenceEvent::RequestCompleted {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    usage,
+                })?;
+                return Ok(usage);
+            }
+            logits = session.decode(token)?;
+        }
+    }
+}
+
+/// First-party generation stop classification.
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationStopReason {
+    /// The tokenizer end-of-sequence ID was produced.
+    EndOfSequence,
+    /// A caller-configured stop ID was produced.
+    ConfiguredToken,
+    /// The request or sampler output ceiling was reached.
+    MaximumGeneratedTokens,
+}
+
+/// Rich internal generation lifecycle; the stable Go wire protocol remains separate.
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InferenceEvent {
+    /// The request passed initial routing validation.
+    RequestAccepted {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+    },
+    /// Prompt tokenization completed.
+    PromptTokenized {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Validated prompt-token count.
+        token_count: u32,
+    },
+    /// Prompt prefill began.
+    PrefillStarted {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+    },
+    /// Prompt prefill completed.
+    PrefillCompleted {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+    },
+    /// One token and safe UTF-8 chunk were produced.
+    TokenGenerated {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Validated generated token.
+        token_id: TokenId,
+        /// Bounded UTF-8 output fragment.
+        text: TextChunk,
+    },
+    /// A validated stop condition was reached.
+    StopConditionReached {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Validated stop classification.
+        reason: GenerationStopReason,
+    },
+    /// Request processing completed.
+    RequestCompleted {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Checked token usage.
+        usage: GenerationUsage,
+    },
+    /// Cancellation was observed.
+    RequestCancelled {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+    },
+    /// A finite resource limit prevented progress.
+    ResourceLimitReached {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Bounded structured failure.
+        error: EngineError,
+    },
+    /// Model, tokenizer, or request validation failed.
+    ModelError {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Bounded structured failure.
+        error: EngineError,
+    },
+    /// The selected compute backend failed.
+    BackendError {
+        /// Request correlation identifier.
+        request_id: RequestId,
+        /// Assigned sequence identifier.
+        sequence_id: SequenceId,
+        /// Bounded structured failure.
+        error: EngineError,
+    },
 }
 
 /// Result of one bounded greedy-generation scheduling quantum.
@@ -438,6 +732,8 @@ pub struct GreedyGeneration<'a> {
     session: Option<CpuDecoderSession<'a>>,
     input_tokens: Vec<u32>,
     input_count: u32,
+    history: Vec<u32>,
+    sampler: Sampler,
     next_input: usize,
     next_generated_token: Option<u32>,
     generated: u32,
@@ -512,14 +808,17 @@ impl GreedyGeneration<'_> {
         } else {
             return Err(EngineError::internal_invariant("tokenizer produced no prompt tokens"));
         };
-        let token = select_next_token_tensor(&logits, SamplingConfig::greedy())?;
+        let token = self.sampler.sample(&logits, &self.history)?;
         self.generated = self
             .generated
             .checked_add(1)
             .ok_or_else(|| EngineError::internal_invariant("generated token count overflows"))?;
         let text = self.stream_decoder.push(token)?;
-        let end_of_sequence = token == self.tokenizer.spec().end_of_sequence_token();
-        let output_limit = self.generated >= self.request.max_output_tokens();
+        self.history.push(token);
+        let end_of_sequence = token == self.tokenizer.spec().end_of_sequence_token()
+            || self.sampler.config().is_stop_token(token);
+        let output_limit = self.generated >= self.request.max_output_tokens()
+            || self.generated >= self.sampler.config().maximum_generated_tokens();
         if end_of_sequence || output_limit {
             self.terminal = Some(if !self.stream_decoder.has_pending_bytes() {
                 TerminalState::Complete
@@ -1194,14 +1493,14 @@ impl CpuEngineRuntime {
             }
         }
 
-        let mut coordinator = GenerationRoundRobin::with_limits(
-            maximum_active,
-            self.service.scheduler.limits().maximum_queued_bytes(),
-        )?;
         let mut active = Vec::new();
         active
             .try_reserve_exact(authenticated.len())
             .map_err(|_| EngineError::resource_exhaustion("active connection allocation failed"))?;
+        let mut coordinator = GenerationRoundRobin::with_limits(
+            maximum_active,
+            self.service.scheduler.limits().maximum_queued_bytes(),
+        )?;
         let mut batch = ConnectionBatchState {
             service: &mut self.service,
             models: &self.models,
@@ -1227,6 +1526,7 @@ impl CpuEngineRuntime {
             batch.active,
             batch.results,
         )?;
+        drop(coordinator);
         collect_connection_results(results)
     }
 
@@ -2075,7 +2375,7 @@ impl EngineService {
                 ));
             }
         }
-        let model = CpuDecoderModel::new(config, weights, &pool)?;
+        let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
         Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
     }
 
@@ -2101,7 +2401,7 @@ impl EngineService {
                 ));
             }
             let weights = verified.materialize_tensors(&pool)?.into_tensors();
-            let model = CpuDecoderModel::new(config, weights, &pool)?;
+            let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
             Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
         })();
         if let Err(error) = &result {
@@ -2643,6 +2943,110 @@ mod tests {
             .expect("queued generation must produce usage");
         assert!(scheduled_usage.output_tokens() >= 1);
         assert!(matches!(scheduled_events.last(), Some(GenerationEvent::Completed { .. })));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn signed_multilayer_fixture_runs_full_sampling_lifecycle_deterministically() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-sampling-golden").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-sampling-golden.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 2).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("signed fixture must load");
+        let request = GenerationRequest::new(
+            RequestId::new(701).unwrap(),
+            model_id,
+            "AB",
+            4,
+            ContextLimit::new(8).unwrap(),
+            budget,
+        )
+        .expect("request must validate");
+        let sampling = SamplingConfig::new(0.8)
+            .unwrap()
+            .with_allowed_token_ids(&[65, 66, 67, 257])
+            .unwrap()
+            .with_top_k(Some(16))
+            .unwrap()
+            .with_top_p(0.9)
+            .unwrap()
+            .with_min_p(0.01)
+            .unwrap()
+            .with_seed(0x5eed)
+            .with_maximum_generated_tokens(4)
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut first_events = Vec::new();
+        let first = loaded
+            .generate(
+                &request,
+                SequenceId::new(31).unwrap(),
+                sampling.clone(),
+                &cancelled,
+                |event| {
+                    first_events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("first generation must complete");
+        let mut second_events = Vec::new();
+        let second = loaded
+            .generate(&request, SequenceId::new(32).unwrap(), sampling, &cancelled, |event| {
+                second_events.push(event);
+                Ok(())
+            })
+            .expect("second generation must complete");
+        let token_ids = |events: &[InferenceEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    InferenceEvent::TokenGenerated { token_id, .. } => Some(token_id.get()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(token_ids(&first_events), token_ids(&second_events));
+        assert_eq!(first, second);
+        assert!(matches!(first_events.first(), Some(InferenceEvent::RequestAccepted { .. })));
+        assert!(
+            first_events
+                .iter()
+                .any(|event| matches!(event, InferenceEvent::PrefillCompleted { .. }))
+        );
+        assert!(matches!(first_events.last(), Some(InferenceEvent::RequestCompleted { .. })));
+        // Golden generated solely by this checked scalar implementation from
+        // DecoderPackageFixtureBuilder v1, seed 0x5eed, and the settings above.
+        assert_eq!(token_ids(&first_events), vec![67, 66, 65, 257]);
+
+        cancelled.store(true, Ordering::Release);
+        let mut cancelled_events = Vec::new();
+        assert!(matches!(
+            loaded.generate(
+                &request,
+                SequenceId::new(33).unwrap(),
+                SamplingConfig::greedy(),
+                &cancelled,
+                |event| {
+                    cancelled_events.push(event);
+                    Ok(())
+                },
+            ),
+            Err(EngineError::Cancellation(_))
+        ));
+        assert!(matches!(
+            cancelled_events.as_slice(),
+            [InferenceEvent::RequestAccepted { .. }, InferenceEvent::RequestCancelled { .. }]
+        ));
     }
 
     #[cfg(feature = "cpu-reference")]

@@ -339,6 +339,7 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // The explicit 17-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
     let allowed: [(&str, &[&str]); 17] = [
         ("engine-types", &[]),
@@ -389,7 +390,10 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-types",
             ],
         ),
-        ("engine-sampling", &["personalai-engine-tensor", "personalai-engine-types"]),
+        (
+            "engine-sampling",
+            &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
+        ),
         ("engine-scheduler", &["personalai-engine-types"]),
         ("engine-protocol", &["personalai-engine-crypto", "personalai-engine-types"]),
         (
@@ -410,6 +414,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             "engine-cli",
             &[
                 "personalai-engine-crypto",
+                "personalai-engine-sampling",
                 "personalai-engine-scheduler",
                 "personalai-engine-server",
                 "personalai-engine-types",

@@ -6,7 +6,7 @@ use personalai_engine_types::{DType, EngineError, MAX_CONTEXT_TOKENS, ResourceBu
 mod contiguous;
 
 pub use contiguous::{
-    ContiguousKvCache, KvCacheMetrics, KvCacheStatus, SequenceHandle, SequenceStatus,
+    ContiguousKvCache, KvCacheMetrics, KvCacheStatus, KvTokenWriter, SequenceHandle, SequenceStatus,
 };
 
 /// Maximum transformer layer count accepted by cache planning.

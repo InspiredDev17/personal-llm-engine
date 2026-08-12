@@ -6,6 +6,7 @@ mod os_signal;
 use personalai_engine_crypto::{
     EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
 };
+use personalai_engine_sampling::SamplingConfig;
 use personalai_engine_scheduler::SchedulerLimits;
 #[cfg(unix)]
 use personalai_engine_server::{
@@ -13,10 +14,11 @@ use personalai_engine_server::{
     UnixFrameListener,
 };
 use personalai_engine_server::{
-    EngineService, FOUNDATION_STATUS, ProtocolDescriptor, ServiceConfig,
+    EngineService, FOUNDATION_STATUS, InferenceEvent, ProtocolDescriptor, ServiceConfig,
 };
 use personalai_engine_types::{
-    EngineError, EngineErrorKind, ModelId, ModelPackageHash, ResourceBudget, SignerKeyId,
+    ContextLimit, EngineError, EngineErrorKind, GenerationRequest, ModelId, ModelPackageHash,
+    RequestId, ResourceBudget, SequenceId, SignerKeyId,
 };
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -30,11 +32,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 #[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 const USAGE: &str = "usage:
   personalai-engine version
   personalai-engine capabilities
   personalai-engine check-config --model-root PATH --runtime-root PATH --socket PATH
+  personalai-engine generate --model-root PATH --runtime-root PATH --socket PATH \
+    --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
+    --signer-key-id HEX32 --signer-public-key HEX64 --prompt TEXT \
+    --max-memory-bytes U64 --max-kv-cache-bytes U64 --max-tokens U32 \
+    [--temperature F32] [--seed U64]
   personalai-engine serve --model-root PATH --runtime-root PATH --socket PATH \
     --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
     --signer-key-id HEX32 --signer-public-key HEX64 \
@@ -58,7 +67,23 @@ enum Command {
     Version,
     Capabilities,
     CheckConfig(ServiceConfig),
+    Generate(Box<GenerateConfig>),
     Serve(Box<ServeConfig>),
+}
+
+#[derive(Debug)]
+struct GenerateConfig {
+    service: ServiceConfig,
+    model_id: ModelId,
+    package_name: PathBuf,
+    package_hash: ModelPackageHash,
+    signer_key_id: SignerKeyId,
+    signer_public_key: [u8; 32],
+    prompt: String,
+    budget: ResourceBudget,
+    maximum_tokens: u32,
+    temperature: f32,
+    seed: u64,
 }
 
 #[derive(Debug)]
@@ -159,6 +184,7 @@ fn run(
             cfg!(unix),
         )
         .map_err(|_| CliError::Io),
+        Command::Generate(config) => generate(*config, output, errors),
         Command::Serve(config) => serve(*config, secrets, errors),
     }
 }
@@ -170,6 +196,7 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
     match command {
         "version" if arguments.next().is_none() => Ok(Command::Version),
         "capabilities" if arguments.next().is_none() => Ok(Command::Capabilities),
+        "generate" => parse_generate(arguments).map(Box::new).map(Command::Generate),
         "serve" => parse_serve(arguments, false).map(Box::new).map(Command::Serve),
         "serve-continuous" => parse_serve(arguments, true).map(Box::new).map(Command::Serve),
         "check-config" => parse_config(arguments).map(Command::CheckConfig),
@@ -178,6 +205,92 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         }
         _ => Err(CliError::InvalidArguments("unknown command")),
     }
+}
+
+fn parse_generate(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<GenerateConfig, CliError> {
+    let mut model_root = None;
+    let mut runtime_root = None;
+    let mut socket_path = None;
+    let mut model_id = None;
+    let mut package_name = None;
+    let mut package_hash = None;
+    let mut signer_key_id = None;
+    let mut signer_public_key = None;
+    let mut prompt = None;
+    let mut maximum_memory = None;
+    let mut maximum_kv = None;
+    let mut maximum_tokens = None;
+    let mut temperature = None;
+    let mut seed = None;
+    while let Some(flag) = arguments.next() {
+        let flag =
+            flag.to_str().ok_or(CliError::InvalidArguments("generate flag must be valid UTF-8"))?;
+        let value =
+            arguments.next().ok_or(CliError::InvalidArguments("generate flag requires a value"))?;
+        let text = value
+            .to_str()
+            .ok_or(CliError::InvalidArguments("generate value must be valid UTF-8"))?;
+        match flag {
+            "--model-root" if model_root.is_none() => model_root = Some(PathBuf::from(value)),
+            "--runtime-root" if runtime_root.is_none() => runtime_root = Some(PathBuf::from(value)),
+            "--socket" if socket_path.is_none() => socket_path = Some(PathBuf::from(value)),
+            "--model-id" if model_id.is_none() => model_id = Some(ModelId::new(text)?),
+            "--package" if package_name.is_none() => package_name = Some(PathBuf::from(value)),
+            "--package-sha384" if package_hash.is_none() => {
+                package_hash = Some(ModelPackageHash::from_sha384_hex(text)?);
+            }
+            "--signer-key-id" if signer_key_id.is_none() => {
+                signer_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
+            }
+            "--signer-public-key" if signer_public_key.is_none() => {
+                signer_public_key = Some(parse_hex(text)?);
+            }
+            "--prompt" if prompt.is_none() => prompt = Some(text.to_owned()),
+            "--max-memory-bytes" if maximum_memory.is_none() => {
+                maximum_memory = Some(parse_u64(text)?);
+            }
+            "--max-kv-cache-bytes" if maximum_kv.is_none() => {
+                maximum_kv = Some(parse_u64(text)?);
+            }
+            "--max-tokens" if maximum_tokens.is_none() => {
+                maximum_tokens = Some(parse_u32(text)?);
+            }
+            "--temperature" if temperature.is_none() => {
+                temperature = Some(text.parse::<f32>().map_err(|_| {
+                    CliError::InvalidArguments("temperature must be a finite number")
+                })?);
+            }
+            "--seed" if seed.is_none() => seed = Some(parse_u64(text)?),
+            _ => {
+                return Err(CliError::InvalidArguments("unknown or repeated generate flag"));
+            }
+        }
+    }
+    let service = ServiceConfig::new(
+        required(model_root, "--model-root is required")?,
+        required(runtime_root, "--runtime-root is required")?,
+        required(socket_path, "--socket is required")?,
+    )?;
+    let budget = ResourceBudget::new(
+        required(maximum_memory, "--max-memory-bytes is required")?,
+        required(maximum_kv, "--max-kv-cache-bytes is required")?,
+        1,
+    )?;
+    Ok(GenerateConfig {
+        service,
+        model_id: required(model_id, "--model-id is required")?,
+        package_name: required(package_name, "--package is required")?,
+        package_hash: required(package_hash, "--package-sha384 is required")?,
+        signer_key_id: required(signer_key_id, "--signer-key-id is required")?,
+        signer_public_key: required(signer_public_key, "--signer-public-key is required")?,
+        prompt: required(prompt, "--prompt is required")?,
+        budget,
+        maximum_tokens: required(maximum_tokens, "--max-tokens is required")?,
+        temperature: temperature.unwrap_or(0.0),
+        seed: seed.unwrap_or(0),
+    })
 }
 
 fn parse_serve(
@@ -399,6 +512,98 @@ const fn hex_nibble(value: u8) -> Option<u8> {
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
+}
+
+#[cfg(unix)]
+fn generate(
+    config: GenerateConfig,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> Result<(), CliError> {
+    let signer = TrustedSigner::active(config.signer_key_id, config.signer_public_key)?;
+    let mut service = EngineService::new(config.service, SchedulerLimits::new(1, 1, 4 << 20)?)?;
+    service.register_configured_model(
+        config.model_id.clone(),
+        config.package_name,
+        config.package_hash,
+        signer,
+    )?;
+    let mut event_write_failed = false;
+    let mut package_events = |event: personalai_engine_types::SecurityEvent| {
+        if writeln!(errors, "native-engine security event: {event:?}").is_err() {
+            event_write_failed = true;
+        }
+    };
+    let loaded =
+        service.load_registered_cpu_model(&config.model_id, &config.budget, &mut package_events)?;
+    if event_write_failed {
+        return Err(CliError::Io);
+    }
+    let context = loaded.model().config().context_limit();
+    let request = GenerationRequest::new(
+        RequestId::new(1)?,
+        config.model_id,
+        config.prompt,
+        config.maximum_tokens,
+        ContextLimit::new(context.get())?,
+        config.budget,
+    )?;
+    let sampling = SamplingConfig::new(config.temperature)?
+        .with_seed(config.seed)
+        .with_maximum_generated_tokens(config.maximum_tokens)?;
+    let signals = os_signal::ProcessSignalGuard::install()?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let watcher_stop = Arc::new(AtomicBool::new(false));
+    let watcher_cancelled = Arc::clone(&cancelled);
+    let watcher_done = Arc::clone(&watcher_stop);
+    let watcher = thread::Builder::new()
+        .name("personalai-generate-signal".to_owned())
+        .spawn(move || {
+            while !watcher_done.load(Ordering::Acquire) {
+                if os_signal::ProcessSignalGuard::shutdown_requested() {
+                    watcher_cancelled.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .map_err(|_| EngineError::backend_failure("generation signal watcher failed"))?;
+    let started = Instant::now();
+    let result = loaded.generate(&request, SequenceId::new(1)?, sampling, &cancelled, |event| {
+        if let InferenceEvent::TokenGenerated { text, .. } = event {
+            write!(output, "{}", text.as_str())
+                .map_err(|_| EngineError::backend_failure("generation output write failed"))?;
+            output
+                .flush()
+                .map_err(|_| EngineError::backend_failure("generation output flush failed"))?;
+        }
+        Ok(())
+    });
+    watcher_stop.store(true, Ordering::Release);
+    watcher
+        .join()
+        .map_err(|_| EngineError::internal_invariant("generation signal watcher panicked"))?;
+    signals.restore()?;
+    let usage = result?;
+    writeln!(
+        errors,
+        "generation complete; input_tokens={}; output_tokens={}; elapsed_ms={}",
+        usage.input_tokens(),
+        usage.output_tokens(),
+        started.elapsed().as_millis(),
+    )
+    .map_err(|_| CliError::Io)
+}
+
+#[cfg(not(unix))]
+fn generate(
+    _config: GenerateConfig,
+    _output: &mut impl Write,
+    _errors: &mut impl Write,
+) -> Result<(), CliError> {
+    Err(CliError::Engine(EngineError::not_implemented(
+        "signed directory-package generation requires a Unix platform",
+    )))
 }
 
 #[cfg(unix)]
@@ -650,6 +855,58 @@ mod tests {
             Err(CliError::InvalidArguments("--model-root is required"))
         ));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn generate_requires_registered_package_configuration_and_valid_sampling() {
+        let package_hash = "01".repeat(48);
+        let signer_key = "03".repeat(32);
+        let arguments = [
+            "generate",
+            "--model-root",
+            "/models",
+            "--runtime-root",
+            "/run/personalai-engine",
+            "--socket",
+            "/run/personalai-engine/engine.sock",
+            "--model-id",
+            "tiny",
+            "--package",
+            "tiny.paimodel",
+            "--package-sha384",
+            &package_hash,
+            "--signer-key-id",
+            "02020202020202020202020202020202",
+            "--signer-public-key",
+            &signer_key,
+            "--prompt",
+            "hello",
+            "--max-memory-bytes",
+            "16777216",
+            "--max-kv-cache-bytes",
+            "1048576",
+            "--max-tokens",
+            "4",
+            "--temperature",
+            "0.8",
+            "--seed",
+            "42",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        let Command::Generate(config) =
+            parse_command(arguments).expect("complete generate command must parse")
+        else {
+            panic!("generate command must select local generation");
+        };
+        assert_eq!(config.maximum_tokens, 4);
+        assert_eq!(config.seed, 42);
+        assert_eq!(config.prompt, "hello");
+
+        assert!(matches!(
+            parse_command([OsString::from("generate")].into_iter()),
+            Err(CliError::InvalidArguments("--model-root is required"))
+        ));
     }
 
     #[test]

@@ -494,6 +494,29 @@ pub struct KvTokenWriter<'a> {
 }
 
 impl KvTokenWriter<'_> {
+    /// Reads one scalar from committed state or the current fully written layer.
+    /// Coordinates are semantic cache dimensions, never client-provided byte offsets.
+    pub fn read_key_value(
+        &self,
+        layer: u32,
+        position: u32,
+        head: u32,
+        dimension: u32,
+    ) -> Result<f32, EngineError> {
+        self.read_value_at(0, layer, position, head, dimension)
+    }
+
+    /// Reads one value scalar from committed state or the current fully written layer.
+    pub fn read_cached_value(
+        &self,
+        layer: u32,
+        position: u32,
+        head: u32,
+        dimension: u32,
+    ) -> Result<f32, EngineError> {
+        self.read_value_at(1, layer, position, head, dimension)
+    }
+
     /// Writes one complete layer K/V pair at the implicit next position.
     pub fn write_layer(
         &mut self,
@@ -562,6 +585,40 @@ impl KvTokenWriter<'_> {
             .ok_or_else(|| EngineError::resource_exhaustion("KV token count overflows"))?;
         self.committed = true;
         Ok(())
+    }
+
+    fn read_value_at(
+        &self,
+        side: u32,
+        layer: u32,
+        position: u32,
+        head: u32,
+        dimension: u32,
+    ) -> Result<f32, EngineError> {
+        if head >= self.cache.plan.kv_head_count()
+            || dimension >= self.cache.plan.head_dimension()
+            || position > self.position
+        {
+            return Err(EngineError::invalid_input("KV read coordinate is outside sequence state"));
+        }
+        let layer_index = usize::try_from(layer)
+            .map_err(|_| EngineError::invalid_input("KV layer index exceeds usize"))?;
+        if layer >= self.cache.plan.layer_count()
+            || (position == self.position
+                && !self.written.get(layer_index).copied().unwrap_or(false))
+        {
+            return Err(EngineError::invalid_input("KV layer is not available at this position"));
+        }
+        let layer_element = usize::try_from(head)
+            .ok()
+            .and_then(|head| {
+                head.checked_mul(usize::try_from(self.cache.plan.head_dimension()).ok()?)
+            })
+            .and_then(|offset| offset.checked_add(usize::try_from(dimension).ok()?))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV coordinate overflows"))?;
+        let offset = self.cache.element_offset(side, layer, position, layer_element)?;
+        let entry = sequence(&self.state, self.handle)?;
+        entry.storage.numeric_f32_value(offset)
     }
 }
 
