@@ -23,7 +23,7 @@ memory, tool, approval, or Agent Green behavior.
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
-| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
+| 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
@@ -43,6 +43,10 @@ memory, tool, approval, or Agent Green behavior.
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.
+- Every accepted Unix stream is admitted only when its kernel-reported effective
+  user ID equals the engine process user. Mismatches are rejected before frame
+  parsing and do not stop the continuous service; signature and replay checks
+  remain independent mandatory layers.
 - Bounded per-control-key durable nonce journal rejects cross-connection and
   post-restart replay before execution, excludes a second live process, and
   fails closed on corrupt or contended state.

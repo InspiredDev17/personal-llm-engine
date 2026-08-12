@@ -12,6 +12,8 @@ mod continuous;
 #[cfg(unix)]
 mod os_lock;
 #[cfg(unix)]
+mod peer_credential;
+#[cfg(unix)]
 mod replay;
 #[cfg(unix)]
 mod transport;
@@ -3436,6 +3438,48 @@ mod tests {
             .expect("incomplete ingress must drain");
         shutdown_thread.join().expect("shutdown request must finish");
         assert!(client.join().expect("silent client must finish").is_empty());
+        assert_eq!(summary.accepted_connections(), 1);
+        assert_eq!(summary.authenticated_commands(), 0);
+        assert_eq!(summary.failed_connections(), 1);
+        assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
+        assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_peer_credential_rejection_is_counted_and_request_local() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut fixture = BatchRuntimeFixture::new("continuous-peer-identity", 1);
+        fixture.listener.reject_current_peer_for_test();
+        let socket = fixture.socket_path();
+        let (connected, wait_for_connection) = mpsc::sync_channel(0);
+        let client = thread::spawn(move || {
+            drop(UnixStream::connect(socket).expect("rejected peer must connect"));
+            connected.send(()).expect("rejected peer must synchronize");
+        });
+        wait_for_connection.recv().expect("rejected peer must be ready");
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let shutdown_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            request_shutdown.request();
+        });
+
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(1).expect("continuous limits must validate"),
+                &shutdown,
+            )
+            .expect("credential rejection must not stop continuous service");
+        client.join().expect("rejected peer must finish");
+        shutdown_thread.join().expect("shutdown request must finish");
         assert_eq!(summary.accepted_connections(), 1);
         assert_eq!(summary.authenticated_commands(), 0);
         assert_eq!(summary.failed_connections(), 1);

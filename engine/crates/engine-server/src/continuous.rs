@@ -278,8 +278,16 @@ impl ContinuousState<'_> {
     fn accept_ready(&mut self, listener: &UnixFrameListener) -> Result<bool, EngineError> {
         let mut accepted = false;
         while self.owned_connections() < self.maximum_connections {
-            let Some(connection) = listener.try_accept()? else {
-                break;
+            let connection = match listener.try_accept() {
+                Ok(Some(connection)) => connection,
+                Ok(None) => break,
+                Err(EngineError::AuthenticationFailure(_)) => {
+                    accepted = true;
+                    increment(&mut self.summary.accepted_connections, "accepted connection count")?;
+                    increment(&mut self.summary.failed_connections, "failed connection count")?;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             accepted = true;
             increment(&mut self.summary.accepted_connections, "accepted connection count")?;

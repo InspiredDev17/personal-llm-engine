@@ -74,9 +74,10 @@ does not execute Python, Node, TypeScript, downloaded scripts, or model code.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
 - Unsafe Rust is denied by default. The approved exceptions are the exact Unix
-  lock module in ADR-0004 and process-signal module in ADR-0011. They expose
-  safe owned guards, perform no pointer arithmetic, and have exact unsafe-block
-  counts enforced by architecture tests. Tests reject unsafe code and
+  lock module in ADR-0004, process-signal module in ADR-0011, and read-only
+  peer-credential module in ADR-0013. They expose safe wrappers, perform no
+  pointer arithmetic, and have exact unsafe-block counts enforced by
+  architecture tests. Tests reject unsafe code and
   unsafe-lint allowances everywhere else. A future FFI/backend exception
   requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written
   invariants, safe wrappers, platform tests, and separate approval.

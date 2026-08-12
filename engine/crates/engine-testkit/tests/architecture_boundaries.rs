@@ -384,6 +384,10 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         .join("crates/engine-cli/src/os_signal.rs")
         .canonicalize()
         .expect("approved process signal FFI must exist");
+    let approved_peer_credential = root
+        .join("crates/engine-server/src/peer_credential.rs")
+        .canonicalize()
+        .expect("approved peer credential FFI must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -394,30 +398,33 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         let production_source = source
             .split_once("#[cfg(test)]")
             .map_or(source.as_str(), |(production, _tests)| production);
-        if canonical == approved_unix_lock {
-            assert_eq!(
-                source.matches(unsafe_block_marker.as_str()).count(),
-                1,
-                "approved Unix lock FFI must contain exactly one unsafe block"
-            );
-            assert_eq!(
-                source.matches(unsafe_allow_marker.as_str()).count(),
-                1,
-                "approved Unix lock FFI must contain exactly one unsafe allowance"
-            );
-        }
-        if canonical == approved_process_signal {
-            assert_eq!(
-                source.matches(unsafe_block_marker.as_str()).count(),
-                2,
-                "approved process signal FFI must contain exactly two unsafe blocks"
-            );
-            assert_eq!(
-                source.matches(unsafe_allow_marker.as_str()).count(),
-                1,
-                "approved process signal FFI must contain exactly one unsafe allowance"
-            );
-        }
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_unix_lock,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            1,
+            "Unix lock FFI",
+        );
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_process_signal,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            2,
+            "process signal FFI",
+        );
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_peer_credential,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            4,
+            "peer credential FFI",
+        );
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
@@ -442,6 +449,11 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             {
                 continue;
             }
+            if canonical == approved_peer_credential
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+            {
+                continue;
+            }
             assert!(
                 !source.contains(marker),
                 "prohibited Rust source marker {marker:?} found in {}",
@@ -450,7 +462,35 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         }
         assert_no_outbound_or_process_egress(&source, production_source, &path);
     }
-    assert!(collect_files(&root, "build.rs").is_empty());
+}
+
+#[test]
+fn workspace_crates_have_no_build_scripts() {
+    assert!(collect_files(&engine_root(), "build.rs").is_empty());
+}
+
+fn assert_exact_unsafe_boundary(
+    source_path: &Path,
+    approved_path: &Path,
+    source: &str,
+    unsafe_block_marker: &str,
+    unsafe_allow_marker: &str,
+    expected_blocks: usize,
+    label: &str,
+) {
+    if source_path != approved_path {
+        return;
+    }
+    assert_eq!(
+        source.matches(unsafe_block_marker).count(),
+        expected_blocks,
+        "approved {label} has an unexpected unsafe block count"
+    );
+    assert_eq!(
+        source.matches(unsafe_allow_marker).count(),
+        1,
+        "approved {label} must contain exactly one unsafe allowance"
+    );
 }
 
 fn assert_no_outbound_or_process_egress(source: &str, production_source: &str, path: &Path) {

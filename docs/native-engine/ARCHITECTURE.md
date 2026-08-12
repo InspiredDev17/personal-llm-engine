@@ -68,7 +68,13 @@ metadata cannot define operations, plugins, paths, executable code, or kernels.
 The only listener is a Unix-domain socket in a pre-existing owner-private
 runtime directory. The socket path is a direct `.sock` child, length bounded,
 created mode 0600, and removed only when its device/inode still match the
-listener that created it. There is no TCP listener or network client.
+listener that created it. The listener records the engine's effective user ID
+at bind. Each accepted stream must have the same kernel-reported effective user
+ID before timeouts, frame allocation, or parsing. A mismatched blocking peer is
+dropped while admission continues; continuous admission counts the failure and
+continues serving authorized neighbors. This is an independent prefilter:
+Ed25519 control authentication and durable replay admission remain mandatory.
+There is no TCP listener or network client.
 
 The Rust data plane is permanently offline; this is not a runtime option that
 a request, model, or operator flag can relax. Its exact dependency graph has no
@@ -159,11 +165,15 @@ CPU loop is active. The response-signing seed is read as exactly 32 bytes from
 stdin before model or socket startup, cleared after signer construction, never
 accepted through argv/model/client data, and never logged. Go validates the
 signature, nonce, ordinal, request ID, event schema, and usage before exposing
-canonical platform responses. It has no HTTP fallback. Operated
-continuous/slow-reader soak, peer-credential qualification, and optional
+canonical platform responses. It has no HTTP fallback. The current
+peer-credential profile requires Go and Rust to share one effective service
+user; a future distinct-user deployment requires a separate reviewed socket
+group/ACL design and must not bypass kernel identity checks. Operated
+continuous/slow-reader soak and optional
 architecture-owned batching remain production hardening work. ADR-0011 defines
 CLI signal integration. ADR-0012 defines the scheduled bounded delayed-reader
-and restart soak; ADR-0010 defines continuous admission and graceful drain;
+and restart soak; ADR-0013 defines kernel peer admission; ADR-0010 defines
+continuous admission and graceful drain;
 ADR-0009 defines bounded output isolation; ADR-0008 defines the bounded
 multi-connection reference path; ADR-0007 defines the resumable generation and
 round-robin coordination boundary; ADR-0005
@@ -197,12 +207,15 @@ model data, and must pass CPU differential and isolated unsafe/FFI review.
 Workspace policy denies unsafe Rust by default. The approved exceptions are
 `engine-server/src/os_lock.rs`, which makes one checked `libc::flock` call using
 an owned valid descriptor, and `engine-cli/src/os_signal.rs`, which uses two
-documented `sigaction` blocks to install and restore owner-process handlers.
-The signal handler retains no pointer and performs only an atomic store.
-Architecture tests enforce the exact block and allowance counts and reject an
-unsafe block or unsafe-lint allowance in every other first-party Rust source.
-ADR-0004 records the lock invariants; ADR-0011 records the signal invariants and
-portability scope.
+documented `sigaction` blocks to install and restore owner-process handlers,
+plus `engine-server/src/peer_credential.rs`, which reads the process and peer
+effective user IDs through platform credential APIs. The signal handler retains
+no pointer and performs only an atomic store; peer outputs use exact initialized
+ABI storage and borrowed live descriptors. Architecture tests enforce the exact
+block and allowance counts and reject an unsafe block or unsafe-lint allowance
+in every other first-party Rust source. ADR-0004 records the lock invariants;
+ADR-0011 records signal invariants; ADR-0013 records peer-credential invariants
+and portability scope.
 
 ## Agent Green
 

@@ -1,6 +1,6 @@
 //! Isolated local Unix-domain-socket frame transport.
 
-use crate::ServiceConfig;
+use crate::{ServiceConfig, peer_credential};
 use personalai_engine_protocol::{FRAME_HEADER_BYTES, Frame, MAX_FRAME_PAYLOAD_BYTES};
 use personalai_engine_types::EngineError;
 use std::fs;
@@ -20,6 +20,7 @@ pub struct UnixFrameListener {
     socket_path: PathBuf,
     device: u64,
     inode: u64,
+    allowed_peer_user_id: u32,
 }
 
 impl UnixFrameListener {
@@ -52,15 +53,26 @@ impl UnixFrameListener {
             socket_path: config.socket_path().to_path_buf(),
             device: socket_metadata.dev(),
             inode: socket_metadata.ino(),
+            allowed_peer_user_id: peer_credential::effective_user_id(),
         })
     }
 
     /// Accepts one local connection and installs finite I/O timeouts.
     pub fn accept(&self) -> Result<UnixFrameConnection, EngineError> {
+        loop {
+            match self.accept_once() {
+                Err(EngineError::AuthenticationFailure(_)) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn accept_once(&self) -> Result<UnixFrameConnection, EngineError> {
         let (stream, _address) = self
             .listener
             .accept()
             .map_err(|_| EngineError::backend_failure("Unix socket accept failed"))?;
+        self.verify_peer(&stream)?;
         configure_stream(&stream)?;
         Ok(UnixFrameConnection { stream })
     }
@@ -78,6 +90,7 @@ impl UnixFrameListener {
     pub fn try_accept(&self) -> Result<Option<UnixFrameConnection>, EngineError> {
         match self.listener.accept() {
             Ok((stream, _address)) => {
+                self.verify_peer(&stream)?;
                 configure_stream(&stream)?;
                 Ok(Some(UnixFrameConnection { stream }))
             }
@@ -89,6 +102,26 @@ impl UnixFrameListener {
     /// Returns the exact bound socket path.
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
+    }
+
+    /// Returns the only effective user ID admitted by this listener.
+    pub const fn allowed_peer_user_id(&self) -> u32 {
+        self.allowed_peer_user_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_current_peer_for_test(&mut self) {
+        self.allowed_peer_user_id = self.allowed_peer_user_id.checked_add(1).unwrap_or(0);
+    }
+
+    fn verify_peer(&self, stream: &UnixStream) -> Result<(), EngineError> {
+        let peer_user_id = peer_credential::peer_effective_user_id(stream)?;
+        if peer_user_id != self.allowed_peer_user_id {
+            return Err(EngineError::authentication_failure(
+                "Unix peer effective user ID is not authorized",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +238,7 @@ mod tests {
         let config = ServiceConfig::new("/models", &directory, &socket)
             .expect("temporary config must validate");
         let listener = UnixFrameListener::bind(&config).expect("socket must bind");
+        assert_eq!(listener.allowed_peer_user_id(), peer_credential::effective_user_id());
         let client_socket = socket.clone();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(client_socket).expect("client must connect");
@@ -227,6 +261,29 @@ mod tests {
             .expect("server must write");
         let response = client.join().expect("client must finish");
         assert_eq!(response.payload(), &[3, 2, 1]);
+        drop(listener);
+        assert!(!socket.exists());
+        fs::remove_dir(&directory).expect("temporary directory must remove");
+    }
+
+    #[test]
+    fn mismatched_kernel_peer_user_is_rejected_before_frame_read() {
+        let directory = temporary_directory();
+        fs::create_dir(&directory).expect("temporary runtime directory must create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions must set");
+        let socket = directory.join("engine.sock");
+        let config = ServiceConfig::new("/models", &directory, &socket)
+            .expect("temporary config must validate");
+        let mut listener = UnixFrameListener::bind(&config).expect("socket must bind");
+        listener.reject_current_peer_for_test();
+        assert_ne!(listener.allowed_peer_user_id(), peer_credential::effective_user_id());
+        let client_socket = socket.clone();
+        let client = thread::spawn(move || {
+            drop(UnixStream::connect(client_socket).expect("client must connect"));
+        });
+        assert!(matches!(listener.accept_once(), Err(EngineError::AuthenticationFailure(_))));
+        client.join().expect("client must finish");
         drop(listener);
         assert!(!socket.exists());
         fs::remove_dir(&directory).expect("temporary directory must remove");

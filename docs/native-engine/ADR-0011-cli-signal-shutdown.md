@@ -77,11 +77,11 @@ The owner can now select continuous local serving and receive ordinary service
 manager termination without abandoning authenticated streams or scheduler
 state. This is reference-runtime activation, not production qualification.
 Operated slow-reader/multi-client soak, production key injection and recovery,
-peer-credential policy, package conversion, performance evidence, canary, and
-rollback work remain.
+package conversion, performance evidence, canary, and rollback work remain.
 
 ADR-0012 subsequently adds scheduled bounded synthetic delayed-reader and
-restart soak. Production-size operated qualification remains distinct.
+restart soak. ADR-0013 adds same-service-user kernel peer admission.
+Production-size operated qualification remains distinct.
 
 ## Rejected alternatives
 

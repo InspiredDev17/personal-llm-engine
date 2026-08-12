@@ -77,8 +77,9 @@ and releases must be vendored with an SBOM.
 
 Unsafe Rust is denied workspace-wide by default. The current exceptions are the
 isolated Unix replay-journal lock FFI module recorded by ADR-0004 and the
-process-signal install/restore module recorded by ADR-0011. Their exact unsafe
-blocks are hidden behind safe owned guards and enforced by an
+process-signal install/restore module recorded by ADR-0011, plus the read-only
+peer-credential module recorded by ADR-0013. Their exact unsafe blocks are
+hidden behind safe wrappers and enforced by an
 architecture-boundary test. Any other unsafe code requires its own invariant
 and review record in an isolated FFI/backend module.
 

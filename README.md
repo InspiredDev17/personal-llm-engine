@@ -81,6 +81,9 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   retiring a key does not delete its replay history;
 - packages are fixed-format data, exact-hash pinned, and signer verified;
 - the UDS is created only in an owner-private runtime directory with mode 0600;
+- every accepted UDS stream must have a kernel-reported effective user ID equal
+  to the engine service user before any frame is read or allocated; cryptographic
+  authentication and durable replay checks remain mandatory afterward;
 - the engine cannot execute tools, approve actions, mutate platform memory, or
   connect directly to Agent Green.
 
