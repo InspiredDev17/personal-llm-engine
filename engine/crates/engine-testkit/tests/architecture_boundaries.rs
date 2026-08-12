@@ -199,6 +199,38 @@ fn continuous_soak_workflow_is_pinned_bounded_and_fail_closed() {
 }
 
 #[test]
+fn linux_service_profile_denies_ip_network_and_limits_filesystem_authority() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let unit =
+        fs::read_to_string(repository.join("ops/native-engine/systemd/personalai-engine.service"))
+            .expect("Linux native-engine service unit must exist");
+    for required in [
+        "User=personalai",
+        "UMask=0077",
+        "StandardInput=file:/run/credentials/personalai-engine.service/response.seed",
+        "RuntimeDirectoryMode=0700",
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "PrivateDevices=yes",
+        "MemoryDenyWriteExecute=yes",
+        "CapabilityBoundingSet=\n",
+        "RestrictAddressFamilies=AF_UNIX",
+        "IPAddressDeny=any",
+        "ReadOnlyPaths=/var/lib/personalai-engine/models",
+        "ReadWritePaths=/run/personalai-engine",
+    ] {
+        assert!(unit.contains(required), "service unit omitted invariant {required:?}");
+    }
+    for prohibited in ["AF_INET", "http://", "https://", "curl ", "wget ", "/bin/sh"] {
+        assert!(
+            !unit.contains(prohibited),
+            "service unit contains prohibited capability {prohibited:?}"
+        );
+    }
+}
+
+#[test]
 fn cross_platform_verification_is_pinned_offline_and_fail_closed() {
     let root = engine_root();
     let repository = root.parent().expect("engine must have repository parent");
