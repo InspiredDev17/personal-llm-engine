@@ -34,7 +34,7 @@ token data, generated text, and engine events are untrusted.
 | Package tamper/downgrade | exact SHA-384 identity, canonical V1 ranges/records, domain-separated strict Ed25519, key ID and active/revoked trust state | key rotation/rollback operational tooling is Stage 9 |
 | Model-supplied code or kernels | flat data-only fixed architecture; no plugins, graph executor, dynamic libraries, Metal/PTX, paths, or kernel selectors | each future backend needs separate code review |
 | Parser/size/overflow attack | fixed schemas, checked arithmetic, exact lengths, central ceilings, flat bounded collections, no arbitrary deserializer, exhaustive fixture mutations, scheduled bounded coverage-guided package/tokenizer/frame fuzzing | production-size corpora and sustained soak campaigns remain required |
-| Memory/CPU denial | aggregate tensor reservations, fallible allocation, queue count/bytes, conservative active request/token/cursor retained-byte charging, tensor/context/token ceilings, CPU operation caps, finite socket deadlines, 64-connection batch ceiling, explicit 256 KiB cancellation-watcher stacks, one-token round-robin turns, and exact-batch multi-stream tests | continuous ingress, allocator-overhead measurement, slow-consumer isolation, production long-context/soak, and authenticated multi-client activation remain |
+| Memory/CPU denial | aggregate tensor reservations, fallible allocation, queue count/bytes, conservative active request/token/cursor/output retained-byte charging, tensor/context/token ceilings, CPU operation caps, finite socket deadlines, 64-connection batch ceiling, eight-event per-stream output queues with ten-frame pipeline reservation, explicit 256 KiB cancellation-watcher/output-writer stacks, one-token round-robin turns, request-local queue saturation, and exact-batch multi-stream tests | continuous ingress, allocator-overhead measurement, operated slow-reader and production long-context soak, and authenticated multi-client activation remain |
 | UDS impersonation/injection | owner-private runtime directory, mode-0600 inode-owned socket, strict frame directions, separate Ed25519 request and response identities, explicit two-key overlap with no discovery | bind peer-credential policy and operated rotation need qualification |
 | Replay/reordering | connection-order checks plus a bounded mode-0600 per-control-key journal that synchronizes each authenticated nonce before execution, holds an exclusive lifetime lock, and rejects duplicate/corrupt/truncated/exhausted/write-uncertain/contended state; current/previous control keys use distinct retained journals; streams cannot switch keys; every signed event binds the request nonce and a strictly increasing ordinal | journal archival/recovery and operated rotation need qualification |
 | Event spoofing/confusion | strict engine signature verified before parse; signed key ID/request nonce/event ordinal; Go validates frame kind, request ID, UTF-8, exact lengths, usage arithmetic and closed errors | add continuous fuzz corpus shared across languages |
@@ -52,8 +52,10 @@ Package 1 TiB hard maximum (always lowered by configured memory), 262,144
 tensors, rank 8, dimension `1<<30`, elements `1<<40`, 4,194,304 vocabulary
 entries, 1,048,576-token collections, 262,144 context tokens, 4 MiB requests,
 8 MiB complete frames, 64 MiB tokenizer data, 4,096 sequences, 64 MiB queued
-request bytes, 100 million CPU operations per bounded operation, and 100-byte
-portable UDS path. Each control-key replay journal retains at most 1,048,576
+request/active-retention bytes, 8 pending events per active output stream, 64
+reference-batch connections, 256 KiB per cancellation/output worker stack, 100
+million CPU operations per bounded operation, and a 100-byte portable UDS path.
+Each control-key replay journal retains at most 1,048,576
 nonces before fail-closed key rotation is required.
 
 ## Security events and Agent Green

@@ -22,8 +22,8 @@ memory, tool, approval, or Agent Green behavior.
 | 4. Tensor/CPU core | COMPLETE for target architecture | Safe owned tensors, aggregate memory pool, checked scalar work |
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `personalai.decoder-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
-| 7. Scheduler | PARTIAL for fair runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, bounded round-robin coordination, and exact-batch multi-stream execution complete; continuous admission remains |
-| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, active cancellation/disconnect watchers, durable per-key replay rejection, single-stream daemon plus bounded multi-stream reference batch, Go `NATIVE_ENGINE` adapter and real socket tests |
+| 7. Scheduler | PARTIAL for fair runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, bounded round-robin coordination, exact-batch multi-stream execution, and bounded output isolation complete; continuous admission remains |
+| 8. UDS/Go adapter | COMPLETE for local reference path | Separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, active cancellation/disconnect watchers, durable per-key replay rejection, single-stream daemon plus bounded multi-stream reference batch with per-stream writers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | PLANNED | Rust-only converter, offline signer workflow, approved model and provenance |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
@@ -58,11 +58,14 @@ memory, tool, approval, or Agent Green behavior.
   step. A bounded pull-based coordinator enforces active/request concurrency
   limits and unique active identities before cursor construction, plus fallible
   queue growth, conservative aggregate active-retention charging, one-turn
-  rotation, zero event buffering, and request-local failure. Deterministic tests
+  rotation, and request-local failure. The UDS batch adds fixed eight-event
+  queues and bounded writer threads; their worst-case retention is charged
+  before cursor creation, and saturation cancels only the affected request.
+  Deterministic tests
   prove independent KV state, non-starvation, and cancellation isolation. The UDS
   reference batch now proves authenticated multi-stream execution and cleanup;
-  the continuous CLI path remains single-worker until ingress, slow-consumer,
-  and shutdown hardening is implemented.
+  the continuous CLI path remains single-worker until continuous ingress and
+  graceful shutdown are implemented, and operated slow-reader soak remains.
 
 ## Next software release gate: production model operations
 
@@ -93,8 +96,9 @@ Before the native runtime becomes mandatory:
 - retain scheduled coverage-guided fuzzing, triage every reproducible finding,
   and grow production-size corpora without placing production model data in CI;
 - replace the exact-batch reference driver with bounded continuous UDS ingress
-  and per-stream output readiness while preserving cancellation, signed event
-  ordering, connection cleanup, and deterministic round-robin execution;
+  and graceful shutdown using the existing per-stream output isolation while
+  preserving cancellation, signed event ordering, connection cleanup, and
+  deterministic round-robin execution;
 - qualify memory, latency, throughput, thermal behavior, and long-context use;
 - reproduce the checked-in vendor graph and SPDX from a fresh offline build and
   renew license/advisory review;

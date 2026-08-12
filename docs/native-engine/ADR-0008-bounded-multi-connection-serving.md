@@ -77,12 +77,12 @@ failure is request-local, signatures and ordinals remain per stream, and the
 scheduler is empty afterward.
 
 The exact-batch reference still has deliberate production limitations. Accept
-waits for the declared count, initial command reads are sequential with finite
-timeouts, and a synchronous bounded event write can delay other cursors until
-that write succeeds or times out. The next activation slice must implement a
-bounded continuous accept/ingress driver and per-stream output readiness or
-equivalent queueing without weakening authentication, replay, ordering, memory,
-or cancellation invariants. Operated multi-client soak remains required before
+waits for the declared count and initial command reads are sequential with
+finite timeouts. ADR-0009 adds bounded per-stream output isolation without
+changing this decision. The next activation slice must implement a bounded
+continuous accept/ingress driver and graceful shutdown without weakening
+authentication, replay, ordering, memory, output-queue, or cancellation
+invariants. Operated multi-client and slow-reader soak remains required before
 the CLI switches from `serve_one`.
 
 ## Rejected alternatives

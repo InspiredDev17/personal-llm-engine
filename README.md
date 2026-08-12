@@ -15,8 +15,9 @@ inference, KV state, deterministic greedy generation, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
-and an owner CLI. The continuous CLI path remains intentionally single-worker
-until ingress and slow-consumer hardening is complete. The Go
+per-stream bounded output queues, and an owner CLI. The continuous CLI path
+remains intentionally single-worker until continuous ingress and graceful
+shutdown hardening is complete. The Go
 repository contains the corresponding `NATIVE_ENGINE` provider adapter; it has
 no HTTP or remote-network fallback.
 
@@ -24,8 +25,8 @@ The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. Rust-only
 conversion/signing operations, an approved production package, stochastic
 sampling, optimized ARM64, Metal, CUDA, performance qualification, and
-coverage-guided fuzzing remain required before replacement of existing
-production runtimes. The locked dependency graph is checked in under
+production-size fuzz/soak evidence remain required before replacement of
+existing production runtimes. The locked dependency graph is checked in under
 `engine/vendor`, Cargo is offline/source-replaced by default, and
 `release/native-engine.spdx` records package versions, checksums, and licenses.
 
@@ -62,7 +63,9 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - Go sends signed same-stream cancellation and Rust observes disconnects while
   CPU generation is active;
 - the multi-stream reference path caps connection count, cancellation-watcher
-  stack size, and aggregate active request/token/cursor retention before work;
+  and output-writer stack sizes, per-stream output events, and aggregate active
+  request/token/cursor/output retention before work; a saturated writer queue
+  cancels only its request;
 - every authenticated command nonce is appended and synchronized to a bounded,
   mode-0600 per-control-key journal before the command can execute; an exclusive
   lifetime lock prevents a second process from using the same key journal, and

@@ -26,8 +26,8 @@ use personalai_engine_loader::ModelRegistry;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::MemoryPool;
 use personalai_engine_protocol::{
-    CancellationEnvelope, Frame, FrameKind, GenerationRequestEnvelope, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind, GENERATION_EVENT_AUTH_BYTES,
+    GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{SamplingConfig, select_next_token_tensor};
@@ -45,7 +45,8 @@ use personalai_engine_types::{
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_types::{
-    GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES, SequenceId, TextChunk, TokenId,
+    GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES, MAX_GENERATION_CHUNK_BYTES,
+    SequenceId, TextChunk, TokenId,
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::collections::BTreeMap;
@@ -59,14 +60,34 @@ use std::sync::Mutex;
 #[cfg(feature = "cpu-reference")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(unix, feature = "cpu-reference"))]
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::thread;
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 /// Hard ceiling for the bounded multi-connection reference batch.
 pub const MAX_CONCURRENT_CONNECTION_BATCH: u32 = 64;
+/// Maximum signed generation events retained for one local output stream.
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub const MAX_PENDING_EVENTS_PER_CONNECTION: usize = 8;
 #[cfg(all(unix, feature = "cpu-reference"))]
 const CANCELLATION_WATCHER_STACK_BYTES: usize = 256 * 1_024;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const OUTPUT_WRITER_STACK_BYTES: usize = 256 * 1_024;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const MAX_OUTBOUND_EVENT_FRAME_BYTES: usize = FRAME_HEADER_BYTES
+    + 44
+    + MAX_GENERATION_CHUNK_BYTES
+    + GENERATION_EVENT_AUTH_BYTES
+    + personalai_engine_crypto::ED25519_SIGNATURE_BYTES;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const OUTBOUND_FRAMES_RESERVED_PER_CONNECTION: usize = MAX_PENDING_EVENTS_PER_CONNECTION + 2;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const OUTBOUND_PIPELINE_RESERVED_BYTES: usize =
+    OUTBOUND_FRAMES_RESERVED_PER_CONNECTION * MAX_OUTBOUND_EVENT_FRAME_BYTES;
+#[cfg(all(unix, feature = "cpu-reference"))]
+const _: () = assert!(MAX_OUTBOUND_EVENT_FRAME_BYTES <= MAX_FRAME_BYTES);
 /// Human-readable status for the current reference runtime.
 pub const FOUNDATION_STATUS: &str = "signed-package-cpu-reference-uds";
 
@@ -654,6 +675,22 @@ impl<'a> GenerationRoundRobin<'a> {
         sequence_id: SequenceId,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(), EngineError> {
+        self.submit_with_retained_bytes(model, request, sequence_id, cancelled, 0)
+    }
+
+    /// Admits one request while reserving caller-owned bounded runtime storage.
+    ///
+    /// The server uses this to charge a stream's fixed outbound queue before
+    /// cursor construction. The coordinator does not own or inspect that
+    /// storage; it only includes the declared bytes in its aggregate ceiling.
+    pub fn submit_with_retained_bytes(
+        &mut self,
+        model: &'a LoadedCpuModel,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: Arc<AtomicBool>,
+        additional_retained_bytes: usize,
+    ) -> Result<(), EngineError> {
         if self.ready.iter().any(|scheduled| {
             scheduled.generation.request_id() == request.request_id()
                 || scheduled.generation.sequence_id() == sequence_id
@@ -686,7 +723,10 @@ impl<'a> GenerationRoundRobin<'a> {
                 "request concurrency budget does not admit another active sequence",
             ));
         }
-        let retained_bytes = generation_retained_bytes(request)?;
+        let retained_bytes =
+            generation_retained_bytes(request)?.checked_add(additional_retained_bytes).ok_or_else(
+                || EngineError::resource_exhaustion("round-robin retained bytes overflow"),
+            )?;
         let next_retained_bytes =
             self.retained_bytes.checked_add(retained_bytes).ok_or_else(|| {
                 EngineError::resource_exhaustion("round-robin retained bytes overflow")
@@ -819,6 +859,10 @@ struct ActiveGenerationConnection {
     next_event_ordinal: u32,
     cancelled: Arc<AtomicBool>,
     watcher_done: Arc<AtomicBool>,
+    outbound_sender: Option<SyncSender<Frame>>,
+    outbound_receiver: Option<Receiver<Frame>>,
+    writer_connection: Option<UnixFrameConnection>,
+    writer_failed: Arc<AtomicBool>,
     stream_error: Option<EngineError>,
 }
 
@@ -837,6 +881,14 @@ struct CancellationWatcherInput {
     cancelled: Arc<AtomicBool>,
     watcher_done: Arc<AtomicBool>,
     replay_journal: Arc<Mutex<DurableReplayJournal>>,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+struct OutputWriterInput {
+    input_index: usize,
+    connection: UnixFrameConnection,
+    receiver: Receiver<Frame>,
+    failed: Arc<AtomicBool>,
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -1224,18 +1276,27 @@ impl CpuEngineRuntime {
         active: &mut Vec<ActiveGenerationConnection>,
         results: &mut [Option<ConnectionServeResult>],
     ) -> Result<(), EngineError> {
-        let watcher_inputs = match prepare_cancellation_watchers(active) {
-            Ok(watcher_inputs) => watcher_inputs,
+        let (watcher_inputs, writer_inputs) = match prepare_connection_worker_inputs(active) {
+            Ok(inputs) => inputs,
             Err(error) => {
+                stop_active_watchers(active);
                 cleanup_active_scheduler(service, active)?;
                 return Err(error);
             }
         };
         thread::scope(|scope| {
             let mut watchers = Vec::new();
-            watchers.try_reserve_exact(watcher_inputs.len()).map_err(|_| {
-                EngineError::resource_exhaustion("cancellation watcher allocation failed")
-            })?;
+            if watchers.try_reserve_exact(watcher_inputs.len()).is_err() {
+                cleanup_active_scheduler(service, active)?;
+                return Err(EngineError::resource_exhaustion(
+                    "cancellation watcher allocation failed",
+                ));
+            }
+            let mut writers = Vec::new();
+            if writers.try_reserve_exact(writer_inputs.len()).is_err() {
+                cleanup_active_scheduler(service, active)?;
+                return Err(EngineError::resource_exhaustion("output writer allocation failed"));
+            }
             let mut spawn_error = None;
             for watcher_input in watcher_inputs {
                 let spawn = thread::Builder::new()
@@ -1260,10 +1321,42 @@ impl CpuEngineRuntime {
                     break;
                 }
             }
+            if spawn_error.is_none() {
+                for writer_input in writer_inputs {
+                    let input_index = writer_input.input_index;
+                    let failed = Arc::clone(&writer_input.failed);
+                    let spawn = thread::Builder::new()
+                        .name("personalai-event-write".to_owned())
+                        .stack_size(OUTPUT_WRITER_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            let result = write_queued_events(
+                                writer_input.connection,
+                                &writer_input.receiver,
+                            );
+                            if result.is_err() {
+                                failed.store(true, Ordering::Release);
+                            }
+                            result
+                        });
+                    if let Ok(writer) = spawn {
+                        writers.push((input_index, writer));
+                    } else {
+                        spawn_error = Some(EngineError::backend_failure(
+                            "output writer thread creation failed",
+                        ));
+                        break;
+                    }
+                }
+            }
             if let Some(error) = spawn_error {
                 stop_active_watchers(active);
-                join_cancellation_watchers(watchers)?;
-                cleanup_active_scheduler(service, active)?;
+                close_output_queues(active);
+                let cleanup_result = cleanup_active_scheduler(service, active);
+                let watcher_join_result = join_cancellation_watchers(watchers);
+                let writer_join_result = join_output_writers(writers, results);
+                cleanup_result?;
+                watcher_join_result?;
+                writer_join_result?;
                 return Err(error);
             }
 
@@ -1274,20 +1367,7 @@ impl CpuEngineRuntime {
                 active,
                 results,
             );
-            stop_active_watchers(active);
-            let join_result = join_cancellation_watchers(watchers);
-            if run_result.is_err() {
-                cleanup_active_scheduler(service, active)?;
-            }
-            run_result?;
-            join_result?;
-            if !active.is_empty() {
-                cleanup_active_scheduler(service, active)?;
-                return Err(EngineError::internal_invariant(
-                    "round-robin coordinator stopped with active connections",
-                ));
-            }
-            Ok(())
+            finish_connection_workers(service, active, results, watchers, writers, run_result)
         })
     }
 }
@@ -1319,6 +1399,9 @@ fn prepare_generation_connection<'a>(
             EngineError::invalid_input("model is not loaded"),
         );
     };
+    let writer_connection = connection.try_clone()?;
+    let (outbound_sender, outbound_receiver) =
+        std::sync::mpsc::sync_channel(MAX_PENDING_EVENTS_PER_CONNECTION);
     if let Err(error) = batch.service.admit(request.clone()) {
         return reject_generation_connection(
             batch,
@@ -1346,7 +1429,13 @@ fn prepare_generation_connection<'a>(
             }
         };
     let cancelled = Arc::new(AtomicBool::new(false));
-    if let Err(error) = coordinator.submit(model, &scheduled, sequence_id, Arc::clone(&cancelled)) {
+    if let Err(error) = coordinator.submit_with_retained_bytes(
+        model,
+        &scheduled,
+        sequence_id,
+        Arc::clone(&cancelled),
+        OUTBOUND_PIPELINE_RESERVED_BYTES,
+    ) {
         batch.service.scheduler.finish(&request_id)?;
         return reject_generation_connection(
             batch,
@@ -1372,6 +1461,10 @@ fn prepare_generation_connection<'a>(
         next_event_ordinal: 1,
         cancelled,
         watcher_done: Arc::new(AtomicBool::new(false)),
+        outbound_sender: Some(outbound_sender),
+        outbound_receiver: Some(outbound_receiver),
+        writer_connection: Some(writer_connection),
+        writer_failed: Arc::new(AtomicBool::new(false)),
         stream_error: None,
     });
     *batch.next_sequence = following_sequence;
@@ -1458,6 +1551,43 @@ fn prepare_cancellation_watchers(
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn prepare_connection_worker_inputs(
+    active: &mut [ActiveGenerationConnection],
+) -> Result<(Vec<CancellationWatcherInput>, Vec<OutputWriterInput>), EngineError> {
+    let watcher_inputs = prepare_cancellation_watchers(active)?;
+    let writer_inputs = prepare_output_writers(active)?;
+    Ok((watcher_inputs, writer_inputs))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn prepare_output_writers(
+    active: &mut [ActiveGenerationConnection],
+) -> Result<Vec<OutputWriterInput>, EngineError> {
+    if active.iter().any(|connection| {
+        connection.outbound_receiver.is_none() || connection.writer_connection.is_none()
+    }) {
+        return Err(EngineError::internal_invariant("active connection output state is missing"));
+    }
+    let mut writers = Vec::new();
+    writers
+        .try_reserve_exact(active.len())
+        .map_err(|_| EngineError::resource_exhaustion("output writer input allocation failed"))?;
+    for connection in active {
+        writers.push(OutputWriterInput {
+            input_index: connection.input_index,
+            connection: connection.writer_connection.take().ok_or_else(|| {
+                EngineError::internal_invariant("active writer connection disappeared")
+            })?,
+            receiver: connection.outbound_receiver.take().ok_or_else(|| {
+                EngineError::internal_invariant("active output receiver disappeared")
+            })?,
+            failed: Arc::clone(&connection.writer_failed),
+        });
+    }
+    Ok(writers)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn drive_generation_connections(
     service: &mut EngineService,
     response_signer: &EngineResponseSigner,
@@ -1513,17 +1643,19 @@ fn write_active_generation_event(
     if let Some(error) = &connection.stream_error {
         return Err(error.clone());
     }
+    if connection.writer_failed.load(Ordering::Acquire) {
+        return Err(EngineError::backend_failure("generation event writer failed"));
+    }
     let ordinal = connection.next_event_ordinal;
     connection.next_event_ordinal = ordinal
         .checked_add(1)
         .ok_or_else(|| EngineError::resource_exhaustion("generation event ordinal exhausted"))?;
-    write_generation_event(
-        &mut connection.connection,
-        event,
-        connection.request_nonce,
-        ordinal,
-        response_signer,
-    )
+    let frame = generation_event_frame(event, connection.request_nonce, ordinal, response_signer)?;
+    let sender = connection
+        .outbound_sender
+        .as_ref()
+        .ok_or_else(|| EngineError::internal_invariant("active output sender is unavailable"))?;
+    enqueue_outbound_frame(sender, frame)
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -1589,6 +1721,13 @@ fn stop_active_watchers(active: &[ActiveGenerationConnection]) {
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn close_output_queues(active: &mut [ActiveGenerationConnection]) {
+    for connection in active {
+        connection.outbound_sender = None;
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn join_cancellation_watchers(
     watchers: Vec<thread::ScopedJoinHandle<'_, ()>>,
 ) -> Result<(), EngineError> {
@@ -1598,6 +1737,73 @@ fn join_cancellation_watchers(
             .map_err(|_| EngineError::internal_invariant("cancellation watcher panicked"))?;
     }
     Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn join_output_writers(
+    writers: Vec<(usize, thread::ScopedJoinHandle<'_, Result<(), EngineError>>)>,
+    results: &mut [Option<ConnectionServeResult>],
+) -> Result<(), EngineError> {
+    for (input_index, writer) in writers {
+        let writer_result =
+            writer.join().map_err(|_| EngineError::internal_invariant("output writer panicked"))?;
+        if let Err(error) = writer_result {
+            replace_connection_result_with_error(results, input_index, error)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn finish_connection_workers(
+    service: &mut EngineService,
+    active: &mut Vec<ActiveGenerationConnection>,
+    results: &mut [Option<ConnectionServeResult>],
+    watchers: Vec<thread::ScopedJoinHandle<'_, ()>>,
+    writers: Vec<(usize, thread::ScopedJoinHandle<'_, Result<(), EngineError>>)>,
+    run_result: Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    stop_active_watchers(active);
+    if run_result.is_err() {
+        cleanup_active_scheduler(service, active)?;
+    }
+    close_output_queues(active);
+    let watcher_join_result = join_cancellation_watchers(watchers);
+    let writer_join_result = join_output_writers(writers, results);
+    run_result?;
+    watcher_join_result?;
+    writer_join_result?;
+    if !active.is_empty() {
+        cleanup_active_scheduler(service, active)?;
+        return Err(EngineError::internal_invariant(
+            "round-robin coordinator stopped with active connections",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn write_queued_events(
+    mut connection: UnixFrameConnection,
+    receiver: &Receiver<Frame>,
+) -> Result<(), EngineError> {
+    while let Ok(frame) = receiver.recv() {
+        connection.write_outbound_frame(&frame)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn enqueue_outbound_frame(sender: &SyncSender<Frame>, frame: Frame) -> Result<(), EngineError> {
+    match sender.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_frame)) => {
+            Err(EngineError::resource_exhaustion("generation event queue is full"))
+        }
+        Err(TrySendError::Disconnected(_frame)) => {
+            Err(EngineError::backend_failure("generation event writer is unavailable"))
+        }
+    }
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -1639,6 +1845,19 @@ fn store_connection_result(
         return Err(EngineError::internal_invariant("connection result was recorded twice"));
     }
     *slot = Some(result);
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn replace_connection_result_with_error(
+    results: &mut [Option<ConnectionServeResult>],
+    input_index: usize,
+    error: EngineError,
+) -> Result<(), EngineError> {
+    let slot = results.get_mut(input_index).ok_or_else(|| {
+        EngineError::internal_invariant("connection result index is outside its allocation")
+    })?;
+    *slot = Some(Err(error));
     Ok(())
 }
 
@@ -1722,14 +1941,24 @@ fn write_generation_event(
     event_ordinal: u32,
     signer: &EngineResponseSigner,
 ) -> Result<(), EngineError> {
+    let frame = generation_event_frame(event, request_nonce, event_ordinal, signer)?;
+    connection.write_outbound_frame(&frame)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn generation_event_frame(
+    event: &GenerationEvent,
+    request_nonce: u64,
+    event_ordinal: u32,
+    signer: &EngineResponseSigner,
+) -> Result<Frame, EngineError> {
     let payload = personalai_engine_protocol::encode_signed_generation_event(
         event,
         request_nonce,
         event_ordinal,
         signer,
     )?;
-    let frame = Frame::new(FrameKind::GenerationEvent, payload)?;
-    connection.write_outbound_frame(&frame)
+    Frame::new(FrameKind::GenerationEvent, payload)
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -2237,6 +2466,24 @@ mod tests {
         assert_eq!(descriptor.listener_implemented, cfg!(unix));
     }
 
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn bounded_output_queue_fails_closed_when_full_or_disconnected() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let frame = Frame::new(FrameKind::GenerationEvent, vec![1])
+            .expect("bounded test frame must construct");
+        enqueue_outbound_frame(&sender, frame.clone()).expect("first frame must queue");
+        assert!(matches!(
+            enqueue_outbound_frame(&sender, frame.clone()),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        drop(receiver);
+        assert!(matches!(
+            enqueue_outbound_frame(&sender, frame),
+            Err(EngineError::BackendFailure(_))
+        ));
+    }
+
     #[cfg(feature = "cpu-reference")]
     #[test]
     fn signed_decoder_package_loads_and_executes_prompt_tokens_end_to_end() {
@@ -2527,6 +2774,63 @@ mod tests {
             ),
             Err(EngineError::ResourceExhaustion(_))
         ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn round_robin_charges_server_output_reservation_before_cursor_creation() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-output-budget").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-output-budget.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 1).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("decoder must load");
+        let request = GenerationRequest::new(
+            RequestId::new(320).expect("request ID must validate"),
+            model_id,
+            "A",
+            1,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let required = generation_retained_bytes(&request)
+            .expect("base retention must calculate")
+            .checked_add(OUTBOUND_PIPELINE_RESERVED_BYTES)
+            .expect("output reservation must fit");
+        let mut insufficient = GenerationRoundRobin::with_limits(1, required - 1)
+            .expect("bounded limit must validate");
+        assert!(matches!(
+            insufficient.submit_with_retained_bytes(
+                &loaded,
+                &request,
+                SequenceId::new(41).expect("sequence must validate"),
+                Arc::new(AtomicBool::new(false)),
+                OUTBOUND_PIPELINE_RESERVED_BYTES,
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        let mut exact =
+            GenerationRoundRobin::with_limits(1, required).expect("exact limit must validate");
+        exact
+            .submit_with_retained_bytes(
+                &loaded,
+                &request,
+                SequenceId::new(42).expect("sequence must validate"),
+                Arc::new(AtomicBool::new(false)),
+                OUTBOUND_PIPELINE_RESERVED_BYTES,
+            )
+            .expect("exact reservation must admit");
+        assert_eq!(exact.retained_bytes(), required);
     }
 
     #[cfg(feature = "cpu-reference")]
@@ -3056,7 +3360,7 @@ mod tests {
                 .expect("runtime config must validate");
             let mut service = EngineService::new(
                 config,
-                SchedulerLimits::new(8, maximum_active, 1 << 20).expect("limits must validate"),
+                SchedulerLimits::new(8, maximum_active, 4 << 20).expect("limits must validate"),
             )
             .expect("service must construct");
             let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");

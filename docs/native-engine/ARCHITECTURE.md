@@ -121,8 +121,8 @@ duplicate active request or sequence IDs before it creates a cursor or
 tokenizes the prompt. It also conservatively charges activation,
 scheduler-owned, and cursor-owned request copies, worst-case byte-token
 storage, and cursor overhead to an aggregate
-retained-byte ceiling. It advances one cursor once per pull, buffers no events,
-and isolates cursor failure to that request. Deterministic tests prove that a
+retained-byte ceiling. It advances one cursor once per pull and isolates cursor
+failure to that request. Deterministic tests prove that a
 shorter prompt can complete without
 waiting for a longer prompt and that cancellation does not prevent its neighbor
 from completing. The current UDS accept loop is still single-worker and does
@@ -131,8 +131,13 @@ batch accepts an exact configured number of connections no greater than the
 scheduler active limit or the separate 64-connection batch ceiling,
 authenticates and durably replay-checks each stream, then drives their cursors
 through the coordinator with per-stream signing, ordinals, 256 KiB bounded-stack
-cancellation watchers, failure isolation, and terminal cleanup. It is covered
-by real socket tests but is not selected by the CLI. The Go adapter
+cancellation watchers, separate 256 KiB bounded-stack output writers, fixed
+eight-event per-stream queues, and a ten-frame reservation covering queued,
+in-flight, and transient enqueue storage before cursor construction. Generation
+never blocks on a socket write: a
+full queue or failed writer cancels and fails only that stream, while writer
+completion is still bounded by the finite socket deadline. It is covered by
+real socket tests but is not selected by the CLI. The Go adapter
 opens one connection per generation and signs with the Go-held private key. On
 cancellation it sends a higher-nonce signed cancellation on the same full-duplex
 stream before closing; a Rust watcher treats that command, disconnect, malformed
@@ -141,11 +146,12 @@ CPU loop is active. The response-signing seed is read as exactly 32 bytes from
 stdin before model or socket startup, cleared after signer construction, never
 accepted through argv/model/client data, and never logged. Go validates the
 signature, nonce, ordinal, request ID, event schema, and usage before exposing
-canonical platform responses. It has no HTTP fallback. Authenticated
-continuous UDS ingress, slow-consumer isolation, graceful shutdown, and
-optional architecture-owned batching remain production hardening work.
-ADR-0008 defines the bounded multi-connection reference path; ADR-0007 defines
-the resumable generation and round-robin coordination boundary; ADR-0005
+canonical platform responses. It has no HTTP fallback. Authenticated continuous
+UDS ingress, graceful shutdown, operated slow-reader soak, and optional
+architecture-owned batching remain production hardening work. ADR-0009 defines
+bounded output isolation; ADR-0008 defines the bounded multi-connection
+reference path; ADR-0007 defines the resumable generation and round-robin
+coordination boundary; ADR-0005
 defines the overlap, cutover, drain, rollback, and retirement order for both
 identities; production secret injection and journal recovery still require
 operated proof.
@@ -156,8 +162,9 @@ The code centrally bounds package bytes (1 TiB hard maximum with lower owner
 budget), tensors (262,144), rank (8), dimensions (`1<<30`), elements (`1<<40`),
 token collections (1,048,576), vocabulary (4,194,304), context (262,144),
 request (4 MiB), complete frame (8 MiB), tokenizer data (64 MiB), sequences
-(4,096), concurrent reference-batch connections (64), cancellation-watcher
-stack (256 KiB each), aggregate queued bytes (64 MiB), active coordinator
+(4,096), concurrent reference-batch connections (64), cancellation-watcher and
+output-writer stacks (256 KiB each), pending output events per active stream
+(8), aggregate queued bytes (64 MiB), active coordinator/request/output
 retention (64 MiB or a lower configured limit), CPU work (100 million
 operations per bounded operation), durable nonces per control key (1,048,576),
 and portable socket path (100 bytes).
