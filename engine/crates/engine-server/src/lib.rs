@@ -38,7 +38,7 @@ use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
 use personalai_engine_tokenizer::{MAX_TOKEN_PIECE_BYTES, Tokenizer, build_tokenizer};
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_transformer::{CpuDecoderModel, TransformerConfig};
+use personalai_engine_transformer::{CpuDecoderModel, CpuDecoderSession, TransformerConfig};
 use personalai_engine_types::{
     BackendId, EngineError, GenerationRequest, MAX_FRAME_BYTES, ModelId, ModelPackageHash,
     RequestId,
@@ -285,14 +285,16 @@ impl LoadedCpuModel {
         self.tokenizer.as_ref()
     }
 
-    /// Runs deterministic greedy generation and synchronously emits bounded events.
-    pub fn generate_greedy(
-        &self,
-        request: &GenerationRequest,
+    /// Creates one validated, resumable greedy-generation sequence.
+    ///
+    /// Each call to [`GreedyGeneration::advance`] performs at most one decoder
+    /// token step. This is the scheduling boundary used to interleave sequences
+    /// without sharing their KV caches or cancellation state.
+    pub fn start_greedy<'a>(
+        &'a self,
+        request: &'a GenerationRequest,
         sequence_id: SequenceId,
-        cancelled: &AtomicBool,
-        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
-    ) -> Result<GenerationUsage, EngineError> {
+    ) -> Result<GreedyGeneration<'a>, EngineError> {
         if request.model_id() != &self.model_id {
             return Err(EngineError::invalid_input(
                 "generation request model differs from the loaded model",
@@ -307,57 +309,215 @@ impl LoadedCpuModel {
         let input_count = u32::try_from(input_tokens.len())
             .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
         request.validate_tokenized_input(input_count)?;
-        emit(GenerationEvent::Started { request_id: request.request_id(), sequence_id })?;
-        let mut session = self.model.start_session(&request.resource_budget())?;
-        let mut logits = None;
-        for token in input_tokens {
-            check_cancelled(cancelled, request.request_id())?;
-            logits = Some(session.forward_token(token)?);
+        Ok(GreedyGeneration {
+            request,
+            sequence_id,
+            model: &self.model,
+            tokenizer: self.tokenizer.as_ref(),
+            session: None,
+            input_tokens,
+            input_count,
+            next_input: 0,
+            next_generated_token: None,
+            generated: 0,
+            pending_utf8: [0_u8; 1_024],
+            pending_length: 0,
+            started: false,
+            terminal: None,
+            usage: None,
+        })
+    }
+
+    /// Runs deterministic greedy generation and synchronously emits bounded events.
+    pub fn generate_greedy(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        let mut generation = self.start_greedy(request, sequence_id)?;
+        loop {
+            match generation.advance(cancelled)? {
+                GreedyAdvance::Progressed => {}
+                GreedyAdvance::Event(event) => {
+                    let completed = match &event {
+                        GenerationEvent::Completed { usage, .. } => Some(*usage),
+                        _ => None,
+                    };
+                    emit(event)?;
+                    if let Some(usage) = completed {
+                        return Ok(usage);
+                    }
+                }
+            }
         }
-        let mut logits = logits.ok_or_else(|| {
-            EngineError::internal_invariant("tokenizer produced no prompt tokens")
-        })?;
-        let mut generated = 0_u32;
-        let mut pending_utf8 = [0_u8; 1_024];
-        let mut pending_length = 0_usize;
-        while generated < request.max_output_tokens() {
-            check_cancelled(cancelled, request.request_id())?;
-            let token = select_next_token_tensor(&logits, SamplingConfig::greedy())?;
-            generated = generated.checked_add(1).ok_or_else(|| {
-                EngineError::internal_invariant("generated token count overflows")
-            })?;
-            let text = append_streaming_piece(
-                self.tokenizer.as_ref(),
-                token,
-                &mut pending_utf8,
-                &mut pending_length,
-            )?;
-            emit(GenerationEvent::Token {
-                request_id: request.request_id(),
-                sequence_id,
-                token_id: TokenId::new(token)?,
-                text: TextChunk::new(text)?,
-            })?;
-            if token == self.tokenizer.spec().end_of_sequence_token() {
-                if pending_length != 0 {
+    }
+}
+
+/// Result of one bounded greedy-generation scheduling quantum.
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GreedyAdvance {
+    /// Bounded internal progress completed without a client-visible event.
+    ///
+    /// This is either request-local session allocation or one prompt-token
+    /// decoder step.
+    Progressed,
+    /// One bounded generation lifecycle event is ready for delivery.
+    Event(GenerationEvent),
+}
+
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalState {
+    Complete,
+    IncompleteUtf8AtEndOfSequence,
+    IncompleteUtf8AtOutputLimit,
+}
+
+/// Mutable state for one independently scheduled greedy-generation sequence.
+///
+/// The cursor owns no authority and performs no I/O. It borrows one immutable
+/// loaded model, owns a request-local decoder session/KV cache, and yields after
+/// at most one model token step so an engine-owned scheduler can rotate fairly
+/// among active sequences.
+#[cfg(feature = "cpu-reference")]
+pub struct GreedyGeneration<'a> {
+    request: &'a GenerationRequest,
+    sequence_id: SequenceId,
+    model: &'a CpuDecoderModel,
+    tokenizer: &'a dyn Tokenizer,
+    session: Option<CpuDecoderSession<'a>>,
+    input_tokens: Vec<u32>,
+    input_count: u32,
+    next_input: usize,
+    next_generated_token: Option<u32>,
+    generated: u32,
+    pending_utf8: [u8; 1_024],
+    pending_length: usize,
+    started: bool,
+    terminal: Option<TerminalState>,
+    usage: Option<GenerationUsage>,
+}
+
+#[cfg(feature = "cpu-reference")]
+impl GreedyGeneration<'_> {
+    /// Advances this sequence by at most one decoder token step.
+    pub fn advance(&mut self, cancelled: &AtomicBool) -> Result<GreedyAdvance, EngineError> {
+        if self.usage.is_some() {
+            return Err(EngineError::protocol_violation(
+                "completed generation sequence cannot advance",
+            ));
+        }
+        if let Some(terminal) = self.terminal.take() {
+            match terminal {
+                TerminalState::IncompleteUtf8AtEndOfSequence => {
                     return Err(EngineError::backend_failure(
                         "generation ended with an incomplete UTF-8 sequence",
                     ));
                 }
-                break;
+                TerminalState::IncompleteUtf8AtOutputLimit => {
+                    return Err(EngineError::backend_failure(
+                        "generation limit ended with an incomplete UTF-8 sequence",
+                    ));
+                }
+                TerminalState::Complete => {}
             }
-            if generated < request.max_output_tokens() {
-                logits = session.forward_token(token)?;
+            let usage =
+                GenerationUsage::for_request(self.request, self.input_count, self.generated)?;
+            self.usage = Some(usage);
+            return Ok(GreedyAdvance::Event(GenerationEvent::Completed {
+                request_id: self.request.request_id(),
+                sequence_id: self.sequence_id,
+                usage,
+            }));
+        }
+        if !self.started {
+            self.started = true;
+            return Ok(GreedyAdvance::Event(GenerationEvent::Started {
+                request_id: self.request.request_id(),
+                sequence_id: self.sequence_id,
+            }));
+        }
+        check_cancelled(cancelled, self.request.request_id())?;
+        if self.session.is_none() {
+            self.session = Some(self.model.start_session(&self.request.resource_budget())?);
+            return Ok(GreedyAdvance::Progressed);
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            EngineError::internal_invariant("generation decoder session disappeared")
+        })?;
+        let logits = if let Some(token) = self.input_tokens.get(self.next_input).copied() {
+            let logits = session.forward_token(token)?;
+            self.next_input = self.next_input.checked_add(1).ok_or_else(|| {
+                EngineError::internal_invariant("generation input position overflows")
+            })?;
+            if self.next_input < self.input_tokens.len() {
+                return Ok(GreedyAdvance::Progressed);
             }
+            logits
+        } else if let Some(token) = self.next_generated_token.take() {
+            session.forward_token(token)?
+        } else {
+            return Err(EngineError::internal_invariant("tokenizer produced no prompt tokens"));
+        };
+        let token = select_next_token_tensor(&logits, SamplingConfig::greedy())?;
+        self.generated = self
+            .generated
+            .checked_add(1)
+            .ok_or_else(|| EngineError::internal_invariant("generated token count overflows"))?;
+        let text = append_streaming_piece(
+            self.tokenizer,
+            token,
+            &mut self.pending_utf8,
+            &mut self.pending_length,
+        )?;
+        let end_of_sequence = token == self.tokenizer.spec().end_of_sequence_token();
+        let output_limit = self.generated >= self.request.max_output_tokens();
+        if end_of_sequence || output_limit {
+            self.terminal = Some(if self.pending_length == 0 {
+                TerminalState::Complete
+            } else if end_of_sequence {
+                TerminalState::IncompleteUtf8AtEndOfSequence
+            } else {
+                TerminalState::IncompleteUtf8AtOutputLimit
+            });
+        } else {
+            self.next_generated_token = Some(token);
         }
-        if pending_length != 0 {
-            return Err(EngineError::backend_failure(
-                "generation limit ended with an incomplete UTF-8 sequence",
-            ));
-        }
-        let usage = GenerationUsage::for_request(request, input_count, generated)?;
-        emit(GenerationEvent::Completed { request_id: request.request_id(), sequence_id, usage })?;
-        Ok(usage)
+        Ok(GreedyAdvance::Event(GenerationEvent::Token {
+            request_id: self.request.request_id(),
+            sequence_id: self.sequence_id,
+            token_id: TokenId::new(token)?,
+            text: TextChunk::new(text)?,
+        }))
+    }
+
+    /// Returns whether this sequence emitted its completed event.
+    pub const fn is_complete(&self) -> bool {
+        self.usage.is_some()
+    }
+
+    /// Returns final usage after completion.
+    pub const fn usage(&self) -> Option<GenerationUsage> {
+        self.usage
+    }
+
+    /// Returns the request correlation identifier.
+    pub const fn request_id(&self) -> RequestId {
+        self.request.request_id()
+    }
+
+    /// Returns the engine-assigned sequence identifier.
+    pub const fn sequence_id(&self) -> SequenceId {
+        self.sequence_id
+    }
+
+    /// Returns decoder tokens committed to this request-local KV cache.
+    pub fn processed_tokens(&self) -> u32 {
+        self.session.as_ref().map_or(0, CpuDecoderSession::token_count)
     }
 }
 
@@ -1243,6 +1403,111 @@ mod tests {
             .expect("queued generation must produce usage");
         assert!(scheduled_usage.output_tokens() >= 1);
         assert!(matches!(scheduled_events.last(), Some(GenerationEvent::Completed { .. })));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn resumable_generation_interleaves_two_sequence_local_cursors_fairly() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-interleaved").expect("model id must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-interleaved.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 2).expect("budget must validate");
+        let loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("decoder must load");
+        let first_request = GenerationRequest::new(
+            RequestId::new(201).expect("request id must validate"),
+            model_id.clone(),
+            "AAA",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("first request must validate");
+        let second_request = GenerationRequest::new(
+            RequestId::new(202).expect("request id must validate"),
+            model_id,
+            "B",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("second request must validate");
+        let first_sequence = SequenceId::new(21).expect("sequence must validate");
+        let second_sequence = SequenceId::new(22).expect("sequence must validate");
+        let mut first =
+            loaded.start_greedy(&first_request, first_sequence).expect("first cursor must start");
+        let mut second = loaded
+            .start_greedy(&second_request, second_sequence)
+            .expect("second cursor must start");
+        let first_cancelled = AtomicBool::new(false);
+        let second_cancelled = AtomicBool::new(false);
+        let mut first_events = Vec::new();
+        let mut second_events = Vec::new();
+        let mut completion_order = Vec::new();
+
+        for _round in 0..64 {
+            if !first.is_complete() {
+                let before = first.processed_tokens();
+                if let GreedyAdvance::Event(event) =
+                    first.advance(&first_cancelled).expect("first cursor must advance")
+                {
+                    if matches!(event, GenerationEvent::Completed { .. }) {
+                        completion_order.push(event.request_id());
+                    }
+                    first_events.push(event);
+                }
+                let advanced = first
+                    .processed_tokens()
+                    .checked_sub(before)
+                    .expect("first cursor token count must not decrease");
+                assert!(advanced <= 1);
+            }
+            if !second.is_complete() {
+                let before = second.processed_tokens();
+                if let GreedyAdvance::Event(event) =
+                    second.advance(&second_cancelled).expect("second cursor must advance")
+                {
+                    if matches!(event, GenerationEvent::Completed { .. }) {
+                        completion_order.push(event.request_id());
+                    }
+                    second_events.push(event);
+                }
+                let advanced = second
+                    .processed_tokens()
+                    .checked_sub(before)
+                    .expect("second cursor token count must not decrease");
+                assert!(advanced <= 1);
+            }
+            if first.is_complete() && second.is_complete() {
+                break;
+            }
+        }
+
+        assert!(first.is_complete());
+        assert!(second.is_complete());
+        assert_eq!(
+            completion_order,
+            [second_request.request_id(), first_request.request_id()],
+            "the shorter prompt must complete without waiting for the longer sequence"
+        );
+        assert!(matches!(first_events.first(), Some(GenerationEvent::Started { .. })));
+        assert!(matches!(first_events.last(), Some(GenerationEvent::Completed { .. })));
+        assert!(matches!(second_events.first(), Some(GenerationEvent::Started { .. })));
+        assert!(matches!(second_events.last(), Some(GenerationEvent::Completed { .. })));
+        assert_eq!(first.request_id(), first_request.request_id());
+        assert_eq!(second.sequence_id(), second_sequence);
+        assert!(first.usage().is_some());
+        assert!(second.usage().is_some());
+        assert!(matches!(first.advance(&first_cancelled), Err(EngineError::ProtocolViolation(_))));
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]

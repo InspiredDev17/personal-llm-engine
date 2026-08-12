@@ -112,8 +112,15 @@ and the configured engine response-key ID. Go pins at most an explicit
 current/previous response public-key pair and verifies the selected binding
 before parsing or exposing event data.
 
-The current runtime executes one CPU sequence at a time. The Go adapter opens
-one connection per generation and signs with the Go-held private key. On
+The current runtime executes one CPU sequence at a time. Internally, greedy CPU
+generation now uses a request-local resumable cursor that yields after at most
+one decoder token step; the existing synchronous generation API advances that
+cursor to completion. Deterministic tests interleave two independent cursors
+and prove that a shorter prompt can complete without waiting for a longer
+prompt. The cursor is the execution boundary for planned round-robin service,
+but the current UDS accept loop is still single-worker and does not yet activate
+multiple connections concurrently. The Go adapter opens one connection per
+generation and signs with the Go-held private key. On
 cancellation it sends a higher-nonce signed cancellation on the same full-duplex
 stream before closing; a Rust watcher treats that command, disconnect, malformed
 follow-up, or mismatched cancellation as request-local cancellation while the
@@ -121,8 +128,10 @@ CPU loop is active. The response-signing seed is read as exactly 32 bytes from
 stdin before model or socket startup, cleared after signer construction, never
 accepted through argv/model/client data, and never logged. Go validates the
 signature, nonce, ordinal, request ID, event schema, and usage before exposing
-canonical platform responses. It has no HTTP fallback. Fair multi-sequence
-scheduling and batching remain production hardening work. ADR-0005 defines the
+canonical platform responses. It has no HTTP fallback. Multi-connection
+round-robin orchestration, backpressure, and optional architecture-owned
+batching remain production hardening work. ADR-0007 defines the resumable
+generation boundary; ADR-0005 defines the
 overlap, cutover, drain, rollback, and retirement order for both identities;
 production secret injection and journal recovery still require operated proof.
 
