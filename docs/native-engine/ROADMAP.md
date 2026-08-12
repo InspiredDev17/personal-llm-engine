@@ -132,7 +132,9 @@ Before the native runtime becomes mandatory:
 - retain the checked-in Linux systemd definition that restricts address
   families to `AF_UNIX`, denies all IP addresses, makes the model store
   read-only, and confines writes to the runtime directory; operated CPU proof
-  under that unit and a separately reviewed macOS profile remain required;
+  under that unit remains required; retain the checked-in macOS deny-by-default
+  Seatbelt profile and local UDS-versus-loopback proof as transitional
+  defense-in-depth while a signed App Sandbox release design remains required;
 - require Go's platform-wide local-only mode to reject every remote primary,
   fallback, verifier, and manual override before sovereign cutover;
 - complete Agent Green telemetry mapping in Go, never in the model or engine;

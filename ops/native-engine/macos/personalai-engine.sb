@@ -1,0 +1,25 @@
+(version 1)
+(deny default)
+
+; File parameters must be absolute normalized paths supplied by the owner launcher.
+(define model-root (param "MODEL_ROOT"))
+(define runtime-root (param "RUNTIME_ROOT"))
+(define socket-path (param "SOCKET_PATH"))
+
+; Runtime and loader support. Model bytes remain read-only.
+(allow process*)
+(allow signal (target self))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow file-read*)
+(allow file-write*
+    (subpath runtime-root))
+
+; No IP, DNS, discovery, or arbitrary Unix sockets. The one configured UDS is
+; the complete communication boundary.
+(allow network-bind
+    (local unix-socket
+        (path-literal "/private/var/run/personalai-engine/engine.sock")))
+(allow network-outbound
+    (remote unix-socket
+        (path-literal "/private/var/run/personalai-engine/engine.sock")))

@@ -231,6 +231,33 @@ fn linux_service_profile_denies_ip_network_and_limits_filesystem_authority() {
 }
 
 #[test]
+fn macos_service_profile_allows_only_the_configured_unix_socket() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let profile =
+        fs::read_to_string(repository.join("ops/native-engine/macos/personalai-engine.sb"))
+            .expect("macOS native-engine sandbox profile must exist");
+    for required in [
+        "(deny default)",
+        "(define model-root (param \"MODEL_ROOT\"))",
+        "(define runtime-root (param \"RUNTIME_ROOT\"))",
+        "(define socket-path (param \"SOCKET_PATH\"))",
+        "(allow file-write*\n    (subpath runtime-root))",
+        "(allow network-bind\n    (local unix-socket",
+        "(path-literal \"/private/var/run/personalai-engine/engine.sock\")))",
+        "(allow network-outbound\n    (remote unix-socket",
+    ] {
+        assert!(profile.contains(required), "macOS sandbox omitted invariant {required:?}");
+    }
+    for prohibited in ["remote ip", "local ip", "network-inbound", "network*"] {
+        assert!(
+            !profile.contains(prohibited),
+            "macOS sandbox contains prohibited network rule {prohibited:?}"
+        );
+    }
+}
+
+#[test]
 fn cross_platform_verification_is_pinned_offline_and_fail_closed() {
     let root = engine_root();
     let repository = root.parent().expect("engine must have repository parent");

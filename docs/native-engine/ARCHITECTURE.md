@@ -337,6 +337,14 @@ protocol. The exact single-command driver serves these control requests;
 continuous generation/cancellation streams retain their bounded path.
 ADR-0020 defines the format and deterministic 4:2:1 scheduler.
 
+Target service confinement is independent of Rust configuration. Linux uses
+the checked-in systemd unit with `AF_UNIX` and all-IP denial. macOS development
+and operated qualification may use the deny-by-default exact-socket Seatbelt
+profile and its local UDS-versus-loopback proof. Because Apple deprecates
+`sandbox-exec`, ADR-0021 keeps a signed hardened/App Sandbox distribution design
+as a mandatory production gate rather than treating the transitional profile
+as permanent authority.
+
 ## Resource ceilings
 
 The code centrally bounds package bytes (1 TiB hard maximum with lower owner
