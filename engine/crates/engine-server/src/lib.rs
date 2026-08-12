@@ -51,7 +51,7 @@ use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, Scheduler
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_tokenizer::{MAX_TOKEN_PIECE_BYTES, Tokenizer, build_tokenizer};
+use personalai_engine_tokenizer::{IncrementalDecoder, Tokenizer, build_tokenizer};
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_transformer::{CpuDecoderModel, CpuDecoderSession, TransformerConfig};
@@ -367,8 +367,7 @@ impl LoadedCpuModel {
             next_input: 0,
             next_generated_token: None,
             generated: 0,
-            pending_utf8: [0_u8; 1_024],
-            pending_length: 0,
+            stream_decoder: IncrementalDecoder::new(self.tokenizer.as_ref()),
             started: false,
             terminal: None,
             usage: None,
@@ -442,8 +441,7 @@ pub struct GreedyGeneration<'a> {
     next_input: usize,
     next_generated_token: Option<u32>,
     generated: u32,
-    pending_utf8: [u8; 1_024],
-    pending_length: usize,
+    stream_decoder: IncrementalDecoder<'a>,
     started: bool,
     terminal: Option<TerminalState>,
     usage: Option<GenerationUsage>,
@@ -515,16 +513,11 @@ impl GreedyGeneration<'_> {
             .generated
             .checked_add(1)
             .ok_or_else(|| EngineError::internal_invariant("generated token count overflows"))?;
-        let text = append_streaming_piece(
-            self.tokenizer,
-            token,
-            &mut self.pending_utf8,
-            &mut self.pending_length,
-        )?;
+        let text = self.stream_decoder.push(token)?;
         let end_of_sequence = token == self.tokenizer.spec().end_of_sequence_token();
         let output_limit = self.generated >= self.request.max_output_tokens();
         if end_of_sequence || output_limit {
-            self.terminal = Some(if self.pending_length == 0 {
+            self.terminal = Some(if !self.stream_decoder.has_pending_bytes() {
                 TerminalState::Complete
             } else if end_of_sequence {
                 TerminalState::IncompleteUtf8AtEndOfSequence
@@ -1995,39 +1988,6 @@ fn check_cancelled(cancelled: &AtomicBool, request_id: RequestId) -> Result<(), 
     }
 }
 
-#[cfg(feature = "cpu-reference")]
-fn append_streaming_piece(
-    tokenizer: &dyn Tokenizer,
-    token: u32,
-    pending: &mut [u8; 1_024],
-    pending_length: &mut usize,
-) -> Result<String, EngineError> {
-    if tokenizer.is_special_token(token)? {
-        return Ok(String::new());
-    }
-    let piece = tokenizer.token_piece(token)?;
-    if piece.len() > usize::from(MAX_TOKEN_PIECE_BYTES) {
-        return Err(EngineError::internal_invariant(
-            "validated tokenizer piece exceeds its hard bound",
-        ));
-    }
-    let end = pending_length
-        .checked_add(piece.len())
-        .filter(|end| *end <= pending.len())
-        .ok_or_else(|| EngineError::backend_failure("generated UTF-8 prefix remains invalid"))?;
-    pending[*pending_length..end].copy_from_slice(piece);
-    *pending_length = end;
-    match std::str::from_utf8(&pending[..end]) {
-        Ok(text) => {
-            let text = text.to_owned();
-            *pending_length = 0;
-            Ok(text)
-        }
-        Err(error) if error.error_len().is_none() => Ok(String::new()),
-        Err(_) => Err(EngineError::backend_failure("generated token bytes are not valid UTF-8")),
-    }
-}
-
 impl EngineService {
     /// Creates a non-listening service composition.
     pub fn new(config: ServiceConfig, limits: SchedulerLimits) -> Result<Self, EngineError> {
@@ -2605,7 +2565,7 @@ mod tests {
             logits = Some(session.forward_token(token).expect("token must execute"));
         }
         let logits = logits.expect("prompt must contain at least one token");
-        assert_eq!(logits.shape().dimensions(), &[258]);
+        assert_eq!(logits.shape().dimensions(), &[259]);
         assert_eq!(session.token_count(), 2);
     }
 

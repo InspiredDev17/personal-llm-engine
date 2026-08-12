@@ -10,8 +10,10 @@ memory, and audit. The engine is inference-only and is not a second AI platform.
 The workspace implements a signed directory-backed data-only `.paimodel`
 format, a Rust-only quarantine safetensors importer, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
-no-follow direct-file opening, read-only non-executable shard mapping, a first-party bounded byte/BPE tokenizer, safe aggregate-
-accounted tensors, one fixed decoder architecture, scalar CPU reference
+no-follow direct-file opening, read-only non-executable shard mapping, strict
+AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
+tokenization, safe aggregate-accounted tensors, one fixed decoder architecture,
+scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
@@ -33,8 +35,11 @@ signed synthetic model. It is not yet a useful production model. A legally
 approved real source model/package and independent numeric evidence, stochastic
 sampling, optimized ARM64, Metal, CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
-existing production runtimes. The locked dependency graph is checked in under
-`engine/vendor`, Cargo is offline/source-replaced by default, and
+existing production runtimes. Tokenizer support is intentionally limited to
+AIPTok Byte-Level BPE v1; SentencePiece, Unigram, WordPiece, tiktoken, and
+arbitrary `tokenizer.json` graphs are not supported. The locked dependency
+graph is checked in under `engine/vendor`, Cargo is offline/source-replaced by
+default, and
 `release/native-engine.spdx` records package versions, checksums, and licenses.
 
 ## Build and verify

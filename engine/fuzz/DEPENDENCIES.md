@@ -33,10 +33,11 @@ All other registry packages in the fuzz lock are exact versions already
 reviewed in `docs/native-engine/DEPENDENCY-INVENTORY.md` for the production
 path crates exercised by the targets.
 
-The directory-manifest, tensor-index, safetensors-import, and package-path
-targets add only first-party path dependencies on `engine-model-format`,
-`engine-model-importer`, and `engine-loader`. They add no external package and
-do not expand the production graph.
+The directory-manifest, tensor-index, safetensors-import, package-path, AIPTok
+parser, encode, decode, and incremental-state targets add only first-party path
+dependencies on `engine-model-format`, `engine-model-importer`,
+`engine-loader`, and `engine-tokenizer`. They add no external package and do not
+expand the production graph.
 
 ## Orchestrator
 

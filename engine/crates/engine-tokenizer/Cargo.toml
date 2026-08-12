@@ -7,8 +7,13 @@ publish.workspace = true
 description = "First-party tokenizer contracts and bounded tokenizer metadata"
 
 [dependencies]
+personalai-engine-crypto.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-types.workspace = true
+
+[[bench]]
+name = "tokenizer"
+harness = false
 
 [dev-dependencies]
 personalai-engine-model-format.workspace = true

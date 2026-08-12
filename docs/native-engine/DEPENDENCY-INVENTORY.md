@@ -6,7 +6,7 @@ networking, dynamic loading, or GPU kernels.
 
 | Package | License | Purpose and attack-surface justification |
 | --- | --- | --- |
-| `sha2 0.11.0` | MIT OR Apache-2.0 | Direct mature SHA-384 implementation; pure digest surface |
+| `sha2 0.11.0` | MIT OR Apache-2.0 | Direct mature SHA-384 implementation for packages, messages, and AIPTok content identity; pure digest surface |
 | `ed25519-dalek 3.0.0` | BSD-3-Clause | Direct strict Ed25519 verification and engine-response signing; only the `zeroize` feature is enabled |
 | `zeroize 1.8.2` | Apache-2.0 OR MIT | Direct audited clearing of the owner-provided response-key seed and Ed25519 signing state; no derive feature |
 | `libc 0.2.189` | MIT OR Apache-2.0 | Direct Unix constants `O_NOFOLLOW`/`O_CLOEXEC` for safe package/replay opens, isolated checked `flock` for exclusive journal ownership, isolated `sigaction` install/restore for graceful shutdown, isolated read-only effective-user/peer-credential calls for UDS admission, and isolated `PROT_READ|MAP_PRIVATE`/`munmap` tensor-shard mapping; no executable mapping or dynamic link discovery |

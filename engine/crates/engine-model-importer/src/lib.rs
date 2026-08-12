@@ -5,7 +5,10 @@
 //! it. It contains no socket, subprocess, dynamic loading, Python, or model-code
 //! execution capability.
 
+mod aiptok_metadata;
 mod safetensors;
+
+pub use aiptok_metadata::{AIPTOK_METADATA_SOURCE_FORMAT, convert as convert_aiptok_metadata};
 
 pub use safetensors::{
     MAX_SAFETENSORS_HEADER_BYTES, MAX_SOURCE_TENSOR_NAME_BYTES, ParsedSafetensors, SafeTensorRecord,
@@ -186,6 +189,13 @@ pub struct ImportReceipt {
     signer_public_key: [u8; 32],
 }
 
+#[derive(Clone, Copy)]
+struct TokenizerSourceEvidence<'a> {
+    name: &'a str,
+    bytes: &'a [u8],
+    format: &'a str,
+}
+
 impl ImportReceipt {
     /// Returns the installed package path.
     pub fn package_path(&self) -> &Path {
@@ -221,6 +231,11 @@ pub fn build_package(
         spec,
         source_name,
         source_bytes,
+        TokenizerSourceEvidence {
+            name: "embedded-tokenizer.aiptok",
+            bytes: tokenizer_bytes,
+            format: "aiptok-byte-level-bpe-v1",
+        },
         tokenizer_bytes,
         signer_key_id,
         signing_seed,
@@ -233,6 +248,7 @@ fn build_package_inner(
     spec: &ImportSpec,
     source_name: &str,
     source_bytes: &[u8],
+    tokenizer_source: TokenizerSourceEvidence<'_>,
     tokenizer_bytes: &[u8],
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
@@ -273,7 +289,14 @@ fn build_package_inner(
         tensor_records,
     )?
     .build_bytes()?;
-    let provenance = provenance(spec, source_name, source_bytes)?;
+    let provenance = provenance(
+        spec,
+        source_name,
+        source_bytes,
+        tokenizer_source.name,
+        tokenizer_source.bytes,
+        tokenizer_source.format,
+    )?;
     let catalog = HashCatalog::new(vec![
         catalog_entry(PackageFileKind::Manifest, 0, "manifest.aipm", &manifest)?,
         catalog_entry(PackageFileKind::Tokenizer, 0, "tokenizer.aiptok", tokenizer_bytes)?,
@@ -319,13 +342,38 @@ pub fn import_local(
         validate_local_path_text(source_path)?;
         validate_local_path_text(tokenizer_path)?;
         let source = read_quarantined_file(quarantine_root, source_path, MAX_MODEL_PACKAGE_BYTES)?;
-        let tokenizer = read_quarantined_file(quarantine_root, tokenizer_path, 64 * 1024 * 1024)?;
+        let tokenizer_source =
+            read_quarantined_file(quarantine_root, tokenizer_path, 64 * 1024 * 1024)?;
+        let tokenizer = convert_aiptok_metadata(&tokenizer_source)?;
         let source_name = source_path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| EngineError::invalid_input("source filename is invalid UTF-8"))?;
-        let package =
-            build_package(spec, source_name, &source, &tokenizer, signer_key_id, signing_seed)?;
+        let tokenizer_source_name = tokenizer_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EngineError::invalid_input("tokenizer filename is invalid UTF-8"))?;
+        if !tokenizer_source_name.ends_with(".aiptokmeta")
+            || tokenizer_source_name.contains('/')
+            || tokenizer_source_name.contains('\\')
+        {
+            return Err(EngineError::invalid_input(
+                "tokenizer source must be one local .aiptokmeta filename",
+            ));
+        }
+        let package = build_package_inner(
+            spec,
+            source_name,
+            &source,
+            TokenizerSourceEvidence {
+                name: tokenizer_source_name,
+                bytes: &tokenizer_source,
+                format: AIPTOK_METADATA_SOURCE_FORMAT,
+            },
+            &tokenizer,
+            signer_key_id,
+            signing_seed,
+        )?;
         install_package(output_root, spec, &package, force_audit_note)?;
         Ok(ImportReceipt {
             package_path: output_root.join(format!("{}.paimodel", spec.model_id.as_str())),
@@ -476,8 +524,13 @@ fn provenance(
     spec: &ImportSpec,
     source_name: &str,
     source_bytes: &[u8],
+    tokenizer_source_name: &str,
+    tokenizer_source_bytes: &[u8],
+    tokenizer_source_format: &str,
 ) -> Result<Vec<u8>, EngineError> {
     validate_provenance_text(source_name, 256)?;
+    validate_provenance_text(tokenizer_source_name, 256)?;
+    validate_provenance_text(tokenizer_source_format, 64)?;
     let document = format!(
         concat!(
             "{{\n",
@@ -489,6 +542,9 @@ fn provenance(
             "  \"source_format\": \"safetensors\",\n",
             "  \"source_label\": \"{}\",\n",
             "  \"source_sha384\": \"{}\",\n",
+            "  \"tokenizer_source_file\": \"{}\",\n",
+            "  \"tokenizer_source_format\": \"{}\",\n",
+            "  \"tokenizer_source_sha384\": \"{}\",\n",
             "  \"tool\": \"personalai-engine-model-importer\",\n",
             "  \"tool_version\": \"{}\"\n",
             "}}\n"
@@ -500,6 +556,9 @@ fn provenance(
         source_name,
         spec.source_label,
         hash_package(source_bytes),
+        tokenizer_source_name,
+        tokenizer_source_format,
+        hash_package(tokenizer_source_bytes),
         env!("CARGO_PKG_VERSION"),
     );
     if document.len() > MAX_PROVENANCE_BYTES {
@@ -768,7 +827,7 @@ mod tests {
             ModelId::new("synthetic-import").expect("model ID must validate"),
             SourceMapping::LlamaSafetensorsV1,
             ContextLimit::new(8).expect("context must validate"),
-            258,
+            259,
             4,
             1,
             1,
@@ -816,6 +875,58 @@ mod tests {
         source.extend_from_slice(header.as_bytes());
         source.extend_from_slice(&data);
         (source, tokenizer)
+    }
+
+    fn source_tokenizer_metadata() -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut text = concat!(
+            "AIPTOK-METADATA-V1\n",
+            "family=byte-level-bpe-v1\n",
+            "normalizer=preserve-bytes\n",
+            "pre_tokenizer=none\n",
+            "decoder=concatenate-bytes-skip-special\n",
+            "unknown_policy=byte-fallback\n",
+            "chat_template=none\n",
+            "vocabulary_size=259\n",
+            "bos_token_id=256\n",
+            "eos_token_id=257\n",
+            "unknown_token_id=258\n",
+            "maximum_input_bytes=4194304\n",
+            "maximum_produced_tokens=1048576\n",
+        )
+        .to_owned();
+        for token in 0_u16..=255 {
+            writeln!(&mut text, "token {token} ordinary {token:02x}")
+                .expect("metadata write must work");
+        }
+        text.push_str(
+            "token 256 bos 3c7c626f737c3e\n\
+             token 257 eos 3c7c656f737c3e\n\
+             token 258 unknown 3c7c756e6b7c3e\n\
+             merge_count=0\n",
+        );
+        text.into_bytes()
+    }
+
+    fn assert_tokenizer_provenance(
+        loaded: &personalai_engine_loader::VerifiedDirectoryPackage,
+        metadata: &[u8],
+    ) {
+        let provenance = std::str::from_utf8(loaded.provenance_bytes())
+            .expect("provenance must be canonical UTF-8");
+        assert!(provenance.contains("\"tokenizer_source_format\": \"aiptok-metadata-v1\""));
+        assert!(
+            provenance
+                .contains(&format!("\"tokenizer_source_sha384\": \"{}\"", hash_package(metadata)))
+        );
+    }
+
+    fn write_import_sources(quarantine: &Path, source: &[u8]) -> Vec<u8> {
+        fs::write(quarantine.join("model.safetensors"), source).expect("source must write");
+        let metadata = source_tokenizer_metadata();
+        fs::write(quarantine.join("tokenizer.aiptokmeta"), &metadata)
+            .expect("tokenizer metadata must write");
+        metadata
     }
 
     fn temporary_root(label: &str) -> PathBuf {
@@ -976,6 +1087,22 @@ mod tests {
         );
         assert_eq!(seed, [0; 32]);
 
+        let mut wrong_vocabulary_spec = spec();
+        wrong_vocabulary_spec.vocabulary_size = 258;
+        let mut seed = [0x58; 32];
+        assert!(
+            build_package(
+                &wrong_vocabulary_spec,
+                "model.safetensors",
+                &source,
+                &tokenizer,
+                key_id,
+                &mut seed,
+            )
+            .is_err()
+        );
+        assert_eq!(seed, [0; 32]);
+
         let mut missing = source.clone();
         let needle = b"lm_head.weight";
         let start = missing
@@ -1044,14 +1171,13 @@ mod tests {
                 .expect("private directory mode must set");
         }
         let (source, tokenizer) = source_and_tokenizer();
-        fs::write(quarantine.join("model.safetensors"), &source).expect("source must write");
-        fs::write(quarantine.join("tokenizer.aiptok"), &tokenizer).expect("tokenizer must write");
+        let tokenizer_metadata = write_import_sources(&quarantine, &source);
         let key_id = SignerKeyId::from_bytes([0x61; 16]).expect("key ID must validate");
         let mut seed = [0x62; 32];
         let receipt = import_local(
             &quarantine,
             Path::new("model.safetensors"),
-            Path::new("tokenizer.aiptok"),
+            Path::new("tokenizer.aiptokmeta"),
             &store,
             &spec(),
             key_id,
@@ -1084,6 +1210,7 @@ mod tests {
         assert!(events.is_empty());
         assert_eq!(loaded.manifest().model_id(), spec().model_id());
         assert_eq!(loaded.tokenizer_bytes(), tokenizer);
+        assert_tokenizer_provenance(&loaded, &tokenizer_metadata);
 
         let parsed_source = ParsedSafetensors::parse(&source).expect("source must parse");
         let source_embedding = parsed_source
@@ -1330,9 +1457,10 @@ mod tests {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
                 .expect("private directory mode must set");
         }
-        let (source, tokenizer) = source_and_tokenizer();
+        let (source, _tokenizer) = source_and_tokenizer();
         fs::write(quarantine.join("model.safetensors"), &source).expect("source must write");
-        fs::write(quarantine.join("tokenizer.aiptok"), &tokenizer).expect("tokenizer must write");
+        fs::write(quarantine.join("tokenizer.aiptokmeta"), source_tokenizer_metadata())
+            .expect("tokenizer metadata must write");
         let outside = root.join("outside.safetensors");
         fs::write(&outside, &source).expect("outside source must write");
         std::os::unix::fs::symlink(&outside, quarantine.join("escape.safetensors"))
@@ -1344,7 +1472,7 @@ mod tests {
             import_local(
                 &quarantine,
                 Path::new("https://invalid/model.safetensors"),
-                Path::new("tokenizer.aiptok"),
+                Path::new("tokenizer.aiptokmeta"),
                 &store,
                 &spec(),
                 key_id,
@@ -1359,7 +1487,7 @@ mod tests {
             import_local(
                 &quarantine,
                 Path::new("escape.safetensors"),
-                Path::new("tokenizer.aiptok"),
+                Path::new("tokenizer.aiptokmeta"),
                 &store,
                 &spec(),
                 key_id,
@@ -1373,7 +1501,7 @@ mod tests {
         import_local(
             &quarantine,
             Path::new("model.safetensors"),
-            Path::new("tokenizer.aiptok"),
+            Path::new("tokenizer.aiptokmeta"),
             &store,
             &spec(),
             key_id,
@@ -1386,7 +1514,7 @@ mod tests {
             import_local(
                 &quarantine,
                 Path::new("model.safetensors"),
-                Path::new("tokenizer.aiptok"),
+                Path::new("tokenizer.aiptokmeta"),
                 &store,
                 &spec(),
                 key_id,
@@ -1399,7 +1527,7 @@ mod tests {
         import_local(
             &quarantine,
             Path::new("model.safetensors"),
-            Path::new("tokenizer.aiptok"),
+            Path::new("tokenizer.aiptokmeta"),
             &store,
             &spec(),
             key_id,

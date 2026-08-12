@@ -265,6 +265,7 @@ dependencies = [
 name = "personalai-engine-tokenizer"
 version = "0.1.0"
 dependencies = [
+ "personalai-engine-crypto",
  "personalai-engine-memory",
  "personalai-engine-model-format",
  "personalai-engine-testkit",

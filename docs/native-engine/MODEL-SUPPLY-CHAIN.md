@@ -44,7 +44,8 @@ no trailing data, no recursion, no compression, and no ambiguous integer
 encoding. Required unknown flags and unsupported optional sections fail closed.
 
 The initial importer emits one 64-byte-aligned F32 shard, quantization `None`,
-RoPE scaling `1.0`, and the first-party `PAIBPE01` tokenizer. Those restrictions
+RoPE scaling `1.0`, and the first-party AIPTok Byte-Level BPE v1 tokenizer.
+Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
 
 ## Cryptographic profile
@@ -67,7 +68,7 @@ The production engine holds only the configured public verification key.
 ## Offline importer
 
 The importer operates on owner-selected local files only. Both source and
-tokenizer must canonicalize under one absolute quarantine root. URLs and
+tokenizer metadata must canonicalize under one absolute quarantine root. URLs and
 symlink escapes are refused. The initial source parser accepts a bounded,
 data-only F32 safetensors subset implemented in Rust: eight-byte little-endian
 header length, bounded JSON object, flat tensor records, exact `dtype`, `shape`,
@@ -80,9 +81,27 @@ loading. The required explicit mapping is `llama-safetensors-v1`; all unknown,
 missing, extra, duplicate, wrongly shaped, wrongly typed, non-finite, or
 out-of-range tensors are rejected against the exact internal architecture.
 
+The exact tokenizer source format is `AIPTOK-METADATA-V1`, selected explicitly
+as `aiptok-metadata-v1`. It is ordered canonical ASCII, not general JSON. It
+requires family `byte-level-bpe-v1`, preserve-bytes normalization, no
+pre-tokenizer, concatenate-bytes/skip-special decoding, byte fallback, and
+`chat_template=none`. Vocabulary IDs and merge ranks must be contiguous;
+special roles/IDs and model vocabulary size must match exactly. Unsupported
+families, arbitrary components, executable normalizers, template/Jinja text,
+remote references, extra fields, trailing data, or lossy conversion are
+rejected. No diagnostic-only lossy writer is implemented.
+
+Canonical `tokenizer.aiptok` has magic `AIPTOK01`, a fixed version/header,
+explicit family and behavior IDs, 256 identity byte tokens, immutable
+length-bounded vocabulary, ranked merge and special-token tables, required
+BOS/EOS/UNK IDs, input/output ceilings, and SHA-384 over the canonical content.
+It contains no scripts, templates, roles, filesystem references, or code. The
+source metadata filename, format, and SHA-384 are included in signed provenance.
+
 Provenance records the architecture, license identifier, mapping, model ID,
-local source filename/label, source format, source SHA-384, importer identity,
-and version. Package bytes, ordering, padding, hashes, provenance, and signature
+local source filename/label, source format/hash, tokenizer source
+filename/format/hash, importer identity, and version. Package bytes, ordering,
+padding, hashes, provenance, and signature
 are deterministic for identical inputs/configuration/key. A staging directory
 is durably written, sealed to read-only file/directory modes, and atomically renamed. An existing approved directory is
 never overwritten implicitly: replacement requires a bounded audit note, writes
@@ -119,9 +138,10 @@ tensors, tokenizer/shard corruption, invalid/untrusted signatures, traversal,
 symlink escape, trailing data, unsupported optional features, unaudited
 overwrite, and package-budget excess.
 
-Four dedicated bounded fuzz targets cover the directory manifest, one tensor
-index record, safetensors import parser, and package-name resolution. A local
-10-second smoke campaign per target is only smoke evidence; production-size
+Dedicated bounded fuzz targets cover the directory manifest, one tensor index
+record, safetensors import parser, package-name resolution, AIPTok parser,
+arbitrary encode bytes, decode token sequences, and incremental decoder state.
+A bounded local smoke campaign per target is only smoke evidence; production-size
 corpora and scheduled sustained campaigns remain release gates.
 
 ## Activation, update, revocation, and remaining gate

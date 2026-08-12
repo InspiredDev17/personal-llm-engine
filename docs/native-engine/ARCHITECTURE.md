@@ -24,7 +24,7 @@ Green authority.
 | `engine-model-format` | fixed directory-manifest, hash-catalog, signature-envelope and legacy test-fixture parsers |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
-| `engine-tokenizer` | first-party `PAIBPE01` parser and bounded encode/decode |
+| `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
 | `engine-memory` | aggregate fallible reservations |
 | `engine-tensor` | safe owned typed storage tied to reservations |
 | `engine-cpu-reference` | checked scalar numeric primitives |
@@ -47,7 +47,8 @@ tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The import and production components are intentionally separate:
 
-1. The offline importer accepts only local `.safetensors` and `PAIBPE01` files
+1. The offline importer accepts only local `.safetensors` and strict
+   `AIPTOK-METADATA-V1` files
    that canonicalize beneath an owner-selected quarantine. It refuses URLs,
    quarantine escapes, pickle/executable formats, unknown tensor names,
    missing/extra tensors, unsupported dtypes, non-finite values, and any
@@ -80,6 +81,36 @@ The supported architecture is `decoder-rms-rope-swiglu-gqa-v1`, a fixed causal d
 with architecture-owned RMSNorm, Q/K/V projections, RoPE, grouped attention,
 output projection, residual paths, SwiGLU MLP, final norm, and logits. Model
 metadata cannot define operations, plugins, paths, executable code, or kernels.
+
+## Tokenizer boundary
+
+`tokenizer.aiptok` uses magic `AIPTOK01`, version 1.0, a fixed 128-byte
+little-endian header, explicit family/normalization/unknown/decoder IDs,
+contiguous vocabulary IDs, length-prefixed vocabulary bytes, fixed 16-byte
+ranked merge records, fixed 8-byte special-token records, required BOS/EOS/UNK
+IDs, per-package input/output limits, and an internal SHA-384 content hash.
+The first 256 IDs are exact one-byte identity tokens. Every later ordinary
+token has exactly one defining merge; special tokens use canonical bounded
+`<|name|>` UTF-8 text and never participate in merges.
+
+Normalization is exactly preserve-bytes. The UTF-8 API cannot receive malformed
+UTF-8 by construction; the byte API accepts all byte strings and preserves
+them. Strict text decode rejects malformed UTF-8, while byte decode returns the
+exact bytes. Incremental decode buffers only an incomplete UTF-8 suffix and
+must finish without pending bytes. Literal special-token text is rejected by
+default; callers must explicitly allow all, allow a validated ID list, or
+treat it as ordinary bytes. The runtime uses the rejecting policy for assembled
+prompt text. Aggregate tokenizer-table memory is reserved before table
+allocation; encoding work is separately bounded and reserved. Chat
+roles/templates, system-prompt files, tools, and policy remain entirely in Go.
+
+The offline converter accepts one ordered, ASCII, line-oriented metadata
+profile. It requires byte preservation, no pre-tokenizer, fixed decoder,
+byte fallback, and `chat_template=none`; unsupported families, normalizers,
+components, template text, extra fields, lossy mappings, and trailing data fail
+closed. The source metadata SHA-384, filename, and format are signed through
+package provenance. There is no diagnostic mode that can emit an approved
+lossy package.
 
 ## Local protocol and authentication
 
@@ -206,8 +237,10 @@ budget), tensors (262,144), rank (8), dimensions (`1<<30`), elements (`1<<40`),
 directory manifest (64 MiB), shards (1,024), tensor name (47 bytes), tensor
 alignment (2 MiB), hash-catalog entries (1,027), provenance (1 MiB), and
 safetensors import header (64 MiB),
-token collections (1,048,576), vocabulary (4,194,304), context (262,144),
-request (4 MiB), complete frame (8 MiB), tokenizer data (64 MiB), sequences
+token collections (1,048,576), vocabulary (4,194,304), tokenizer specials
+(4,096), token pieces (256 bytes), AIPTok source/package data (64 MiB each),
+context (262,144),
+request (4 MiB), complete frame (8 MiB), sequences
 (4,096), continuously owned/reference-batch connections (64), ingress,
 cancellation-watcher, and output-writer stacks (256 KiB each), pending output
 events per active stream (8), aggregate queued bytes (64 MiB), active coordinator/request/output

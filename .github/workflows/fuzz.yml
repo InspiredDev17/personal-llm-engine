@@ -46,6 +46,34 @@ jobs:
           --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
           tokenizer_data "$RUNNER_TEMP/personalai-fuzz-corpus/tokenizer_data"
           -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz AIPTok v1 parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          aiptok_parser "$RUNNER_TEMP/personalai-fuzz-corpus/aiptok_parser"
+          -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz AIPTok encode input
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          aiptok_encode "$RUNNER_TEMP/personalai-fuzz-corpus/aiptok_encode"
+          -- -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz AIPTok decode tokens
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          aiptok_decode "$RUNNER_TEMP/personalai-fuzz-corpus/aiptok_decode"
+          -- -max_total_time=60 -max_len=262144 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz AIPTok incremental decoder
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          aiptok_incremental "$RUNNER_TEMP/personalai-fuzz-corpus/aiptok_incremental"
+          -- -max_total_time=60 -max_len=262144 -timeout=10 -rss_limit_mb=1024
       - name: Fuzz protocol frame parser
         working-directory: /tmp
         run: >-

@@ -191,8 +191,8 @@ impl ModelPackageHeader {
 /// Declarative tokenizer-data representation selected by the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerDataFormat {
-    /// First-party bounded byte-pair-encoding data.
-    FirstPartyBpeV1,
+    /// First-party AIPTok Byte-Level BPE v1 data.
+    AipTokByteLevelBpeV1,
 }
 
 /// Validated canonical model manifest.
@@ -241,7 +241,7 @@ impl ModelManifest {
         let context_limit = ContextLimit::new(read_u32(input, 100)?)
             .map_err(|_| corrupt("model manifest context limit is invalid"))?;
         let tokenizer_format = match read_u16(input, 104)? {
-            1 => TokenizerDataFormat::FirstPartyBpeV1,
+            1 => TokenizerDataFormat::AipTokByteLevelBpeV1,
             _ => return Err(corrupt("model manifest tokenizer format is unsupported")),
         };
         let storage_dtype = decode_dtype(input[106])?;

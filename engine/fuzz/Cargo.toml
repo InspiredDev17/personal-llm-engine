@@ -34,6 +34,34 @@ doc = false
 bench = false
 
 [[bin]]
+name = "aiptok_parser"
+path = "fuzz_targets/aiptok_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aiptok_encode"
+path = "fuzz_targets/aiptok_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aiptok_decode"
+path = "fuzz_targets/aiptok_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aiptok_incremental"
+path = "fuzz_targets/aiptok_incremental.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
 test = false

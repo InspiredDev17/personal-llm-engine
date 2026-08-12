@@ -20,11 +20,12 @@ use personalai_engine_types::{
 const TEST_SIGNING_SECRET: [u8; 32] = [0x5a; 32];
 const TEST_SIGNER_KEY_ID_BYTES: [u8; 16] = [0x71; 16];
 const FIXTURE_ARCHITECTURE: &[u8] = b"personalai.synthetic-transformer.v1";
-const TOKENIZER_MAGIC: &[u8; 8] = b"PAIBPE01";
-const TOKENIZER_HEADER_BYTES: usize = 40;
-const FIXTURE_VOCABULARY_SIZE: u32 = 258;
+const TOKENIZER_MAGIC: &[u8; 8] = b"AIPTOK01";
+const TOKENIZER_HEADER_BYTES: usize = 128;
+const FIXTURE_VOCABULARY_SIZE: u32 = 259;
 const FIXTURE_BOS_TOKEN: u32 = 256;
 const FIXTURE_EOS_TOKEN: u32 = 257;
+const FIXTURE_UNKNOWN_TOKEN: u32 = 258;
 const FIXTURE_TENSOR_ELEMENTS: u64 = 4;
 const DECODER_ARCHITECTURE: &[u8] = b"decoder-rms-rope-swiglu-gqa-v1";
 
@@ -238,9 +239,9 @@ fn decoder_manifest() -> ManifestFixture {
 
 fn decoder_tensors() -> Result<Vec<TensorFixture>, EngineError> {
     let mut tensors = vec![
-        f32_tensor("token_embedding.weight", &[258, 4], &repeated(1_032, 0.0005))?,
+        f32_tensor("token_embedding.weight", &[259, 4], &repeated(1_036, 0.0005))?,
         f32_tensor("final_norm.weight", &[4], &[1.0; 4])?,
-        f32_tensor("output.weight", &[258, 4], &repeated(1_032, 0.0003))?,
+        f32_tensor("output.weight", &[259, 4], &repeated(1_036, 0.0003))?,
         f32_tensor("layers.000.attn_norm.weight", &[4], &[1.0; 4])?,
         f32_tensor("layers.000.q_proj.weight", &[4, 4], &identity(4))?,
         f32_tensor("layers.000.k_proj.weight", &[4, 4], &identity(4))?,
@@ -310,44 +311,87 @@ fn exact_f32_from_u32(value: u32) -> Result<f32, EngineError> {
 }
 
 fn build_byte_tokenizer_data() -> Result<Vec<u8>, EngineError> {
-    let byte_entry_bytes = 5_usize;
-    let special_entry_bytes = 4_usize;
+    let byte_entry_bytes = 9_usize;
+    let special_pieces: [&[u8]; 3] = [b"<|bos|>", b"<|eos|>", b"<|unk|>"];
+    let special_entry_bytes = special_pieces.iter().try_fold(0_usize, |total, piece| {
+        total
+            .checked_add(8 + piece.len())
+            .ok_or_else(|| EngineError::resource_exhaustion("fixture tokenizer length overflows"))
+    })?;
     let entries_bytes = 256_usize
         .checked_mul(byte_entry_bytes)
-        .and_then(|value| value.checked_add(2 * special_entry_bytes))
+        .and_then(|value| value.checked_add(special_entry_bytes))
         .ok_or_else(|| EngineError::resource_exhaustion("fixture tokenizer length overflows"))?;
     let total_bytes = TOKENIZER_HEADER_BYTES
         .checked_add(entries_bytes)
+        .and_then(|value| value.checked_add(3 * 8))
         .ok_or_else(|| EngineError::resource_exhaustion("fixture tokenizer length overflows"))?;
     let mut bytes = zeroed_bytes(usize_to_u64(total_bytes)?)?;
     bytes[..8].copy_from_slice(TOKENIZER_MAGIC);
     write_u16(&mut bytes, 8, 1)?;
     write_u16(&mut bytes, 10, 0)?;
     write_u32(&mut bytes, 12, usize_to_u32(TOKENIZER_HEADER_BYTES)?)?;
-    write_u32(&mut bytes, 16, FIXTURE_VOCABULARY_SIZE)?;
-    write_u32(&mut bytes, 20, 0)?;
-    write_u32(&mut bytes, 24, FIXTURE_BOS_TOKEN)?;
-    write_u32(&mut bytes, 28, FIXTURE_EOS_TOKEN)?;
-    write_u16(&mut bytes, 32, 1)?;
-    write_u16(&mut bytes, 34, 0)?;
-    write_u32(&mut bytes, 36, usize_to_u32(total_bytes)?)?;
+    write_u16(&mut bytes, 16, 1)?;
+    write_u16(&mut bytes, 18, 1)?;
+    write_u16(&mut bytes, 20, 1)?;
+    write_u16(&mut bytes, 22, 1)?;
+    write_u32(&mut bytes, 24, FIXTURE_VOCABULARY_SIZE)?;
+    write_u32(&mut bytes, 28, 0)?;
+    write_u32(&mut bytes, 32, 3)?;
+    write_u32(&mut bytes, 36, FIXTURE_BOS_TOKEN)?;
+    write_u32(&mut bytes, 40, FIXTURE_EOS_TOKEN)?;
+    write_u32(&mut bytes, 44, FIXTURE_UNKNOWN_TOKEN)?;
+    write_u16(&mut bytes, 48, 7)?;
+    write_u16(&mut bytes, 50, 0)?;
+    write_u32(&mut bytes, 52, 4 * 1024 * 1024)?;
+    write_u32(&mut bytes, 56, 1_048_576)?;
+    write_u32(&mut bytes, 60, usize_to_u32(TOKENIZER_HEADER_BYTES)?)?;
     let mut cursor = TOKENIZER_HEADER_BYTES;
     for byte in 0_u16..=255 {
-        write_u16(&mut bytes, cursor, 1)?;
-        write_u16(&mut bytes, cursor + 2, 0)?;
-        bytes[cursor + 4] = u8::try_from(byte)
+        write_u32(&mut bytes, cursor, u32::from(byte))?;
+        write_u16(&mut bytes, cursor + 4, 0)?;
+        write_u16(&mut bytes, cursor + 6, 1)?;
+        bytes[cursor + 8] = u8::try_from(byte)
             .map_err(|_| EngineError::internal_invariant("fixture byte token overflows"))?;
         cursor = cursor
             .checked_add(byte_entry_bytes)
             .ok_or_else(|| EngineError::internal_invariant("fixture tokenizer cursor overflows"))?;
     }
-    for _ in 0..2 {
-        write_u16(&mut bytes, cursor, 0)?;
-        write_u16(&mut bytes, cursor + 2, 1)?;
+    for (offset, piece) in special_pieces.iter().enumerate() {
+        let token_id = FIXTURE_BOS_TOKEN
+            .checked_add(
+                u32::try_from(offset).map_err(|_| {
+                    EngineError::internal_invariant("fixture special index overflows")
+                })?,
+            )
+            .ok_or_else(|| EngineError::internal_invariant("fixture special token overflows"))?;
+        write_u32(&mut bytes, cursor, token_id)?;
+        write_u16(&mut bytes, cursor + 4, 1)?;
+        write_u16(
+            &mut bytes,
+            cursor + 6,
+            u16::try_from(piece.len())
+                .map_err(|_| EngineError::internal_invariant("fixture special length overflows"))?,
+        )?;
+        copy_at(&mut bytes, usize_to_u64(cursor + 8)?, piece)?;
         cursor = cursor
-            .checked_add(special_entry_bytes)
+            .checked_add(8 + piece.len())
             .ok_or_else(|| EngineError::internal_invariant("fixture tokenizer cursor overflows"))?;
     }
+    write_u32(&mut bytes, 64, usize_to_u32(cursor)?)?;
+    write_u32(&mut bytes, 68, usize_to_u32(cursor)?)?;
+    for (token_id, role) in
+        [(FIXTURE_BOS_TOKEN, 1_u32), (FIXTURE_EOS_TOKEN, 2_u32), (FIXTURE_UNKNOWN_TOKEN, 4_u32)]
+    {
+        write_u32(&mut bytes, cursor, token_id)?;
+        write_u32(&mut bytes, cursor + 4, role)?;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| EngineError::internal_invariant("fixture tokenizer cursor overflows"))?;
+    }
+    write_u32(&mut bytes, 72, usize_to_u32(total_bytes)?)?;
+    let content_hash = hash_package(&bytes[TOKENIZER_HEADER_BYTES..]);
+    bytes[80..128].copy_from_slice(content_hash.as_bytes());
     if cursor != total_bytes {
         return Err(EngineError::internal_invariant("fixture tokenizer length invariant failed"));
     }
@@ -613,7 +657,7 @@ mod tests {
         let fixture = DecoderPackageFixtureBuilder::new().build().expect("decoder must build");
         let parsed = ParsedModelPackage::parse(fixture.bytes()).expect("decoder must parse");
         assert_eq!(parsed.manifest().architecture_id().as_str(), "decoder-rms-rope-swiglu-gqa-v1");
-        assert_eq!(parsed.manifest().vocabulary_size(), 258);
+        assert_eq!(parsed.manifest().vocabulary_size(), 259);
         assert_eq!(parsed.tensors().len(), 12);
         assert!(parsed.tensors().iter().any(|tensor| tensor.name().as_str() == "output.weight"));
     }

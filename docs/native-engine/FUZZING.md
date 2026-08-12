@@ -18,7 +18,11 @@ reproducible.
 | Target | Boundary | Per-input ceiling |
 | --- | --- | ---: |
 | `model_package` | complete canonical `ParsedModelPackage` parser | 8 MiB campaign input |
-| `tokenizer_data` | first-party `PAIBPE01` parser | 8 MiB input and 128 MiB accounting pool |
+| `tokenizer_data` | retained first-party AIPTok parser compatibility target | 8 MiB input and 128 MiB accounting pool |
+| `aiptok_parser` | AIPTok Byte-Level BPE v1 parser | 8 MiB input and 128 MiB accounting pool |
+| `aiptok_encode` | arbitrary byte-oriented encode input | 64 KiB input |
+| `aiptok_decode` | arbitrary little-endian token-ID sequence | 256 KiB input |
+| `aiptok_incremental` | arbitrary incremental decoder token state | 256 KiB input |
 | `protocol_frame` | inbound and outbound directional frame decoders | engine 8 MiB frame ceiling |
 | `manifest_parser` | directory-backed `.paimodel` manifest parser | 8 MiB campaign input; parser hard cap 64 MiB |
 | `tensor_index_parser` | one fixed directory tensor-index record | 192 bytes |
@@ -51,9 +55,11 @@ cargo +nightly-2026-08-01 fuzz run \
   -runs=1000 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
 ```
 
-Replace the target and corpus directory for any table entry and lower `max_len`
-to 192 for `tensor_index_parser` or 1,024 for `package_path_resolution`. Copy a checked-in corpus to a temporary directory when the
-run must not retain newly discovered coverage inputs.
+Replace the target and corpus directory for any table entry and use its exact
+table ceiling (`max_len` is 192 for `tensor_index_parser`, 1,024 for
+`package_path_resolution`, 65,536 for `aiptok_encode`, or 262,144 for either
+AIPTok token-sequence target). Copy a checked-in corpus to a temporary
+directory when the run must not retain newly discovered coverage inputs.
 
 ## Continuous campaign
 

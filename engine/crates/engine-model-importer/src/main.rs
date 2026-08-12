@@ -1,7 +1,9 @@
 //! Owner-facing offline importer executable.
 
 use personalai_engine_model_format::DIRECTORY_DECODER_ARCHITECTURE_ID;
-use personalai_engine_model_importer::{ImportSpec, SourceMapping, import_local};
+use personalai_engine_model_importer::{
+    AIPTOK_METADATA_SOURCE_FORMAT, ImportSpec, SourceMapping, import_local,
+};
 use personalai_engine_types::{ContextLimit, EngineError, ModelId, SignerKeyId};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -13,7 +15,8 @@ use zeroize::Zeroize;
 const USAGE: &str = "usage: personalai-engine-model-importer import \
   --quarantine-root PATH --source PATH --tokenizer PATH --output-root PATH \
   --model-id ID --architecture decoder-rms-rope-swiglu-gqa-v1 \
-  --mapping llama-safetensors-v1 --context-limit U32 --vocabulary-size U32 \
+  --mapping llama-safetensors-v1 --tokenizer-source-format aiptok-metadata-v1 \
+  --context-limit U32 --vocabulary-size U32 \
   --hidden-dimension U32 --layer-count U32 --attention-head-count U32 \
   --kv-head-count U32 --feed-forward-dimension U32 --rope-theta F32 \
   --rope-scaling F32 --tied-output true|false --source-label TEXT \
@@ -67,6 +70,9 @@ fn run(
     }
     let model_id = ModelId::new(text(take(&mut values, "--model-id")?)?)?;
     let mapping = SourceMapping::parse(&text(take(&mut values, "--mapping")?)?)?;
+    if text(take(&mut values, "--tokenizer-source-format")?)? != AIPTOK_METADATA_SOURCE_FORMAT {
+        return Err(EngineError::unsupported_tokenizer("offline tokenizer source format"));
+    }
     let context_limit = ContextLimit::new(number(&mut values, "--context-limit")?)?;
     let spec = ImportSpec::new(
         model_id,

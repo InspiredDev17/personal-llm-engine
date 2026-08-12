@@ -40,12 +40,20 @@ plugins, shared libraries, Metal source, PTX, or executable configuration.
 Production activation requires a non-symlink model root, package directory,
 and trusted files with no write permission bits.
 
-The Rust-only offline importer accepts bounded local safetensors plus the
-first-party tokenizer format from an owner quarantine, converts the exact
+The Rust-only offline importer accepts bounded local safetensors plus strict
+`AIPTOK-METADATA-V1` tokenizer source metadata from an owner quarantine,
+converts the exact
 allowlisted architecture, emits deterministic hashes/provenance, and signs the
 closed package file set. It has no network, subprocess, plugin, pickle, Python,
 or repository-code execution capability. The production loader cannot import
 source formats; it opens only an already converted registered directory.
+
+The sole tokenizer family is AIPTok Byte-Level BPE v1. It preserves exact
+input bytes, has mandatory byte fallback and fixed decoder behavior, and
+contains no programmable normalization, pre-tokenizer, chat template, role,
+tool, prompt-file, policy, or remote-code behavior. Go assembles chat text and
+retains every policy boundary. Rust treats prompt text and explicit token data
+only as bounded inference input.
 
 The implemented V1 CPU path is validated by a tiny deterministic test package.
 That fixture is not a production model. No production model is bundled or
@@ -111,7 +119,8 @@ and review record in an isolated FFI/backend module.
 The software foundation through deterministic offline synthetic-model import,
 signed directory-package verification/mapping, mutually authenticated
 CPU-reference UDS generation and bounded continuous graceful-drain reference
-serving plus deterministic delayed-reader/restart soak is implemented and
+serving, strict AIPTok conversion/encoding/streaming decode, plus deterministic
+delayed-reader/restart soak is implemented and
 tested. Remaining release work is selecting and licensing an approved real
 source model, producing/reviewing its production package and independent
 numeric vectors, production-size fuzz/operated-soak/performance evidence, operated

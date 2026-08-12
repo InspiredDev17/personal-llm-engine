@@ -62,11 +62,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     safetensors.extend_from_slice(&u64::try_from(safetensors_header.len())?.to_le_bytes());
     safetensors.extend_from_slice(safetensors_header);
     safetensors.extend_from_slice(&1.0_f32.to_le_bytes());
+    let token_sequence = [65_u32, 258, u32::MAX]
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect::<Vec<_>>();
+    let incremental_sequence = "世界"
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| u32::from(*byte).to_le_bytes())
+        .collect::<Vec<_>>();
 
     write_seed(&corpus, "model_package", "valid-decoder.paipkg", fixture.bytes())?;
     write_seed(&corpus, "model_package", "truncated-magic", b"PAIMDL")?;
     write_seed(&corpus, "tokenizer_data", "valid-byte-bpe.bin", tokenizer)?;
-    write_seed(&corpus, "tokenizer_data", "truncated-magic", b"PAIBPE")?;
+    write_seed(&corpus, "tokenizer_data", "truncated-magic", b"AIPTOK")?;
+    write_seed(&corpus, "aiptok_parser", "valid.aiptok", tokenizer)?;
+    write_seed(&corpus, "aiptok_parser", "truncated-magic", b"AIPTOK")?;
+    write_seed(&corpus, "aiptok_encode", "utf8-and-null", b"hello \xf0\x9f\xa6\x80\0")?;
+    write_seed(&corpus, "aiptok_decode", "mixed-token-ids", &token_sequence)?;
+    write_seed(&corpus, "aiptok_incremental", "unicode-byte-tokens", &incremental_sequence)?;
     write_seed(&corpus, "protocol_frame", "valid-capability.bin", &capability)?;
     write_seed(&corpus, "protocol_frame", "truncated-magic", b"PAIE")?;
     write_seed(&corpus, "manifest_parser", "valid-directory.aipm", &manifest)?;

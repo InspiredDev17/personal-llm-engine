@@ -42,7 +42,9 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 `zeroize 1.8.2`, and `libc 0.2.189`, all with default features disabled.
 SHA-384 and strict Ed25519 are package/control-message/response integrity
-mechanisms. The narrowly enabled Ed25519 `zeroize` feature plus the direct
+mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper
+for AIPTok's internal content hash; it adds no external dependency. The
+narrowly enabled Ed25519 `zeroize` feature plus the direct
 `zeroize` crate clear response-key seed material and signing state; no derive
 feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
 constants to safe `std::fs::OpenOptions` for package and durable replay state,

@@ -133,7 +133,7 @@ fn fuzz_tooling_is_isolated_from_the_production_release_graph() {
 }
 
 #[test]
-fn defensive_fuzz_workflow_covers_directory_artifact_parsers() {
+fn defensive_fuzz_workflow_covers_artifact_and_tokenizer_boundaries() {
     let root = engine_root();
     let repository = root.parent().expect("engine must have repository parent");
     let workflow = fs::read_to_string(repository.join(".github/workflows/fuzz.yml"))
@@ -147,9 +147,15 @@ fn defensive_fuzz_workflow_covers_directory_artifact_parsers() {
         "tensor_index_parser",
         "safetensors_import",
         "package_path_resolution",
+        "aiptok_parser",
+        "aiptok_encode",
+        "aiptok_decode",
+        "aiptok_incremental",
         "-max_total_time=60",
         "-max_len=192",
         "-max_len=1024",
+        "-max_len=65536",
+        "-max_len=262144",
         "-timeout=10",
         "-rss_limit_mb=1024",
         "git -C \"$GITHUB_WORKSPACE\" diff --exit-code -- engine/fuzz/corpus",
@@ -358,7 +364,10 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-types",
             ],
         ),
-        ("engine-tokenizer", &["personalai-engine-memory", "personalai-engine-types"]),
+        (
+            "engine-tokenizer",
+            &["personalai-engine-crypto", "personalai-engine-memory", "personalai-engine-types"],
+        ),
         ("engine-tensor", &["personalai-engine-memory", "personalai-engine-types"]),
         (
             "engine-cpu-reference",
