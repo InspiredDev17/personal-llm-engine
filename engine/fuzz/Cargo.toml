@@ -10,6 +10,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = { version = "=0.4.13", default-features = false, features = ["link_libfuzzer"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+personalai-engine-crypto = { path = "../crates/engine-crypto" }
 personalai-engine-memory = { path = "../crates/engine-memory" }
 personalai-engine-loader = { path = "../crates/engine-loader" }
 personalai-engine-model-format = { path = "../crates/engine-model-format" }
@@ -64,6 +66,13 @@ bench = false
 [[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_envelope"
+path = "fuzz_targets/service_envelope.rs"
 test = false
 doc = false
 bench = false

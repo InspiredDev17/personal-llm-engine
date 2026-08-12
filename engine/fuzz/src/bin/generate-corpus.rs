@@ -62,10 +62,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     safetensors.extend_from_slice(&u64::try_from(safetensors_header.len())?.to_le_bytes());
     safetensors.extend_from_slice(safetensors_header);
     safetensors.extend_from_slice(&1.0_f32.to_le_bytes());
-    let token_sequence = [65_u32, 258, u32::MAX]
-        .iter()
-        .flat_map(|token| token.to_le_bytes())
-        .collect::<Vec<_>>();
+    let token_sequence =
+        [65_u32, 258, u32::MAX].iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
     let incremental_sequence = "世界"
         .as_bytes()
         .iter()
@@ -83,6 +81,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_seed(&corpus, "aiptok_incremental", "unicode-byte-tokens", &incremental_sequence)?;
     write_seed(&corpus, "protocol_frame", "valid-capability.bin", &capability)?;
     write_seed(&corpus, "protocol_frame", "truncated-magic", b"PAIE")?;
+    write_seed(&corpus, "service_envelope", "valid-health-request", &[0, 12])?;
+    write_seed(&corpus, "service_envelope", "valid-health-response", &[1, 12, 1])?;
+    write_seed(&corpus, "service_envelope", "malformed-tokenize-request", &[0, 8, 5, 0, b'x'])?;
     write_seed(&corpus, "manifest_parser", "valid-directory.aipm", &manifest)?;
     write_seed(&corpus, "manifest_parser", "truncated-magic", b"PAIDIR")?;
     write_seed(

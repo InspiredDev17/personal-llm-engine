@@ -81,6 +81,13 @@ jobs:
           --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
           protocol_frame "$RUNNER_TEMP/personalai-fuzz-corpus/protocol_frame"
           -- -max_total_time=60 -max_len=8388608 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz authenticated service envelope and body parsers
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          service_envelope "$RUNNER_TEMP/personalai-fuzz-corpus/service_envelope"
+          -- -max_total_time=60 -max_len=65538 -timeout=10 -rss_limit_mb=1024
       - name: Fuzz directory manifest parser
         working-directory: /tmp
         run: >-

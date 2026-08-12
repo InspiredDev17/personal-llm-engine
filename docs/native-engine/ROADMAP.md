@@ -67,6 +67,7 @@ memory, tool, approval, or Agent Green behavior.
 - Exhaustive canonical-fixture and signed-event truncation/single-byte mutation suites, signed
   active cancellation, a checked-in vendor graph, and lockfile-bound SPDX.
 - Isolated coverage-guided Rust fuzz targets for package, tokenizer, frame,
+  authenticated service envelope/body,
   directory manifest, tensor-index, safetensors-import, and package-path
   parsers plus bounded Go fuzz targets for unsigned and authenticated response
   events, with deterministic Rust-generated seeds and scheduled CI campaigns.

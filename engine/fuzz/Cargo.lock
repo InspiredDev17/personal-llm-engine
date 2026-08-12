@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-cpu-reference"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-memory",
+ "personalai-engine-tensor",
+ "personalai-engine-types",
+]
+
+[[package]]
 name = "personalai-engine-crypto"
 version = "0.1.0"
 dependencies = [
@@ -184,7 +193,9 @@ dependencies = [
 name = "personalai-engine-fuzz"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
  "libfuzzer-sys",
+ "personalai-engine-crypto",
  "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",
@@ -256,8 +267,11 @@ name = "personalai-engine-testkit"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "personalai-engine-cpu-reference",
  "personalai-engine-crypto",
+ "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 

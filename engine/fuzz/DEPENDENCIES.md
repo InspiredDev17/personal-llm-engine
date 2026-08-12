@@ -34,9 +34,10 @@ reviewed in `docs/native-engine/DEPENDENCY-INVENTORY.md` for the production
 path crates exercised by the targets.
 
 The directory-manifest, tensor-index, safetensors-import, package-path, AIPTok
-parser, encode, decode, and incremental-state targets add only first-party path
-dependencies on `engine-model-format`, `engine-model-importer`,
-`engine-loader`, and `engine-tokenizer`. They add no external package and do not
+parser, encode, decode, incremental-state, and authenticated service-envelope
+targets add only first-party path dependencies plus a direct declaration of
+the already production-reviewed `ed25519-dalek 3.0.0` used to re-sign mutated
+local envelopes. They add no external package to either lockfile and do not
 expand the production graph.
 
 ## Orchestrator

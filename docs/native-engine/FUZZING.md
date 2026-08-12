@@ -24,6 +24,7 @@ reproducible.
 | `aiptok_decode` | arbitrary little-endian token-ID sequence | 256 KiB input |
 | `aiptok_incremental` | arbitrary incremental decoder token state | 256 KiB input |
 | `protocol_frame` | inbound and outbound directional frame decoders | engine 8 MiB frame ceiling |
+| `service_envelope` | correctly signed request/response envelopes plus closed message-body decoders | 64 KiB body plus two harness selector bytes |
 | `manifest_parser` | directory-backed `.paimodel` manifest parser | 8 MiB campaign input; parser hard cap 64 MiB |
 | `tensor_index_parser` | one fixed directory tensor-index record | 192 bytes |
 | `safetensors_import` | offline importer's bounded safetensors parser | 8 MiB campaign input |
@@ -35,7 +36,9 @@ exercise declared hard-limit behavior.
 
 The corpus generator is Rust-only and additionally produces valid directory
 manifest/tensor-record/safetensors/package-name seeds plus malformed boundary
-seeds. It retains the original decoder package, tokenizer, and frame seeds:
+seeds. It retains the decoder package, tokenizer, and frame seeds. The decoder
+seed is generated from the current two-layer grouped-query-attention fixture,
+so corpus verification catches stale fixture bytes:
 
 ```sh
 cd /tmp
@@ -58,8 +61,17 @@ cargo +nightly-2026-08-01 fuzz run \
 Replace the target and corpus directory for any table entry and use its exact
 table ceiling (`max_len` is 192 for `tensor_index_parser`, 1,024 for
 `package_path_resolution`, 65,536 for `aiptok_encode`, or 262,144 for either
-AIPTok token-sequence target). Copy a checked-in corpus to a temporary
-directory when the run must not retain newly discovered coverage inputs.
+AIPTok token-sequence target; `service_envelope` uses 65,538). Copy a
+checked-in corpus to a temporary directory when the run must not retain newly
+discovered coverage inputs.
+
+The `service_envelope` target received a bounded local macOS ARM64 smoke run on
+2026-08-12: an initial 1,000-run campaign and a separate 10-second campaign.
+The timed campaign completed 32,451 inputs in 11 wall-clock seconds, reached
+1,248 coverage counters and 1,874 features, stayed below 123 MiB RSS, and
+produced no crash, sanitizer, timeout, or resource-limit artifact. Local `atos`
+symbolizer startup warnings did not stop the campaign. This is smoke evidence,
+not a claim that scheduled or production-size fuzzing is complete.
 
 ## Continuous campaign
 
