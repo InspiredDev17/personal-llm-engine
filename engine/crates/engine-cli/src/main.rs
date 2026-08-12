@@ -13,7 +13,7 @@ use personalai_engine_server::{
     UnixFrameListener,
 };
 use personalai_engine_server::{
-    EngineService, FOUNDATION_STATUS, ProtocolDescriptor, ServiceConfig,
+    EngineService, FOUNDATION_STATUS, ProtocolDescriptor, RegistrySelectionV2, ServiceConfig,
 };
 use personalai_engine_types::{
     EngineError, EngineErrorKind, ModelId, ModelPackageHash, ResourceBudget, SignerKeyId,
@@ -36,20 +36,28 @@ const USAGE: &str = "usage:
   personalai-engine capabilities
   personalai-engine check-config --model-root PATH --runtime-root PATH --socket PATH
   personalai-engine serve --model-root PATH --runtime-root PATH --socket PATH \
-    --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
+    --registration-mode owner-pinned --model-id ID \
+    --package BASENAME.paimodel --package-sha384 HEX96 \
     --signer-key-id HEX32 --signer-public-key HEX64 \
     --control-key-id HEX32 --control-public-key HEX64 \
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
-    --model-id ID --package BASENAME.paimodel --package-sha384 HEX96 \
+    --registration-mode owner-pinned --model-id ID \
+    --package BASENAME.paimodel --package-sha384 HEX96 \
     --signer-key-id HEX32 --signer-public-key HEX64 \
     --control-key-id HEX32 --control-public-key HEX64 \
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
     --max-active-sequences U32 --max-connections U32
+  replace the owner-pinned package flags in either serving command with:
+    --registration-mode model-foundry-registry-v2 --model-id ID \
+    --artifact-id ID --registry-sequence U64 --minimum-registry-sequence U64 \
+    --registry-entry-sha384 HEX96 \
+    --registry-signer-key-id HEX32 --registry-signer-public-key HEX64 \
+    --package-signer-key-id HEX32 --package-signer-public-key HEX64
   serving reads exactly 32 binary response-key seed bytes from stdin;
   continuous serving drains on SIGINT or SIGTERM";
 
@@ -72,10 +80,7 @@ enum ServeMode {
 struct ServeConfig {
     service: ServiceConfig,
     model_id: ModelId,
-    package_name: PathBuf,
-    package_hash: ModelPackageHash,
-    signer_key_id: SignerKeyId,
-    signer_public_key: [u8; 32],
+    registration: RegistrationConfig,
     control_key_id: SignerKeyId,
     control_public_key: [u8; 32],
     previous_control_key: Option<(SignerKeyId, [u8; 32])>,
@@ -84,16 +89,42 @@ struct ServeConfig {
     mode: ServeMode,
 }
 
+#[derive(Debug)]
+enum RegistrationConfig {
+    OwnerPinned {
+        package_name: PathBuf,
+        package_hash: ModelPackageHash,
+        signer_key_id: SignerKeyId,
+        signer_public_key: [u8; 32],
+    },
+    ModelFoundryRegistryV2(RegistrySelectionV2),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationMode {
+    OwnerPinned,
+    ModelFoundryRegistryV2,
+}
+
 #[derive(Default)]
 struct RawServeConfig {
     model_root: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     socket_path: Option<PathBuf>,
     model_id: Option<ModelId>,
+    registration_mode: Option<RegistrationMode>,
     package_name: Option<PathBuf>,
     package_hash: Option<ModelPackageHash>,
     signer_key_id: Option<SignerKeyId>,
     signer_public_key: Option<[u8; 32]>,
+    artifact_id: Option<String>,
+    registry_sequence: Option<u64>,
+    minimum_registry_sequence: Option<u64>,
+    registry_entry_hash: Option<ModelPackageHash>,
+    registry_signer_key_id: Option<SignerKeyId>,
+    registry_signer_public_key: Option<[u8; 32]>,
+    package_signer_key_id: Option<SignerKeyId>,
+    package_signer_public_key: Option<[u8; 32]>,
     control_key_id: Option<SignerKeyId>,
     control_public_key: Option<[u8; 32]>,
     previous_control_key_id: Option<SignerKeyId>,
@@ -180,6 +211,10 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one closed flag table keeps duplicate and unknown serving options fail-closed"
+)]
 fn parse_serve(
     mut arguments: impl Iterator<Item = OsString>,
     continuous: bool,
@@ -205,6 +240,9 @@ fn parse_serve(
             "--model-id" if config.model_id.is_none() => {
                 config.model_id = Some(ModelId::new(text)?);
             }
+            "--registration-mode" if config.registration_mode.is_none() => {
+                config.registration_mode = Some(parse_registration_mode(text)?);
+            }
             "--package" if config.package_name.is_none() => {
                 config.package_name = Some(PathBuf::from(value));
             }
@@ -216,6 +254,30 @@ fn parse_serve(
             }
             "--signer-public-key" if config.signer_public_key.is_none() => {
                 config.signer_public_key = Some(parse_hex(text)?);
+            }
+            "--artifact-id" if config.artifact_id.is_none() => {
+                config.artifact_id = Some(text.to_owned());
+            }
+            "--registry-sequence" if config.registry_sequence.is_none() => {
+                config.registry_sequence = Some(parse_u64(text)?);
+            }
+            "--minimum-registry-sequence" if config.minimum_registry_sequence.is_none() => {
+                config.minimum_registry_sequence = Some(parse_u64(text)?);
+            }
+            "--registry-entry-sha384" if config.registry_entry_hash.is_none() => {
+                config.registry_entry_hash = Some(ModelPackageHash::from_sha384_hex(text)?);
+            }
+            "--registry-signer-key-id" if config.registry_signer_key_id.is_none() => {
+                config.registry_signer_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
+            }
+            "--registry-signer-public-key" if config.registry_signer_public_key.is_none() => {
+                config.registry_signer_public_key = Some(parse_hex(text)?);
+            }
+            "--package-signer-key-id" if config.package_signer_key_id.is_none() => {
+                config.package_signer_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
+            }
+            "--package-signer-public-key" if config.package_signer_public_key.is_none() => {
+                config.package_signer_public_key = Some(parse_hex(text)?);
             }
             "--control-key-id" if config.control_key_id.is_none() => {
                 config.control_key_id = Some(SignerKeyId::from_bytes(parse_hex(text)?)?);
@@ -248,10 +310,19 @@ fn parse_serve(
             | "--runtime-root"
             | "--socket"
             | "--model-id"
+            | "--registration-mode"
             | "--package"
             | "--package-sha384"
             | "--signer-key-id"
             | "--signer-public-key"
+            | "--artifact-id"
+            | "--registry-sequence"
+            | "--minimum-registry-sequence"
+            | "--registry-entry-sha384"
+            | "--registry-signer-key-id"
+            | "--registry-signer-public-key"
+            | "--package-signer-key-id"
+            | "--package-signer-public-key"
             | "--control-key-id"
             | "--control-public-key"
             | "--previous-control-key-id"
@@ -270,6 +341,8 @@ fn parse_serve(
 }
 
 fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<ServeConfig, CliError> {
+    let model_id = required(config.model_id.clone(), "--model-id is required")?;
+    let registration = finish_registration(&config, &model_id)?;
     let service = ServiceConfig::new(
         required(config.model_root, "--model-root is required")?,
         required(config.runtime_root, "--runtime-root is required")?,
@@ -283,11 +356,8 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         rotation_key_pair(config.previous_control_key_id, config.previous_control_public_key)?;
     Ok(ServeConfig {
         service,
-        model_id: required(config.model_id, "--model-id is required")?,
-        package_name: required(config.package_name, "--package is required")?,
-        package_hash: required(config.package_hash, "--package-sha384 is required")?,
-        signer_key_id: required(config.signer_key_id, "--signer-key-id is required")?,
-        signer_public_key: required(config.signer_public_key, "--signer-public-key is required")?,
+        model_id,
+        registration,
         control_key_id: required(config.control_key_id, "--control-key-id is required")?,
         control_public_key: required(
             config.control_public_key,
@@ -298,6 +368,88 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         budget,
         mode,
     })
+}
+
+fn finish_registration(
+    config: &RawServeConfig,
+    model_id: &ModelId,
+) -> Result<RegistrationConfig, CliError> {
+    match required(config.registration_mode, "--registration-mode is required")? {
+        RegistrationMode::OwnerPinned => {
+            if registry_fields_present(config) {
+                return Err(CliError::InvalidArguments(
+                    "registry flags are forbidden in owner-pinned mode",
+                ));
+            }
+            Ok(RegistrationConfig::OwnerPinned {
+                package_name: required(config.package_name.clone(), "--package is required")?,
+                package_hash: required(config.package_hash, "--package-sha384 is required")?,
+                signer_key_id: required(config.signer_key_id, "--signer-key-id is required")?,
+                signer_public_key: required(
+                    config.signer_public_key,
+                    "--signer-public-key is required",
+                )?,
+            })
+        }
+        RegistrationMode::ModelFoundryRegistryV2 => {
+            if config.package_name.is_some()
+                || config.package_hash.is_some()
+                || config.signer_key_id.is_some()
+                || config.signer_public_key.is_some()
+            {
+                return Err(CliError::InvalidArguments(
+                    "owner-pinned package flags are forbidden in registry mode",
+                ));
+            }
+            let registry_signer = TrustedSigner::active(
+                required(config.registry_signer_key_id, "--registry-signer-key-id is required")?,
+                required(
+                    config.registry_signer_public_key,
+                    "--registry-signer-public-key is required",
+                )?,
+            )?;
+            let package_signer = TrustedSigner::active(
+                required(config.package_signer_key_id, "--package-signer-key-id is required")?,
+                required(
+                    config.package_signer_public_key,
+                    "--package-signer-public-key is required",
+                )?,
+            )?;
+            Ok(RegistrationConfig::ModelFoundryRegistryV2(RegistrySelectionV2::new(
+                model_id.clone(),
+                required(config.artifact_id.clone(), "--artifact-id is required")?,
+                required(config.registry_entry_hash, "--registry-entry-sha384 is required")?,
+                required(config.registry_sequence, "--registry-sequence is required")?,
+                required(
+                    config.minimum_registry_sequence,
+                    "--minimum-registry-sequence is required",
+                )?,
+                registry_signer,
+                package_signer,
+            )?))
+        }
+    }
+}
+
+fn registry_fields_present(config: &RawServeConfig) -> bool {
+    config.artifact_id.is_some()
+        || config.registry_sequence.is_some()
+        || config.minimum_registry_sequence.is_some()
+        || config.registry_entry_hash.is_some()
+        || config.registry_signer_key_id.is_some()
+        || config.registry_signer_public_key.is_some()
+        || config.package_signer_key_id.is_some()
+        || config.package_signer_public_key.is_some()
+}
+
+fn parse_registration_mode(value: &str) -> Result<RegistrationMode, CliError> {
+    match value {
+        "owner-pinned" => Ok(RegistrationMode::OwnerPinned),
+        "model-foundry-registry-v2" => Ok(RegistrationMode::ModelFoundryRegistryV2),
+        _ => Err(CliError::InvalidArguments(
+            "registration mode must be owner-pinned or model-foundry-registry-v2",
+        )),
+    }
 }
 
 fn serve_budget(
@@ -407,7 +559,6 @@ fn serve(
     secrets: &mut impl Read,
     errors: &mut impl Write,
 ) -> Result<(), CliError> {
-    let signer = TrustedSigner::active(config.signer_key_id, config.signer_public_key)?;
     let control_key =
         TrustedControlPlaneKey::active(config.control_key_id, config.control_public_key)?;
     let mut control_keys = vec![control_key];
@@ -419,16 +570,27 @@ fn serve(
     secrets.read_exact(&mut response_seed).map_err(|_| CliError::Io)?;
     let response_signer =
         EngineResponseSigner::from_seed(config.response_key_id, &mut response_seed)?;
+    validate_registration_key_roles(&config.registration, &control_keys, &response_signer)?;
     let mut service = EngineService::new(
         config.service,
         SchedulerLimits::new(128, config.budget.max_concurrent_sequences(), 64 << 20)?,
     )?;
-    service.register_configured_model(
-        config.model_id.clone(),
-        config.package_name,
-        config.package_hash,
-        signer,
-    )?;
+    match config.registration {
+        RegistrationConfig::OwnerPinned {
+            package_name,
+            package_hash,
+            signer_key_id,
+            signer_public_key,
+        } => service.register_configured_model(
+            config.model_id.clone(),
+            package_name,
+            package_hash,
+            TrustedSigner::active(signer_key_id, signer_public_key)?,
+        )?,
+        RegistrationConfig::ModelFoundryRegistryV2(selection) => {
+            service.register_model_foundry_registry_v2(&selection)?;
+        }
+    }
     let mut runtime =
         CpuEngineRuntime::new_with_control_keys(service, control_keys, response_signer)?;
     let mut event_write_failed = false;
@@ -459,6 +621,29 @@ fn serve(
             .map_err(|_| CliError::Io)
         }
     }
+}
+
+#[cfg(unix)]
+fn validate_registration_key_roles(
+    registration: &RegistrationConfig,
+    control_keys: &TrustedControlPlaneKeys,
+    response_signer: &EngineResponseSigner,
+) -> Result<(), CliError> {
+    let RegistrationConfig::ModelFoundryRegistryV2(selection) = registration else {
+        return Ok(());
+    };
+    let control_conflict = control_keys
+        .configured_keys()
+        .any(|key| selection.conflicts_with_identity(key.key_id(), key.public_key()));
+    if control_conflict
+        || selection.conflicts_with_identity(response_signer.key_id(), response_signer.public_key())
+    {
+        return Err(EngineError::authentication_failure(
+            "registry, package, control-plane, and response identities must be distinct",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -647,7 +832,7 @@ mod tests {
                 &mut output,
                 &mut errors,
             ),
-            Err(CliError::InvalidArguments("--model-root is required"))
+            Err(CliError::InvalidArguments("--model-id is required"))
         ));
         assert!(errors.is_empty());
     }
@@ -679,6 +864,65 @@ mod tests {
             panic!("serve command must parse as serve");
         };
         assert!(config.previous_control_key.is_some());
+    }
+
+    #[test]
+    fn registry_activation_is_exact_restart_stable_and_has_no_legacy_fallback() {
+        let arguments = complete_registry_serve_arguments();
+        for _restart in 0..2 {
+            let Command::Serve(config) =
+                parse_command(arguments.clone().into_iter()).expect("registry activation parses")
+            else {
+                panic!("registry activation must be a serving command");
+            };
+            let RegistrationConfig::ModelFoundryRegistryV2(selection) = config.registration else {
+                panic!("registry activation must remain in registry mode");
+            };
+            assert_eq!(selection.expected_model_id().as_str(), "synthetic-import");
+            assert_eq!(selection.expected_artifact_id(), "phase0-synthetic-import");
+            assert_eq!(selection.expected_sequence(), 2);
+            assert_eq!(selection.minimum_sequence(), 2);
+        }
+
+        let mut mixed = arguments.clone();
+        mixed.extend([OsString::from("--package"), OsString::from("legacy.paimodel")]);
+        assert!(matches!(
+            parse_command(mixed.into_iter()),
+            Err(CliError::InvalidArguments(
+                "owner-pinned package flags are forbidden in registry mode"
+            ))
+        ));
+
+        let mut rollback = arguments;
+        let checkpoint = rollback
+            .iter()
+            .position(|value| value == "--minimum-registry-sequence")
+            .expect("checkpoint flag");
+        rollback[checkpoint + 1] = OsString::from("3");
+        assert!(matches!(parse_command(rollback.into_iter()), Err(CliError::Engine(_))));
+
+        let Command::Serve(config) = parse_command(complete_registry_serve_arguments().into_iter())
+            .expect("registry activation parses")
+        else {
+            panic!("registry activation must be a serving command");
+        };
+        let control_public_key =
+            parse_hex("2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653")
+                .expect("registry fixture public key");
+        let control_keys = TrustedControlPlaneKeys::new([TrustedControlPlaneKey::active(
+            config.control_key_id,
+            control_public_key,
+        )
+        .expect("control key")])
+        .expect("control key ring");
+        let mut colliding_seed = [0x72_u8; 32];
+        let response_signer =
+            EngineResponseSigner::from_seed(config.response_key_id, &mut colliding_seed)
+                .expect("response signer");
+        assert!(
+            validate_registration_key_roles(&config.registration, &control_keys, &response_signer,)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -842,6 +1086,8 @@ mod tests {
             "/run/personalai-engine/engine.sock".to_owned(),
             "--model-id".to_owned(),
             "decoder-v1".to_owned(),
+            "--registration-mode".to_owned(),
+            "owner-pinned".to_owned(),
             "--package".to_owned(),
             "decoder-v1.paimodel".to_owned(),
             "--package-sha384".to_owned(),
@@ -850,6 +1096,51 @@ mod tests {
             "01010101010101010101010101010101".to_owned(),
             "--signer-public-key".to_owned(),
             "02".repeat(32),
+            "--control-key-id".to_owned(),
+            "03030303030303030303030303030303".to_owned(),
+            "--control-public-key".to_owned(),
+            "04".repeat(32),
+            "--response-key-id".to_owned(),
+            "07070707070707070707070707070707".to_owned(),
+            "--max-memory-bytes".to_owned(),
+            "1048576".to_owned(),
+            "--max-kv-cache-bytes".to_owned(),
+            "524288".to_owned(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    fn complete_registry_serve_arguments() -> Vec<OsString> {
+        vec![
+            "serve".to_owned(),
+            "--model-root".to_owned(),
+            "/models".to_owned(),
+            "--runtime-root".to_owned(),
+            "/run/personalai-engine".to_owned(),
+            "--socket".to_owned(),
+            "/run/personalai-engine/engine.sock".to_owned(),
+            "--model-id".to_owned(),
+            "synthetic-import".to_owned(),
+            "--registration-mode".to_owned(),
+            "model-foundry-registry-v2".to_owned(),
+            "--artifact-id".to_owned(),
+            "phase0-synthetic-import".to_owned(),
+            "--registry-sequence".to_owned(),
+            "2".to_owned(),
+            "--minimum-registry-sequence".to_owned(),
+            "2".to_owned(),
+            "--registry-entry-sha384".to_owned(),
+            "d8daca9dd48249f0f6f2526bafcd771eafc1969ecfc248b7d52d722cc1da3aa965a15dffba2485696628bd9c12cadd15".to_owned(),
+            "--registry-signer-key-id".to_owned(),
+            "63636363636363636363636363636363".to_owned(),
+            "--registry-signer-public-key".to_owned(),
+            "2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653".to_owned(),
+            "--package-signer-key-id".to_owned(),
+            "51515151515151515151515151515151".to_owned(),
+            "--package-signer-public-key".to_owned(),
+            "2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7".to_owned(),
             "--control-key-id".to_owned(),
             "03030303030303030303030303030303".to_owned(),
             "--control-public-key".to_owned(),

@@ -51,6 +51,13 @@ impl RegistrySelectionV2 {
                 "registry selection requires active public trust identities",
             ));
         }
+        if registry_signer.key_id() == package_signer.key_id()
+            || registry_signer.public_key() == package_signer.public_key()
+        {
+            return Err(EngineError::authentication_failure(
+                "registry and package signing identities must be distinct",
+            ));
+        }
         Ok(Self {
             expected_model_id,
             expected_artifact_id,
@@ -85,6 +92,20 @@ impl RegistrySelectionV2 {
     /// Returns the independently retained nondecreasing sequence floor.
     pub const fn minimum_sequence(&self) -> u64 {
         self.minimum_sequence
+    }
+
+    /// Returns whether either Model Foundry trust role reuses another public
+    /// identity. Startup configuration uses this to keep registry, package,
+    /// control-plane, and response signing roles separate.
+    pub fn conflicts_with_identity(
+        &self,
+        key_id: personalai_engine_types::SignerKeyId,
+        public_key: [u8; 32],
+    ) -> bool {
+        self.registry_signer.key_id() == key_id
+            || self.package_signer.key_id() == key_id
+            || self.registry_signer.public_key() == public_key
+            || self.package_signer.public_key() == public_key
     }
 }
 
@@ -331,6 +352,18 @@ mod tests {
                 3,
                 active(0x63, registry_public()),
                 active(0x51, package_public()),
+            )
+            .is_err()
+        );
+        assert!(
+            RegistrySelectionV2::new(
+                ModelId::new("synthetic-import").expect("model ID"),
+                "phase0-synthetic-import",
+                exact_hash,
+                2,
+                2,
+                active(0x63, registry_public()),
+                active(0x51, registry_public()),
             )
             .is_err()
         );

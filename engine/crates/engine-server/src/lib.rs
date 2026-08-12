@@ -35,6 +35,7 @@ use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
+pub use personalai_engine_loader::RegistrySelectionV2;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::MemoryPool;
 #[cfg(all(feature = "cpu-reference", test))]
@@ -2047,6 +2048,19 @@ impl EngineService {
         trusted_signer: TrustedSigner,
     ) -> Result<(), EngineError> {
         self.registry.register(model_id, relative_package_path, expected_hash, trusted_signer)
+    }
+
+    /// Registers one exact owner-selected Model Foundry V2 decision.
+    ///
+    /// This is a startup-only configuration path. It verifies the exact signed
+    /// registry entry before deriving the package location and never falls back
+    /// to the owner-pinned registration mode.
+    #[cfg(unix)]
+    pub fn register_model_foundry_registry_v2(
+        &mut self,
+        selection: &RegistrySelectionV2,
+    ) -> Result<(), EngineError> {
+        self.registry.register_registry_v2(selection)
     }
 
     /// Admits a request only when its model ID exists in local configuration.

@@ -19,7 +19,8 @@ protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
 and an owner CLI. The CLI exposes the continuous driver only through an explicit
-bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
+bounded mode, requires an explicit owner-pinned or Model Foundry V2 registration
+mode, and translates owner-process `SIGINT`/`SIGTERM` into the existing
 stop-admit, cancel, and drain path. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
 a pinned weekly/manual workflow is configured to repeat that bounded test eight
@@ -63,6 +64,8 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - registry-backed admission verifies the exact owner-selected signed V2 entry
   before package access, derives the approved path from signed identities, and
   never chooses `latest` or falls back to owner-pinned registration;
+- registry and package signing identities must be distinct from each other and
+  from Go control/engine response identities;
 - Go signs control requests; Rust signs every response with a separate
   owner-provisioned response identity whose seed enters only through stdin and
   is zeroized after construction;

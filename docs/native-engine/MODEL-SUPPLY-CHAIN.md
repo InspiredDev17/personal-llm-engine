@@ -146,6 +146,10 @@ nondecreasing sequence floor. The engine opens only the derived sequence file,
 verifies it before package access, and derives the approved package path from
 the signed entry. It then rechecks the signed catalog, package signer, context,
 tokenizer, provenance, and shard identities before allocation. Failure never
-falls back to owner-pinned registration. Owner CLI/Go activation remains a
-separate integration gate. Model Foundry flat V1 is not compatible with this
-loader and must not be translated or used as fallback. See ADR-0020.
+falls back to owner-pinned registration. The owner CLI now requires an explicit
+registration mode and accepts the complete exact V2 decision as public startup
+configuration; the Go native-engine adapter binds the same selection without
+accepting any artifact path. Owner-pinned rollback remains a separate explicit
+configuration and cannot be selected after registry failure. Model Foundry flat
+V1 is not compatible with this loader and must not be translated or used as
+fallback. See ADR-0020.

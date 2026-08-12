@@ -1,6 +1,6 @@
 # ADR-0020: Model Foundry registry V2 and directory-package boundary
 
-- Status: Accepted; Phases 1 and 2 implemented
+- Status: Accepted; Phases 1 through 3 implemented
 - Date: 2026-08-12
 - Native Engine review base: `f458c46cd7cd69e73fddd575669604f99373acce`
 - Model Foundry review base: `d6ab7b99fa083a76688ac5ef4b32b2e31480118c`
@@ -42,9 +42,10 @@ it does not accept request paths, query a remote registry, choose `latest`, or
 fall back after registry verification failure.
 
 Phase 1 added bounded parsing, signature verification, fuzzing, and shared
-positive/negative vectors. Phase 2 adds a separate registry-backed registration
-mode and terminally binds the selected registry decision to package loading.
-It does not add owner CLI or Go activation; that remains Phase 3.
+positive/negative vectors. Phase 2 added a separate registry-backed registration
+mode and terminally bound the selected registry decision to package loading.
+Phase 3 makes the mode and exact selection available through owner startup
+configuration and binds the same public decision into the Go adapter.
 
 ## Frozen evidence
 
@@ -83,5 +84,14 @@ exists, a symlinked registry entry, a symlinked artifact root, wrong
 owner-selected identities, signer-role mismatch, signature corruption, and
 anti-rollback mismatch. The positive test regenerates the frozen synthetic
 package, registers it only through the exact signed V2 entry, and loads it under
-the ordinary resource budget. Owner CLI/Go activation is intentionally still
-absent, so model requests cannot select or mutate this mode.
+the ordinary resource budget.
+
+Phase 3 requires `--registration-mode` for every serving process. Registry mode
+requires the exact model/artifact IDs, sequence, envelope SHA-384, independently
+retained minimum sequence, and distinct active registry/package public signer
+identities. Owner-pinned package flags are rejected in registry mode and all
+registry flags are rejected in owner-pinned mode. The Go `NATIVE_ENGINE` adapter
+binds the same public selection, refuses implicit mode, revoked roles, identity
+reuse, and rollback below the retained checkpoint, and contains no artifact
+path. Restart and bounded rotation tests preserve that decision. Runtime model
+requests still carry only `ModelId` and cannot select or mutate registration.

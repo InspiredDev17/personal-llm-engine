@@ -223,6 +223,11 @@ impl TrustedSigner {
         self.key_id
     }
 
+    /// Returns the exact public verification key bytes.
+    pub const fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.public_key
+    }
+
     /// Returns whether this signer is currently active.
     pub const fn is_active(&self) -> bool {
         self.active
