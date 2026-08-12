@@ -351,6 +351,9 @@ impl ContinuousState<'_> {
         let ContinuousAuthenticatedConnection { connection, session, replay_journal, command } =
             authenticated;
         match command {
+            InboundCommand::Service(_request) => {
+                increment(&mut self.summary.failed_connections, "failed connection count")
+            }
             InboundCommand::Cancel(request_id) => {
                 self.apply_cancellation(request_id)?;
                 increment(&mut self.summary.cancelled_commands, "cancellation command count")
@@ -640,6 +643,9 @@ impl ContinuousState<'_> {
                 | ServeOutcome::CancelledActive(_)
                 | ServeOutcome::CancellationNotFound(_),
             ) => increment(&mut self.summary.cancelled_commands, "cancellation outcome count"),
+            Ok(ServeOutcome::ServiceResponded { .. }) => {
+                increment(&mut self.summary.authenticated_commands, "service response count")
+            }
             Err(_) => increment(&mut self.summary.failed_connections, "failed connection count"),
         }
     }

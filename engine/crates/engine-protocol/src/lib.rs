@@ -5,11 +5,16 @@
 //! decoders. No general-purpose deserializer is used.
 
 mod messages;
+mod service;
 
 pub use messages::{
     CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_EVENT_AUTH_BYTES,
     GENERATION_REQUEST_FIXED_BYTES, GenerationRequestEnvelope, attach_cancellation_signature,
     attach_generation_signature, encode_signed_generation_event,
+};
+pub use service::{
+    AuthenticatedServiceRequest, SERVICE_REQUEST_FIXED_BYTES, ServiceMessageKind,
+    attach_service_signature, encode_signed_service_response,
 };
 
 use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};
@@ -39,6 +44,10 @@ pub enum FrameKind {
     Capability = 4,
     /// Sanitized non-authoritative engine security telemetry.
     SecurityEvent = 5,
+    /// Authenticated non-generation control-plane request.
+    ServiceRequest = 6,
+    /// Signed non-generation service response.
+    ServiceResponse = 7,
 }
 
 impl FrameKind {
@@ -49,16 +58,24 @@ impl FrameKind {
             3 => Ok(Self::Cancellation),
             4 => Ok(Self::Capability),
             5 => Ok(Self::SecurityEvent),
+            6 => Ok(Self::ServiceRequest),
+            7 => Ok(Self::ServiceResponse),
             _ => Err(EngineError::protocol_violation("frame kind is unsupported")),
         }
     }
 
     const fn accepted_inbound(self) -> bool {
-        matches!(self, Self::GenerationRequest | Self::Cancellation | Self::Capability)
+        matches!(
+            self,
+            Self::GenerationRequest | Self::Cancellation | Self::Capability | Self::ServiceRequest
+        )
     }
 
     const fn accepted_outbound(self) -> bool {
-        matches!(self, Self::GenerationEvent | Self::Capability | Self::SecurityEvent)
+        matches!(
+            self,
+            Self::GenerationEvent | Self::Capability | Self::SecurityEvent | Self::ServiceResponse
+        )
     }
 }
 
@@ -197,7 +214,9 @@ fn validate_payload(kind: FrameKind, payload: &[u8]) -> Result<(), EngineError> 
     if payload.is_empty() || payload.len() > MAX_FRAME_PAYLOAD_BYTES {
         return Err(EngineError::invalid_input("frame payload length is outside hard bounds"));
     }
-    if kind == FrameKind::GenerationRequest && payload.len() > MAX_REQUEST_BYTES {
+    if matches!(kind, FrameKind::GenerationRequest | FrameKind::ServiceRequest)
+        && payload.len() > MAX_REQUEST_BYTES
+    {
         return Err(EngineError::invalid_input(
             "generation request payload exceeds the request hard bound",
         ));

@@ -133,6 +133,11 @@ impl ModelRegistry {
         self.registrations.is_empty()
     }
 
+    /// Iterates configuration-owned registrations in deterministic model-ID order.
+    pub fn registrations(&self) -> impl ExactSizeIterator<Item = &RegisteredModel> {
+        self.registrations.values()
+    }
+
     /// Opens and reads one configuration-owned package without following a
     /// package symlink.
     ///

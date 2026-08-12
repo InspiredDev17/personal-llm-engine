@@ -1455,6 +1455,42 @@ pub enum ModelPackageRejection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SecurityEvent {
+    /// Kernel peer credentials or request authentication denied a client.
+    UnauthorizedClient,
+    /// A bounded authentication-failure threshold was reached.
+    RepeatedAuthenticationFailure,
+    /// A frame could not satisfy the fixed protocol grammar.
+    MalformedFrame,
+    /// A frame declared or carried more than the hard byte ceiling.
+    OversizedFrame,
+    /// A peer offered an unknown protocol version.
+    UnknownProtocolVersion,
+    /// A request supplied a syntactically invalid model identifier.
+    InvalidModelId {
+        /// Correlation identifier, when safely decoded.
+        request_id: Option<RequestId>,
+    },
+    /// A registered package signature failed verification.
+    ModelSignatureFailure {
+        /// Configuration-owned model identifier.
+        model_id: ModelId,
+    },
+    /// A registered package hash failed verification.
+    ModelHashFailure {
+        /// Configuration-owned model identifier.
+        model_id: ModelId,
+    },
+    /// Descriptor-safe package resolution detected a path escape attempt.
+    ModelPathEscapeAttempt {
+        /// Configuration-owned model identifier, when resolution reached one.
+        model_id: Option<ModelId>,
+    },
+    /// Repeated bounded resource exhaustion crossed the alert threshold.
+    ResourceExhaustionPattern,
+    /// The owner supervisor reported a bounded crash-loop threshold.
+    CrashLoopIndication,
+    /// Repeated request rejection crossed the alert threshold.
+    RepeatedRejectedRequests,
     /// A peer failed local authentication.
     AuthenticationFailure {
         /// Request correlation identifier, when safely decoded.

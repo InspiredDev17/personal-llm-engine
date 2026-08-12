@@ -11,7 +11,58 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_IO_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Validated finite local connection and frame timeouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixSocketPolicy {
+    idle_timeout: Duration,
+    frame_timeout: Duration,
+    recover_stale_socket: bool,
+}
+
+impl UnixSocketPolicy {
+    /// Creates a same-user policy with finite bounded timeouts.
+    pub fn new(
+        idle_timeout: Duration,
+        frame_timeout: Duration,
+        recover_stale_socket: bool,
+    ) -> Result<Self, EngineError> {
+        if !(MIN_IO_TIMEOUT..=MAX_IO_TIMEOUT).contains(&idle_timeout)
+            || !(MIN_IO_TIMEOUT..=MAX_IO_TIMEOUT).contains(&frame_timeout)
+        {
+            return Err(EngineError::invalid_input("Unix socket timeout is outside hard bounds"));
+        }
+        Ok(Self { idle_timeout, frame_timeout, recover_stale_socket })
+    }
+
+    /// Returns the maximum time waiting for a new command on a connection.
+    pub const fn idle_timeout(self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Returns the maximum time waiting for an individual frame read or write.
+    pub const fn frame_timeout(self) -> Duration {
+        self.frame_timeout
+    }
+
+    /// Returns whether inode-checked stale socket recovery is enabled.
+    pub const fn recover_stale_socket(self) -> bool {
+        self.recover_stale_socket
+    }
+}
+
+impl Default for UnixSocketPolicy {
+    fn default() -> Self {
+        Self {
+            idle_timeout: DEFAULT_IO_TIMEOUT,
+            frame_timeout: DEFAULT_IO_TIMEOUT,
+            recover_stale_socket: true,
+        }
+    }
+}
 
 /// Bound local-only socket with inode-safe cleanup ownership.
 #[derive(Debug)]
@@ -21,11 +72,20 @@ pub struct UnixFrameListener {
     device: u64,
     inode: u64,
     allowed_peer_user_id: u32,
+    policy: UnixSocketPolicy,
 }
 
 impl UnixFrameListener {
     /// Binds the configured socket only inside an existing owner-private runtime directory.
     pub fn bind(config: &ServiceConfig) -> Result<Self, EngineError> {
+        Self::bind_with_policy(config, UnixSocketPolicy::default())
+    }
+
+    /// Binds with explicit finite I/O timeouts and stale-socket policy.
+    pub fn bind_with_policy(
+        config: &ServiceConfig,
+        policy: UnixSocketPolicy,
+    ) -> Result<Self, EngineError> {
         let runtime_metadata = fs::symlink_metadata(config.runtime_root())
             .map_err(|_| EngineError::invalid_input("runtime root is unavailable"))?;
         if !runtime_metadata.is_dir()
@@ -36,9 +96,7 @@ impl UnixFrameListener {
                 "runtime root must be a non-symlink owner-private directory",
             ));
         }
-        if fs::symlink_metadata(config.socket_path()).is_ok() {
-            return Err(EngineError::invalid_input("configured engine socket path already exists"));
-        }
+        prepare_socket_path(config, policy)?;
         let listener = UnixListener::bind(config.socket_path())
             .map_err(|_| EngineError::backend_failure("Unix socket bind failed"))?;
         fs::set_permissions(config.socket_path(), fs::Permissions::from_mode(0o600))
@@ -54,6 +112,7 @@ impl UnixFrameListener {
             device: socket_metadata.dev(),
             inode: socket_metadata.ino(),
             allowed_peer_user_id: peer_credential::effective_user_id(),
+            policy,
         })
     }
 
@@ -73,7 +132,7 @@ impl UnixFrameListener {
             .accept()
             .map_err(|_| EngineError::backend_failure("Unix socket accept failed"))?;
         self.verify_peer(&stream)?;
-        configure_stream(&stream)?;
+        configure_stream(&stream, self.policy)?;
         Ok(UnixFrameConnection { stream })
     }
 
@@ -91,7 +150,7 @@ impl UnixFrameListener {
         match self.listener.accept() {
             Ok((stream, _address)) => {
                 self.verify_peer(&stream)?;
-                configure_stream(&stream)?;
+                configure_stream(&stream, self.policy)?;
                 Ok(Some(UnixFrameConnection { stream }))
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -125,16 +184,66 @@ impl UnixFrameListener {
     }
 }
 
-fn configure_stream(stream: &UnixStream) -> Result<(), EngineError> {
+fn configure_stream(stream: &UnixStream, policy: UnixSocketPolicy) -> Result<(), EngineError> {
     stream
         .set_nonblocking(false)
         .map_err(|_| EngineError::backend_failure("Unix stream blocking mode setup failed"))?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(policy.frame_timeout().min(policy.idle_timeout())))
         .map_err(|_| EngineError::backend_failure("Unix socket read timeout setup failed"))?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(policy.frame_timeout()))
         .map_err(|_| EngineError::backend_failure("Unix socket write timeout setup failed"))
+}
+
+fn prepare_socket_path(
+    config: &ServiceConfig,
+    policy: UnixSocketPolicy,
+) -> Result<(), EngineError> {
+    let metadata = match fs::symlink_metadata(config.socket_path()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(EngineError::authentication_failure("socket path metadata failed")),
+    };
+    if !policy.recover_stale_socket()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != peer_credential::effective_user_id()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(EngineError::authentication_failure(
+            "existing socket path is not eligible for safe recovery",
+        ));
+    }
+    match UnixStream::connect(config.socket_path()) {
+        Ok(_active) => {
+            return Err(EngineError::authentication_failure(
+                "configured engine socket is already active",
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(_) => {
+            return Err(EngineError::authentication_failure(
+                "existing socket liveness could not be established",
+            ));
+        }
+    }
+    let current = fs::symlink_metadata(config.socket_path())
+        .map_err(|_| EngineError::authentication_failure("stale socket changed during recovery"))?;
+    if !current.file_type().is_socket()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || current.uid() != metadata.uid()
+    {
+        return Err(EngineError::authentication_failure(
+            "stale socket identity changed during recovery",
+        ));
+    }
+    fs::remove_file(config.socket_path())
+        .map_err(|_| EngineError::authentication_failure("stale socket removal failed"))
 }
 
 impl Drop for UnixFrameListener {
@@ -303,6 +412,45 @@ mod tests {
             Err(EngineError::AuthenticationFailure(_))
         ));
         fs::remove_dir(&directory).expect("temporary directory must remove");
+    }
+
+    #[test]
+    fn stale_socket_recovery_is_inode_checked_and_configurable() {
+        let directory = temporary_directory();
+        fs::create_dir(&directory).expect("temporary runtime directory must create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions must set");
+        let socket = directory.join("engine.sock");
+        let config = ServiceConfig::new("/models", &directory, &socket)
+            .expect("temporary config must validate");
+        let stale = UnixListener::bind(&socket).expect("stale socket must bind");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+            .expect("stale socket permissions must set");
+        drop(stale);
+
+        let strict = UnixSocketPolicy::new(Duration::from_secs(1), Duration::from_secs(1), false)
+            .expect("policy must validate");
+        assert!(matches!(
+            UnixFrameListener::bind_with_policy(&config, strict),
+            Err(EngineError::AuthenticationFailure(_))
+        ));
+        let listener = UnixFrameListener::bind(&config).expect("stale socket must recover");
+        drop(listener);
+        fs::remove_dir(&directory).expect("temporary directory must remove");
+    }
+
+    #[test]
+    fn socket_timeout_policy_is_bounded() {
+        assert!(UnixSocketPolicy::new(Duration::ZERO, Duration::from_secs(1), true).is_err());
+        assert!(
+            UnixSocketPolicy::new(Duration::from_secs(1), Duration::from_secs(301), true,).is_err()
+        );
+        assert_eq!(
+            UnixSocketPolicy::new(Duration::from_secs(2), Duration::from_secs(3), true,)
+                .expect("policy")
+                .frame_timeout(),
+            Duration::from_secs(3)
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub use continuous::{
 #[cfg(unix)]
 pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 #[cfg(unix)]
-pub use transport::{UnixFrameConnection, UnixFrameListener};
+pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 
 use personalai_engine_crypto::{
     EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
@@ -40,8 +40,9 @@ use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_model_format::ParsedModelPackage;
 use personalai_engine_protocol::{
-    CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind, GENERATION_EVENT_AUTH_BYTES,
-    GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    AuthenticatedServiceRequest, CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind,
+    GENERATION_EVENT_AUTH_BYTES, GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ServiceMessageKind, encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -61,8 +62,9 @@ use personalai_engine_types::{
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_types::{
-    GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES, MAX_GENERATION_CHUNK_BYTES,
-    ModelPackageRejection, SecurityEvent, SequenceId, TextChunk, TokenId,
+    EngineCapability, GenerationEvent, GenerationUsage, MAX_CONCURRENT_SEQUENCES,
+    MAX_GENERATION_CHUNK_BYTES, ModelPackageRejection, ResourceBudget, ResourceKind, SecurityEvent,
+    SequenceId, TextChunk, TokenId,
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::collections::BTreeMap;
@@ -87,6 +89,9 @@ pub const MAX_CONCURRENT_CONNECTION_BATCH: u32 = 64;
 /// Maximum signed generation events retained for one local output stream.
 #[cfg(all(unix, feature = "cpu-reference"))]
 pub const MAX_PENDING_EVENTS_PER_CONNECTION: usize = 8;
+/// Maximum sanitized security events retained for Go control-plane polling.
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub const MAX_PENDING_SECURITY_EVENTS: usize = 256;
 #[cfg(all(unix, feature = "cpu-reference"))]
 const CANCELLATION_WATCHER_STACK_BYTES: usize = 256 * 1_024;
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -210,6 +215,8 @@ pub enum InboundCommand {
     },
     /// Cancellation of one previously submitted request.
     Cancel(RequestId),
+    /// One authenticated non-generation service command.
+    Service(AuthenticatedServiceRequest),
 }
 
 /// Per-connection authentication and strict monotonic anti-replay state.
@@ -251,6 +258,11 @@ impl AuthenticatedControlSession {
                     envelope.control_key_id(),
                     InboundCommand::Cancel(envelope.request_id()),
                 )
+            }
+            FrameKind::ServiceRequest => {
+                let envelope =
+                    AuthenticatedServiceRequest::decode(frame.payload(), &self.trusted_keys)?;
+                (envelope.nonce(), envelope.control_key_id(), InboundCommand::Service(envelope))
             }
             _ => {
                 return Err(EngineError::protocol_violation(
@@ -1144,6 +1156,65 @@ pub enum ServeOutcome {
     CancelledActive(RequestId),
     /// Cancellation named no queued or active request.
     CancellationNotFound(RequestId),
+    /// One authenticated service-control request received a signed response.
+    ServiceResponded {
+        /// Correlation identifier from the service header.
+        request_id: RequestId,
+        /// Exact response category.
+        kind: ServiceMessageKind,
+    },
+}
+
+/// Content-free cumulative and live runtime metrics.
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMetrics {
+    /// Currently loaded model count.
+    pub loaded_models: u64,
+    /// Currently active generation count.
+    pub active_requests: u64,
+    /// Currently queued generation count.
+    pub queued_requests: u64,
+    /// Requests rejected after admission began.
+    pub rejected_requests: u64,
+    /// Requests cancelled before normal completion.
+    pub cancelled_requests: u64,
+    /// Successfully processed prompt tokens.
+    pub prompt_tokens: u64,
+    /// Successfully generated tokens.
+    pub generated_tokens: u64,
+    /// Accumulated prefill nanoseconds when separately measurable.
+    pub prefill_nanoseconds: u64,
+    /// Accumulated decode nanoseconds when separately measurable.
+    pub decode_nanoseconds: u64,
+    /// Generated tokens per second multiplied by 1,000; zero until timed decode exists.
+    pub tokens_per_second_milli: u64,
+    /// Reserved host bytes across loaded CPU model pools.
+    pub host_memory_bytes: u64,
+    /// Reserved device bytes; zero for the CPU reference backend.
+    pub device_memory_bytes: u64,
+    /// Reserved KV-cache bytes observable from active sequences.
+    pub kv_cache_bytes: u64,
+    /// Package verification or validation failures.
+    pub package_validation_failures: u64,
+    /// Local peer or message authentication failures observed by this runtime.
+    pub authentication_failures: u64,
+    /// Bounded protocol violations observed by this runtime.
+    pub protocol_violations: u64,
+    /// Backend failures observed by this runtime.
+    pub backend_failures: u64,
+}
+
+/// Fail-closed service health classification.
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceHealth {
+    /// Service is accepting work and all loaded models are healthy.
+    Ready,
+    /// Service is running but has no loaded model.
+    Degraded,
+    /// An administrative drain has begun.
+    Draining,
 }
 
 /// Per-connection result returned by one bounded concurrent serving batch.
@@ -1237,6 +1308,10 @@ pub struct CpuEngineRuntime {
     replay_journals:
         BTreeMap<personalai_engine_types::SignerKeyId, Arc<Mutex<DurableReplayJournal>>>,
     models: BTreeMap<String, LoadedCpuModel>,
+    model_load_budgets: BTreeMap<String, ResourceBudget>,
+    security_events: VecDeque<SecurityEvent>,
+    metrics: RuntimeMetrics,
+    draining: bool,
     next_sequence: u64,
 }
 
@@ -1284,8 +1359,264 @@ impl CpuEngineRuntime {
             response_signer,
             replay_journals,
             models: BTreeMap::new(),
+            model_load_budgets: BTreeMap::new(),
+            security_events: VecDeque::new(),
+            metrics: RuntimeMetrics::default(),
+            draining: false,
             next_sequence: 1,
         })
+    }
+
+    /// Installs a trusted load budget for one statically registered model.
+    ///
+    /// This owner-only API is not reachable from the client protocol. A client
+    /// `LoadModel` request supplies only the registered model ID.
+    pub fn configure_model_load_budget(
+        &mut self,
+        model_id: &ModelId,
+        budget: ResourceBudget,
+    ) -> Result<(), EngineError> {
+        self.service.registry.resolve(model_id)?;
+        self.model_load_budgets.insert(model_id.as_str().to_owned(), budget);
+        Ok(())
+    }
+
+    /// Returns content-free live and cumulative metrics.
+    pub fn metrics(&self) -> Result<RuntimeMetrics, EngineError> {
+        let mut metrics = self.metrics;
+        metrics.loaded_models = u64::try_from(self.models.len())
+            .map_err(|_| EngineError::internal_invariant("loaded model count exceeds u64"))?;
+        metrics.active_requests = u64::try_from(self.service.scheduler.active_len())
+            .map_err(|_| EngineError::internal_invariant("active request count exceeds u64"))?;
+        metrics.queued_requests = u64::try_from(self.service.scheduler.queued_len())
+            .map_err(|_| EngineError::internal_invariant("queued request count exceeds u64"))?;
+        metrics.host_memory_bytes = self.models.values().try_fold(0_u64, |total, loaded| {
+            let used = loaded.model().memory_pool().used_bytes()?;
+            total.checked_add(used).ok_or_else(|| {
+                EngineError::resource_exhaustion("loaded model memory metric overflows")
+            })
+        })?;
+        Ok(metrics)
+    }
+
+    /// Returns the current local health classification.
+    pub fn health(&self) -> ServiceHealth {
+        if self.draining {
+            ServiceHealth::Draining
+        } else if self.models.is_empty() {
+            ServiceHealth::Degraded
+        } else {
+            ServiceHealth::Ready
+        }
+    }
+
+    /// Drains sanitized typed telemetry for Go-owned delivery and audit.
+    pub fn drain_security_events(&mut self) -> Vec<SecurityEvent> {
+        self.security_events.drain(..).collect()
+    }
+
+    fn record_security_event(&mut self, event: SecurityEvent) {
+        if self.security_events.len() == MAX_PENDING_SECURITY_EVENTS {
+            let _oldest = self.security_events.pop_front();
+        }
+        self.security_events.push_back(event);
+    }
+
+    fn record_runtime_error(
+        &mut self,
+        request_id: RequestId,
+        error: &EngineError,
+    ) -> Result<(), EngineError> {
+        let event = match error {
+            EngineError::AuthenticationFailure(_) => {
+                self.metrics.authentication_failures = checked_increment(
+                    self.metrics.authentication_failures,
+                    "authentication failure counter",
+                )?;
+                SecurityEvent::AuthenticationFailure { request_id: Some(request_id) }
+            }
+            EngineError::ProtocolViolation(_) => {
+                self.metrics.protocol_violations = checked_increment(
+                    self.metrics.protocol_violations,
+                    "protocol violation counter",
+                )?;
+                SecurityEvent::ProtocolViolation { request_id: Some(request_id) }
+            }
+            EngineError::BackendFailure(_) => {
+                self.metrics.backend_failures =
+                    checked_increment(self.metrics.backend_failures, "backend failure counter")?;
+                SecurityEvent::BackendFailure { request_id: Some(request_id), backend: None }
+            }
+            EngineError::ResourceExhaustion(detail) => {
+                self.metrics.rejected_requests =
+                    checked_increment(self.metrics.rejected_requests, "rejected request counter")?;
+                SecurityEvent::ResourceLimitExceeded {
+                    request_id: Some(request_id),
+                    resource: detail.resource().unwrap_or(ResourceKind::RequestBytes),
+                    requested: detail.requested(),
+                    limit: detail.limit_value().unwrap_or(0),
+                }
+            }
+            _ => SecurityEvent::ProtocolViolation { request_id: Some(request_id) },
+        };
+        self.record_security_event(event);
+        Ok(())
+    }
+
+    /// Unloads one idle model. Active or queued ownership fails closed.
+    pub fn unload_model(&mut self, model_id: &ModelId) -> Result<(), EngineError> {
+        if self.service.scheduler.has_active_model(model_id)
+            || self.service.scheduler.has_queued_model(model_id)
+        {
+            return Err(EngineError::resource_exhaustion(
+                "model cannot unload while a request owns scheduler state",
+            ));
+        }
+        if self.models.remove(model_id.as_str()).is_none() {
+            return Err(EngineError::invalid_input("model is not loaded"));
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_lines, reason = "closed protocol catalog stays visibly exhaustive")]
+    fn handle_service_request(
+        &mut self,
+        request: &AuthenticatedServiceRequest,
+    ) -> Result<(ServiceMessageKind, Vec<u8>), EngineError> {
+        match request.kind() {
+            ServiceMessageKind::Hello => {
+                if request.payload().len() != 4 {
+                    return Err(EngineError::protocol_violation(
+                        "hello payload must contain exact major and minor versions",
+                    ));
+                }
+                let major =
+                    u16::from_le_bytes(request.payload()[..2].try_into().map_err(|_| {
+                        EngineError::protocol_violation("hello major is truncated")
+                    })?);
+                let minor =
+                    u16::from_le_bytes(request.payload()[2..].try_into().map_err(|_| {
+                        EngineError::protocol_violation("hello minor is truncated")
+                    })?);
+                let kind = if major == PROTOCOL_MAJOR && minor == PROTOCOL_MINOR {
+                    ServiceMessageKind::HelloAccepted
+                } else {
+                    ServiceMessageKind::HelloRejected
+                };
+                Ok((kind, [PROTOCOL_MAJOR.to_le_bytes(), PROTOCOL_MINOR.to_le_bytes()].concat()))
+            }
+            ServiceMessageKind::ListCapabilities => {
+                require_empty_service_payload(request.payload())?;
+                let capabilities = [
+                    EngineCapability::CpuReference,
+                    EngineCapability::StreamingGeneration,
+                    EngineCapability::UnixDomainSocket,
+                ];
+                let mut mask = 0_u64;
+                for capability in capabilities {
+                    let bit = match capability {
+                        EngineCapability::CpuReference => 0,
+                        EngineCapability::Arm64 => 1,
+                        EngineCapability::Metal => 2,
+                        EngineCapability::Cuda => 3,
+                        EngineCapability::StreamingGeneration => 4,
+                        EngineCapability::UnixDomainSocket => 5,
+                        _ => {
+                            return Err(EngineError::internal_invariant(
+                                "unknown engine capability reached service encoding",
+                            ));
+                        }
+                    };
+                    mask |= 1_u64 << bit;
+                }
+                Ok((request.kind(), mask.to_le_bytes().to_vec()))
+            }
+            ServiceMessageKind::ListRegisteredModels => {
+                require_empty_service_payload(request.payload())?;
+                let registrations = self.service.registry.registrations();
+                let count = u16::try_from(registrations.len()).map_err(|_| {
+                    EngineError::internal_invariant("registered model count exceeds u16")
+                })?;
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&count.to_le_bytes());
+                for registration in registrations {
+                    let model = registration.model_id().as_str().as_bytes();
+                    let length = u16::try_from(model.len()).map_err(|_| {
+                        EngineError::internal_invariant("registered model ID exceeds u16")
+                    })?;
+                    payload.extend_from_slice(&length.to_le_bytes());
+                    payload.extend_from_slice(model);
+                }
+                Ok((request.kind(), payload))
+            }
+            ServiceMessageKind::LoadModel => {
+                let model_id = decode_service_model_id(request.payload())?;
+                let budget =
+                    self.model_load_budgets.get(model_id.as_str()).copied().ok_or_else(|| {
+                        EngineError::authentication_failure(
+                            "registered model has no owner-configured load budget",
+                        )
+                    })?;
+                let mut emitted = Vec::new();
+                let result = self.load_registered_model(&model_id, &budget, &mut |event| {
+                    emitted.push(event);
+                });
+                for event in emitted {
+                    self.record_security_event(event);
+                }
+                result?;
+                Ok((request.kind(), Vec::new()))
+            }
+            ServiceMessageKind::UnloadModel => {
+                let model_id = decode_service_model_id(request.payload())?;
+                self.unload_model(&model_id)?;
+                Ok((request.kind(), Vec::new()))
+            }
+            ServiceMessageKind::Tokenize => {
+                let (model_id, text) = decode_tokenize_payload(request.payload())?;
+                let model = self
+                    .models
+                    .get(model_id.as_str())
+                    .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
+                let tokens = model.tokenizer().encode(text)?;
+                let count = u32::try_from(tokens.len())
+                    .map_err(|_| EngineError::resource_exhaustion("token count exceeds u32"))?;
+                let capacity = 4_usize
+                    .checked_add(tokens.len().checked_mul(4).ok_or_else(|| {
+                        EngineError::resource_exhaustion("token response length overflows")
+                    })?)
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("token response length overflows")
+                    })?;
+                let mut payload = Vec::new();
+                payload.try_reserve_exact(capacity).map_err(|_| {
+                    EngineError::resource_exhaustion("token response allocation failed")
+                })?;
+                payload.extend_from_slice(&count.to_le_bytes());
+                for token in tokens {
+                    payload.extend_from_slice(&token.to_le_bytes());
+                }
+                Ok((request.kind(), payload))
+            }
+            ServiceMessageKind::Health => {
+                require_empty_service_payload(request.payload())?;
+                let state = match self.health() {
+                    ServiceHealth::Ready => 1,
+                    ServiceHealth::Degraded => 2,
+                    ServiceHealth::Draining => 3,
+                };
+                Ok((request.kind(), vec![state]))
+            }
+            ServiceMessageKind::Metrics => {
+                require_empty_service_payload(request.payload())?;
+                Ok((request.kind(), encode_metrics(self.metrics()?)))
+            }
+            ServiceMessageKind::ShutdownRequest => {
+                require_empty_service_payload(request.payload())?;
+                Ok((ServiceMessageKind::ShutdownRejected, vec![1]))
+            }
+            _ => Err(EngineError::protocol_violation("message type is not a service request")),
+        }
     }
 
     /// Verifies and installs one legacy flat fixture package in memory.
@@ -1319,7 +1650,18 @@ impl CpuEngineRuntime {
         if self.models.contains_key(model_id.as_str()) {
             return Err(EngineError::invalid_input("model is already loaded"));
         }
-        let loaded = self.service.load_registered_cpu_model(model_id, budget, events)?;
+        let loaded = match self.service.load_registered_cpu_model(model_id, budget, events) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.metrics.package_validation_failures =
+                    self.metrics.package_validation_failures.checked_add(1).ok_or_else(|| {
+                        EngineError::resource_exhaustion(
+                            "package validation failure counter exhausted",
+                        )
+                    })?;
+                return Err(error);
+            }
+        };
         self.models.insert(model_id.as_str().to_owned(), loaded);
         Ok(())
     }
@@ -1369,6 +1711,7 @@ impl CpuEngineRuntime {
     /// A caller-owned outer loop decides service lifetime and restart policy.
     /// The method never opens a network connection or performs filesystem model
     /// discovery.
+    #[expect(clippy::too_many_lines, reason = "authenticated connection cleanup remains linear")]
     pub fn serve_one(&mut self, listener: &UnixFrameListener) -> Result<ServeOutcome, EngineError> {
         let mut connection = listener.accept()?;
         let frame = connection.read_inbound_frame()?;
@@ -1383,11 +1726,43 @@ impl CpuEngineRuntime {
         })?;
         admit_durable_nonce(replay_journal, session.last_nonce())?;
         match command {
+            InboundCommand::Service(request) => {
+                let request_id = request.request_id();
+                let nonce = request.nonce();
+                let (kind, payload) = match self.handle_service_request(&request) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.record_runtime_error(request_id, &error)?;
+                        (ServiceMessageKind::Error, vec![engine_error_code(&error)])
+                    }
+                };
+                let frame = service_response_frame(
+                    kind,
+                    request_id,
+                    nonce,
+                    &payload,
+                    &self.response_signer,
+                )?;
+                connection.write_outbound_frame(&frame)?;
+                Ok(ServeOutcome::ServiceResponded { request_id, kind })
+            }
             InboundCommand::Cancel(request_id) => {
                 let outcome = self.service.scheduler.cancel(&request_id)?;
                 Ok(match outcome {
-                    CancellationOutcome::Queued => ServeOutcome::CancelledQueued(request_id),
-                    CancellationOutcome::Active => ServeOutcome::CancelledActive(request_id),
+                    CancellationOutcome::Queued => {
+                        self.metrics.cancelled_requests = checked_increment(
+                            self.metrics.cancelled_requests,
+                            "cancelled request counter",
+                        )?;
+                        ServeOutcome::CancelledQueued(request_id)
+                    }
+                    CancellationOutcome::Active => {
+                        self.metrics.cancelled_requests = checked_increment(
+                            self.metrics.cancelled_requests,
+                            "cancelled request counter",
+                        )?;
+                        ServeOutcome::CancelledActive(request_id)
+                    }
                     CancellationOutcome::NotFound => ServeOutcome::CancellationNotFound(request_id),
                 })
             }
@@ -1462,6 +1837,20 @@ impl CpuEngineRuntime {
                 let usage = generation_result?.ok_or_else(|| {
                     EngineError::internal_invariant("admitted request was not scheduled")
                 })?;
+                self.metrics.prompt_tokens = self
+                    .metrics
+                    .prompt_tokens
+                    .checked_add(u64::from(usage.input_tokens()))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("prompt token counter exhausted")
+                    })?;
+                self.metrics.generated_tokens = self
+                    .metrics
+                    .generated_tokens
+                    .checked_add(u64::from(usage.output_tokens()))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("generated token counter exhausted")
+                    })?;
                 Ok(ServeOutcome::Generated { request_id, sequence_id, usage })
             }
         }
@@ -1558,10 +1947,18 @@ impl CpuEngineRuntime {
         let AuthenticatedConnection { input_index, connection, session, replay_journal, command } =
             authenticated;
         let InboundCommand::Generate { request, nonce } = command else {
-            let InboundCommand::Cancel(request_id) = command else {
-                return Err(EngineError::internal_invariant(
-                    "authenticated command variant disappeared",
-                ));
+            let request_id = match command {
+                InboundCommand::Cancel(request_id) => request_id,
+                InboundCommand::Service(_) => {
+                    return Err(EngineError::protocol_violation(
+                        "service request is not valid in a generation batch",
+                    ));
+                }
+                InboundCommand::Generate { .. } => {
+                    return Err(EngineError::internal_invariant(
+                        "authenticated command variant disappeared",
+                    ));
+                }
             };
             let outcome = if let Some(connection) =
                 batch.active.iter().find(|connection| connection.request_id == request_id)
@@ -2283,6 +2680,106 @@ fn generation_event_frame(
     Frame::new(FrameKind::GenerationEvent, payload)
 }
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn service_response_frame(
+    kind: ServiceMessageKind,
+    request_id: RequestId,
+    request_nonce: u64,
+    payload: &[u8],
+    signer: &EngineResponseSigner,
+) -> Result<Frame, EngineError> {
+    let payload = encode_signed_service_response(kind, request_id, request_nonce, payload, signer)?;
+    Frame::new(FrameKind::ServiceResponse, payload)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn require_empty_service_payload(payload: &[u8]) -> Result<(), EngineError> {
+    if payload.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::protocol_violation("service request contains trailing fields"))
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn decode_service_model_id(payload: &[u8]) -> Result<ModelId, EngineError> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| EngineError::protocol_violation("model ID is not UTF-8"))?;
+    ModelId::new(text).map_err(|_| EngineError::protocol_violation("model ID is invalid"))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn decode_tokenize_payload(payload: &[u8]) -> Result<(ModelId, &str), EngineError> {
+    if payload.len() < 2 {
+        return Err(EngineError::protocol_violation("tokenize payload is truncated"));
+    }
+    let model_length = usize::from(u16::from_le_bytes(
+        payload[..2]
+            .try_into()
+            .map_err(|_| EngineError::protocol_violation("model length is truncated"))?,
+    ));
+    let model_end = 2_usize
+        .checked_add(model_length)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| EngineError::protocol_violation("tokenize model range is invalid"))?;
+    let model_id = decode_service_model_id(&payload[2..model_end])?;
+    let text = std::str::from_utf8(&payload[model_end..])
+        .map_err(|_| EngineError::protocol_violation("tokenize text is not UTF-8"))?;
+    Ok((model_id, text))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn encode_metrics(metrics: RuntimeMetrics) -> Vec<u8> {
+    let values = [
+        metrics.loaded_models,
+        metrics.active_requests,
+        metrics.queued_requests,
+        metrics.rejected_requests,
+        metrics.cancelled_requests,
+        metrics.prompt_tokens,
+        metrics.generated_tokens,
+        metrics.prefill_nanoseconds,
+        metrics.decode_nanoseconds,
+        metrics.tokens_per_second_milli,
+        metrics.host_memory_bytes,
+        metrics.device_memory_bytes,
+        metrics.kv_cache_bytes,
+        metrics.package_validation_failures,
+        metrics.authentication_failures,
+        metrics.protocol_violations,
+        metrics.backend_failures,
+    ];
+    let mut encoded = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        encoded.extend_from_slice(&value.to_le_bytes());
+    }
+    encoded
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+const fn engine_error_code(error: &EngineError) -> u8 {
+    match error {
+        EngineError::InvalidInput(_) => 1,
+        EngineError::UnsupportedArchitecture(_) => 2,
+        EngineError::UnsupportedTokenizer(_) => 3,
+        EngineError::CorruptModelPackage(_) => 4,
+        EngineError::SignatureFailure(_) => 5,
+        EngineError::ResourceExhaustion(_) => 6,
+        EngineError::Cancellation(_) => 7,
+        EngineError::BackendFailure(_) => 8,
+        EngineError::InternalInvariantViolation(_) => 9,
+        EngineError::AuthenticationFailure(_) => 10,
+        EngineError::ProtocolViolation(_) => 11,
+        EngineError::NotImplemented(_) => 12,
+        _ => 255,
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn checked_increment(value: u64, name: &'static str) -> Result<u64, EngineError> {
+    value.checked_add(1).ok_or_else(|| EngineError::resource_exhaustion(name))
+}
+
 #[cfg(feature = "cpu-reference")]
 fn check_cancelled(cancelled: &AtomicBool, request_id: RequestId) -> Result<(), EngineError> {
     if cancelled.load(Ordering::Acquire) {
@@ -2493,8 +2990,9 @@ mod tests {
         control_plane_signature_message, engine_response_signature_message,
     };
     use personalai_engine_protocol::{
-        CancellationEnvelope, GenerationRequestEnvelope, attach_cancellation_signature,
-        attach_generation_signature,
+        AuthenticatedServiceRequest, CancellationEnvelope, GenerationRequestEnvelope,
+        ServiceMessageKind, attach_cancellation_signature, attach_generation_signature,
+        attach_service_signature,
     };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
@@ -4169,6 +4667,70 @@ mod tests {
             fs::remove_file(replay_path).expect("replay journal must clean");
             fs::remove_dir(self.runtime_root).expect("runtime root must clean");
         }
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_local_health_request_receives_signed_service_response() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut fixture = BatchRuntimeFixture::new("service-health", 1);
+        let request_id = RequestId::new(0x5151).expect("request ID");
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            ServiceMessageKind::Health,
+            request_id,
+            1,
+            fixture.control_key_id,
+            &[],
+        )
+        .expect("service request must encode");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+        let encoded = Frame::new(FrameKind::ServiceRequest, payload)
+            .expect("service frame")
+            .encode()
+            .expect("encoded service frame");
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            stream.write_all(&encoded).expect("request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length");
+            let mut frame = header.to_vec();
+            frame.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("response payload");
+            let response = Frame::decode_outbound_exact(&frame).expect("response frame");
+            assert_eq!(response.kind(), FrameKind::ServiceResponse);
+            let response_payload = response.payload();
+            assert_eq!(response_payload[10], ServiceMessageKind::Health as u8);
+            assert_eq!(response_payload[56], 1);
+            let signed_length = response_payload.len() - 64;
+            let signature = Signature::from_bytes(
+                response_payload[signed_length..].try_into().expect("response signature"),
+            );
+            let transcript = engine_response_signature_message(&response_payload[..signed_length])
+                .expect("response transcript");
+            VerifyingKey::from_bytes(&response_public_key)
+                .expect("response key")
+                .verify_strict(&transcript, &signature)
+                .expect("response signature must verify");
+        });
+        assert!(matches!(
+            fixture.runtime.serve_one(&fixture.listener),
+            Ok(ServeOutcome::ServiceResponded {
+                request_id: returned,
+                kind: ServiceMessageKind::Health,
+            }) if returned == request_id
+        ));
+        client.join().expect("client must finish");
+        fixture.cleanup();
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]

@@ -325,6 +325,18 @@ defines the overlap, cutover, drain, rollback, and retirement order for both
 identities; production secret injection and journal recovery still require
 operated proof.
 
+Service-control requests use the same protected socket and cryptographic
+identities but a separate fixed `PAISVC01` envelope. Its header carries the
+closed message type, nonzero nonce, request ID, control key ID, and exact
+payload length; `PAISVR01` responses are signed by the engine identity. The
+catalog is limited to negotiation, capability/model listing, registered-ID
+load/unload, tokenize, health, metrics, and shutdown response types. Normal
+data-plane sessions cannot authorize shutdown. Package paths, signer
+configuration, model budgets, and administrative authority never cross this
+protocol. The exact single-command driver serves these control requests;
+continuous generation/cancellation streams retain their bounded path.
+ADR-0020 defines the format and deterministic 4:2:1 scheduler.
+
 ## Resource ceilings
 
 The code centrally bounds package bytes (1 TiB hard maximum with lower owner

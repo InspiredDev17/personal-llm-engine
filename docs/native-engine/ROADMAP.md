@@ -88,6 +88,13 @@ memory, tool, approval, or Agent Green behavior.
   signatures/order, drains, and proves cleanup. The exact configured CI workload
   of eight repetitions passed locally; GitHub's weekly cron begins only after
   default-branch integration. Production-size operated soak remains required.
+- The protected UDS now also carries a signed, fixed-header service-control
+  envelope with the closed lifecycle/tokenize/health/metrics/shutdown catalog.
+  Owner-configured model budgets remain outside client messages, unload rejects
+  scheduler ownership, and normal data-plane clients cannot authorize shutdown.
+  Scheduler admission adds deterministic 4:2:1 priority service, bounded agent
+  quotas, per-model concurrency, deadlines, and head-of-line avoidance while
+  preserving count and aggregate-byte limits. ADR-0020 records exact semantics.
 
 ## Next software release gate: production model operations
 
