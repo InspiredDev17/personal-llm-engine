@@ -260,12 +260,12 @@ impl CpuDecoderSession<'_> {
             zero_f32(attention_heads.checked_mul(head_dimension).ok_or_else(|| {
                 EngineError::resource_exhaustion("attention output length overflows")
             })?)?;
-        let scale = f32_from_u32(self.model.config.head_dimension())?.sqrt();
+        let scale = f64::from(self.model.config.head_dimension()).sqrt();
         for query_head in 0..attention_heads {
             let kv_head = query_head / group_size;
             let mut scores = zero_f32(sequence_length)?;
             for (position, score) in scores.iter_mut().enumerate() {
-                let mut dot = 0.0_f32;
+                let mut dot = 0.0_f64;
                 for dimension in 0..head_dimension {
                     let query_index = query_head
                         .checked_mul(head_dimension)
@@ -278,13 +278,14 @@ impl CpuDecoderSession<'_> {
                         u32_from_usize(kv_head)?,
                         u32_from_usize(dimension)?,
                     )?;
-                    dot = query[query_index].mul_add(self.cache.f32_value(cache_index)?, dot);
+                    dot += f64::from(finite(query[query_index])?)
+                        * f64::from(finite(self.cache.f32_value(cache_index)?)?);
                 }
-                *score = dot / scale;
+                *score = f32_from_f64(dot / scale)?;
             }
             softmax(&mut scores)?;
             for dimension in 0..head_dimension {
-                let mut value = 0.0_f32;
+                let mut value = 0.0_f64;
                 for (position, probability) in scores.iter().copied().enumerate() {
                     let cache_index = self.cache_index(
                         1,
@@ -293,13 +294,14 @@ impl CpuDecoderSession<'_> {
                         u32_from_usize(kv_head)?,
                         u32_from_usize(dimension)?,
                     )?;
-                    value = probability.mul_add(self.cache.f32_value(cache_index)?, value);
+                    value += f64::from(finite(probability)?)
+                        * f64::from(finite(self.cache.f32_value(cache_index)?)?);
                 }
                 let output_index = query_head
                     .checked_mul(head_dimension)
                     .and_then(|offset| offset.checked_add(dimension))
                     .ok_or_else(|| EngineError::internal_invariant("attention index overflows"))?;
-                output[output_index] = finite(value)?;
+                output[output_index] = f32_from_f64(value)?;
             }
         }
         Ok(output)
@@ -418,31 +420,48 @@ fn linear(
         let row_offset = row
             .checked_mul(input_dimension)
             .ok_or_else(|| EngineError::internal_invariant("linear row offset overflows"))?;
-        let mut accumulator = 0.0_f32;
+        let mut accumulator = 0.0_f64;
         for (column, input_value) in input.iter().copied().enumerate() {
             let weight_value = weight.f32_value(
                 row_offset
                     .checked_add(column)
                     .ok_or_else(|| EngineError::internal_invariant("linear index overflows"))?,
             )?;
-            accumulator = finite(weight_value)?.mul_add(finite(input_value)?, accumulator);
+            accumulator += f64::from(finite(weight_value)?) * f64::from(finite(input_value)?);
         }
-        *result = finite(accumulator)?;
+        *result = f32_from_f64(accumulator)?;
     }
     Ok(output)
 }
 
 fn rms_norm(input: &[f32], weight: &Tensor, epsilon: f32) -> Result<Vec<f32>, EngineError> {
-    let mut sum_squares = 0.0_f32;
+    let mut scale = 0.0_f64;
+    let mut sum_scaled_squares = 1.0_f64;
     for value in input.iter().copied() {
-        let value = finite(value)?;
-        sum_squares = value.mul_add(value, sum_squares);
+        let absolute = f64::from(finite(value)?.abs());
+        if absolute != 0.0 {
+            if scale < absolute {
+                let ratio = scale / absolute;
+                sum_scaled_squares = 1.0 + sum_scaled_squares * ratio * ratio;
+                scale = absolute;
+            } else {
+                let ratio = absolute / scale;
+                sum_scaled_squares += ratio * ratio;
+            }
+        }
     }
     let count = u32_from_usize(input.len())?;
-    let inverse_rms = finite((sum_squares / f32_from_u32(count)? + epsilon).sqrt().recip())?;
+    let inverse_rms = if scale == 0.0 {
+        1.0_f64 / f64::from(epsilon).sqrt()
+    } else {
+        let normalized_epsilon = f64::from(epsilon) / (scale * scale);
+        (1.0 / scale) / (sum_scaled_squares / f64::from(count) + normalized_epsilon).sqrt()
+    };
     let mut output = zero_f32(input.len())?;
     for (index, value) in input.iter().copied().enumerate() {
-        output[index] = finite(value * inverse_rms * finite(weight.f32_value(index)?)?)?;
+        output[index] = f32_from_f64(
+            f64::from(finite(value)?) * inverse_rms * f64::from(finite(weight.f32_value(index)?)?),
+        )?;
     }
     Ok(output)
 }
@@ -465,13 +484,13 @@ fn apply_rope(
             .checked_mul(dimension)
             .ok_or_else(|| EngineError::internal_invariant("RoPE head offset overflows"))?;
         for pair in (0..dimension).step_by(2) {
-            let exponent = f32_from_u32(u32_from_usize(pair)?)? / f32_from_u32(head_dimension)?;
-            let angle = f32_from_u32(position)? / theta.powf(exponent);
+            let exponent = f64::from(u32_from_usize(pair)?) / f64::from(head_dimension);
+            let angle = f64::from(position) / f64::from(theta).powf(exponent);
             let (sine, cosine) = angle.sin_cos();
-            let first = finite(values[base + pair])?;
-            let second = finite(values[base + pair + 1])?;
-            values[base + pair] = finite(first * cosine - second * sine)?;
-            values[base + pair + 1] = finite(first * sine + second * cosine)?;
+            let first = f64::from(finite(values[base + pair])?);
+            let second = f64::from(finite(values[base + pair + 1])?);
+            values[base + pair] = f32_from_f64(first * cosine - second * sine)?;
+            values[base + pair + 1] = f32_from_f64(first * sine + second * cosine)?;
         }
     }
     Ok(())
@@ -482,16 +501,16 @@ fn softmax(values: &mut [f32]) -> Result<(), EngineError> {
         .iter()
         .copied()
         .try_fold(f32::NEG_INFINITY, |maximum, value| Ok(maximum.max(finite(value)?)))?;
-    let mut sum = 0.0_f32;
+    let mut sum = 0.0_f64;
     for value in values.iter_mut() {
-        *value = finite((*value - maximum).exp())?;
-        sum = finite(sum + *value)?;
+        *value = f32_from_f64(f64::from(*value - maximum).exp())?;
+        sum += f64::from(*value);
     }
     if sum <= 0.0 {
         return Err(EngineError::backend_failure("softmax normalization is nonpositive"));
     }
     for value in values {
-        *value = finite(*value / sum)?;
+        *value = f32_from_f64(f64::from(*value) / sum)?;
     }
     Ok(())
 }
@@ -502,9 +521,9 @@ fn swiglu(gate: &[f32], up: &[f32]) -> Result<Vec<f32>, EngineError> {
     }
     let mut output = zero_f32(gate.len())?;
     for index in 0..gate.len() {
-        let gate_value = finite(gate[index])?;
-        let silu = finite(gate_value / (1.0 + (-gate_value).exp()))?;
-        output[index] = finite(silu * finite(up[index])?)?;
+        let gate_value = f64::from(finite(gate[index])?);
+        let silu = gate_value / (1.0 + (-gate_value).exp());
+        output[index] = f32_from_f64(silu * f64::from(finite(up[index])?))?;
     }
     Ok(output)
 }
@@ -525,6 +544,15 @@ fn finite(value: f32) -> Result<f32, EngineError> {
     } else {
         Err(EngineError::backend_failure("CPU decoder encountered a non-finite value"))
     }
+}
+
+fn f32_from_f64(value: f64) -> Result<f32, EngineError> {
+    if !value.is_finite() || value > f64::from(f32::MAX) || value < f64::from(f32::MIN) {
+        return Err(EngineError::backend_failure("CPU decoder accumulator is outside f32 range"));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let converted = value as f32;
+    Ok(converted)
 }
 
 fn zero_f32(length: usize) -> Result<Vec<f32>, EngineError> {
@@ -618,16 +646,6 @@ fn usize_from_u32(value: u32) -> Result<usize, EngineError> {
 fn u32_from_usize(value: usize) -> Result<u32, EngineError> {
     u32::try_from(value)
         .map_err(|_| EngineError::resource_exhaustion("model index exceeds its field"))
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn f32_from_u32(value: u32) -> Result<f32, EngineError> {
-    if value > 1_u32 << 24 {
-        return Err(EngineError::resource_exhaustion(
-            "CPU reference integer exceeds exact f32 range",
-        ));
-    }
-    Ok(value as f32)
 }
 
 #[cfg(test)]

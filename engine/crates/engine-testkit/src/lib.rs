@@ -5,17 +5,25 @@
 //! trusted by production configuration or used to sign a production package.
 
 use ed25519_dalek::{Signer, SigningKey};
+use personalai_engine_cpu_reference::{
+    Backend, CpuReferenceBackend, InferenceGraph, Operation, ValueId,
+};
 use personalai_engine_crypto::{
     TrustedSigner, hash_package, hash_signed_content, signature_message,
 };
+use personalai_engine_memory::MemoryPool;
 use personalai_engine_model_format::{
     MODEL_MANIFEST_BYTES, MODEL_MANIFEST_MAGIC, MODEL_PACKAGE_HEADER_BYTES, MODEL_PACKAGE_MAGIC,
     ParsedModelPackage, SIGNATURE_ENVELOPE_BYTES, SIGNATURE_ENVELOPE_MAGIC, TENSOR_DATA_ALIGNMENT,
     TENSOR_INDEX_ENTRY_BYTES, encode_dtype,
 };
+use personalai_engine_tensor::{MutableTensor, Tensor, TensorRead};
 use personalai_engine_types::{
     DType, EngineError, MAX_MODEL_PACKAGE_BYTES, MAX_TENSOR_COUNT, ModelPackageHash, SignerKeyId,
+    TensorShape,
 };
+use std::collections::BTreeMap;
+use std::fmt;
 
 const TEST_SIGNING_SECRET: [u8; 32] = [0x5a; 32];
 const TEST_SIGNER_KEY_ID_BYTES: [u8; 16] = [0x71; 16];
@@ -28,6 +36,160 @@ const FIXTURE_EOS_TOKEN: u32 = 257;
 const FIXTURE_UNKNOWN_TOKEN: u32 = 258;
 const FIXTURE_TENSOR_ELEMENTS: u64 = 4;
 const DECODER_ARCHITECTURE: &[u8] = b"decoder-rms-rope-swiglu-gqa-v1";
+
+/// Tiny deterministic pseudo-random source for test fixtures only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    /// Creates a deterministic generator; a zero seed maps to a fixed nonzero state.
+    pub const fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed } }
+    }
+
+    /// Returns the next deterministic 64-bit value using xorshift64*.
+    pub fn next_u64(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        self.state = value;
+        value.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Returns a finite deterministic F32 in the closed interval `[-1, 1]`.
+    pub fn next_f32(&mut self) -> f32 {
+        let fraction_bits = u32::try_from(self.next_u64() >> 41).unwrap_or(0);
+        let unit = f32::from_bits(0x3f80_0000 | fraction_bits) - 1.0;
+        unit * 2.0 - 1.0
+    }
+}
+
+/// Generates one small deterministic F32 tensor from a fixed seed.
+pub fn deterministic_tensor(
+    shape: TensorShape,
+    seed: u64,
+    pool: &MemoryPool,
+) -> Result<Tensor, EngineError> {
+    let count = usize::try_from(shape.element_count())
+        .map_err(|_| EngineError::resource_exhaustion("test tensor size is not addressable"))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| EngineError::resource_exhaustion("test tensor allocation failed"))?;
+    let mut random = DeterministicRng::new(seed);
+    for _ in 0..count {
+        values.push(random.next_f32());
+    }
+    MutableTensor::from_f32_values(shape, &values, pool)
+}
+
+/// Detailed finite-tensor comparison failure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TensorMismatch {
+    index: Option<usize>,
+    detail: &'static str,
+    expected: Option<f32>,
+    actual: Option<f32>,
+}
+
+impl fmt::Display for TensorMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.index, self.expected, self.actual) {
+            (Some(index), Some(expected), Some(actual)) => write!(
+                formatter,
+                "{} at element {index}: expected {expected:?}, actual {actual:?}",
+                self.detail
+            ),
+            _ => formatter.write_str(self.detail),
+        }
+    }
+}
+
+impl std::error::Error for TensorMismatch {}
+
+/// Compares finite F32 tensors with absolute and relative tolerances.
+pub fn compare_tensors(
+    actual: &impl TensorRead,
+    expected: &impl TensorRead,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+) -> Result<(), TensorMismatch> {
+    if actual.dtype() != DType::F32
+        || expected.dtype() != DType::F32
+        || actual.shape() != expected.shape()
+        || !absolute_tolerance.is_finite()
+        || absolute_tolerance < 0.0
+        || !relative_tolerance.is_finite()
+        || relative_tolerance < 0.0
+    {
+        return Err(TensorMismatch {
+            index: None,
+            detail: "tensor types, shapes, or tolerances differ",
+            expected: None,
+            actual: None,
+        });
+    }
+    let count = usize::try_from(actual.shape().element_count()).map_err(|_| TensorMismatch {
+        index: None,
+        detail: "tensor element count is not addressable",
+        expected: None,
+        actual: None,
+    })?;
+    for index in 0..count {
+        let actual_value = actual.f32_value(index).map_err(|_| TensorMismatch {
+            index: Some(index),
+            detail: "actual tensor could not be decoded",
+            expected: None,
+            actual: None,
+        })?;
+        let expected_value = expected.f32_value(index).map_err(|_| TensorMismatch {
+            index: Some(index),
+            detail: "expected tensor could not be decoded",
+            expected: None,
+            actual: None,
+        })?;
+        if !actual_value.is_finite() || !expected_value.is_finite() {
+            return Err(TensorMismatch {
+                index: Some(index),
+                detail: "tensor contains NaN or infinity",
+                expected: Some(expected_value),
+                actual: Some(actual_value),
+            });
+        }
+        let difference = (actual_value - expected_value).abs();
+        let scale = actual_value.abs().max(expected_value.abs());
+        if difference > absolute_tolerance.max(relative_tolerance * scale) {
+            return Err(TensorMismatch {
+                index: Some(index),
+                detail: "tensor values exceed tolerance",
+                expected: Some(expected_value),
+                actual: Some(actual_value),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Executes one allowlisted graph operation using the scalar reference backend.
+pub fn execute_reference_node(
+    operation: &Operation,
+    inputs: &[&Tensor],
+    pool: &MemoryPool,
+) -> Result<Tensor, EngineError> {
+    CpuReferenceBackend::new()?.execute_operation(operation, inputs, pool)
+}
+
+/// Executes one complete validated graph using the scalar reference backend.
+pub fn execute_reference_graph(
+    graph: &InferenceGraph,
+    inputs: BTreeMap<ValueId, Tensor>,
+    pool: &MemoryPool,
+) -> Result<BTreeMap<ValueId, Tensor>, EngineError> {
+    graph.execute(&CpuReferenceBackend::new()?, inputs, pool)
+}
 
 #[derive(Clone, Copy)]
 struct ManifestFixture {
@@ -660,5 +822,44 @@ mod tests {
         assert_eq!(parsed.manifest().vocabulary_size(), 259);
         assert_eq!(parsed.tensors().len(), 12);
         assert!(parsed.tensors().iter().any(|tensor| tensor.name().as_str() == "output.weight"));
+    }
+
+    #[test]
+    fn deterministic_tensor_and_rng_repeat_exactly() {
+        let first_pool = MemoryPool::new(4096).unwrap();
+        let second_pool = MemoryPool::new(4096).unwrap();
+        let shape = TensorShape::new([2, 3]).unwrap();
+        let first = deterministic_tensor(shape.clone(), 42, &first_pool).unwrap();
+        let second = deterministic_tensor(shape, 42, &second_pool).unwrap();
+        compare_tensors(&first, &second, 0.0, 0.0).unwrap();
+        let mut first_rng = DeterministicRng::new(7);
+        let mut second_rng = DeterministicRng::new(7);
+        for _ in 0..100 {
+            assert_eq!(first_rng.next_u64(), second_rng.next_u64());
+        }
+    }
+
+    #[test]
+    fn tensor_comparison_reports_mismatch_and_nonfinite_values() {
+        let pool = MemoryPool::new(4096).unwrap();
+        let shape = TensorShape::new([2]).unwrap();
+        let expected = MutableTensor::from_f32_values(shape.clone(), &[1.0, 2.0], &pool).unwrap();
+        let close = MutableTensor::from_f32_values(shape.clone(), &[1.0, 2.000_01], &pool).unwrap();
+        compare_tensors(&close, &expected, 1.0e-4, 1.0e-4).unwrap();
+        let far = MutableTensor::from_f32_values(shape.clone(), &[1.0, 3.0], &pool).unwrap();
+        assert!(compare_tensors(&far, &expected, 1.0e-4, 1.0e-4).is_err());
+        let nan = MutableTensor::from_f32_values(shape, &[1.0, f32::NAN], &pool).unwrap();
+        assert!(compare_tensors(&nan, &expected, 0.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn reference_node_helper_executes_allowlisted_operation() {
+        let pool = MemoryPool::new(4096).unwrap();
+        let shape = TensorShape::new([2]).unwrap();
+        let left = MutableTensor::from_f32_values(shape.clone(), &[1.0, 2.0], &pool).unwrap();
+        let right = MutableTensor::from_f32_values(shape, &[3.0, 4.0], &pool).unwrap();
+        let output = execute_reference_node(&Operation::Add, &[&left, &right], &pool).unwrap();
+        assert_eq!(output.f32_value(0).unwrap().to_bits(), 4.0_f32.to_bits());
+        assert_eq!(output.f32_value(1).unwrap().to_bits(), 6.0_f32.to_bits());
     }
 }

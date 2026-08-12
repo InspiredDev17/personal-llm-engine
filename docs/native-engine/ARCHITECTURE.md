@@ -26,8 +26,8 @@ Green authority.
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
 | `engine-memory` | aggregate fallible reservations |
-| `engine-tensor` | safe owned typed storage tied to reservations |
-| `engine-cpu-reference` | checked scalar numeric primitives |
+| `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
+| `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-kv-cache` | bounded sequence KV storage/accounting |
 | `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
 | `engine-sampling` | deterministic tensor-direct greedy selection |
@@ -73,7 +73,8 @@ The import and production components are intentionally separate:
    package budget before exposure. Each failure emits one typed event to its
    mandatory caller-owned security-event sink.
 7. Tensor shards are privately mapped `PROT_READ` without `PROT_EXEC`; immutable
-   ranges are then copied into aggregate-accounted CPU tensors. No loader API
+   F32, F16, or BF16 ranges are then converted into aggregate-accounted F32 CPU
+   execution tensors. No loader API
    accepts source formats, an arbitrary path, or an unsigned package. The old
    flat package remains only as deterministic unit-test compatibility data.
 
@@ -81,6 +82,42 @@ The supported architecture is `decoder-rms-rope-swiglu-gqa-v1`, a fixed causal d
 with architecture-owned RMSNorm, Q/K/V projections, RoPE, grouped attention,
 output projection, residual paths, SwiGLU MLP, final norm, and logits. Model
 metadata cannot define operations, plugins, paths, executable code, or kernels.
+
+## Tensor, graph, and numerical policy
+
+Owned tensors use canonical dense row-major order with the final dimension
+contiguous. `TensorLayout` carries explicit element strides and offsets;
+transpose creates a checked non-contiguous view and never relabels it as
+contiguous. Logical package alignment is a bounded power of two and every
+reachable byte, element count, stride, shape, storage length, and view offset
+is checked. Engine operations allocate a fresh destination in the same
+aggregate `MemoryPool`, so input/output aliasing is structurally excluded;
+mutable overlapping borrows remain prohibited by Rust's borrow rules.
+
+F32 is the initial execution type. Signed packages may store unquantized F32,
+IEEE binary16, or BF16 tensors; the loader performs explicit first-party
+conversion to F32 and rejects every other type. F16 handles normal, subnormal,
+signed-zero, infinity, and NaN bit patterns with round-to-nearest-ties-to-even;
+BF16 narrowing also uses ties-to-even. Conversion preserves non-finite classes,
+while arithmetic rejects NaN and infinity except that softmax accepts negative
+infinity only as an explicit mask. RMSNorm uses a scaled F64 sum-of-squares;
+softmax subtracts the row maximum and accumulates exponentials in F64. Scalar
+loops execute in fixed row-major order with no SIMD, threads, fusion, BLAS, or
+platform acceleration and reject non-finite arithmetic results.
+
+`InferenceGraph` is immutable after validation. Nodes use the closed
+first-party `Operation` enum, explicit value IDs, static F32 shape propagation,
+deterministic node-ID-tiebroken topological order, cycle/missing/duplicate
+rejection, and a conservative checked sum of intermediate bytes. The graph
+executor accepts no package/client operation strings or code. The reviewed
+transformer architecture constructs its own 14-node reference decoder-block
+graph; packages select only the allowlisted architecture ID. The scalar backend
+implements copy, F32/F16/BF16 conversion, broadcast add/multiply, scalar
+multiply, matrix-vector/matrix-matrix, embedding lookup, RMSNorm, stable
+softmax, SiLU, SwiGLU, RoPE, head split/merge, grouped-query attention, causal
+masking, residual addition, Q/K/V projection composition, and logit projection.
+The 100-million-iteration operation ceiling and aggregate memory pool apply
+before output allocation. ADR-0017 records these invariants.
 
 ## Tokenizer boundary
 

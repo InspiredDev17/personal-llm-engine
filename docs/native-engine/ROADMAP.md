@@ -19,7 +19,7 @@ memory, tool, approval, or Agent Green behavior.
 | 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
 | 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for AIPTok V1 synthetic profile | First-party `AIPTOK01`, strict metadata conversion, content hash, byte fallback, ranked merges, explicit special policies, exact byte/UTF-8/incremental decode, property/malformed/fuzz tests and dependency-free benchmarks |
-| 4. Tensor/CPU core | COMPLETE for target architecture | Safe owned tensors, aggregate memory pool, checked scalar work |
+| 4. Tensor/CPU core | COMPLETE as correctness oracle | Canonical row-major tensors, explicit checked views, F32 execution plus F16/BF16 conversion, immutable statically validated graph, complete scalar operation set, aggregate memory/compute bounds, exhaustive F16 tests and benchmarks |
 | 5. Decoder architecture | COMPLETE for synthetic V1 | Fixed `decoder-rms-rope-swiglu-gqa-v1`, exact tensor inventory, causal grouped attention and SwiGLU |
 | 6. Generation | COMPLETE for greedy CPU | Prefill/decode, real KV tensors, streaming UTF-8 events, usage and cancellation checks |
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
@@ -41,7 +41,8 @@ memory, tool, approval, or Agent Green behavior.
 - Deterministic fixture generation entirely in Rust.
 - Strictly separated Rust-only offline importer and production directory loader;
   source parsing/signing authority is absent from the runtime graph.
-- First-party tokenizer, tensor, memory, KV, decoder, greedy sampling,
+- First-party tokenizer, tensor, immutable graph, scalar correctness backend,
+  memory, KV, decoder, greedy sampling,
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
   and Go provider translation.
 - CPU socket-to-signed-package generation exercised end to end.

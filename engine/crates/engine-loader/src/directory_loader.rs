@@ -112,7 +112,7 @@ impl VerifiedDirectoryPackage {
         let metadata_reservation = pool.reserve(metadata_bytes)?;
         let mut tensors = BTreeMap::new();
         for record in self.manifest.tensors() {
-            let tensor = Tensor::copy_from_bytes(
+            let tensor = Tensor::convert_storage_to_f32(
                 record.dtype(),
                 record.shape().clone(),
                 self.tensor_bytes(record)?,
@@ -131,7 +131,7 @@ impl VerifiedDirectoryPackage {
                 .iter()
                 .find(|record| record.name() == "token_embedding.weight")
                 .ok_or_else(|| EngineError::internal_invariant("tied embedding is missing"))?;
-            let output = Tensor::copy_from_bytes(
+            let output = Tensor::convert_storage_to_f32(
                 embedding.dtype(),
                 embedding.shape().clone(),
                 self.tensor_bytes(embedding)?,
@@ -437,10 +437,13 @@ fn open_direct_file(
 }
 
 fn validate_architecture(manifest: &DirectoryManifest) -> Result<(), EngineError> {
-    if manifest.architecture_id().as_str() != DIRECTORY_DECODER_ARCHITECTURE_ID
-        || manifest.storage_dtype() != DType::F32
-    {
+    if manifest.architecture_id().as_str() != DIRECTORY_DECODER_ARCHITECTURE_ID {
         return Err(EngineError::unsupported_architecture(manifest.architecture_id().clone()));
+    }
+    if !matches!(manifest.storage_dtype(), DType::F32 | DType::F16 | DType::BFloat16)
+        || manifest.tensors().iter().any(|tensor| tensor.dtype() != manifest.storage_dtype())
+    {
+        return Err(corrupt("directory tensor storage dtype is unsupported or inconsistent"));
     }
     let expected = expected_shapes(manifest)?;
     let observed = manifest

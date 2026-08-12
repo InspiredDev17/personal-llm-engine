@@ -111,6 +111,9 @@ and review record in an isolated FFI/backend module.
   error; no empty success or fake inference is allowed.
 - CPU reference is the default oracle. ARM64, Metal, and CUDA remain disabled
   until their own hardware acceptance gates pass.
+- Inference graphs are immutable engine-owned plans built only by reviewed
+  architecture code. A model package or client cannot supply operations,
+  operation names, executable graphs, kernels, or backend choices.
 - The Go platform never depends on unfinished behavior. Adoption is additive,
   canaried, and reversible.
 

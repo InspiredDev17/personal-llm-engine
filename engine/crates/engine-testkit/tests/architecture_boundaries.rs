@@ -415,8 +415,11 @@ fn internal_crate_dependencies_match_the_approved_dag() {
         (
             "engine-testkit",
             &[
+                "personalai-engine-cpu-reference",
                 "personalai-engine-crypto",
+                "personalai-engine-memory",
                 "personalai-engine-model-format",
+                "personalai-engine-tensor",
                 "personalai-engine-types",
             ],
         ),

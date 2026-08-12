@@ -12,7 +12,8 @@ format, a Rust-only quarantine safetensors importer, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
 no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
-tokenization, safe aggregate-accounted tensors, one fixed decoder architecture,
+tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
+storage conversion, an immutable architecture-owned graph, one fixed decoder architecture,
 scalar CPU reference
 inference, KV state, deterministic greedy generation, a bounded scheduler,
 resumable one-token round-robin coordination, mutually authenticated binary

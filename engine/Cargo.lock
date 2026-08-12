@@ -256,8 +256,11 @@ name = "personalai-engine-testkit"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "personalai-engine-cpu-reference",
  "personalai-engine-crypto",
+ "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 

@@ -341,8 +341,12 @@ impl VerifiedModelPackage<'_> {
         let mut tensors = BTreeMap::new();
         for record in self.parsed.tensors() {
             let source = self.parsed.tensor_data(self.package_bytes, record)?;
-            let tensor =
-                Tensor::copy_from_bytes(record.dtype(), record.shape().clone(), source, pool)?;
+            let tensor = Tensor::convert_storage_to_f32(
+                record.dtype(),
+                record.shape().clone(),
+                source,
+                pool,
+            )?;
             if tensors.insert(record.name().as_str().to_owned(), tensor).is_some() {
                 return Err(EngineError::internal_invariant(
                     "validated tensor index contains a duplicate name",

@@ -15,6 +15,13 @@ use personalai_engine_types::{
     ResourceBudget,
 };
 
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_cpu_reference::{
+    GraphNode, GraphNodeId, InferenceGraph, Operation, TensorSpec, ValueId,
+};
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_types::TensorShape;
+
 /// Maximum model hidden dimension accepted by transformer planning.
 pub const MAX_HIDDEN_DIMENSION: u32 = 1_048_576;
 /// Maximum feed-forward intermediate dimension.
@@ -128,7 +135,7 @@ impl TransformerConfig {
             manifest.kv_head_count(),
             manifest.vocabulary_size(),
             manifest.context_limit(),
-            manifest.storage_dtype(),
+            DType::F32,
             manifest.feed_forward_dimension(),
             1.0e-5,
             manifest.rope_theta(),
@@ -145,7 +152,7 @@ impl TransformerConfig {
             manifest.kv_head_count(),
             manifest.vocabulary_size(),
             manifest.context_limit(),
-            manifest.storage_dtype(),
+            DType::F32,
             manifest.intermediate_dimension(),
             manifest.rms_norm_epsilon(),
             manifest.rope_theta(),
@@ -325,6 +332,112 @@ impl TransformerConfig {
     pub const fn head_dimension(&self) -> u32 {
         self.hidden_dimension / self.attention_head_count
     }
+
+    /// Constructs one immutable, first-party scalar decoder-block graph.
+    ///
+    /// Runtime values 1 through 10 are respectively the hidden state,
+    /// attention-normalization weight, query projection, immutable key cache,
+    /// immutable value cache, attention output projection, feed-forward
+    /// normalization weight, gate projection, up projection, and down
+    /// projection. The sole output is value 33. Package data cannot add or
+    /// redefine operations.
+    #[cfg(feature = "cpu-reference")]
+    pub fn reference_block_graph(&self, position: u32) -> Result<InferenceGraph, EngineError> {
+        if position >= self.context_limit.get() {
+            return Err(EngineError::invalid_input(
+                "reference graph position exceeds context limit",
+            ));
+        }
+        let hidden = u64::from(self.hidden_dimension);
+        let kv_heads = u64::from(self.kv_head_count);
+        let head_dimension = u64::from(self.head_dimension());
+        let intermediate = u64::from(self.intermediate_dimension);
+        let sequence = u64::from(position).checked_add(1).ok_or_else(|| {
+            EngineError::resource_exhaustion("reference graph position overflows")
+        })?;
+        let f32_spec = |dimensions| TensorSpec::new(DType::F32, TensorShape::new(dimensions)?);
+        let value = |identifier| ValueId::new(identifier);
+        let node = |identifier| GraphNodeId::new(identifier);
+        let inputs = vec![
+            (value(1)?, f32_spec(vec![hidden])?),
+            (value(2)?, f32_spec(vec![hidden])?),
+            (value(3)?, f32_spec(vec![hidden, hidden])?),
+            (value(4)?, f32_spec(vec![sequence, kv_heads, head_dimension])?),
+            (value(5)?, f32_spec(vec![sequence, kv_heads, head_dimension])?),
+            (value(6)?, f32_spec(vec![hidden, hidden])?),
+            (value(7)?, f32_spec(vec![hidden])?),
+            (value(8)?, f32_spec(vec![intermediate, hidden])?),
+            (value(9)?, f32_spec(vec![intermediate, hidden])?),
+            (value(10)?, f32_spec(vec![hidden, intermediate])?),
+        ];
+        let nodes = vec![
+            GraphNode::new(
+                node(1)?,
+                Operation::RmsNorm { epsilon: self.rms_norm_epsilon },
+                [value(1)?, value(2)?],
+                value(20)?,
+            )?,
+            GraphNode::new(node(2)?, Operation::MatrixVector, [value(3)?, value(20)?], value(21)?)?,
+            GraphNode::new(
+                node(3)?,
+                Operation::HeadReshape { head_count: self.attention_head_count },
+                [value(21)?],
+                value(22)?,
+            )?,
+            GraphNode::new(
+                node(4)?,
+                Operation::Rope { position, theta: self.rope_theta },
+                [value(22)?],
+                value(23)?,
+            )?,
+            GraphNode::new(
+                node(5)?,
+                Operation::GroupedQueryAttention { causal_position: position },
+                [value(23)?, value(4)?, value(5)?],
+                value(24)?,
+            )?,
+            GraphNode::new(
+                node(6)?,
+                Operation::HeadReshape { head_count: self.attention_head_count },
+                [value(24)?],
+                value(25)?,
+            )?,
+            GraphNode::new(node(7)?, Operation::MatrixVector, [value(6)?, value(25)?], value(26)?)?,
+            GraphNode::new(node(8)?, Operation::ResidualAdd, [value(1)?, value(26)?], value(27)?)?,
+            GraphNode::new(
+                node(9)?,
+                Operation::RmsNorm { epsilon: self.rms_norm_epsilon },
+                [value(27)?, value(7)?],
+                value(28)?,
+            )?,
+            GraphNode::new(
+                node(10)?,
+                Operation::MatrixVector,
+                [value(8)?, value(28)?],
+                value(29)?,
+            )?,
+            GraphNode::new(
+                node(11)?,
+                Operation::MatrixVector,
+                [value(9)?, value(28)?],
+                value(30)?,
+            )?,
+            GraphNode::new(node(12)?, Operation::SwiGlu, [value(29)?, value(30)?], value(31)?)?,
+            GraphNode::new(
+                node(13)?,
+                Operation::MatrixVector,
+                [value(10)?, value(31)?],
+                value(32)?,
+            )?,
+            GraphNode::new(
+                node(14)?,
+                Operation::ResidualAdd,
+                [value(27)?, value(32)?],
+                value(33)?,
+            )?,
+        ];
+        InferenceGraph::new(inputs, nodes, vec![value(33)?])
+    }
 }
 
 /// Resource plan for an otherwise unsupported transformer architecture.
@@ -374,6 +487,15 @@ impl TransformerPlan {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cpu-reference")]
+    use personalai_engine_cpu_reference::CpuReferenceBackend;
+    #[cfg(feature = "cpu-reference")]
+    use personalai_engine_memory::MemoryPool;
+    #[cfg(feature = "cpu-reference")]
+    use personalai_engine_tensor::MutableTensor;
+    #[cfg(feature = "cpu-reference")]
+    use std::collections::BTreeMap;
+
     #[test]
     fn validates_transformer_and_cache_dimensions() {
         let config = config();
@@ -420,6 +542,46 @@ mod tests {
         assert_eq!(status.compiled(), cfg!(feature = "cpu-reference"));
         assert_eq!(status.default_backend(), cfg!(feature = "cpu-reference"));
         assert_eq!(status.model_execution_implemented(), cfg!(feature = "cpu-reference"));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn first_party_architecture_constructs_and_executes_a_tiny_immutable_block() {
+        let config = TransformerConfig::new_decoder(
+            ArchitectureId::new(FIRST_PARTY_DECODER_ARCHITECTURE_ID).unwrap(),
+            1,
+            4,
+            2,
+            1,
+            8,
+            ContextLimit::new(4).unwrap(),
+            DType::F32,
+            8,
+            1.0e-5,
+            10_000.0,
+        )
+        .unwrap();
+        let graph = config.reference_block_graph(0).unwrap();
+        assert_eq!(graph.nodes().len(), 14);
+        assert_eq!(graph.outputs(), [ValueId::new(33).unwrap()]);
+        let pool = MemoryPool::new(1 << 20).unwrap();
+        let mut inputs = BTreeMap::new();
+        for (identifier, specification) in graph.inputs() {
+            let count = usize::try_from(specification.shape().element_count()).unwrap();
+            let values = vec![0.125_f32; count];
+            inputs.insert(
+                *identifier,
+                MutableTensor::from_f32_values(specification.shape().clone(), &values, &pool)
+                    .unwrap(),
+            );
+        }
+        let result = graph.execute(&CpuReferenceBackend::new().unwrap(), inputs, &pool).unwrap();
+        let output = &result[&ValueId::new(33).unwrap()];
+        assert_eq!(output.shape().dimensions(), [4]);
+        for index in 0..4 {
+            assert!(output.f32_value(index).unwrap().is_finite());
+        }
+        assert!(config.reference_block_graph(4).is_err());
     }
 
     fn config() -> TransformerConfig {
