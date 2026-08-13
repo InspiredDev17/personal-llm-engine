@@ -26,7 +26,7 @@ memory, tool, approval, or Agent Green behavior.
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
 | 9a. Quantized package storage | COMPLETE for AIPQ8/AIPQ4 synthetic evidence | Explicit profiles, canonical fixed-block payloads, signed source/destination/error evidence, secure loading, scalar kernels, and F32/Q8/Q4 transformer divergence regression |
-| 10. ARM64/Metal | ARM64 GRAPH COMPLETE / SERVICE + METAL PENDING | ARM64 graph backend has runtime dispatch, all baseline operation classes, bounded workers, Q8/Q4, M1 differential/benchmark evidence; signed decoder/service integration and all Metal work remain |
+| 10. ARM64/Metal | GRAPH BACKENDS COMPLETE / SERVICE CUTOVER PENDING | ARM64 and Metal immutable-graph backends have hardware dispatch, baseline operation classes, Q8/Q4, differential evidence, resource metrics, and safe fallback; signed decoder/service selection remains |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
@@ -133,7 +133,11 @@ currently included in this repository.
 ARM64, Metal, and CUDA remain default-off. ARM64 now has a complete optimized
 graph backend with isolated documented intrinsics, runtime dispatch, bounded
 workers, scalar differential tests, and Apple M1 release measurements; the
-signed decoder/service does not yet advertise ARM64 model execution. Each
+signed decoder/service does not yet advertise ARM64 model execution. Metal now
+has a build-time first-party metallib, closed C ABI, all baseline correctness
+kernels, bounded reuse, explicit transfer/dispatch metrics, and contiguous
+sequence-isolated device KV storage with Apple M1 differential evidence. Its
+signed decoder/service cutover and end-to-end generation gate remain open. Each
 activated backend requires fixed
 architecture-owned kernels, isolated documented unsafe/FFI if unavoidable,
 exact device and allocation bounds, cancellation, differential tests against

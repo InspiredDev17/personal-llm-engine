@@ -1,0 +1,30 @@
+[package]
+name = "personalai-engine-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "First-party Apple Metal graph backend for the PersonalAI native engine"
+build = "build.rs"
+
+[[bench]]
+name = "metal_graph"
+harness = false
+
+[dependencies]
+personalai-engine-cpu-reference.workspace = true
+personalai-engine-crypto.workspace = true
+personalai-engine-kv-cache.workspace = true
+personalai-engine-memory.workspace = true
+personalai-engine-tensor.workspace = true
+personalai-engine-types.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+personalai-engine-arm64.workspace = true
+personalai-engine-testkit.workspace = true
+
+[lints]
+workspace = true

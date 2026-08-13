@@ -9,6 +9,12 @@ pub use cpu_decoder::{CpuDecoderModel, CpuDecoderSession};
 pub use personalai_engine_arm64::{
     Arm64Backend, Arm64Capabilities, Arm64ExecutionConfig, HostCpuBackend,
 };
+#[cfg(feature = "metal")]
+pub use personalai_engine_metal::{
+    MetalBackend, MetalCancellation, MetalDeviceInfo, MetalStatistics,
+};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use personalai_engine_metal::{MetalKvCache, MetalKvCacheMetrics, MetalKvSequenceHandle};
 
 use personalai_engine_kv_cache::{
     KvCachePlan, MAX_HEAD_DIMENSION, MAX_KV_HEAD_COUNT, MAX_LAYER_COUNT,

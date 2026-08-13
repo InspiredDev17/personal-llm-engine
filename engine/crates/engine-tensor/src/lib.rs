@@ -23,6 +23,8 @@ pub enum Device {
     Cpu,
     /// First-party ARM64 Advanced SIMD host execution.
     Arm64,
+    /// First-party Apple Metal GPU execution.
+    Metal,
 }
 
 /// Validated logical tensor layout expressed in element strides.

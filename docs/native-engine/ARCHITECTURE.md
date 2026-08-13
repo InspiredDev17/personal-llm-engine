@@ -420,8 +420,12 @@ pool is fixed at one to sixteen threads, requires one thread in deterministic
 mode, bounds ingress to the worker count, isolates panics, and joins cleanly.
 The generic graph executor can select ARM64 through `HostCpuBackend`; the signed
 model decoder/service path is not yet integrated and does not advertise ARM64
-model execution. Metal and CUDA report not-implemented and their native
-directories contain no kernels.
+model execution. The Metal feature now exposes a real immutable-graph backend,
+an embedded SHA-384-identified first-party metallib, a closed 19-kernel C ABI,
+bounded pooling and transfer metrics, scalar fallback, and sequence-isolated
+contiguous device KV storage. Its production signed-decoder/service selection
+is not yet integrated and therefore does not advertise complete model
+execution. CUDA remains not implemented.
 Any backend is selected by trusted engine configuration and architecture code,
 never by model data, and must pass CPU differential and isolated unsafe/FFI
 review.
@@ -432,6 +436,9 @@ Workspace policy denies unsafe Rust by default. The approved exceptions are
 `engine-arm64/src/intrinsics.rs`, whose twelve Advanced SIMD blocks load and
 store only complete in-bounds lane groups supplied by safe slices or fixed
 arrays,
+`engine-metal/src/ffi.rs`, whose safe wrappers contain the opaque pointer
+lifetime, null/status checks, exact buffer lengths, fixed kernel enum, and
+explicit destruction for the reviewed Objective-C++ bridge,
 `engine-server/src/os_lock.rs`, which makes one checked `libc::flock` call using
 an owned valid descriptor, and `engine-cli/src/os_signal.rs`, which uses two
 documented `sigaction` blocks to install and restore owner-process handlers,

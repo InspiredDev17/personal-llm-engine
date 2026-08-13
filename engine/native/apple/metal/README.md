@@ -1,12 +1,34 @@
 # Apple Metal backend boundary
 
-Status: **PLANNED / DISABLED**.
+Status: **GRAPH BACKEND IMPLEMENTED / MODEL-SERVICE CUTOVER PENDING**.
 
-This directory is reserved for a first-party Apple Metal system-API backend.
-No Metal bindings, shaders, dynamic-library discovery, kernels, or unsafe FFI
-exist in the foundation stage. Future work must isolate FFI and unsafe code,
-document invariants, select kernels only from engine-owned code, and never load
-model-supplied executable code.
+The `personalai-engine-metal` crate owns the safe Rust integration. This
+directory owns one minimal Objective-C++ bridge and first-party MSL kernels.
+The build compiles `shaders/all.metal` into an embedded metallib, records its
+SHA-384 digest, and refuses an identity mismatch before device creation. There
+is no runtime source compilation, shader download, dynamic-library discovery,
+model kernel selector, or client-provided kernel name.
 
-The separate host-only `engine-arm64` crate does not change this status. Its
-Advanced SIMD CPU kernels do not call Metal or provide GPU execution.
+The C ABI exposes opaque contexts and buffers with explicit create/destroy,
+whole and bounded-range transfers, synchronization, a fixed 19-value kernel
+enum, capability discovery, and content-free resource statistics. Objective-C
+objects and C++ exceptions never cross the boundary. Rust unsafe code is
+isolated to `engine-metal/src/ffi.rs`; the Objective-C++ bridge catches
+Objective-C exceptions and compiles with C++ exceptions disabled.
+
+Implemented kernels are copy, F32 add/multiply/scalar multiply, F32 and F16
+matvec/matmul, RMSNorm, softmax, SiLU, SwiGLU, RoPE, embedding lookup,
+attention scores, causal mask, attention value accumulation, AIPQ8 matvec, and
+AIPQ4 matvec. Unsupported validated graph operations, layouts, and data types
+fall back to the scalar oracle. Transfers and dispatches are explicit metrics.
+
+Metal KV storage is contiguous, model-owned, sequence-isolated,
+generation-checked, context-bounded, and cleared on allocation, reset,
+cancellation, destruction, pooling, or model unload. This implementation is a
+correctness-first device cache; paged KV and fused attention remain future
+performance work.
+
+The generic immutable graph runs on Metal and hardware differential tests pass
+on the recorded Apple M1 host. The production decoder/service is not yet
+wired to select this graph backend, so Metal must not yet be advertised as a
+complete model-execution backend.

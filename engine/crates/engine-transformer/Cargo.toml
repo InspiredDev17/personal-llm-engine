@@ -10,12 +10,13 @@ description = "Validated transformer plans and backend boundaries for the Person
 default = ["cpu-reference"]
 cpu-reference = ["dep:personalai-engine-cpu-reference"]
 arm64 = ["dep:personalai-engine-arm64"]
-metal = []
+metal = ["dep:personalai-engine-metal"]
 cuda = []
 
 [dependencies]
 personalai-engine-cpu-reference = { workspace = true, optional = true }
 personalai-engine-arm64 = { workspace = true, optional = true }
+personalai-engine-metal = { workspace = true, optional = true }
 personalai-engine-kv-cache.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-model-format.workspace = true

@@ -23,7 +23,8 @@ token data, generated text, and engine events are untrusted.
 7. Engine events back to Go.
 8. Go to its separate authenticated Agent Green liaison.
 9. Safe Rust to the isolated Unix lock/read-only-map FFI modules.
-10. Future safe Rust backend to isolated Metal/CUDA FFI.
+10. Safe Rust Metal backend to its reviewed isolated C ABI and future safe Rust
+    CUDA backend to isolated FFI.
 
 ## Threats and controls
 

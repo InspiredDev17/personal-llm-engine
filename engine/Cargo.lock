@@ -189,6 +189,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-metal"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-arm64",
+ "personalai-engine-cpu-reference",
+ "personalai-engine-crypto",
+ "personalai-engine-kv-cache",
+ "personalai-engine-memory",
+ "personalai-engine-tensor",
+ "personalai-engine-testkit",
+ "personalai-engine-types",
+ "sha2",
+]
+
+[[package]]
 name = "personalai-engine-model-format"
 version = "0.1.0"
 dependencies = [
@@ -310,6 +325,7 @@ dependencies = [
  "personalai-engine-cpu-reference",
  "personalai-engine-kv-cache",
  "personalai-engine-memory",
+ "personalai-engine-metal",
  "personalai-engine-model-format",
  "personalai-engine-tensor",
  "personalai-engine-types",

@@ -401,9 +401,9 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 19-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 20-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 19] = [
+    let allowed: [(&str, &[&str]); 20] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-model-format", &["personalai-engine-types"]),
@@ -459,6 +459,17 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-types",
             ],
         ),
+        (
+            "engine-metal",
+            &[
+                "personalai-engine-cpu-reference",
+                "personalai-engine-crypto",
+                "personalai-engine-kv-cache",
+                "personalai-engine-memory",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
         ("engine-memory", &["personalai-engine-types"]),
         (
             "engine-kv-cache",
@@ -470,6 +481,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-arm64",
                 "personalai-engine-cpu-reference",
                 "personalai-engine-kv-cache",
+                "personalai-engine-metal",
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
                 "personalai-engine-tensor",
@@ -594,6 +606,14 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         .join("crates/engine-arm64/src/intrinsics.rs")
         .canonicalize()
         .expect("approved ARM64 intrinsic boundary must exist");
+    let approved_metal_ffi = root
+        .join("crates/engine-metal/src/ffi.rs")
+        .canonicalize()
+        .expect("approved Metal FFI boundary must exist");
+    let approved_metal_build = root
+        .join("crates/engine-metal/build.rs")
+        .canonicalize()
+        .expect("approved Metal build script must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -649,6 +669,15 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             12,
             "ARM64 Advanced SIMD",
         );
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_metal_ffi,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            18,
+            "Metal C ABI",
+        );
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
@@ -688,19 +717,29 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             {
                 continue;
             }
+            if canonical == approved_metal_ffi
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+            {
+                continue;
+            }
             assert!(
                 !source.contains(marker),
                 "prohibited Rust source marker {marker:?} found in {}",
                 path.display()
             );
         }
+        let production_source =
+            if canonical == approved_metal_build { "" } else { production_source };
         assert_no_outbound_or_process_egress(&source, production_source, &path);
     }
 }
 
 #[test]
-fn workspace_crates_have_no_build_scripts() {
-    assert!(collect_files(&engine_root(), "build.rs").is_empty());
+fn workspace_has_only_the_reviewed_local_metal_build_script() {
+    assert_eq!(
+        collect_files(&engine_root(), "build.rs"),
+        [engine_root().join("crates/engine-metal/build.rs")]
+    );
 }
 
 fn assert_exact_unsafe_boundary(

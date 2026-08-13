@@ -75,14 +75,19 @@ does not execute Python, Node, TypeScript, downloaded scripts, or model code.
 
 - Disable unnecessary direct default features.
 - No workspace crate may declare native `links` or weaken workspace lints.
-- No `build.rs` is permitted in workspace crates. A transitive build script
-  requires explicit inventory review; current curve arithmetic build metadata
-  is offline and locked.
+- Exactly one workspace build script is permitted:
+  `engine-metal/build.rs`, recorded in ADR-0025. It invokes only the installed
+  Apple `metal`, `metallib`, `clang++`, and `ar` tools against repository-owned
+  sources, writes only to `OUT_DIR`, embeds the result, and performs no network
+  access. Architecture tests reject every additional workspace build script.
+  A transitive build script requires explicit inventory review; current curve
+  arithmetic build metadata is offline and locked.
 - No runtime dynamic-library lookup by arbitrary/configured name.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
 - Unsafe Rust is denied by default. The approved exceptions are the isolated
-  ARM64 Advanced SIMD module recorded in ADR-0023 and the exact Unix
+  ARM64 Advanced SIMD module recorded in ADR-0023, the Metal C ABI module
+  recorded in ADR-0025, and the exact Unix
   lock module in ADR-0004, process-signal module in ADR-0011, and read-only
   peer-credential module in ADR-0013, plus the read-only shard mapping module
   in ADR-0015. They expose safe wrappers; the mapping owns the descriptor,
