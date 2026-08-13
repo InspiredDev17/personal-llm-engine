@@ -1,7 +1,7 @@
 # Native Engine Roadmap
 
 - Version: 0.2.0
-- Updated: 2026-08-12
+- Updated: 2026-08-13
 - Scope: inference only
 
 ## Delivery rule
@@ -87,8 +87,9 @@ memory, tool, approval, or Agent Green behavior.
   drain. A non-ignored test runs eight six-client restart cycles, holds one
   reader until five authenticated neighbors finish, validates all terminal
   signatures/order, drains, and proves cleanup. The exact configured CI workload
-  of eight repetitions passed locally; GitHub's weekly cron begins only after
-  default-branch integration. Production-size operated soak remains required.
+  of eight repetitions passed locally. The weekly workflow is present on the
+  default branch, but successful hosted execution is still absent.
+  Production-size operated soak remains required.
 - The protected UDS now also carries a signed, fixed-header service-control
   envelope with the closed lifecycle/tokenize/health/metrics/model-status/
   shutdown catalog. The path-free model-status query returns one signed load,
