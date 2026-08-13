@@ -73,6 +73,13 @@ produced no crash, sanitizer, timeout, or resource-limit artifact. Local `atos`
 symbolizer startup warnings did not stop the campaign. This is smoke evidence,
 not a claim that scheduled or production-size fuzzing is complete.
 
+After adding the closed `ModelStatus` body, the deterministic corpus gained one
+valid request and one valid response seed. A separate five-second macOS ARM64
+campaign on 2026-08-13 completed 16,092 inputs in six wall-clock seconds,
+reached 1,269 coverage counters and 1,777 features, stayed below 82 MiB RSS,
+and produced no crash, sanitizer, timeout, or resource-limit artifact. The same
+non-fatal local `atos` symbolizer warning occurred.
+
 ## Continuous campaign
 
 `.github/workflows/fuzz.yml` runs weekly and on explicit dispatch. Each target

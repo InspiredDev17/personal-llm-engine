@@ -58,6 +58,8 @@ pub enum ServiceMessageKind {
     ShutdownRejected = 16,
     /// Shutdown was accepted by the separate administrative policy.
     ShutdownAccepted = 17,
+    /// Query one registered model's atomic load and scheduler status.
+    ModelStatus = 18,
 }
 
 impl ServiceMessageKind {
@@ -80,6 +82,7 @@ impl ServiceMessageKind {
             15 => Ok(Self::ShutdownRequest),
             16 => Ok(Self::ShutdownRejected),
             17 => Ok(Self::ShutdownAccepted),
+            18 => Ok(Self::ModelStatus),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -96,6 +99,7 @@ impl ServiceMessageKind {
                 | Self::Health
                 | Self::Metrics
                 | Self::ShutdownRequest
+                | Self::ModelStatus
         )
     }
 
@@ -114,6 +118,7 @@ impl ServiceMessageKind {
                 | Self::Error
                 | Self::ShutdownRejected
                 | Self::ShutdownAccepted
+                | Self::ModelStatus
         )
     }
 }
@@ -495,6 +500,42 @@ mod tests {
             ]
         );
         assert_eq!(request.body(), &ServiceRequestBody::Health);
+    }
+
+    #[test]
+    fn go_model_status_request_conformance_fixture_verifies_and_decodes() {
+        let fixture = decode_hex(include_str!(
+            "../../../../docs/native-engine/fixtures/go-service-model-status-request-v1.hex"
+        ));
+        let key_id_bytes = [0x32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let key_id = SignerKeyId::from_bytes(key_id_bytes).expect("Go fixture key ID");
+        let mut signing_seed = [0_u8; 32];
+        signing_seed[0] = 0x31;
+        let signing = SigningKey::from_bytes(&signing_seed);
+        let trusted = TrustedControlPlaneKeys::single(
+            TrustedControlPlaneKey::active(key_id, signing.verifying_key().to_bytes())
+                .expect("Go fixture key"),
+        )
+        .expect("Go fixture key ring");
+        let request = AuthenticatedServiceRequest::decode(&fixture, &trusted)
+            .expect("Go model status request");
+
+        assert_eq!(request.kind(), ServiceMessageKind::ModelStatus);
+        assert_eq!(request.nonce(), 79);
+        assert_eq!(request.control_key_id(), key_id);
+        assert_eq!(
+            request.request_id().to_bytes(),
+            [
+                0x92, 0xb4, 0x66, 0x04, 0x77, 0x70, 0x40, 0xb6, 0xfe, 0x0a, 0x32, 0xb5, 0x7c, 0x3b,
+                0x67, 0xb4,
+            ]
+        );
+        assert_eq!(
+            request.body(),
+            &ServiceRequestBody::ModelStatus(
+                personalai_engine_types::ModelId::new("tiny.decoder").expect("model ID")
+            )
+        );
     }
 
     #[test]

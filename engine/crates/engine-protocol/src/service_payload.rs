@@ -13,6 +13,8 @@ use personalai_engine_types::{
 pub const MAX_SERVICE_REGISTERED_MODELS: usize = 1_024;
 /// Number of fixed `u64` values in a service metrics response.
 pub const SERVICE_METRIC_COUNT: usize = 17;
+/// Exact bytes in an atomic model-status response.
+pub const SERVICE_MODEL_STATUS_BYTES: usize = 44;
 
 const KNOWN_CAPABILITY_BITS: u64 = 0b11_1111;
 
@@ -47,6 +49,8 @@ pub enum ServiceRequestBody {
     Metrics,
     /// Request shutdown through the separately authorized administrative path.
     ShutdownRequest,
+    /// Query one statically registered model's load and scheduler status.
+    ModelStatus(ModelId),
 }
 
 impl ServiceRequestBody {
@@ -62,6 +66,7 @@ impl ServiceRequestBody {
             Self::Health => ServiceMessageKind::Health,
             Self::Metrics => ServiceMessageKind::Metrics,
             Self::ShutdownRequest => ServiceMessageKind::ShutdownRequest,
+            Self::ModelStatus(_) => ServiceMessageKind::ModelStatus,
         }
     }
 
@@ -76,6 +81,7 @@ impl ServiceRequestBody {
             Self::LoadModel(model_id) | Self::UnloadModel(model_id) => {
                 Ok(model_id.as_str().as_bytes().to_vec())
             }
+            Self::ModelStatus(model_id) => Ok(model_id.as_str().as_bytes().to_vec()),
             Self::Tokenize { model_id, text } => encode_tokenize(model_id, text),
         }
     }
@@ -109,6 +115,7 @@ impl ServiceRequestBody {
                 require_empty(payload)?;
                 Ok(Self::ShutdownRequest)
             }
+            ServiceMessageKind::ModelStatus => Ok(Self::ModelStatus(decode_model_id(payload)?)),
             _ => Err(EngineError::protocol_violation("message type has no service request body")),
         }
     }
@@ -253,6 +260,140 @@ impl ServiceMetrics {
     }
 }
 
+/// Atomic, content-free status for one registered model and its scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceModelStatus {
+    model_loaded: bool,
+    health: ServiceHealthStatus,
+    capabilities: ServiceCapabilitySet,
+    active_requests: u32,
+    queued_requests: u32,
+    maximum_active: u32,
+    maximum_queued: u32,
+    queued_bytes: u64,
+    maximum_queued_bytes: u64,
+}
+
+impl ServiceModelStatus {
+    /// Constructs one internally consistent atomic status snapshot.
+    #[expect(clippy::too_many_arguments, reason = "wire fields are intentionally explicit")]
+    pub fn new(
+        model_loaded: bool,
+        health: ServiceHealthStatus,
+        capabilities: ServiceCapabilitySet,
+        active_requests: u32,
+        queued_requests: u32,
+        maximum_active: u32,
+        maximum_queued: u32,
+        queued_bytes: u64,
+        maximum_queued_bytes: u64,
+    ) -> Result<Self, EngineError> {
+        if maximum_active == 0
+            || maximum_queued == 0
+            || maximum_queued_bytes == 0
+            || active_requests > maximum_active
+            || queued_requests > maximum_queued
+            || queued_bytes > maximum_queued_bytes
+        {
+            return Err(EngineError::internal_invariant(
+                "model status scheduler accounting is inconsistent",
+            ));
+        }
+        Ok(Self {
+            model_loaded,
+            health,
+            capabilities,
+            active_requests,
+            queued_requests,
+            maximum_active,
+            maximum_queued,
+            queued_bytes,
+            maximum_queued_bytes,
+        })
+    }
+
+    /// Returns whether the requested registered model is loaded.
+    pub const fn model_loaded(self) -> bool {
+        self.model_loaded
+    }
+
+    /// Returns the service health captured in the same snapshot.
+    pub const fn health(self) -> ServiceHealthStatus {
+        self.health
+    }
+
+    /// Returns reviewed engine capabilities captured in the same snapshot.
+    pub const fn capabilities(self) -> ServiceCapabilitySet {
+        self.capabilities
+    }
+
+    /// Returns active request ownership.
+    pub const fn active_requests(self) -> u32 {
+        self.active_requests
+    }
+
+    /// Returns queued request ownership.
+    pub const fn queued_requests(self) -> u32 {
+        self.queued_requests
+    }
+
+    /// Returns the active request ceiling.
+    pub const fn maximum_active(self) -> u32 {
+        self.maximum_active
+    }
+
+    /// Returns the queued request ceiling.
+    pub const fn maximum_queued(self) -> u32 {
+        self.maximum_queued
+    }
+
+    /// Returns bytes currently retained by the request queue.
+    pub const fn queued_bytes(self) -> u64 {
+        self.queued_bytes
+    }
+
+    /// Returns the aggregate queued-byte ceiling.
+    pub const fn maximum_queued_bytes(self) -> u64 {
+        self.maximum_queued_bytes
+    }
+
+    fn encode(self) -> [u8; SERVICE_MODEL_STATUS_BYTES] {
+        let mut encoded = [0_u8; SERVICE_MODEL_STATUS_BYTES];
+        encoded[0] = u8::from(self.model_loaded);
+        encoded[1] = self.health as u8;
+        encoded[4..12].copy_from_slice(&self.capabilities.bits().to_le_bytes());
+        encoded[12..16].copy_from_slice(&self.active_requests.to_le_bytes());
+        encoded[16..20].copy_from_slice(&self.queued_requests.to_le_bytes());
+        encoded[20..24].copy_from_slice(&self.maximum_active.to_le_bytes());
+        encoded[24..28].copy_from_slice(&self.maximum_queued.to_le_bytes());
+        encoded[28..36].copy_from_slice(&self.queued_bytes.to_le_bytes());
+        encoded[36..44].copy_from_slice(&self.maximum_queued_bytes.to_le_bytes());
+        encoded
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, EngineError> {
+        require_length(payload, SERVICE_MODEL_STATUS_BYTES)?;
+        if payload[0] > 1 || payload[2] != 0 || payload[3] != 0 {
+            return Err(EngineError::protocol_violation(
+                "model status flags or reserved bytes are invalid",
+            ));
+        }
+        let status = Self::new(
+            payload[0] == 1,
+            ServiceHealthStatus::decode(payload[1])?,
+            ServiceCapabilitySet::decode(read_u64(payload, 4)?)?,
+            read_u32(payload, 12)?,
+            read_u32(payload, 16)?,
+            read_u32(payload, 20)?,
+            read_u32(payload, 24)?,
+            read_u64(payload, 28)?,
+            read_u64(payload, 36)?,
+        )
+        .map_err(|_| EngineError::protocol_violation("model status accounting is inconsistent"))?;
+        Ok(status)
+    }
+}
+
 /// Closed response payload catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceResponseBody {
@@ -284,6 +425,8 @@ pub enum ServiceResponseBody {
     Health(ServiceHealthStatus),
     /// Content-free runtime metrics.
     Metrics(ServiceMetrics),
+    /// Atomic status for one registered model and scheduler.
+    ModelStatus(ServiceModelStatus),
     /// Stable failure category without sensitive diagnostics.
     Error(ServiceErrorCode),
     /// Shutdown lacks separate administrative authorization.
@@ -305,6 +448,7 @@ impl ServiceResponseBody {
             Self::Tokenized(_) => ServiceMessageKind::Tokenize,
             Self::Health(_) => ServiceMessageKind::Health,
             Self::Metrics(_) => ServiceMessageKind::Metrics,
+            Self::ModelStatus(_) => ServiceMessageKind::ModelStatus,
             Self::Error(_) => ServiceMessageKind::Error,
             Self::ShutdownRejected(_) => ServiceMessageKind::ShutdownRejected,
             Self::ShutdownAccepted => ServiceMessageKind::ShutdownAccepted,
@@ -328,6 +472,7 @@ impl ServiceResponseBody {
                 }
                 Ok(encoded)
             }
+            Self::ModelStatus(status) => Ok(status.encode().to_vec()),
             Self::Error(code) => Ok(vec![*code as u8]),
             Self::ShutdownRejected(reason) => Ok(vec![*reason as u8]),
         }
@@ -372,6 +517,9 @@ impl ServiceResponseBody {
                     *value = read_u64(payload, index * 8)?;
                 }
                 Ok(Self::Metrics(ServiceMetrics::new(values)))
+            }
+            ServiceMessageKind::ModelStatus => {
+                Ok(Self::ModelStatus(ServiceModelStatus::decode(payload)?))
             }
             ServiceMessageKind::Error => {
                 require_length(payload, 1)?;
@@ -641,6 +789,7 @@ mod tests {
             ServiceRequestBody::Health,
             ServiceRequestBody::Metrics,
             ServiceRequestBody::ShutdownRequest,
+            ServiceRequestBody::ModelStatus(model("tiny-status")),
         ];
         for body in bodies {
             let encoded = body.encode().expect("request body must encode");
@@ -672,6 +821,20 @@ mod tests {
             ServiceResponseBody::Metrics(ServiceMetrics::new(core::array::from_fn(|index| {
                 u64::try_from(index).expect("metric index")
             }))),
+            ServiceResponseBody::ModelStatus(
+                ServiceModelStatus::new(
+                    true,
+                    ServiceHealthStatus::Ready,
+                    capabilities,
+                    1,
+                    2,
+                    4,
+                    8,
+                    1_024,
+                    8_192,
+                )
+                .expect("model status"),
+            ),
             ServiceResponseBody::Error(ServiceErrorCode::ProtocolViolation),
             ServiceResponseBody::ShutdownRejected(
                 ShutdownRejectionReason::AdministrativeAuthorizationRequired,
@@ -693,6 +856,13 @@ mod tests {
         assert!(ServiceResponseBody::decode(ServiceMessageKind::Health, &[]).is_err());
         assert!(ServiceResponseBody::decode(ServiceMessageKind::Health, &[1, 0]).is_err());
         assert!(ServiceResponseBody::decode(ServiceMessageKind::ShutdownAccepted, &[0]).is_err());
+        assert!(
+            ServiceResponseBody::decode(
+                ServiceMessageKind::ModelStatus,
+                &[0; SERVICE_MODEL_STATUS_BYTES - 1],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -716,6 +886,15 @@ mod tests {
                 &[1, 0, 0, 0, 255, 255, 255, 255],
             )
             .is_err()
+        );
+        let mut inconsistent = [0_u8; SERVICE_MODEL_STATUS_BYTES];
+        inconsistent[0] = 2;
+        inconsistent[1] = ServiceHealthStatus::Ready as u8;
+        inconsistent[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        inconsistent[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        inconsistent[36..44].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(
+            ServiceResponseBody::decode(ServiceMessageKind::ModelStatus, &inconsistent).is_err()
         );
     }
 

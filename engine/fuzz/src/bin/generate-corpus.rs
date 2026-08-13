@@ -69,6 +69,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .flat_map(|byte| u32::from(*byte).to_le_bytes())
         .collect::<Vec<_>>();
+    let mut model_status_request = vec![0, 18];
+    model_status_request.extend_from_slice(b"fuzz-seed");
+    let mut model_status_response = vec![1, 18];
+    let mut model_status_body = [0_u8; 44];
+    model_status_body[0] = 1;
+    model_status_body[1] = 1;
+    model_status_body[4..12].copy_from_slice(&0x31_u64.to_le_bytes());
+    model_status_body[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    model_status_body[24..28].copy_from_slice(&8_u32.to_le_bytes());
+    model_status_body[36..44].copy_from_slice(&(64_u64 << 20).to_le_bytes());
+    model_status_response.extend_from_slice(&model_status_body);
 
     write_seed(&corpus, "model_package", "valid-decoder.paipkg", fixture.bytes())?;
     write_seed(&corpus, "model_package", "truncated-magic", b"PAIMDL")?;
@@ -83,6 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_seed(&corpus, "protocol_frame", "truncated-magic", b"PAIE")?;
     write_seed(&corpus, "service_envelope", "valid-health-request", &[0, 12])?;
     write_seed(&corpus, "service_envelope", "valid-health-response", &[1, 12, 1])?;
+    write_seed(&corpus, "service_envelope", "valid-model-status-request", &model_status_request)?;
+    write_seed(&corpus, "service_envelope", "valid-model-status-response", &model_status_response)?;
     write_seed(&corpus, "service_envelope", "malformed-tokenize-request", &[0, 8, 5, 0, b'x'])?;
     write_seed(&corpus, "manifest_parser", "valid-directory.aipm", &manifest)?;
     write_seed(&corpus, "manifest_parser", "truncated-magic", b"PAIDIR")?;

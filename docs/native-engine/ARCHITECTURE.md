@@ -330,7 +330,8 @@ identities but a separate fixed `PAISVC01` envelope. Its header carries the
 closed message type, nonzero nonce, request ID, control key ID, and exact
 payload length; `PAISVR01` responses are signed by the engine identity. The
 catalog is limited to negotiation, capability/model listing, registered-ID
-load/unload, tokenize, health, metrics, and shutdown response types. Normal
+load/unload, tokenize, health, metrics, atomic registered-model status, and
+shutdown response types. Normal
 data-plane sessions cannot authorize shutdown. Package paths, signer
 configuration, model budgets, and administrative authority never cross this
 protocol. Each message uses a closed, bounded first-party body codec; signing
@@ -339,7 +340,10 @@ unknown values, duplicate model IDs, malformed lengths, invalid token IDs,
 truncation, and trailing data before exposing a typed body. The exact
 single-command driver serves these control requests;
 continuous generation/cancellation streams retain their bounded path.
-ADR-0020 defines the format and deterministic 4:2:1 scheduler.
+The model-status response combines load state, health, capabilities, scheduler
+counts/limits, and queued-byte accounting under one signed correlation rather
+than making the Go router combine independent observations. ADR-0020 defines
+the format and deterministic 4:2:1 scheduler.
 
 Target service confinement is independent of Rust configuration. Linux uses
 the checked-in systemd unit with `AF_UNIX` and all-IP denial. macOS development

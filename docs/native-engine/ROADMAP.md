@@ -90,7 +90,10 @@ memory, tool, approval, or Agent Green behavior.
   of eight repetitions passed locally; GitHub's weekly cron begins only after
   default-branch integration. Production-size operated soak remains required.
 - The protected UDS now also carries a signed, fixed-header service-control
-  envelope with the closed lifecycle/tokenize/health/metrics/shutdown catalog.
+  envelope with the closed lifecycle/tokenize/health/metrics/model-status/
+  shutdown catalog. The path-free model-status query returns one signed load,
+  capability, health, and scheduler-accounting snapshot for Go resource
+  routing.
   Owner-configured model budgets remain outside client messages, unload rejects
   scheduler ownership, and normal data-plane clients cannot authorize shutdown.
   Scheduler admission adds deterministic 4:2:1 priority service, bounded agent

@@ -30,24 +30,28 @@ lifecycle acknowledgements; validated `ModelId` text for load/unload; a
 `u16` model-ID length plus bounded UTF-8 text for tokenize; a reviewed `u64`
 capability mask; at most 1,024 length-prefixed unique model IDs; a `u32` token
 count followed by validated `u32` token IDs; one closed byte for health,
-errors, and shutdown rejection; and exactly 17 little-endian `u64` metrics.
+errors, and shutdown rejection; exactly 17 little-endian `u64` metrics; and a
+fixed 44-byte model-status snapshot containing loaded state, health,
+capabilities, active/queued counts and limits, and queued-byte use and limit.
 Unknown capability bits, enum values, token IDs, duplicate models, truncation,
 trailing data, invalid UTF-8, NUL prompt text, and kind/body mismatches fail
 closed. This tightens parsing without changing the PAISVC01/PAISVR01 wire
 representation.
 
-`fixtures/go-service-health-request-v1.hex` is an exact signed health request
+`fixtures/go-service-health-request-v1.hex` and
+`fixtures/go-service-model-status-request-v1.hex` are exact signed requests
 emitted by the production Go encoder with deterministic test-only identity
-material. The Rust decoder verifies its signature, correlation fields, key ID,
-message kind, and empty health body. The reciprocal Rust-generated signed
-response fixture is verified in Go. These copied fixtures are transitional
-cross-repository evidence until Sovereign Contracts owns a shared canonical
-corpus.
+material. The Rust decoder verifies their signatures, correlation fields, key
+IDs, message kinds, and bodies. Reciprocal Rust-generated signed health and
+model-status response fixtures are verified in Go. These copied fixtures are
+transitional cross-repository evidence until Sovereign Contracts owns a shared
+canonical corpus.
 
 The closed service catalog is `Hello`, `HelloAccepted`, `HelloRejected`,
 `ListCapabilities`, `ListRegisteredModels`, `LoadModel`, `UnloadModel`,
 `Tokenize`, `Generate`, `Cancel`, `GenerationEvent`, `Health`, `Metrics`,
-`Error`, `ShutdownRequest`, `ShutdownRejected`, and `ShutdownAccepted`.
+`Error`, `ShutdownRequest`, `ShutdownRejected`, `ShutdownAccepted`, and
+`ModelStatus`.
 Generation, cancellation, and events remain their specialized streams. Normal
 data-plane authentication always returns `ShutdownRejected`; only the
 owner-controlled process signal may begin graceful drain. `ShutdownAccepted`
@@ -57,7 +61,10 @@ Metrics are fixed-order unsigned counters and never contain prompts, generated
 content, paths, keys, or model bytes. Health is `ready`, `degraded` (no loaded
 model), or `draining`. Load uses an owner-installed budget for a statically
 registered ID. Unload rejects queued or active ownership. Package failures
-produce bounded typed security events for Go polling.
+produce bounded typed security events for Go polling. `ModelStatus` resolves
+one registered ID and returns one signed response containing the load,
+capability, health, and scheduler-accounting values used for resource routing;
+the request never carries a path.
 
 The admission scheduler uses three queues and the repeating deterministic
 dispatch cycle `interactive, standard, interactive, background, interactive,

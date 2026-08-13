@@ -43,8 +43,8 @@ use personalai_engine_protocol::{
     AuthenticatedServiceRequest, CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind,
     GENERATION_EVENT_AUTH_BYTES, GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind,
-    ServiceMetrics, ServiceRequestBody, ServiceResponseBody, ShutdownRejectionReason,
-    encode_signed_service_response,
+    ServiceMetrics, ServiceModelStatus, ServiceRequestBody, ServiceResponseBody,
+    ShutdownRejectionReason, encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -1499,12 +1499,7 @@ impl CpuEngineRuntime {
                 }
             }
             ServiceRequestBody::ListCapabilities => {
-                let capabilities = ServiceCapabilitySet::from_capabilities([
-                    EngineCapability::CpuReference,
-                    EngineCapability::StreamingGeneration,
-                    EngineCapability::UnixDomainSocket,
-                ])?;
-                Ok(ServiceResponseBody::Capabilities(capabilities))
+                Ok(ServiceResponseBody::Capabilities(service_capabilities()?))
             }
             ServiceRequestBody::ListRegisteredModels => {
                 let models = self
@@ -1546,12 +1541,7 @@ impl CpuEngineRuntime {
                 Ok(ServiceResponseBody::Tokenized(tokens))
             }
             ServiceRequestBody::Health => {
-                let state = match self.health() {
-                    ServiceHealth::Ready => ServiceHealthStatus::Ready,
-                    ServiceHealth::Degraded => ServiceHealthStatus::Degraded,
-                    ServiceHealth::Draining => ServiceHealthStatus::Draining,
-                };
-                Ok(ServiceResponseBody::Health(state))
+                Ok(ServiceResponseBody::Health(service_health_status(self.health())))
             }
             ServiceRequestBody::Metrics => {
                 Ok(ServiceResponseBody::Metrics(service_metrics(self.metrics()?)))
@@ -1559,6 +1549,32 @@ impl CpuEngineRuntime {
             ServiceRequestBody::ShutdownRequest => Ok(ServiceResponseBody::ShutdownRejected(
                 ShutdownRejectionReason::AdministrativeAuthorizationRequired,
             )),
+            ServiceRequestBody::ModelStatus(model_id) => {
+                self.service.registry.resolve(model_id)?;
+                let limits = self.service.scheduler.limits();
+                let status = ServiceModelStatus::new(
+                    self.models.contains_key(model_id.as_str()),
+                    service_health_status(self.health()),
+                    service_capabilities()?,
+                    u32::try_from(self.service.scheduler.active_len()).map_err(|_| {
+                        EngineError::internal_invariant("active scheduler count exceeds u32")
+                    })?,
+                    u32::try_from(self.service.scheduler.queued_len()).map_err(|_| {
+                        EngineError::internal_invariant("queued scheduler count exceeds u32")
+                    })?,
+                    limits.maximum_active(),
+                    u32::try_from(limits.maximum_queued()).map_err(|_| {
+                        EngineError::internal_invariant("queued scheduler limit exceeds u32")
+                    })?,
+                    u64::try_from(self.service.scheduler.queued_bytes()).map_err(|_| {
+                        EngineError::internal_invariant("queued scheduler bytes exceed u64")
+                    })?,
+                    u64::try_from(limits.maximum_queued_bytes()).map_err(|_| {
+                        EngineError::internal_invariant("queued scheduler byte limit exceeds u64")
+                    })?,
+                )?;
+                Ok(ServiceResponseBody::ModelStatus(status))
+            }
         }
     }
 
@@ -2628,6 +2644,24 @@ fn service_response_frame(
 ) -> Result<Frame, EngineError> {
     let payload = encode_signed_service_response(request_id, request_nonce, body, signer)?;
     Frame::new(FrameKind::ServiceResponse, payload)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn service_capabilities() -> Result<ServiceCapabilitySet, EngineError> {
+    ServiceCapabilitySet::from_capabilities([
+        EngineCapability::CpuReference,
+        EngineCapability::StreamingGeneration,
+        EngineCapability::UnixDomainSocket,
+    ])
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+const fn service_health_status(health: ServiceHealth) -> ServiceHealthStatus {
+    match health {
+        ServiceHealth::Ready => ServiceHealthStatus::Ready,
+        ServiceHealth::Degraded => ServiceHealthStatus::Degraded,
+        ServiceHealth::Draining => ServiceHealthStatus::Draining,
+    }
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -4621,6 +4655,82 @@ mod tests {
             Ok(ServeOutcome::ServiceResponded {
                 request_id: returned,
                 kind: ServiceMessageKind::Health,
+            }) if returned == request_id
+        ));
+        client.join().expect("client must finish");
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_model_status_is_one_signed_scheduler_snapshot() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut fixture = BatchRuntimeFixture::new("service-model-status", 1);
+        let request_id = RequestId::new(0x5252).expect("request ID");
+        let request_body = ServiceRequestBody::ModelStatus(fixture.model_id.clone());
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            request_id,
+            2,
+            fixture.control_key_id,
+            &request_body,
+        )
+        .expect("service request must encode");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+        let encoded = Frame::new(FrameKind::ServiceRequest, payload)
+            .expect("service frame")
+            .encode()
+            .expect("encoded service frame");
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            stream.write_all(&encoded).expect("request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length");
+            let mut frame = header.to_vec();
+            frame.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("response payload");
+            let response = Frame::decode_outbound_exact(&frame).expect("response frame");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            let verified = AuthenticatedServiceResponse::decode(
+                response.payload(),
+                request_id,
+                2,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("service response must verify");
+            let ServiceResponseBody::ModelStatus(status) = verified.body() else {
+                panic!("model status response kind changed");
+            };
+            assert!(status.model_loaded());
+            assert_eq!(status.health(), ServiceHealthStatus::Ready);
+            assert!(
+                status
+                    .capabilities()
+                    .contains(EngineCapability::CpuReference)
+                    .expect("known capability")
+            );
+            assert_eq!(status.active_requests(), 0);
+            assert_eq!(status.queued_requests(), 0);
+            assert_eq!(status.maximum_active(), 1);
+            assert_eq!(status.maximum_queued(), 8);
+            assert_eq!(status.queued_bytes(), 0);
+            assert_eq!(status.maximum_queued_bytes(), 4 << 20);
+        });
+        assert!(matches!(
+            fixture.runtime.serve_one(&fixture.listener),
+            Ok(ServeOutcome::ServiceResponded {
+                request_id: returned,
+                kind: ServiceMessageKind::ModelStatus,
             }) if returned == request_id
         ));
         client.join().expect("client must finish");
