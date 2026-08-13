@@ -17,6 +17,8 @@ personalai-engine-loader = { path = "../crates/engine-loader" }
 personalai-engine-model-format = { path = "../crates/engine-model-format" }
 personalai-engine-model-importer = { path = "../crates/engine-model-importer" }
 personalai-engine-protocol = { path = "../crates/engine-protocol" }
+personalai-engine-sampling = { path = "../crates/engine-sampling" }
+personalai-engine-tensor = { path = "../crates/engine-tensor" }
 personalai-engine-testkit = { path = "../crates/engine-testkit" }
 personalai-engine-tokenizer = { path = "../crates/engine-tokenizer" }
 personalai-engine-types = { path = "../crates/engine-types" }
@@ -108,6 +110,27 @@ bench = false
 [[bin]]
 name = "model_registry_v2"
 path = "fuzz_targets/model_registry_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "configuration_importer"
+path = "fuzz_targets/configuration_importer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "generation_request"
+path = "fuzz_targets/generation_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sampling_parameters"
+path = "fuzz_targets/sampling_parameters.rs"
 test = false
 doc = false
 bench = false

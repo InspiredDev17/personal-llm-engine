@@ -17,6 +17,12 @@ must never contain the response signing seed. systemd presents the exact
 32-byte seed from its credential directory on standard input; the engine clears
 its copy after signer construction.
 
+The template also sets a nonexistent home, removes common cloud/proxy secret
+variables, disables core dumps and swap, restricts namespaces, and caps open
+files at 1,024, processes/tasks at 128, and resident memory at 16 GiB. Review
+and lower the memory ceiling for the selected package and host. Raising any
+limit requires recorded capacity and denial-of-service review.
+
 Before enabling the unit, substitute a legally approved registered package and
 run `systemd-analyze security personalai-engine.service`. Operated proof must
 also show that generation succeeds over `/run/personalai-engine/engine.sock`

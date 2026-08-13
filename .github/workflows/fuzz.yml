@@ -123,6 +123,27 @@ jobs:
           --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
           model_registry_v2 "$RUNNER_TEMP/personalai-fuzz-corpus/model_registry_v2"
           -- -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz offline tokenizer configuration importer
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          configuration_importer "$RUNNER_TEMP/personalai-fuzz-corpus/configuration_importer"
+          -- -max_total_time=60 -max_len=262144 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz authenticated generation request parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          generation_request "$RUNNER_TEMP/personalai-fuzz-corpus/generation_request"
+          -- -max_total_time=60 -max_len=262144 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz sampling parameter validation and selection
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          sampling_parameters "$RUNNER_TEMP/personalai-fuzz-corpus/sampling_parameters"
+          -- -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=1024
       - name: Preserve crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

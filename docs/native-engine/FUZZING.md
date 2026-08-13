@@ -30,6 +30,9 @@ reproducible.
 | `safetensors_import` | offline importer's bounded safetensors parser | 8 MiB campaign input |
 | `package_path_resolution` | safe direct-child `.paimodel` name parser | 1,024 bytes |
 | `model_registry_v2` | canonical signed Model Foundry registry V2 parser | 64 KiB |
+| `configuration_importer` | strict offline `AIPTOK-METADATA-V1` conversion | 256 KiB campaign input; parser hard cap 64 MiB |
+| `generation_request` | correctly signed generation envelope and request fields | 256 KiB campaign prompt |
+| `sampling_parameters` | sampler parameter validation and bounded token selection | 4 KiB campaign input; 128-token harness vocabulary |
 
 The input ceiling is a campaign resource bound, not a reduction of the parser's
 documented format limit. Deterministic unit and mutation tests continue to
@@ -97,6 +100,32 @@ target received a separate bounded 1,000-run macOS ARM64 smoke campaign on
 timeout, or resource-limit artifact. Non-fatal local `atos` symbolizer warnings
 did not stop the campaign. This is smoke evidence only, not a completeness
 claim.
+
+On 2026-08-13, all nine release-requested boundaries (`manifest_parser`,
+`tensor_index_parser`, `aiptok_parser`, `safetensors_import`,
+`configuration_importer`, `protocol_frame`, `generation_request`,
+`sampling_parameters`, and `model_registry_v2`) received separate five-second
+macOS ARM64 campaigns from deterministic valid and malformed seeds. Each target
+reported `Done` after six wall-clock seconds; the combined command exited zero
+with no crash, timeout, sanitizer, or resource-limit artifact. Local `atos`
+symbolizer startup warnings were non-fatal. The command was:
+
+```sh
+for target in manifest_parser tensor_index_parser aiptok_parser \
+  safetensors_import configuration_importer protocol_frame \
+  generation_request sampling_parameters model_registry_v2; do
+  cargo +nightly-2026-08-01 fuzz run --fuzz-dir engine/fuzz "$target" \
+    "engine/fuzz/corpus/$target" -- \
+    -max_total_time=5 -timeout=5 -rss_limit_mb=1024 || exit 1
+done
+```
+
+The generation harness was then corrected to carry a valid model ID so valid
+requests reach prompt parsing, and rerun against a temporary corpus: 11,658
+inputs, 845 coverage counters, 923 features, 76 MiB RSS, and no crash or
+resource artifact in six seconds. The resulting 60 seconds of aggregate target
+runtime is smoke evidence, not evidence of parser exhaustion or long-duration
+coverage stability.
 
 ## Continuous campaign
 

@@ -33,7 +33,8 @@ All other registry packages in the fuzz lock are exact versions already
 reviewed in `docs/native-engine/DEPENDENCY-INVENTORY.md` for the production
 path crates exercised by the targets.
 
-The directory-manifest, tensor-index, safetensors-import, package-path, AIPTok
+The directory-manifest, tensor-index, safetensors-import, configuration-import,
+generation-request, sampling-parameter, package-path, AIPTok
 parser, encode, decode, incremental-state, and authenticated service-envelope
 targets add only first-party path dependencies plus a direct declaration of
 the already production-reviewed `ed25519-dalek 3.0.0` used to re-sign mutated

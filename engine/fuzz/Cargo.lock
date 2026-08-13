@@ -201,6 +201,8 @@ dependencies = [
  "personalai-engine-model-format",
  "personalai-engine-model-importer",
  "personalai-engine-protocol",
+ "personalai-engine-sampling",
+ "personalai-engine-tensor",
  "personalai-engine-testkit",
  "personalai-engine-tokenizer",
  "personalai-engine-types",
@@ -214,6 +216,7 @@ dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-quantization",
  "personalai-engine-tensor",
  "personalai-engine-types",
 ]
@@ -241,6 +244,7 @@ dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-quantization",
  "personalai-engine-tensor",
  "personalai-engine-tokenizer",
  "personalai-engine-types",
@@ -252,6 +256,25 @@ name = "personalai-engine-protocol"
 version = "0.1.0"
 dependencies = [
  "personalai-engine-crypto",
+ "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-quantization"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-tensor",
+ "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-sampling"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-memory",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 

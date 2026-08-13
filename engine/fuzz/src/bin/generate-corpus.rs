@@ -3,6 +3,7 @@ use personalai_engine_model_format::{
     DirectoryManifestBuilder, DirectoryShardRecord, DirectoryTensorRecord, ParsedModelPackage,
     Quantization,
 };
+use personalai_engine_model_importer::convert_aiptok_metadata;
 use personalai_engine_protocol::{Frame, FrameKind};
 use personalai_engine_testkit::DecoderPackageFixtureBuilder;
 use personalai_engine_types::{ContextLimit, DType, ModelId, ModelPackageHash, TensorShape};
@@ -91,6 +92,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     model_status_body[24..28].copy_from_slice(&8_u32.to_le_bytes());
     model_status_body[36..44].copy_from_slice(&(64_u64 << 20).to_le_bytes());
     model_status_response.extend_from_slice(&model_status_body);
+    let mut tokenizer_metadata = String::from(
+        "AIPTOK-METADATA-V1\nfamily=byte-level-bpe-v1\nnormalizer=preserve-bytes\n\
+pre_tokenizer=none\ndecoder=concatenate-bytes-skip-special\nunknown_policy=byte-fallback\n\
+chat_template=none\nvocabulary_size=259\nbos_token_id=256\neos_token_id=257\n\
+unknown_token_id=258\nmaximum_input_bytes=4096\nmaximum_produced_tokens=4096\n",
+    );
+    for token_id in 0_u32..256 {
+        tokenizer_metadata.push_str(&format!("token {token_id} ordinary {token_id:02x}\n"));
+    }
+    tokenizer_metadata.push_str(
+        "token 256 bos 3c7c626f737c3e\ntoken 257 eos 3c7c656f737c3e\ntoken 258 unknown 3c7c756e6b7c3e\nmerge_count=0\n",
+    );
+    let _validated_tokenizer_seed = convert_aiptok_metadata(tokenizer_metadata.as_bytes())?;
+    let mut sampling_parameters = vec![0_u8; 42];
+    sampling_parameters[0..4].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+    sampling_parameters[9..13].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+    sampling_parameters[13..17].copy_from_slice(&0.0_f32.to_bits().to_le_bytes());
+    sampling_parameters[17..21].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+    sampling_parameters[25] = 4;
+    for (index, value) in [0.0_f32, 1.0, 2.0, 3.0].iter().enumerate() {
+        let start = 26 + index * 4;
+        sampling_parameters[start..start + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+    }
 
     write_seed(&corpus, "model_package", "valid-decoder.paipkg", fixture.bytes())?;
     write_seed(&corpus, "model_package", "truncated-magic", b"PAIMDL")?;
@@ -129,5 +153,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     ));
     write_seed(&corpus, "model_registry_v2", "valid-entry.json", registry)?;
     write_seed(&corpus, "model_registry_v2", "truncated-entry", b"{\"entry\":\n")?;
+    write_seed(
+        &corpus,
+        "configuration_importer",
+        "valid-aiptok-metadata.txt",
+        tokenizer_metadata.as_bytes(),
+    )?;
+    write_seed(
+        &corpus,
+        "configuration_importer",
+        "unsupported-template.txt",
+        b"AIPTOK-METADATA-V1\nfamily=byte-level-bpe-v1\nnormalizer=script\n",
+    )?;
+    write_seed(&corpus, "generation_request", "valid-prompt", b"local prompt")?;
+    write_seed(&corpus, "generation_request", "invalid-utf8-prompt", &[0xff, 0xfe])?;
+    write_seed(&corpus, "sampling_parameters", "valid-stochastic.bin", &sampling_parameters)?;
+    write_seed(
+        &corpus,
+        "sampling_parameters",
+        "nonfinite-temperature.bin",
+        &f32::NAN.to_bits().to_le_bytes(),
+    )?;
     Ok(())
 }

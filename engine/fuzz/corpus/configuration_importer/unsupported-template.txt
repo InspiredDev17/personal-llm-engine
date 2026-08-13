@@ -1,0 +1,3 @@
+AIPTOK-METADATA-V1
+family=byte-level-bpe-v1
+normalizer=script
