@@ -93,11 +93,15 @@ regular files, permissive entries, and uncertain liveness fail closed.
 
 ## Consequences and limits
 
-The exact single-command reference path serves the complete service-control
-catalog. The continuous path currently admits generation/cancellation streams;
-general control requests use short separate connections through the same
-authenticated listener. CPU generation remains scalar and one token per
-round-robin quantum; continuous batching is not claimed. CPU timings are
+Both the exact single-command reference path and the long-running continuous
+path serve the complete service-control catalog. Continuous control requests
+use short authenticated connections under the same global connection ceiling
+while generation streams retain their bounded queues and cancellation watchers.
+Generation cursors own cloned immutable model and tokenizer handles, allowing
+the owner-configured model map to change without invalidating in-flight state;
+unload still fails closed whenever scheduler state owns that model. CPU
+generation remains scalar and one token per round-robin quantum; continuous
+batching is not claimed. CPU timings are
 operational observability, not benchmark evidence: clock resolution, host load,
 and scalar fixture size can yield zero-duration individual turns. Accelerator
 backends must supply separate device-memory and timing accounting before they

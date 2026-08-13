@@ -32,6 +32,16 @@ read/write deadline. Each incomplete handshake runs in one fallibly created,
 Authentication and durable nonce admission complete before the command enters
 the scheduler.
 
+Authenticated service-control commands use the same continuous accept path,
+same peer/signature/replay checks, and same connection ceiling. Their one
+bounded signed response is written under the finite frame timeout. Health,
+metrics, capabilities, registered-model listing, tokenization, model status,
+registered-ID load/unload, and shutdown rejection therefore remain available
+while the daemon is continuously admitting generation. Generation cursors own
+cloned immutable model/tokenizer handles, so inserting another validated model
+cannot invalidate active state; scheduler ownership still rejects unload of an
+active or queued model.
+
 Authenticated generation streams reuse ADR-0009's fixed output queue and
 bounded writer plus the existing same-stream cancellation watcher. Requests can
 remain in the bounded scheduler queue while active cursors advance one turn at a
@@ -63,6 +73,8 @@ authority, filesystem scope, or outbound-network capability changes.
 - A client controls neither listener mode, worker count, queue capacity, nor
   shutdown.
 - Authentication and synchronized replay admission precede scheduler mutation.
+- Service controls cannot install paths, signer state, budgets, or shutdown authority.
+- Model-map mutation cannot invalidate an active generation's immutable handles.
 - New queued requests do not mutate active KV/session state.
 - Shutdown and every error path join all owned workers and leave no queued or
   active scheduler request.

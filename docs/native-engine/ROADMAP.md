@@ -106,7 +106,9 @@ memory, tool, approval, or Agent Green behavior.
   envelope with the closed lifecycle/tokenize/health/metrics/model-status/
   shutdown catalog. The path-free model-status query returns one signed load,
   capability, health, and scheduler-accounting snapshot for Go resource
-  routing.
+  routing. The complete catalog is served by both the one-command reference
+  path and the continuously admitting daemon, including while another stream
+  generates.
   Owner-configured model budgets remain outside client messages, unload rejects
   scheduler ownership, and normal data-plane clients cannot authorize shutdown.
   Scheduler admission adds deterministic 4:2:1 priority service, bounded agent

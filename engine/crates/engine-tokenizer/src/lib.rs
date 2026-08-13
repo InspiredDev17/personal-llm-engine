@@ -13,6 +13,7 @@ use personalai_engine_types::{
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::mem::size_of;
+use std::sync::Arc;
 
 /// Maximum vocabulary size accepted by the engine.
 pub use personalai_engine_types::MAX_VOCABULARY_SIZE;
@@ -616,23 +617,36 @@ impl Tokenizer for FirstPartyBpeTokenizer {
 
 /// Stateful strict UTF-8 decoder for token-at-a-time generation.
 pub struct IncrementalDecoder<'a> {
-    tokenizer: &'a dyn Tokenizer,
+    tokenizer: TokenizerHandle<'a>,
     pending: Vec<u8>,
     decoded_bytes: usize,
+}
+
+enum TokenizerHandle<'a> {
+    Borrowed(&'a dyn Tokenizer),
+    Shared(Arc<dyn Tokenizer>),
 }
 
 impl<'a> IncrementalDecoder<'a> {
     /// Starts an empty decoder over immutable tokenizer tables.
     pub fn new(tokenizer: &'a dyn Tokenizer) -> Self {
-        Self { tokenizer, pending: Vec::with_capacity(4), decoded_bytes: 0 }
+        Self {
+            tokenizer: TokenizerHandle::Borrowed(tokenizer),
+            pending: Vec::with_capacity(4),
+            decoded_bytes: 0,
+        }
     }
 
     /// Pushes one token and returns the currently complete UTF-8 prefix.
     pub fn push(&mut self, token: u32) -> Result<String, EngineError> {
-        if self.tokenizer.is_special_token(token)? {
+        let tokenizer = match &self.tokenizer {
+            TokenizerHandle::Borrowed(tokenizer) => *tokenizer,
+            TokenizerHandle::Shared(tokenizer) => tokenizer.as_ref(),
+        };
+        if tokenizer.is_special_token(token)? {
             return Ok(String::new());
         }
-        let piece = self.tokenizer.token_piece(token)?;
+        let piece = tokenizer.token_piece(token)?;
         self.decoded_bytes = self
             .decoded_bytes
             .checked_add(piece.len())
@@ -675,6 +689,17 @@ impl<'a> IncrementalDecoder<'a> {
     /// Returns whether a partial UTF-8 sequence is buffered.
     pub fn has_pending_bytes(&self) -> bool {
         !self.pending.is_empty()
+    }
+}
+
+impl IncrementalDecoder<'static> {
+    /// Starts an owned decoder over shared immutable tokenizer tables.
+    pub fn new_shared(tokenizer: Arc<dyn Tokenizer>) -> Self {
+        Self {
+            tokenizer: TokenizerHandle::Shared(tokenizer),
+            pending: Vec::with_capacity(4),
+            decoded_bytes: 0,
+        }
     }
 }
 

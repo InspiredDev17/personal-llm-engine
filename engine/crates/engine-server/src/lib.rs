@@ -326,10 +326,11 @@ pub struct EngineService {
 
 /// Fully loaded CPU model and its first-party tokenizer.
 #[cfg(feature = "cpu-reference")]
+#[derive(Clone)]
 pub struct LoadedCpuModel {
     model_id: ModelId,
     model: CpuDecoderModel,
-    tokenizer: Box<dyn Tokenizer>,
+    tokenizer: Arc<dyn Tokenizer>,
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -354,21 +355,21 @@ impl LoadedCpuModel {
     /// Each call to [`GreedyGeneration::advance`] performs at most one decoder
     /// token step. This is the scheduling boundary used to interleave sequences
     /// without sharing their KV caches or cancellation state.
-    pub fn start_greedy<'a>(
-        &'a self,
+    pub fn start_greedy(
+        &self,
         request: &GenerationRequest,
         sequence_id: SequenceId,
-    ) -> Result<GreedyGeneration<'a>, EngineError> {
+    ) -> Result<GreedyGeneration, EngineError> {
         self.start_generation(request, sequence_id, SamplingConfig::greedy())
     }
 
     /// Creates one validated, resumable generation sequence with first-party sampling.
-    pub fn start_generation<'a>(
-        &'a self,
+    pub fn start_generation(
+        &self,
         request: &GenerationRequest,
         sequence_id: SequenceId,
         sampling: SamplingConfig,
-    ) -> Result<GreedyGeneration<'a>, EngineError> {
+    ) -> Result<GreedyGeneration, EngineError> {
         if request.model_id() != &self.model_id {
             return Err(EngineError::invalid_input(
                 "generation request model differs from the loaded model",
@@ -388,8 +389,8 @@ impl LoadedCpuModel {
         Ok(GreedyGeneration {
             request: request.clone(),
             sequence_id,
-            model: &self.model,
-            tokenizer: self.tokenizer.as_ref(),
+            model: self.model.clone(),
+            tokenizer: Arc::clone(&self.tokenizer),
             session: None,
             input_tokens,
             input_count,
@@ -398,7 +399,7 @@ impl LoadedCpuModel {
             next_input: 0,
             next_generated_token: None,
             generated: 0,
-            stream_decoder: IncrementalDecoder::new(self.tokenizer.as_ref()),
+            stream_decoder: IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer)),
             started: false,
             terminal: None,
             usage: None,
@@ -562,7 +563,7 @@ impl LoadedCpuModel {
                 EngineError::resource_exhaustion("generation history allocation failed")
             })?;
         let mut sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
-        let mut decoder = IncrementalDecoder::new(self.tokenizer.as_ref());
+        let mut decoder = IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer));
         let mut generated = 0_u32;
         loop {
             check_cancelled(cancelled, request.request_id())?;
@@ -754,12 +755,12 @@ enum TerminalState {
 /// at most one model token step so an engine-owned scheduler can rotate fairly
 /// among active sequences.
 #[cfg(feature = "cpu-reference")]
-pub struct GreedyGeneration<'a> {
+pub struct GreedyGeneration {
     request: GenerationRequest,
     sequence_id: SequenceId,
-    model: &'a CpuDecoderModel,
-    tokenizer: &'a dyn Tokenizer,
-    session: Option<CpuDecoderSession<'a>>,
+    model: CpuDecoderModel,
+    tokenizer: Arc<dyn Tokenizer>,
+    session: Option<CpuDecoderSession>,
     input_tokens: Vec<u32>,
     input_count: u32,
     history: Vec<u32>,
@@ -767,7 +768,7 @@ pub struct GreedyGeneration<'a> {
     next_input: usize,
     next_generated_token: Option<u32>,
     generated: u32,
-    stream_decoder: IncrementalDecoder<'a>,
+    stream_decoder: IncrementalDecoder<'static>,
     started: bool,
     terminal: Option<TerminalState>,
     usage: Option<GenerationUsage>,
@@ -776,7 +777,7 @@ pub struct GreedyGeneration<'a> {
 }
 
 #[cfg(feature = "cpu-reference")]
-impl GreedyGeneration<'_> {
+impl GreedyGeneration {
     /// Advances this sequence by at most one decoder token step.
     pub fn advance(&mut self, cancelled: &AtomicBool) -> Result<GreedyAdvance, EngineError> {
         if self.usage.is_some() {
@@ -1022,8 +1023,8 @@ impl ScheduledGenerationAdvance {
 }
 
 #[cfg(feature = "cpu-reference")]
-struct ScheduledGeneration<'a> {
-    generation: GreedyGeneration<'a>,
+struct ScheduledGeneration {
+    generation: GreedyGeneration,
     cancelled: Arc<AtomicBool>,
     retained_bytes: usize,
 }
@@ -1035,15 +1036,15 @@ struct ScheduledGeneration<'a> {
 /// failures become request-local `Failed` events and do not stop neighboring
 /// sequences. This type performs no socket I/O and grants no authority.
 #[cfg(feature = "cpu-reference")]
-pub struct GenerationRoundRobin<'a> {
+pub struct GenerationRoundRobin {
     maximum_active: u32,
     maximum_retained_bytes: usize,
     retained_bytes: usize,
-    ready: VecDeque<ScheduledGeneration<'a>>,
+    ready: VecDeque<ScheduledGeneration>,
 }
 
 #[cfg(feature = "cpu-reference")]
-impl<'a> GenerationRoundRobin<'a> {
+impl GenerationRoundRobin {
     /// Creates an empty coordinator with a hard active-sequence ceiling.
     pub fn new(maximum_active: u32) -> Result<Self, EngineError> {
         Self::with_limits(maximum_active, MAX_QUEUED_REQUEST_BYTES)
@@ -1075,7 +1076,7 @@ impl<'a> GenerationRoundRobin<'a> {
     /// Admits one request and creates its cursor only after capacity checks.
     pub fn submit(
         &mut self,
-        model: &'a LoadedCpuModel,
+        model: &LoadedCpuModel,
         request: &GenerationRequest,
         sequence_id: SequenceId,
         cancelled: Arc<AtomicBool>,
@@ -1090,7 +1091,7 @@ impl<'a> GenerationRoundRobin<'a> {
     /// storage; it only includes the declared bytes in its aggregate ceiling.
     pub fn submit_with_retained_bytes(
         &mut self,
-        model: &'a LoadedCpuModel,
+        model: &LoadedCpuModel,
         request: &GenerationRequest,
         sequence_id: SequenceId,
         cancelled: Arc<AtomicBool>,
@@ -1414,6 +1415,243 @@ pub struct CpuEngineRuntime {
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn runtime_metrics(
+    service: &EngineService,
+    models: &BTreeMap<String, LoadedCpuModel>,
+    mut metrics: RuntimeMetrics,
+) -> Result<RuntimeMetrics, EngineError> {
+    metrics.loaded_models = u64::try_from(models.len())
+        .map_err(|_| EngineError::internal_invariant("loaded model count exceeds u64"))?;
+    metrics.active_requests = u64::try_from(service.scheduler.active_len())
+        .map_err(|_| EngineError::internal_invariant("active request count exceeds u64"))?;
+    metrics.queued_requests = u64::try_from(service.scheduler.queued_len())
+        .map_err(|_| EngineError::internal_invariant("queued request count exceeds u64"))?;
+    metrics.host_memory_bytes = models.values().try_fold(0_u64, |total, loaded| {
+        let used = loaded.model().memory_pool().used_bytes()?;
+        total
+            .checked_add(used)
+            .ok_or_else(|| EngineError::resource_exhaustion("loaded model memory metric overflows"))
+    })?;
+    metrics.kv_cache_bytes = models.values().try_fold(0_u64, |total, loaded| {
+        let reserved = loaded.model().kv_cache_metrics()?.reserved_bytes;
+        total
+            .checked_add(reserved)
+            .ok_or_else(|| EngineError::resource_exhaustion("KV-cache memory metric overflows"))
+    })?;
+    Ok(metrics)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn runtime_health(draining: bool, models: &BTreeMap<String, LoadedCpuModel>) -> ServiceHealth {
+    if draining {
+        ServiceHealth::Draining
+    } else if models.is_empty() {
+        ServiceHealth::Degraded
+    } else {
+        ServiceHealth::Ready
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn retain_security_event(events: &mut VecDeque<SecurityEvent>, event: SecurityEvent) {
+    if events.len() == MAX_PENDING_SECURITY_EVENTS {
+        let _oldest = events.pop_front();
+    }
+    events.push_back(event);
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn record_runtime_error_parts(
+    metrics: &mut RuntimeMetrics,
+    events: &mut VecDeque<SecurityEvent>,
+    request_id: RequestId,
+    error: &EngineError,
+) -> Result<(), EngineError> {
+    let event = match error {
+        EngineError::AuthenticationFailure(_) => {
+            metrics.authentication_failures = checked_increment(
+                metrics.authentication_failures,
+                "authentication failure counter",
+            )?;
+            SecurityEvent::AuthenticationFailure { request_id: Some(request_id) }
+        }
+        EngineError::ProtocolViolation(_) => {
+            metrics.protocol_violations =
+                checked_increment(metrics.protocol_violations, "protocol violation counter")?;
+            SecurityEvent::ProtocolViolation { request_id: Some(request_id) }
+        }
+        EngineError::BackendFailure(_) => {
+            metrics.backend_failures =
+                checked_increment(metrics.backend_failures, "backend failure counter")?;
+            SecurityEvent::BackendFailure { request_id: Some(request_id), backend: None }
+        }
+        EngineError::ResourceExhaustion(detail) => {
+            metrics.rejected_requests =
+                checked_increment(metrics.rejected_requests, "rejected request counter")?;
+            SecurityEvent::ResourceLimitExceeded {
+                request_id: Some(request_id),
+                resource: detail.resource().unwrap_or(ResourceKind::RequestBytes),
+                requested: detail.requested(),
+                limit: detail.limit_value().unwrap_or(0),
+            }
+        }
+        _ => SecurityEvent::ProtocolViolation { request_id: Some(request_id) },
+    };
+    retain_security_event(events, event);
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn unload_model_parts(
+    service: &EngineService,
+    models: &mut BTreeMap<String, LoadedCpuModel>,
+    model_id: &ModelId,
+) -> Result<(), EngineError> {
+    if service.scheduler.has_active_model(model_id) || service.scheduler.has_queued_model(model_id)
+    {
+        return Err(EngineError::resource_exhaustion(
+            "model cannot unload while a request owns scheduler state",
+        ));
+    }
+    if models.remove(model_id.as_str()).is_none() {
+        return Err(EngineError::invalid_input("model is not loaded"));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn load_registered_model_parts(
+    service: &EngineService,
+    models: &mut BTreeMap<String, LoadedCpuModel>,
+    metrics: &mut RuntimeMetrics,
+    model_id: &ModelId,
+    budget: &ResourceBudget,
+    events: &mut impl DirectorySecurityEventSink,
+) -> Result<(), EngineError> {
+    if models.contains_key(model_id.as_str()) {
+        return Err(EngineError::invalid_input("model is already loaded"));
+    }
+    let loaded = match service.load_registered_cpu_model(model_id, budget, events) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            metrics.package_validation_failures =
+                metrics.package_validation_failures.checked_add(1).ok_or_else(|| {
+                    EngineError::resource_exhaustion("package validation failure counter exhausted")
+                })?;
+            return Err(error);
+        }
+    };
+    models.insert(model_id.as_str().to_owned(), loaded);
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn handle_service_request_parts(
+    service: &mut EngineService,
+    models: &mut BTreeMap<String, LoadedCpuModel>,
+    model_load_budgets: &BTreeMap<String, ResourceBudget>,
+    security_events: &mut VecDeque<SecurityEvent>,
+    metrics: &mut RuntimeMetrics,
+    draining: bool,
+    request: &AuthenticatedServiceRequest,
+) -> Result<ServiceResponseBody, EngineError> {
+    match request.body() {
+        ServiceRequestBody::Hello { major, minor } => {
+            if *major == PROTOCOL_MAJOR && *minor == PROTOCOL_MINOR {
+                Ok(ServiceResponseBody::HelloAccepted {
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                })
+            } else {
+                Ok(ServiceResponseBody::HelloRejected {
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                })
+            }
+        }
+        ServiceRequestBody::ListCapabilities => {
+            Ok(ServiceResponseBody::Capabilities(service_capabilities()?))
+        }
+        ServiceRequestBody::ListRegisteredModels => {
+            let registered = service
+                .registry
+                .registrations()
+                .map(|registration| registration.model_id().clone())
+                .collect();
+            Ok(ServiceResponseBody::RegisteredModels(registered))
+        }
+        ServiceRequestBody::LoadModel(model_id) => {
+            let budget = model_load_budgets.get(model_id.as_str()).copied().ok_or_else(|| {
+                EngineError::authentication_failure(
+                    "registered model has no owner-configured load budget",
+                )
+            })?;
+            let mut emitted = Vec::new();
+            let result = load_registered_model_parts(
+                service,
+                models,
+                metrics,
+                model_id,
+                &budget,
+                &mut |event| emitted.push(event),
+            );
+            for event in emitted {
+                retain_security_event(security_events, event);
+            }
+            result?;
+            Ok(ServiceResponseBody::ModelLoaded)
+        }
+        ServiceRequestBody::UnloadModel(model_id) => {
+            unload_model_parts(service, models, model_id)?;
+            Ok(ServiceResponseBody::ModelUnloaded)
+        }
+        ServiceRequestBody::Tokenize { model_id, text } => {
+            let model = models
+                .get(model_id.as_str())
+                .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
+            let tokens = model.tokenizer().encode(text)?;
+            let tokens = tokens.into_iter().map(TokenId::new).collect::<Result<Vec<_>, _>>()?;
+            Ok(ServiceResponseBody::Tokenized(tokens))
+        }
+        ServiceRequestBody::Health => {
+            Ok(ServiceResponseBody::Health(service_health_status(runtime_health(draining, models))))
+        }
+        ServiceRequestBody::Metrics => Ok(ServiceResponseBody::Metrics(service_metrics(
+            runtime_metrics(service, models, *metrics)?,
+        ))),
+        ServiceRequestBody::ShutdownRequest => Ok(ServiceResponseBody::ShutdownRejected(
+            ShutdownRejectionReason::AdministrativeAuthorizationRequired,
+        )),
+        ServiceRequestBody::ModelStatus(model_id) => {
+            service.registry.resolve(model_id)?;
+            let limits = service.scheduler.limits();
+            let status = ServiceModelStatus::new(
+                models.contains_key(model_id.as_str()),
+                service_health_status(runtime_health(draining, models)),
+                service_capabilities()?,
+                u32::try_from(service.scheduler.active_len()).map_err(|_| {
+                    EngineError::internal_invariant("active scheduler count exceeds u32")
+                })?,
+                u32::try_from(service.scheduler.queued_len()).map_err(|_| {
+                    EngineError::internal_invariant("queued scheduler count exceeds u32")
+                })?,
+                limits.maximum_active(),
+                u32::try_from(limits.maximum_queued()).map_err(|_| {
+                    EngineError::internal_invariant("queued scheduler limit exceeds u32")
+                })?,
+                u64::try_from(service.scheduler.queued_bytes()).map_err(|_| {
+                    EngineError::internal_invariant("queued scheduler bytes exceed u64")
+                })?,
+                u64::try_from(limits.maximum_queued_bytes()).map_err(|_| {
+                    EngineError::internal_invariant("queued scheduler byte limit exceeds u64")
+                })?,
+            )?;
+            Ok(ServiceResponseBody::ModelStatus(status))
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 impl CpuEngineRuntime {
     /// Creates an unloaded runtime with distinct control and response identities.
     pub fn new(
@@ -1481,37 +1719,12 @@ impl CpuEngineRuntime {
 
     /// Returns content-free live and cumulative metrics.
     pub fn metrics(&self) -> Result<RuntimeMetrics, EngineError> {
-        let mut metrics = self.metrics;
-        metrics.loaded_models = u64::try_from(self.models.len())
-            .map_err(|_| EngineError::internal_invariant("loaded model count exceeds u64"))?;
-        metrics.active_requests = u64::try_from(self.service.scheduler.active_len())
-            .map_err(|_| EngineError::internal_invariant("active request count exceeds u64"))?;
-        metrics.queued_requests = u64::try_from(self.service.scheduler.queued_len())
-            .map_err(|_| EngineError::internal_invariant("queued request count exceeds u64"))?;
-        metrics.host_memory_bytes = self.models.values().try_fold(0_u64, |total, loaded| {
-            let used = loaded.model().memory_pool().used_bytes()?;
-            total.checked_add(used).ok_or_else(|| {
-                EngineError::resource_exhaustion("loaded model memory metric overflows")
-            })
-        })?;
-        metrics.kv_cache_bytes = self.models.values().try_fold(0_u64, |total, loaded| {
-            let reserved = loaded.model().kv_cache_metrics()?.reserved_bytes;
-            total
-                .checked_add(reserved)
-                .ok_or_else(|| EngineError::resource_exhaustion("KV-cache memory metric overflows"))
-        })?;
-        Ok(metrics)
+        runtime_metrics(&self.service, &self.models, self.metrics)
     }
 
     /// Returns the current local health classification.
     pub fn health(&self) -> ServiceHealth {
-        if self.draining {
-            ServiceHealth::Draining
-        } else if self.models.is_empty() {
-            ServiceHealth::Degraded
-        } else {
-            ServiceHealth::Ready
-        }
+        runtime_health(self.draining, &self.models)
     }
 
     /// Drains sanitized typed telemetry for Go-owned delivery and audit.
@@ -1519,165 +1732,32 @@ impl CpuEngineRuntime {
         self.security_events.drain(..).collect()
     }
 
-    fn record_security_event(&mut self, event: SecurityEvent) {
-        if self.security_events.len() == MAX_PENDING_SECURITY_EVENTS {
-            let _oldest = self.security_events.pop_front();
-        }
-        self.security_events.push_back(event);
-    }
-
     fn record_runtime_error(
         &mut self,
         request_id: RequestId,
         error: &EngineError,
     ) -> Result<(), EngineError> {
-        let event = match error {
-            EngineError::AuthenticationFailure(_) => {
-                self.metrics.authentication_failures = checked_increment(
-                    self.metrics.authentication_failures,
-                    "authentication failure counter",
-                )?;
-                SecurityEvent::AuthenticationFailure { request_id: Some(request_id) }
-            }
-            EngineError::ProtocolViolation(_) => {
-                self.metrics.protocol_violations = checked_increment(
-                    self.metrics.protocol_violations,
-                    "protocol violation counter",
-                )?;
-                SecurityEvent::ProtocolViolation { request_id: Some(request_id) }
-            }
-            EngineError::BackendFailure(_) => {
-                self.metrics.backend_failures =
-                    checked_increment(self.metrics.backend_failures, "backend failure counter")?;
-                SecurityEvent::BackendFailure { request_id: Some(request_id), backend: None }
-            }
-            EngineError::ResourceExhaustion(detail) => {
-                self.metrics.rejected_requests =
-                    checked_increment(self.metrics.rejected_requests, "rejected request counter")?;
-                SecurityEvent::ResourceLimitExceeded {
-                    request_id: Some(request_id),
-                    resource: detail.resource().unwrap_or(ResourceKind::RequestBytes),
-                    requested: detail.requested(),
-                    limit: detail.limit_value().unwrap_or(0),
-                }
-            }
-            _ => SecurityEvent::ProtocolViolation { request_id: Some(request_id) },
-        };
-        self.record_security_event(event);
-        Ok(())
+        record_runtime_error_parts(&mut self.metrics, &mut self.security_events, request_id, error)
     }
 
     /// Unloads one idle model. Active or queued ownership fails closed.
     pub fn unload_model(&mut self, model_id: &ModelId) -> Result<(), EngineError> {
-        if self.service.scheduler.has_active_model(model_id)
-            || self.service.scheduler.has_queued_model(model_id)
-        {
-            return Err(EngineError::resource_exhaustion(
-                "model cannot unload while a request owns scheduler state",
-            ));
-        }
-        if self.models.remove(model_id.as_str()).is_none() {
-            return Err(EngineError::invalid_input("model is not loaded"));
-        }
-        Ok(())
+        unload_model_parts(&self.service, &mut self.models, model_id)
     }
 
     fn handle_service_request(
         &mut self,
         request: &AuthenticatedServiceRequest,
     ) -> Result<ServiceResponseBody, EngineError> {
-        match request.body() {
-            ServiceRequestBody::Hello { major, minor } => {
-                if *major == PROTOCOL_MAJOR && *minor == PROTOCOL_MINOR {
-                    Ok(ServiceResponseBody::HelloAccepted {
-                        major: PROTOCOL_MAJOR,
-                        minor: PROTOCOL_MINOR,
-                    })
-                } else {
-                    Ok(ServiceResponseBody::HelloRejected {
-                        major: PROTOCOL_MAJOR,
-                        minor: PROTOCOL_MINOR,
-                    })
-                }
-            }
-            ServiceRequestBody::ListCapabilities => {
-                Ok(ServiceResponseBody::Capabilities(service_capabilities()?))
-            }
-            ServiceRequestBody::ListRegisteredModels => {
-                let models = self
-                    .service
-                    .registry
-                    .registrations()
-                    .map(|registration| registration.model_id().clone())
-                    .collect();
-                Ok(ServiceResponseBody::RegisteredModels(models))
-            }
-            ServiceRequestBody::LoadModel(model_id) => {
-                let budget =
-                    self.model_load_budgets.get(model_id.as_str()).copied().ok_or_else(|| {
-                        EngineError::authentication_failure(
-                            "registered model has no owner-configured load budget",
-                        )
-                    })?;
-                let mut emitted = Vec::new();
-                let result = self.load_registered_model(model_id, &budget, &mut |event| {
-                    emitted.push(event);
-                });
-                for event in emitted {
-                    self.record_security_event(event);
-                }
-                result?;
-                Ok(ServiceResponseBody::ModelLoaded)
-            }
-            ServiceRequestBody::UnloadModel(model_id) => {
-                self.unload_model(model_id)?;
-                Ok(ServiceResponseBody::ModelUnloaded)
-            }
-            ServiceRequestBody::Tokenize { model_id, text } => {
-                let model = self
-                    .models
-                    .get(model_id.as_str())
-                    .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
-                let tokens = model.tokenizer().encode(text)?;
-                let tokens = tokens.into_iter().map(TokenId::new).collect::<Result<Vec<_>, _>>()?;
-                Ok(ServiceResponseBody::Tokenized(tokens))
-            }
-            ServiceRequestBody::Health => {
-                Ok(ServiceResponseBody::Health(service_health_status(self.health())))
-            }
-            ServiceRequestBody::Metrics => {
-                Ok(ServiceResponseBody::Metrics(service_metrics(self.metrics()?)))
-            }
-            ServiceRequestBody::ShutdownRequest => Ok(ServiceResponseBody::ShutdownRejected(
-                ShutdownRejectionReason::AdministrativeAuthorizationRequired,
-            )),
-            ServiceRequestBody::ModelStatus(model_id) => {
-                self.service.registry.resolve(model_id)?;
-                let limits = self.service.scheduler.limits();
-                let status = ServiceModelStatus::new(
-                    self.models.contains_key(model_id.as_str()),
-                    service_health_status(self.health()),
-                    service_capabilities()?,
-                    u32::try_from(self.service.scheduler.active_len()).map_err(|_| {
-                        EngineError::internal_invariant("active scheduler count exceeds u32")
-                    })?,
-                    u32::try_from(self.service.scheduler.queued_len()).map_err(|_| {
-                        EngineError::internal_invariant("queued scheduler count exceeds u32")
-                    })?,
-                    limits.maximum_active(),
-                    u32::try_from(limits.maximum_queued()).map_err(|_| {
-                        EngineError::internal_invariant("queued scheduler limit exceeds u32")
-                    })?,
-                    u64::try_from(self.service.scheduler.queued_bytes()).map_err(|_| {
-                        EngineError::internal_invariant("queued scheduler bytes exceed u64")
-                    })?,
-                    u64::try_from(limits.maximum_queued_bytes()).map_err(|_| {
-                        EngineError::internal_invariant("queued scheduler byte limit exceeds u64")
-                    })?,
-                )?;
-                Ok(ServiceResponseBody::ModelStatus(status))
-            }
-        }
+        handle_service_request_parts(
+            &mut self.service,
+            &mut self.models,
+            &self.model_load_budgets,
+            &mut self.security_events,
+            &mut self.metrics,
+            self.draining,
+            request,
+        )
     }
 
     /// Verifies and installs one legacy flat fixture package in memory.
@@ -1708,23 +1788,14 @@ impl CpuEngineRuntime {
         budget: &personalai_engine_types::ResourceBudget,
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<(), EngineError> {
-        if self.models.contains_key(model_id.as_str()) {
-            return Err(EngineError::invalid_input("model is already loaded"));
-        }
-        let loaded = match self.service.load_registered_cpu_model(model_id, budget, events) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                self.metrics.package_validation_failures =
-                    self.metrics.package_validation_failures.checked_add(1).ok_or_else(|| {
-                        EngineError::resource_exhaustion(
-                            "package validation failure counter exhausted",
-                        )
-                    })?;
-                return Err(error);
-            }
-        };
-        self.models.insert(model_id.as_str().to_owned(), loaded);
-        Ok(())
+        load_registered_model_parts(
+            &self.service,
+            &mut self.models,
+            &mut self.metrics,
+            model_id,
+            budget,
+            events,
+        )
     }
 
     /// Accepts and fairly executes an exact bounded batch of local connections.
@@ -1990,10 +2061,10 @@ impl CpuEngineRuntime {
         Ok(AuthenticatedConnection { input_index, connection, session, replay_journal, command })
     }
 
-    fn prepare_authenticated_connection<'a>(
-        batch: &mut ConnectionBatchState<'a>,
+    fn prepare_authenticated_connection(
+        batch: &mut ConnectionBatchState<'_>,
         authenticated: AuthenticatedConnection,
-        coordinator: &mut GenerationRoundRobin<'a>,
+        coordinator: &mut GenerationRoundRobin,
     ) -> Result<(), EngineError> {
         let AuthenticatedConnection { input_index, connection, session, replay_journal, command } =
             authenticated;
@@ -2052,7 +2123,7 @@ impl CpuEngineRuntime {
         service: &mut EngineService,
         metrics: &mut RuntimeMetrics,
         response_signer: &EngineResponseSigner,
-        coordinator: &mut GenerationRoundRobin<'_>,
+        coordinator: &mut GenerationRoundRobin,
         active: &mut Vec<ActiveGenerationConnection>,
         results: &mut [Option<ConnectionServeResult>],
     ) -> Result<(), EngineError> {
@@ -2154,9 +2225,9 @@ impl CpuEngineRuntime {
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-fn prepare_generation_connection<'a>(
-    batch: &mut ConnectionBatchState<'a>,
-    coordinator: &mut GenerationRoundRobin<'a>,
+fn prepare_generation_connection(
+    batch: &mut ConnectionBatchState<'_>,
+    coordinator: &mut GenerationRoundRobin,
     generation: GenerationConnection,
 ) -> Result<(), EngineError> {
     let GenerationConnection {
@@ -2373,7 +2444,7 @@ fn drive_generation_connections(
     service: &mut EngineService,
     metrics: &mut RuntimeMetrics,
     response_signer: &EngineResponseSigner,
-    coordinator: &mut GenerationRoundRobin<'_>,
+    coordinator: &mut GenerationRoundRobin,
     active: &mut Vec<ActiveGenerationConnection>,
     results: &mut [Option<ConnectionServeResult>],
 ) -> Result<(), EngineError> {
@@ -2970,7 +3041,7 @@ impl EngineService {
         let pool = MemoryPool::from_budget(budget)?;
         let config = TransformerConfig::from_manifest(parsed.manifest())?;
         let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
-        let tokenizer = build_tokenizer(tokenizer_data, &pool)?;
+        let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
         if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
@@ -3006,7 +3077,8 @@ impl EngineService {
         let result = (|| {
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
-            let tokenizer = build_tokenizer(verified.tokenizer_bytes(), &pool)?;
+            let tokenizer =
+                Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
             if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
                 return Err(EngineError::corrupt_model_package(
                     "manifest and tokenizer vocabulary sizes differ",
@@ -4529,6 +4601,202 @@ mod tests {
         fixture.listener.set_nonblocking(false).expect("listener mode must return to blocking");
         assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
         assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_reference_serves_authenticated_control_and_generation_together() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let mut fixture = BatchRuntimeFixture::new("continuous-control", 1);
+        let generation_request = fixture.request(643, "A", 2);
+        let generation = signed_generation_frame(
+            &generation_request,
+            50,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let service_request_id = RequestId::new(644).expect("service request ID");
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            service_request_id,
+            51,
+            fixture.control_key_id,
+            &ServiceRequestBody::Health,
+        )
+        .expect("health request must encode");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let service_payload =
+            attach_service_signature(&unsigned, &signature).expect("signature must attach");
+        let service_frame = Frame::new(FrameKind::ServiceRequest, service_payload)
+            .expect("service frame")
+            .encode()
+            .expect("service frame must encode");
+
+        let generation_client = spawn_ordered_runtime_test_client(
+            fixture.socket_path(),
+            generation,
+            fixture.response_public_key,
+            50,
+            3,
+        );
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let service_client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            configure_runtime_test_client(&stream);
+            stream.write_all(&service_frame).expect("health request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("health response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length must address");
+            let mut encoded = header.to_vec();
+            encoded.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream.read_exact(&mut encoded[FRAME_HEADER_BYTES..]).expect("health response payload");
+            let response = Frame::decode_outbound_exact(&encoded).expect("response frame");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            AuthenticatedServiceResponse::decode(
+                response.payload(),
+                service_request_id,
+                51,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("health response must authenticate")
+        });
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let shutdown_thread = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(200));
+            request_shutdown.request();
+        });
+
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(2).expect("continuous limits must validate"),
+                &shutdown,
+            )
+            .expect("continuous service must handle control and generation");
+        shutdown_thread.join().expect("shutdown request must finish");
+        assert_eq!(generation_client.join().expect("generation client").last(), Some(&3));
+        let response = service_client.join().expect("service client must finish");
+        assert_eq!(response.kind(), ServiceMessageKind::Health);
+        assert_eq!(response.body(), &ServiceResponseBody::Health(ServiceHealthStatus::Ready));
+        assert_eq!(summary.accepted_connections(), 2);
+        assert_eq!(summary.authenticated_commands(), 2);
+        assert_eq!(summary.completed_generations(), 1);
+        assert_eq!(summary.failed_connections(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_reference_applies_authenticated_idle_model_unload() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let mut fixture = BatchRuntimeFixture::new("continuous-unload", 1);
+        let request_id = RequestId::new(645).expect("service request ID");
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            request_id,
+            1,
+            fixture.control_key_id,
+            &ServiceRequestBody::UnloadModel(fixture.model_id.clone()),
+        )
+        .expect("unload request must encode");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+        let encoded = Frame::new(FrameKind::ServiceRequest, payload)
+            .expect("service frame")
+            .encode()
+            .expect("service frame must encode");
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            configure_runtime_test_client(&stream);
+            stream.write_all(&encoded).expect("unload request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("unload response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length must address");
+            let mut response_bytes = header.to_vec();
+            response_bytes.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream
+                .read_exact(&mut response_bytes[FRAME_HEADER_BYTES..])
+                .expect("unload response payload");
+            let response =
+                Frame::decode_outbound_exact(&response_bytes).expect("response frame must decode");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            let verified = AuthenticatedServiceResponse::decode(
+                response.payload(),
+                request_id,
+                1,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("unload response must authenticate");
+            request_shutdown.request();
+            verified
+        });
+
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(1).expect("continuous limits must validate"),
+                &shutdown,
+            )
+            .expect("continuous service must handle model unload");
+        let response = client.join().expect("service client must finish");
+        assert_eq!(response.kind(), ServiceMessageKind::UnloadModel);
+        assert_eq!(response.body(), &ServiceResponseBody::ModelUnloaded);
+        assert_eq!(fixture.runtime.health(), ServiceHealth::Degraded);
+        assert_eq!(fixture.runtime.metrics().expect("metrics").loaded_models, 0);
+        assert_eq!(summary.accepted_connections(), 1);
+        assert_eq!(summary.authenticated_commands(), 1);
+        assert_eq!(summary.failed_connections(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn model_unload_rejects_queued_scheduler_ownership_then_releases_cleanly() {
+        let mut fixture = BatchRuntimeFixture::new("unload-ownership", 1);
+        let request = fixture.request(646, "A", 2);
+        let request_id = request.request_id();
+        fixture.runtime.service.admit(request).expect("request must queue");
+        assert!(matches!(
+            fixture.runtime.unload_model(&fixture.model_id),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert_eq!(
+            fixture
+                .runtime
+                .service
+                .scheduler
+                .cancel(&request_id)
+                .expect("queued request must cancel"),
+            CancellationOutcome::Queued
+        );
+        fixture
+            .runtime
+            .unload_model(&fixture.model_id)
+            .expect("idle model must unload after scheduler release");
+        assert_eq!(fixture.runtime.health(), ServiceHealth::Degraded);
         fixture.cleanup();
     }
 

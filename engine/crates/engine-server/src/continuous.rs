@@ -8,11 +8,14 @@ use super::{
     MAX_PENDING_EVENTS_PER_CONNECTION, OUTBOUND_PIPELINE_RESERVED_BYTES, OUTPUT_WRITER_STACK_BYTES,
     RequestId, RuntimeMetrics, SequenceId, ServeOutcome, SyncSender, TrustedControlPlaneKeys,
     UnixFrameConnection, UnixFrameListener, activate_queued_request, admit_durable_nonce,
-    enqueue_outbound_frame, generation_event_frame, record_generation_timing,
-    record_generation_usage, terminal_connection_result, watch_generation_cancellation,
+    enqueue_outbound_frame, generation_event_frame, handle_service_request_parts,
+    record_generation_timing, record_generation_usage, record_runtime_error_parts,
+    service_response_frame, terminal_connection_result, watch_generation_cancellation,
     write_queued_events,
 };
+use personalai_engine_protocol::ServiceResponseBody;
 use personalai_engine_types::SignerKeyId;
+use personalai_engine_types::{ResourceBudget, SecurityEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -161,10 +164,12 @@ struct ContinuousState<'a> {
     trusted_control_keys: Arc<TrustedControlPlaneKeys>,
     response_signer: &'a EngineResponseSigner,
     replay_journals: Arc<BTreeMap<SignerKeyId, Arc<Mutex<DurableReplayJournal>>>>,
-    models: &'a BTreeMap<String, LoadedCpuModel>,
+    models: &'a mut BTreeMap<String, LoadedCpuModel>,
+    model_load_budgets: &'a BTreeMap<String, ResourceBudget>,
+    security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
     next_sequence: &'a mut u64,
-    coordinator: GenerationRoundRobin<'a>,
+    coordinator: GenerationRoundRobin,
     ingress: Vec<IngressWorker>,
     pending: Vec<PendingGenerationConnection>,
     active: Vec<ContinuousActiveConnection>,
@@ -219,7 +224,9 @@ impl CpuEngineRuntime {
             trusted_control_keys: Arc::new(self.trusted_control_keys.clone()),
             response_signer: &self.response_signer,
             replay_journals: Arc::new(self.replay_journals.clone()),
-            models: &self.models,
+            models: &mut self.models,
+            model_load_budgets: &self.model_load_budgets,
+            security_events: &mut self.security_events,
             metrics: &mut self.metrics,
             next_sequence: &mut self.next_sequence,
             coordinator,
@@ -354,8 +361,12 @@ impl ContinuousState<'_> {
         let ContinuousAuthenticatedConnection { connection, session, replay_journal, command } =
             authenticated;
         match command {
-            InboundCommand::Service(_request) => {
-                increment(&mut self.summary.failed_connections, "failed connection count")
+            InboundCommand::Service(request) => {
+                let result = self.respond_to_service_request(connection, &request);
+                if result.is_err() {
+                    increment(&mut self.summary.failed_connections, "failed connection count")?;
+                }
+                Ok(())
             }
             InboundCommand::Cancel(request_id) => {
                 self.apply_cancellation(request_id)?;
@@ -396,6 +407,32 @@ impl ContinuousState<'_> {
                 Ok(())
             }
         }
+    }
+
+    fn respond_to_service_request(
+        &mut self,
+        mut connection: UnixFrameConnection,
+        request: &super::AuthenticatedServiceRequest,
+    ) -> Result<(), EngineError> {
+        let request_id = request.request_id();
+        let nonce = request.nonce();
+        let body = match handle_service_request_parts(
+            self.service,
+            self.models,
+            self.model_load_budgets,
+            self.security_events,
+            self.metrics,
+            false,
+            request,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                record_runtime_error_parts(self.metrics, self.security_events, request_id, &error)?;
+                ServiceResponseBody::Error(super::service_error_code(&error))
+            }
+        };
+        let frame = service_response_frame(request_id, nonce, &body, self.response_signer)?;
+        connection.write_outbound_frame(&frame)
     }
 
     fn activate_pending(&mut self) -> Result<bool, EngineError> {

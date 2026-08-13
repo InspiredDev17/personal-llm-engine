@@ -12,13 +12,23 @@ use personalai_engine_types::{
     TensorShape,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const WEIGHTS_PER_LAYER: usize = 9;
 const GLOBAL_WEIGHT_COUNT: usize = 3;
 
 /// Fully validated, aggregate-accounted CPU decoder model.
-#[derive(Debug)]
+///
+/// Clones share immutable weights, configuration, memory accounting, and the
+/// synchronized sequence cache. A session owns one clone so model-registry map
+/// mutation cannot invalidate active inference state.
+#[derive(Clone, Debug)]
 pub struct CpuDecoderModel {
+    inner: Arc<CpuDecoderModelInner>,
+}
+
+#[derive(Debug)]
+struct CpuDecoderModelInner {
     config: TransformerConfig,
     weights: BTreeMap<String, Tensor>,
     pool: MemoryPool,
@@ -75,22 +85,24 @@ impl CpuDecoderModel {
         )?;
         let cache =
             ContiguousKvCache::new(model_id, cache_plan, MAX_CONCURRENT_SEQUENCES, pool.clone())?;
-        Ok(Self { config, weights, pool: pool.clone(), cache })
+        Ok(Self {
+            inner: Arc::new(CpuDecoderModelInner { config, weights, pool: pool.clone(), cache }),
+        })
     }
 
     /// Returns the validated architecture configuration.
-    pub const fn config(&self) -> &TransformerConfig {
-        &self.config
+    pub fn config(&self) -> &TransformerConfig {
+        &self.inner.config
     }
 
     /// Returns the aggregate pool used for request-scoped runtime accounting.
-    pub const fn memory_pool(&self) -> &MemoryPool {
-        &self.pool
+    pub fn memory_pool(&self) -> &MemoryPool {
+        &self.inner.pool
     }
 
     /// Returns exact live and peak contiguous KV-cache accounting.
     pub fn kv_cache_metrics(&self) -> Result<KvCacheMetrics, EngineError> {
-        self.cache.metrics()
+        self.inner.cache.metrics()
     }
 
     /// Allocates one bounded sequence cache under the model's aggregate pool.
@@ -99,49 +111,51 @@ impl CpuDecoderModel {
         budget: &ResourceBudget,
         request_id: RequestId,
         sequence_id: SequenceId,
-    ) -> Result<CpuDecoderSession<'_>, EngineError> {
-        let plan = TransformerPlan::new(self.config.clone(), budget)?;
+    ) -> Result<CpuDecoderSession, EngineError> {
+        let plan = TransformerPlan::new(self.inner.config.clone(), budget)?;
         plan.require_executable_architecture()?;
-        if plan.kv_cache() != self.cache.plan() {
+        if plan.kv_cache() != self.inner.cache.plan() {
             return Err(EngineError::internal_invariant(
                 "request and model KV-cache layouts differ",
             ));
         }
-        if self.cache.metrics()?.active_sequence_count >= budget.max_concurrent_sequences() {
+        if self.inner.cache.metrics()?.active_sequence_count >= budget.max_concurrent_sequences() {
             return Err(EngineError::resource_exhaustion(
                 "request sequence concurrency budget is exhausted",
             ));
         }
-        let handle = self.cache.create_sequence(request_id, sequence_id)?;
+        let handle = self.inner.cache.create_sequence(request_id, sequence_id)?;
         Ok(CpuDecoderSession {
-            model: self,
-            cache: &self.cache,
+            model: self.clone(),
             handle,
-            scratch_pool: self.pool.scoped(MemoryOwner::RequestScratch(request_id)),
-            output_pool: self.pool.scoped(MemoryOwner::OutputLogits(request_id)),
+            scratch_pool: self.inner.pool.scoped(MemoryOwner::RequestScratch(request_id)),
+            output_pool: self.inner.pool.scoped(MemoryOwner::OutputLogits(request_id)),
             token_count: 0,
         })
     }
 
     fn weight(&self, name: &str) -> Result<&Tensor, EngineError> {
-        self.weights
+        self.inner
+            .weights
             .get(name)
             .ok_or_else(|| EngineError::internal_invariant("validated decoder weight is missing"))
     }
 }
 
 /// Mutable per-sequence CPU decoder state and materialized KV cache.
+///
+/// The session owns a shared model handle and destroys only its own sequence
+/// slot on drop.
 #[derive(Debug)]
-pub struct CpuDecoderSession<'a> {
-    model: &'a CpuDecoderModel,
-    cache: &'a ContiguousKvCache,
+pub struct CpuDecoderSession {
+    model: CpuDecoderModel,
     handle: SequenceHandle,
     scratch_pool: MemoryPool,
     output_pool: MemoryPool,
     token_count: u32,
 }
 
-impl CpuDecoderSession<'_> {
+impl CpuDecoderSession {
     /// Returns the number of tokens already committed to this sequence.
     pub const fn token_count(&self) -> u32 {
         self.token_count
@@ -157,7 +171,7 @@ impl CpuDecoderSession<'_> {
         if self
             .token_count
             .checked_add(additional)
-            .is_none_or(|total| total > self.model.config.context_limit().get())
+            .is_none_or(|total| total > self.model.inner.config.context_limit().get())
         {
             return Err(EngineError::resource_exhaustion("decoder prefill exceeds context"));
         }
@@ -175,16 +189,16 @@ impl CpuDecoderSession<'_> {
 
     /// Executes one token and returns finite next-token logits.
     pub fn forward_token(&mut self, token: u32) -> Result<Tensor, EngineError> {
-        if token >= self.model.config.vocabulary_size() {
+        if token >= self.model.inner.config.vocabulary_size() {
             return Err(EngineError::invalid_input("input token is outside the model vocabulary"));
         }
-        if self.token_count >= self.model.config.context_limit().get() {
+        if self.token_count >= self.model.inner.config.context_limit().get() {
             return Err(EngineError::resource_exhaustion("decoder context capacity is exhausted"));
         }
-        check_operation_count(&self.model.config, self.token_count)?;
-        let workspace_bytes = workspace_bytes(&self.model.config, self.token_count)?;
+        check_operation_count(&self.model.inner.config, self.token_count)?;
+        let workspace_bytes = workspace_bytes(&self.model.inner.config, self.token_count)?;
         let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
-        let hidden = usize_from_u32(self.model.config.hidden_dimension())?;
+        let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
         let mut state = embedding_row(
             self.model.weight("token_embedding.weight")?,
             usize::try_from(token)
@@ -192,23 +206,23 @@ impl CpuDecoderSession<'_> {
             hidden,
         )?;
 
-        let mut writer = self.cache.begin_token(self.handle)?;
-        for layer in 0..self.model.config.layer_count() {
+        let mut writer = self.model.inner.cache.begin_token(self.handle)?;
+        for layer in 0..self.model.inner.config.layer_count() {
             self.forward_layer(layer, &mut writer, &mut state)?;
         }
         let normalized = rms_norm(
             &state,
             self.model.weight("final_norm.weight")?,
-            self.model.config.rms_norm_epsilon(),
+            self.model.inner.config.rms_norm_epsilon(),
         )?;
         let logits = linear(
             self.model.weight("output.weight")?,
             &normalized,
-            usize_from_u32(self.model.config.vocabulary_size())?,
+            usize_from_u32(self.model.inner.config.vocabulary_size())?,
             hidden,
         )?;
         let output = Tensor::from_f32_values(
-            TensorShape::new([u64::from(self.model.config.vocabulary_size())])?,
+            TensorShape::new([u64::from(self.model.inner.config.vocabulary_size())])?,
             &logits,
             &self.output_pool,
         )?;
@@ -226,19 +240,20 @@ impl CpuDecoderSession<'_> {
         writer: &mut KvTokenWriter<'_>,
         state: &mut [f32],
     ) -> Result<(), EngineError> {
-        let hidden = usize_from_u32(self.model.config.hidden_dimension())?;
+        let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
         let kv_dimension = usize_from_u32(
             self.model
+                .inner
                 .config
                 .kv_head_count()
-                .checked_mul(self.model.config.head_dimension())
+                .checked_mul(self.model.inner.config.head_dimension())
                 .ok_or_else(|| EngineError::internal_invariant("KV dimension overflows"))?,
         )?;
         let prefix = format!("layers.{layer:03}");
         let attention_input = rms_norm(
             state,
             self.model.weight(&format!("{prefix}.attn_norm.weight"))?,
-            self.model.config.rms_norm_epsilon(),
+            self.model.inner.config.rms_norm_epsilon(),
         )?;
         let mut query = linear(
             self.model.weight(&format!("{prefix}.q_proj.weight"))?,
@@ -260,17 +275,17 @@ impl CpuDecoderSession<'_> {
         )?;
         apply_rope(
             &mut query,
-            self.model.config.attention_head_count(),
-            self.model.config.head_dimension(),
+            self.model.inner.config.attention_head_count(),
+            self.model.inner.config.head_dimension(),
             self.token_count,
-            self.model.config.rope_theta(),
+            self.model.inner.config.rope_theta(),
         )?;
         apply_rope(
             &mut key,
-            self.model.config.kv_head_count(),
-            self.model.config.head_dimension(),
+            self.model.inner.config.kv_head_count(),
+            self.model.inner.config.head_dimension(),
             self.token_count,
-            self.model.config.rope_theta(),
+            self.model.inner.config.rope_theta(),
         )?;
         writer.write_layer(layer, &key, &value)?;
         let attention = self.attention(layer, writer, &query)?;
@@ -285,9 +300,9 @@ impl CpuDecoderSession<'_> {
         let ffn_input = rms_norm(
             state,
             self.model.weight(&format!("{prefix}.ffn_norm.weight"))?,
-            self.model.config.rms_norm_epsilon(),
+            self.model.inner.config.rms_norm_epsilon(),
         )?;
-        let intermediate = usize_from_u32(self.model.config.intermediate_dimension())?;
+        let intermediate = usize_from_u32(self.model.inner.config.intermediate_dimension())?;
         let gate = linear(
             self.model.weight(&format!("{prefix}.gate_proj.weight"))?,
             &ffn_input,
@@ -316,9 +331,9 @@ impl CpuDecoderSession<'_> {
         writer: &KvTokenWriter<'_>,
         query: &[f32],
     ) -> Result<Vec<f32>, EngineError> {
-        let attention_heads = usize_from_u32(self.model.config.attention_head_count())?;
-        let kv_heads = usize_from_u32(self.model.config.kv_head_count())?;
-        let head_dimension = usize_from_u32(self.model.config.head_dimension())?;
+        let attention_heads = usize_from_u32(self.model.inner.config.attention_head_count())?;
+        let kv_heads = usize_from_u32(self.model.inner.config.kv_head_count())?;
+        let head_dimension = usize_from_u32(self.model.inner.config.head_dimension())?;
         let sequence_length = usize_from_u32(
             self.token_count
                 .checked_add(1)
@@ -331,7 +346,7 @@ impl CpuDecoderSession<'_> {
             zero_f32(attention_heads.checked_mul(head_dimension).ok_or_else(|| {
                 EngineError::resource_exhaustion("attention output length overflows")
             })?)?;
-        let scale = f64::from(self.model.config.head_dimension()).sqrt();
+        let scale = f64::from(self.model.inner.config.head_dimension()).sqrt();
         for query_head in 0..attention_heads {
             let kv_head = query_head / group_size;
             let mut scores = zero_f32(sequence_length)?;
@@ -375,9 +390,9 @@ impl CpuDecoderSession<'_> {
     }
 }
 
-impl Drop for CpuDecoderSession<'_> {
+impl Drop for CpuDecoderSession {
     fn drop(&mut self) {
-        let _ = self.cache.destroy_sequence(self.handle);
+        let _ = self.model.inner.cache.destroy_sequence(self.handle);
     }
 }
 

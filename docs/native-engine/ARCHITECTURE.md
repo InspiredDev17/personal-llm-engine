@@ -354,8 +354,13 @@ protocol. Each message uses a closed, bounded first-party body codec; signing
 derives the message kind from that body, and authenticated decoders reject
 unknown values, duplicate model IDs, malformed lengths, invalid token IDs,
 truncation, and trailing data before exposing a typed body. The exact
-single-command driver serves these control requests;
-continuous generation/cancellation streams retain their bounded path.
+single-command driver and the continuously admitting daemon both serve these
+control requests. Continuous controls use short authenticated connections
+under the same 64-connection ownership ceiling as handshakes, queued/active
+generations, and draining writers. Generation cursors own cloned immutable
+model/tokenizer handles, so a separately registered model may load without
+invalidating active state; unload remains prohibited while that model has
+queued or active scheduler ownership.
 The model-status response combines load state, health, capabilities, scheduler
 counts/limits, and queued-byte accounting under one signed correlation rather
 than making the Go router combine independent observations. ADR-0020 defines
