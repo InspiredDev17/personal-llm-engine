@@ -173,6 +173,7 @@ dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-quantization",
  "personalai-engine-tensor",
  "personalai-engine-testkit",
  "personalai-engine-types",
@@ -202,6 +203,7 @@ dependencies = [
  "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-quantization",
  "personalai-engine-scheduler",
  "personalai-engine-server",
  "personalai-engine-tensor",
@@ -217,6 +219,16 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "personalai-engine-crypto",
+ "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-quantization"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-tensor",
  "personalai-engine-types",
 ]
 

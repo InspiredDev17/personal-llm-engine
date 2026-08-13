@@ -26,6 +26,16 @@ pub const MAX_DIRECTORY_SHARDS: u32 = 1_024;
 pub const MAX_TENSOR_ALIGNMENT: u32 = 2 * 1024 * 1024;
 /// Maximum canonical tensor-name bytes.
 pub const MAX_DIRECTORY_TENSOR_NAME_BYTES: usize = 47;
+/// Number of logical values in every AIPQ block.
+pub const AIPQ_BLOCK_VALUES: u64 = 32;
+/// Fixed self-describing header length for one quantized tensor payload.
+pub const AIPQ_TENSOR_HEADER_BYTES: u64 = 32;
+/// Fixed AIPQ8 block length: one little-endian F32 scale and 32 signed bytes.
+pub const AIPQ8_BLOCK_BYTES: u64 = 36;
+/// Fixed AIPQ4 block length: one little-endian F32 scale and 16 packed bytes.
+pub const AIPQ4_BLOCK_BYTES: u64 = 20;
+/// Required package alignment for all AIPQ tensor payloads.
+pub const AIPQ_REQUIRED_ALIGNMENT: u32 = 64;
 
 const ENDIAN_MARKER: u32 = 0x0102_0304;
 const FLAG_TIED_OUTPUT: u32 = 1;
@@ -36,18 +46,53 @@ const KNOWN_FLAGS: u32 = FLAG_TIED_OUTPUT;
 pub enum Quantization {
     /// Exact unquantized tensor storage.
     None,
+    /// First-party symmetric signed eight-bit block storage.
+    AipQ8V1,
+    /// First-party symmetric packed signed four-bit block storage.
+    AipQ4V1,
 }
 
 impl Quantization {
-    const fn encode(self) -> u8 {
+    /// Returns the stable package-format identifier.
+    pub const fn id(self) -> u8 {
         match self {
             Self::None => 0,
+            Self::AipQ8V1 => 1,
+            Self::AipQ4V1 => 2,
+        }
+    }
+
+    /// Returns the exact encoded payload length for a logical element count.
+    pub fn payload_len(self, element_count: u64) -> Result<u64, EngineError> {
+        if element_count == 0 {
+            return Err(corrupt("quantized tensor element count is zero"));
+        }
+        match self {
+            Self::None => Err(corrupt("unquantized storage has no AIPQ payload length")),
+            Self::AipQ8V1 | Self::AipQ4V1 => {
+                let blocks = element_count
+                    .checked_add(AIPQ_BLOCK_VALUES - 1)
+                    .and_then(|value| value.checked_div(AIPQ_BLOCK_VALUES))
+                    .ok_or_else(|| corrupt("quantized tensor block count overflows"))?;
+                let block_bytes = match self {
+                    Self::AipQ8V1 => AIPQ8_BLOCK_BYTES,
+                    Self::AipQ4V1 => AIPQ4_BLOCK_BYTES,
+                    Self::None => return Err(corrupt("unquantized storage has no AIPQ blocks")),
+                };
+                blocks
+                    .checked_mul(block_bytes)
+                    .and_then(|bytes| bytes.checked_add(AIPQ_TENSOR_HEADER_BYTES))
+                    .filter(|bytes| *bytes <= MAX_MODEL_PACKAGE_BYTES)
+                    .ok_or_else(|| corrupt("quantized tensor payload length overflows"))
+            }
         }
     }
 
     fn decode(value: u8) -> Result<Self, EngineError> {
         match value {
             0 => Ok(Self::None),
+            1 => Ok(Self::AipQ8V1),
+            2 => Ok(Self::AipQ4V1),
             _ => Err(corrupt("directory manifest quantization is unsupported")),
         }
     }
@@ -150,8 +195,17 @@ impl DirectoryTensorRecord {
         {
             return Err(corrupt("tensor alignment is invalid"));
         }
-        if byte_length == 0 || byte_length != shape.byte_len(dtype)? {
-            return Err(corrupt("tensor byte length does not match dtype and shape"));
+        let expected_length = match quantization {
+            Quantization::None => shape.byte_len(dtype)?,
+            Quantization::AipQ8V1 | Quantization::AipQ4V1 => {
+                if dtype != DType::F32 || required_alignment < AIPQ_REQUIRED_ALIGNMENT {
+                    return Err(corrupt("quantized tensor dtype or required alignment is invalid"));
+                }
+                quantization.payload_len(shape.element_count())?
+            }
+        };
+        if byte_length == 0 || byte_length != expected_length {
+            return Err(corrupt("tensor byte length does not match storage declaration"));
         }
         byte_offset
             .checked_add(byte_length)
@@ -381,6 +435,7 @@ impl DirectoryManifest {
             return Err(corrupt("directory tensor names are not in canonical order"));
         }
         validate_tensor_ranges(&shards, &tensors)?;
+        validate_quantization_profile(storage_dtype, quantization, &tensors)?;
 
         Ok(Self {
             model_id,
@@ -595,7 +650,7 @@ impl DirectoryManifestBuilder {
         write_u32(&mut bytes, 36, tensor_count)?;
         write_u32(&mut bytes, 40, shard_count)?;
         bytes[44] = encode_dtype(self.manifest.storage_dtype)?;
-        bytes[45] = self.manifest.quantization.encode();
+        bytes[45] = self.manifest.quantization.id();
         write_u32(&mut bytes, 48, self.manifest.context_limit.get())?;
         write_u32(&mut bytes, 52, self.manifest.vocabulary_size)?;
         write_u32(&mut bytes, 56, self.manifest.hidden_dimension)?;
@@ -629,7 +684,7 @@ impl DirectoryManifestBuilder {
                 .map_err(|_| corrupt("tensor rank exceeds its field"))?;
             write_u32(&mut bytes, cursor + 4, tensor.shard_index)?;
             write_u32(&mut bytes, cursor + 8, tensor.required_alignment)?;
-            bytes[cursor + 12] = tensor.quantization.encode();
+            bytes[cursor + 12] = tensor.quantization.id();
             for (index, dimension) in tensor.shape.dimensions().iter().enumerate() {
                 write_u64(&mut bytes, cursor + 16 + index * 8, *dimension)?;
             }
@@ -724,6 +779,45 @@ fn validate_tensor_ranges(
         shard_ranges.sort_unstable();
         if shard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(corrupt("directory tensor ranges overlap"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_quantization_profile(
+    storage_dtype: DType,
+    profile: Quantization,
+    tensors: &[DirectoryTensorRecord],
+) -> Result<(), EngineError> {
+    match profile {
+        Quantization::None => {
+            if tensors.iter().any(|tensor| tensor.quantization() != Quantization::None) {
+                return Err(corrupt(
+                    "unquantized manifest contains a quantized tensor declaration",
+                ));
+            }
+        }
+        Quantization::AipQ8V1 | Quantization::AipQ4V1 => {
+            if storage_dtype != DType::F32 {
+                return Err(corrupt("quantized manifest logical dtype must be F32"));
+            }
+            let mut observed_quantized = false;
+            for tensor in tensors {
+                match tensor.quantization() {
+                    Quantization::None => {}
+                    value if value == profile => observed_quantized = true,
+                    _ => {
+                        return Err(corrupt(
+                            "manifest contains unsupported mixed quantization formats",
+                        ));
+                    }
+                }
+            }
+            if !observed_quantized {
+                return Err(corrupt(
+                    "quantized manifest contains no quantized tensor declarations",
+                ));
+            }
         }
     }
     Ok(())
@@ -962,6 +1056,79 @@ mod tests {
         let encoded = manifest.encode().expect("manifest must encode");
         assert_eq!(DirectoryManifest::parse(&encoded).expect("manifest must parse"), manifest);
         assert_eq!(manifest.encode().expect("repeat must encode"), encoded);
+    }
+
+    #[test]
+    fn quantized_manifest_accepts_only_canonical_profile_and_lengths() {
+        let matrix_shape = TensorShape::new([4, 4]).expect("matrix shape must validate");
+        let matrix = DirectoryTensorRecord::new(
+            "matrix.weight",
+            DType::F32,
+            matrix_shape.clone(),
+            0,
+            0,
+            Quantization::AipQ8V1
+                .payload_len(matrix_shape.element_count())
+                .expect("Q8 length must calculate"),
+            AIPQ_REQUIRED_ALIGNMENT,
+            Quantization::AipQ8V1,
+            hash(3),
+        )
+        .expect("Q8 tensor must validate");
+        let norm = DirectoryTensorRecord::new(
+            "norm.weight",
+            DType::F32,
+            TensorShape::new([4]).expect("norm shape must validate"),
+            0,
+            128,
+            16,
+            64,
+            Quantization::None,
+            hash(4),
+        )
+        .expect("F32 tensor must validate");
+        let manifest = DirectoryManifestBuilder::new(
+            ModelId::new("synthetic-quantized").expect("model ID must validate"),
+            (0, 1, 0),
+            ContextLimit::new(128).expect("context must validate"),
+            256,
+            4,
+            1,
+            1,
+            1,
+            8,
+            10_000.0,
+            1.0,
+            DType::F32,
+            Quantization::AipQ8V1,
+            false,
+            hash(1),
+            vec![DirectoryShardRecord::new(0, 192, hash(2)).expect("shard must validate")],
+            vec![matrix, norm],
+        )
+        .expect("Q8 manifest must validate")
+        .build_bytes()
+        .expect("Q8 manifest must encode");
+        let parsed = DirectoryManifest::parse(&manifest).expect("Q8 manifest must parse");
+        assert_eq!(parsed.quantization(), Quantization::AipQ8V1);
+
+        let mut mixed = manifest.clone();
+        mixed[45] = Quantization::AipQ4V1.id();
+        assert!(DirectoryManifest::parse(&mixed).is_err());
+        assert!(
+            DirectoryTensorRecord::new(
+                "bad.weight",
+                DType::F32,
+                matrix_shape,
+                0,
+                0,
+                64,
+                64,
+                Quantization::AipQ8V1,
+                hash(5),
+            )
+            .is_err()
+        );
     }
 
     #[test]

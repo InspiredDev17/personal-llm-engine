@@ -15,7 +15,7 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
-| 0. Boundaries/workspace | COMPLETE | 18-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
+| 0. Boundaries/workspace | COMPLETE | 19-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
 | 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
 | 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for AIPTok V1 synthetic profile | First-party `AIPTOK01`, strict metadata conversion, content hash, byte fallback, ranked merges, explicit special policies, exact byte/UTF-8/incremental decode, property/malformed/fuzz tests and dependency-free benchmarks |
@@ -25,6 +25,7 @@ memory, tool, approval, or Agent Green behavior.
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
+| 9a. Quantized package storage | COMPLETE for AIPQ8/AIPQ4 synthetic evidence | Explicit profiles, canonical fixed-block payloads, signed source/destination/error evidence, secure loading, scalar kernels, and F32/Q8/Q4 transformer divergence regression |
 | 10. ARM64/Metal | IN PROGRESS / HARDWARE GATED | ARM64 graph backend has fixed Advanced SIMD elementwise/dot/matrix-vector kernels and M1 differential tests; decoder integration and all Metal work remain |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
@@ -45,8 +46,9 @@ memory, tool, approval, or Agent Green behavior.
   enforces one global tensor inventory and aggregate byte ceiling, records every
   source digest, and emits contiguous signed destination shards independently
   of caller argument order. F32, F16, and BF16 source tensors are explicitly
-  validated; compact IEEE storage is converted through the first-party tensor
-  routines into finite F32 correctness-oracle package storage.
+  validated; finite values enter an explicit F32, AIPQ8, or AIPQ4 package
+  profile. Signed per-tensor and per-layer error evidence retains poor results;
+  the synthetic AIPQ4 fixture currently diverges on all four generated tokens.
 - First-party tokenizer, tensor, immutable graph, scalar correctness backend,
   memory, KV, decoder, bounded first-party sampling,
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,

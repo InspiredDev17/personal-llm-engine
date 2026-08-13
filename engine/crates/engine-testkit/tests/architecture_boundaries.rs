@@ -401,18 +401,28 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 18-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 19-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 18] = [
+    let allowed: [(&str, &[&str]); 19] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-model-format", &["personalai-engine-types"]),
+        (
+            "engine-quantization",
+            &[
+                "personalai-engine-memory",
+                "personalai-engine-model-format",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
         (
             "engine-loader",
             &[
                 "personalai-engine-crypto",
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
+                "personalai-engine-quantization",
                 "personalai-engine-tensor",
                 "personalai-engine-types",
             ],
@@ -423,6 +433,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-crypto",
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
+                "personalai-engine-quantization",
                 "personalai-engine-tensor",
                 "personalai-engine-tokenizer",
                 "personalai-engine-types",

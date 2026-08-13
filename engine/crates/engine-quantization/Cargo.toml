@@ -1,0 +1,20 @@
+[package]
+name = "personalai-engine-quantization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "First-party AIPQ block quantization formats and scalar reference kernels"
+
+[dependencies]
+personalai-engine-memory.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-tensor.workspace = true
+personalai-engine-types.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "scalar_quantization"
+harness = false

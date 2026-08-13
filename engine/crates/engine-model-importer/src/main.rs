@@ -4,6 +4,7 @@ use personalai_engine_model_format::DIRECTORY_DECODER_ARCHITECTURE_ID;
 use personalai_engine_model_importer::{
     AIPTOK_METADATA_SOURCE_FORMAT, ImportSpec, SourceMapping, import_local, import_local_sharded,
 };
+use personalai_engine_quantization::QuantizationProfile;
 use personalai_engine_types::{ContextLimit, EngineError, ModelId, SignerKeyId};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -20,7 +21,8 @@ const USAGE: &str = "usage: personalai-engine-model-importer import \
   --hidden-dimension U32 --layer-count U32 --attention-head-count U32 \
   --kv-head-count U32 --feed-forward-dimension U32 --rope-theta F32 \
   --rope-scaling F32 --tied-output true|false --source-label TEXT \
-  --license-id TEXT --signer-key-id HEX32 [--force-audit-note TEXT]\n\
+  --license-id TEXT --quantization-profile reference-f32|balanced-q8|compact-q4 \
+  --signer-key-id HEX32 [--force-audit-note TEXT]\n\
 reads exactly 32 binary Ed25519 signing-seed bytes from stdin; local paths only";
 
 fn main() -> ExitCode {
@@ -95,6 +97,7 @@ fn run(
         boolean(&mut values, "--tied-output")?,
         text(take(&mut values, "--source-label")?)?,
         text(take(&mut values, "--license-id")?)?,
+        QuantizationProfile::parse(&text(take(&mut values, "--quantization-profile")?)?)?,
     )?;
     let signer_key_id =
         SignerKeyId::from_bytes(parse_hex(&text(take(&mut values, "--signer-key-id")?)?)?)?;

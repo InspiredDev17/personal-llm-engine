@@ -15,7 +15,8 @@ an explicit exact-owner-selected Model Foundry registry V2 admission mode,
 no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
 tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
-storage conversion, an immutable architecture-owned graph, one fixed decoder architecture,
+storage conversion, deterministic first-party AIPQ8/AIPQ4 package profiles and
+scalar quantized reference kernels, an immutable architecture-owned graph, one fixed decoder architecture,
 scalar CPU reference
 inference, contiguous sequence-owned KV state, deterministic greedy and seeded
 temperature/top-k/top-p/min-p/repetition-penalty sampling, a bounded scheduler,
@@ -113,4 +114,6 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 
 See [the charter](docs/native-engine/CHARTER.md),
 [architecture](docs/native-engine/ARCHITECTURE.md), and
-[roadmap](docs/native-engine/ROADMAP.md).
+[roadmap](docs/native-engine/ROADMAP.md). The exact quantization format and
+synthetic accuracy limitations are in
+[first-party quantization](docs/native-engine/QUANTIZATION.md).

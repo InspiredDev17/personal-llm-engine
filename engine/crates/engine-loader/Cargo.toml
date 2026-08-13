@@ -9,6 +9,7 @@ description = "Fail-closed registered-model resolution for the PersonalAI native
 [dependencies]
 personalai-engine-crypto.workspace = true
 personalai-engine-model-format.workspace = true
+personalai-engine-quantization.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-tensor.workspace = true
 personalai-engine-types.workspace = true

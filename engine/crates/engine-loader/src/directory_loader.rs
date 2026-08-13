@@ -7,8 +7,9 @@ use personalai_engine_crypto::{
 use personalai_engine_memory::{MemoryOwner, MemoryPool, MemoryReservation};
 use personalai_engine_model_format::{
     DIRECTORY_DECODER_ARCHITECTURE_ID, DirectoryManifest, DirectoryTensorRecord, HashCatalog,
-    PackageFileKind, SignatureEnvelope,
+    PackageFileKind, Quantization, SignatureEnvelope,
 };
+use personalai_engine_quantization::QuantizedTensor;
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
     DType, EngineError, MAX_MODEL_PACKAGE_BYTES, ModelId, ModelPackageRejection, ResourceBudget,
@@ -176,12 +177,7 @@ impl VerifiedDirectoryPackage {
         let metadata_reservation = metadata_pool.reserve(metadata_bytes)?;
         let mut tensors = BTreeMap::new();
         for record in self.manifest.tensors() {
-            let tensor = Tensor::convert_storage_to_f32(
-                record.dtype(),
-                record.shape().clone(),
-                self.tensor_bytes_verified(record)?,
-                &weight_pool,
-            )?;
+            let tensor = self.materialize_tensor(record, &weight_pool)?;
             if tensors.insert(record.name().to_owned(), tensor).is_some() {
                 return Err(EngineError::internal_invariant(
                     "validated directory manifest contains duplicate tensor name",
@@ -195,12 +191,7 @@ impl VerifiedDirectoryPackage {
                 .iter()
                 .find(|record| record.name() == "token_embedding.weight")
                 .ok_or_else(|| EngineError::internal_invariant("tied embedding is missing"))?;
-            let output = Tensor::convert_storage_to_f32(
-                embedding.dtype(),
-                embedding.shape().clone(),
-                self.tensor_bytes_verified(embedding)?,
-                &weight_pool,
-            )?;
+            let output = self.materialize_tensor(embedding, &weight_pool)?;
             if tensors.insert("output.weight".to_owned(), output).is_some() {
                 return Err(EngineError::internal_invariant(
                     "tied output conflicts with explicit output tensor",
@@ -208,6 +199,23 @@ impl VerifiedDirectoryPackage {
             }
         }
         Ok(LoadedDirectoryTensors { tensors, _metadata_reservation: metadata_reservation })
+    }
+
+    fn materialize_tensor(
+        &self,
+        record: &DirectoryTensorRecord,
+        pool: &MemoryPool,
+    ) -> Result<Tensor, EngineError> {
+        let bytes = self.tensor_bytes_verified(record)?;
+        match record.quantization() {
+            Quantization::None => {
+                Tensor::convert_storage_to_f32(record.dtype(), record.shape().clone(), bytes, pool)
+            }
+            Quantization::AipQ8V1 | Quantization::AipQ4V1 => {
+                QuantizedTensor::parse(record.quantization(), record.shape(), bytes)?
+                    .dequantize(pool)
+            }
+        }
     }
 }
 
@@ -647,8 +655,12 @@ fn expected_shapes(
 
 fn validate_tensor_hashes(package: &VerifiedDirectoryPackage) -> Result<(), EngineError> {
     for tensor in package.manifest.tensors() {
-        if hash_package(package.tensor_bytes(tensor)?) != tensor.content_hash() {
+        let bytes = package.tensor_bytes(tensor)?;
+        if hash_package(bytes) != tensor.content_hash() {
             return Err(EngineError::signature_failure("tensor content hash verification failed"));
+        }
+        if matches!(tensor.quantization(), Quantization::AipQ8V1 | Quantization::AipQ4V1) {
+            QuantizedTensor::parse(tensor.quantization(), tensor.shape(), bytes)?;
         }
     }
     Ok(())

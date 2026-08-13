@@ -44,6 +44,9 @@ Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 SHA-384 and strict Ed25519 are package/control-message/response integrity
 mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper
 for AIPTok's internal content hash; it adds no external dependency. The
+first-party `engine-quantization` crate uses only workspace model-format,
+tensor, memory, and types crates; it adds no external dependency or native
+code. The
 narrowly enabled Ed25519 `zeroize` feature plus the direct
 `zeroize` crate clear response-key seed material and signing state; no derive
 feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`

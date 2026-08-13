@@ -24,6 +24,7 @@ use personalai_engine_model_format::{
     DirectoryTensorRecord, HashCatalog, HashCatalogEntry, MAX_DIRECTORY_SHARDS, PackageFileKind,
     Quantization, SignatureEnvelope,
 };
+use personalai_engine_quantization::{QuantizationErrorMetrics, QuantizationProfile, quantize};
 use personalai_engine_tensor::{bf16_bits_to_f32, f16_bits_to_f32};
 use personalai_engine_tokenizer::{FirstPartyBpeTokenizer, Tokenizer};
 use personalai_engine_types::{
@@ -118,6 +119,7 @@ pub struct ImportSpec {
     tied_output: bool,
     source_label: String,
     license_id: String,
+    quantization_profile: QuantizationProfile,
 }
 
 impl ImportSpec {
@@ -138,6 +140,7 @@ impl ImportSpec {
         tied_output: bool,
         source_label: impl Into<String>,
         license_id: impl Into<String>,
+        quantization_profile: QuantizationProfile,
     ) -> Result<Self, EngineError> {
         let source_label = source_label.into();
         let license_id = license_id.into();
@@ -173,6 +176,7 @@ impl ImportSpec {
             tied_output,
             source_label,
             license_id,
+            quantization_profile,
         })
     }
 
@@ -180,6 +184,26 @@ impl ImportSpec {
     pub const fn model_id(&self) -> &ModelId {
         &self.model_id
     }
+
+    /// Returns the explicit storage profile selected by the offline operator.
+    pub const fn quantization_profile(&self) -> QuantizationProfile {
+        self.quantization_profile
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TensorQuantizationEvidence {
+    name: String,
+    format: Quantization,
+    source_hash: ModelPackageHash,
+    destination_hash: ModelPackageHash,
+    metrics: Option<QuantizationErrorMetrics>,
+}
+
+struct BuiltShards {
+    shards: Vec<Vec<u8>>,
+    records: Vec<DirectoryTensorRecord>,
+    evidence: Vec<TensorQuantizationEvidence>,
 }
 
 /// Deterministic signed package files before their atomic local-store install.
@@ -315,7 +339,7 @@ fn build_package_inner(
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
     let source = SafetensorsSource::new(source_name, source_bytes)?;
-    let (shards, tensor_records) = build_shards(spec, &[source])?;
+    let built = build_shards(spec, &[source])?;
     let provenance = provenance(
         spec,
         source_name,
@@ -323,11 +347,12 @@ fn build_package_inner(
         tokenizer_source.name,
         tokenizer_source.bytes,
         tokenizer_source.format,
+        &built.evidence,
     )?;
     finish_package(
         spec,
-        shards,
-        tensor_records,
+        built.shards,
+        built.records,
         provenance,
         tokenizer_bytes,
         signer_key_id,
@@ -344,18 +369,19 @@ fn build_package_sharded_inner(
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
     let ordered = validate_and_order_sources(sources)?;
-    let (shards, tensor_records) = build_shards(spec, &ordered)?;
+    let built = build_shards(spec, &ordered)?;
     let provenance = sharded_provenance(
         spec,
         &ordered,
         tokenizer_source.name,
         tokenizer_source.bytes,
         tokenizer_source.format,
+        &built.evidence,
     )?;
     finish_package(
         spec,
-        shards,
-        tensor_records,
+        built.shards,
+        built.records,
         provenance,
         tokenizer_bytes,
         signer_key_id,
@@ -411,7 +437,7 @@ fn finish_package(
         spec.rope_theta,
         spec.rope_scaling,
         DType::F32,
-        Quantization::None,
+        spec.quantization_profile.format(),
         spec.tied_output,
         tokenizer_hash,
         shard_records,
@@ -637,21 +663,26 @@ fn validate_and_order_sources<'a>(
     Ok(ordered)
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_shards(
     spec: &ImportSpec,
     sources: &[SafetensorsSource<'_>],
-) -> Result<(Vec<Vec<u8>>, Vec<DirectoryTensorRecord>), EngineError> {
+) -> Result<BuiltShards, EngineError> {
     let expected = expected_shapes(spec)?;
     let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
     let mut seen_names = BTreeSet::new();
     let mut shards = Vec::new();
     let mut records = Vec::new();
+    let mut evidence = Vec::new();
     shards
         .try_reserve_exact(sources.len())
         .map_err(|_| EngineError::resource_exhaustion("output shard allocation failed"))?;
     records.try_reserve_exact(expected.len()).map_err(|_| {
         EngineError::resource_exhaustion("import tensor metadata allocation failed")
     })?;
+    evidence
+        .try_reserve_exact(expected.len())
+        .map_err(|_| EngineError::resource_exhaustion("quantization evidence allocation failed"))?;
     let mut completed_output_bytes = 0_u64;
 
     for (shard_index, source) in sources.iter().copied().enumerate() {
@@ -684,12 +715,18 @@ fn build_shards(
             let source_bytes = parsed.tensor_bytes(tensor)?;
             let aligned =
                 align_up(shard.len(), usize::try_from(IMPORT_TENSOR_ALIGNMENT).unwrap_or(64))?;
-            let destination_length = usize::try_from(tensor.shape().byte_len(DType::F32)?)
-                .map_err(|_| {
-                    EngineError::resource_exhaustion(
-                        "converted tensor length is not addressable on this host",
-                    )
-                })?;
+            let converted = convert_source_tensor_to_f32(tensor.dtype(), source_bytes)?;
+            let values = f32_values(&converted)?;
+            let quantization = spec.quantization_profile.tensor_format(tensor.shape().rank());
+            let (destination, metrics) = match quantization {
+                Quantization::None => (converted, None),
+                Quantization::AipQ8V1 | Quantization::AipQ4V1 => {
+                    let payload = quantize(quantization, tensor.shape(), &values)?;
+                    let metrics = payload.metrics();
+                    (payload.into_bytes(), Some(metrics))
+                }
+            };
+            let destination_length = destination.len();
             let planned_shard_end = aligned.checked_add(destination_length).ok_or_else(|| {
                 EngineError::resource_exhaustion("converted output shard length overflows")
             })?;
@@ -701,30 +738,32 @@ fn build_shards(
                         "aggregate converted output bytes exceed hard limit",
                     )
                 })?;
-            let converted = convert_source_tensor_to_f32(tensor.dtype(), source_bytes)?;
-            if converted.len() != destination_length {
-                return Err(EngineError::internal_invariant(
-                    "converted tensor differs from its architecture byte plan",
-                ));
-            }
             shard
                 .try_reserve_exact(planned_shard_end - shard.len())
                 .map_err(|_| EngineError::resource_exhaustion("import shard allocation failed"))?;
             if aligned > shard.len() {
                 shard.resize(aligned, 0);
             }
-            shard.extend_from_slice(&converted);
+            shard.extend_from_slice(&destination);
+            let destination_hash = hash_package(&destination);
             records.push(DirectoryTensorRecord::new(
-                name,
+                name.clone(),
                 DType::F32,
                 tensor.shape().clone(),
                 shard_index,
                 usize_to_u64(aligned)?,
-                usize_to_u64(converted.len())?,
+                usize_to_u64(destination.len())?,
                 IMPORT_TENSOR_ALIGNMENT,
-                Quantization::None,
-                hash_package(&converted),
+                quantization,
+                destination_hash,
             )?);
+            evidence.push(TensorQuantizationEvidence {
+                name,
+                format: quantization,
+                source_hash: hash_package(source_bytes),
+                destination_hash,
+                metrics,
+            });
         }
         completed_output_bytes =
             completed_output_bytes.checked_add(usize_to_u64(shard.len())?).ok_or_else(|| {
@@ -736,7 +775,8 @@ fn build_shards(
         return Err(corrupt("source tensor inventory has missing tensors"));
     }
     records.sort_by(|left, right| left.name().cmp(right.name()));
-    Ok((shards, records))
+    evidence.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(BuiltShards { shards, records, evidence })
 }
 
 fn expected_shapes(spec: &ImportSpec) -> Result<BTreeMap<String, TensorShape>, EngineError> {
@@ -821,6 +861,133 @@ fn map_llama_name(source: &str, layer_count: u32) -> Result<String, EngineError>
     Ok(format!("layers.{layer:03}.{canonical_suffix}"))
 }
 
+fn render_quantization_evidence(
+    evidence: &[TensorQuantizationEvidence],
+) -> Result<String, EngineError> {
+    use std::fmt::Write as _;
+
+    let mut records = String::new();
+    for (index, tensor) in evidence.iter().enumerate() {
+        let (maximum, mean, rms, relative, relative_count) =
+            tensor.metrics.map_or((0.0, 0.0, 0.0, 0.0, 0), |metrics| {
+                (
+                    metrics.maximum_absolute_error(),
+                    metrics.mean_absolute_error(),
+                    metrics.root_mean_square_error(),
+                    metrics.maximum_relative_error(),
+                    metrics.relative_value_count(),
+                )
+            });
+        writeln!(
+            &mut records,
+            concat!(
+                "    {{\"destination_sha384\": \"{}\", \"format\": \"{}\", ",
+                "\"maximum_absolute_error\": {:.9e}, \"maximum_relative_error\": {:.9e}, ",
+                "\"mean_absolute_error\": {:.9e}, \"name\": \"{}\", ",
+                "\"relative_value_count\": {}, \"root_mean_square_error\": {:.9e}, ",
+                "\"source_sha384\": \"{}\"}}{}"
+            ),
+            tensor.destination_hash,
+            quantization_name(tensor.format),
+            maximum,
+            relative,
+            mean,
+            tensor.name,
+            relative_count,
+            rms,
+            tensor.source_hash,
+            if index + 1 == evidence.len() { "" } else { "," },
+        )
+        .map_err(|_| EngineError::internal_invariant("quantization evidence write failed"))?;
+        if records.len() > MAX_PROVENANCE_BYTES {
+            return Err(EngineError::resource_exhaustion(
+                "quantization evidence exceeds provenance limit",
+            ));
+        }
+    }
+    Ok(records)
+}
+
+fn render_layer_error_evidence(
+    evidence: &[TensorQuantizationEvidence],
+) -> Result<String, EngineError> {
+    use std::fmt::Write as _;
+
+    let mut layers = BTreeMap::<String, (u64, f64, f64, f64, f64)>::new();
+    for tensor in evidence {
+        let layer = tensor
+            .name
+            .strip_prefix("layers.")
+            .and_then(|suffix| suffix.get(..3))
+            .map_or("global".to_owned(), |number| format!("layer-{number}"));
+        let entry = layers.entry(layer).or_insert((0, 0.0, 0.0, 0.0, 0.0));
+        entry.0 = entry
+            .0
+            .checked_add(1)
+            .ok_or_else(|| EngineError::resource_exhaustion("layer evidence count overflows"))?;
+        if let Some(metrics) = tensor.metrics {
+            entry.1 = entry.1.max(metrics.maximum_absolute_error());
+            entry.2 = entry.2.max(metrics.mean_absolute_error());
+            entry.3 = entry.3.max(metrics.root_mean_square_error());
+            entry.4 = entry.4.max(metrics.maximum_relative_error());
+        }
+    }
+    let mut records = String::new();
+    let count = layers.len();
+    for (index, (layer, (tensor_count, maximum, mean, rms, relative))) in
+        layers.into_iter().enumerate()
+    {
+        writeln!(
+            &mut records,
+            concat!(
+                "    {{\"layer\": \"{}\", \"maximum_absolute_error\": {:.9e}, ",
+                "\"maximum_mean_absolute_error\": {:.9e}, ",
+                "\"maximum_relative_error\": {:.9e}, ",
+                "\"maximum_root_mean_square_error\": {:.9e}, \"tensor_count\": {}}}{}"
+            ),
+            layer,
+            maximum,
+            mean,
+            relative,
+            rms,
+            tensor_count,
+            if index + 1 == count { "" } else { "," },
+        )
+        .map_err(|_| EngineError::internal_invariant("layer error evidence write failed"))?;
+    }
+    Ok(records)
+}
+
+const fn quantization_name(format: Quantization) -> &'static str {
+    match format {
+        Quantization::None => "f32",
+        Quantization::AipQ8V1 => "aipq8-v1",
+        Quantization::AipQ4V1 => "aipq4-v1",
+    }
+}
+
+fn f32_values(bytes: &[u8]) -> Result<Vec<f32>, EngineError> {
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(EngineError::internal_invariant("converted F32 tensor byte length is invalid"));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(bytes.len() / 4)
+        .map_err(|_| EngineError::resource_exhaustion("F32 conversion allocation failed"))?;
+    for scalar in bytes.chunks_exact(4) {
+        let value = f32::from_le_bytes(
+            scalar
+                .try_into()
+                .map_err(|_| EngineError::internal_invariant("F32 scalar length is invalid"))?,
+        );
+        if !value.is_finite() {
+            return Err(corrupt("source tensor contains non-finite F32 data"));
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn provenance(
     spec: &ImportSpec,
     source_name: &str,
@@ -828,10 +995,13 @@ fn provenance(
     tokenizer_source_name: &str,
     tokenizer_source_bytes: &[u8],
     tokenizer_source_format: &str,
+    quantization_evidence: &[TensorQuantizationEvidence],
 ) -> Result<Vec<u8>, EngineError> {
     validate_provenance_text(source_name, 256)?;
     validate_provenance_text(tokenizer_source_name, 256)?;
     validate_provenance_text(tokenizer_source_format, 64)?;
+    let quantization_records = render_quantization_evidence(quantization_evidence)?;
+    let layer_error_records = render_layer_error_evidence(quantization_evidence)?;
     let document = format!(
         concat!(
             "{{\n",
@@ -839,6 +1009,13 @@ fn provenance(
             "  \"license_id\": \"{}\",\n",
             "  \"mapping\": \"{}\",\n",
             "  \"model_id\": \"{}\",\n",
+            "  \"quantization_layer_errors\": [\n",
+            "{}",
+            "  ],\n",
+            "  \"quantization_profile\": \"{}\",\n",
+            "  \"quantization_tensors\": [\n",
+            "{}",
+            "  ],\n",
             "  \"source_file\": \"{}\",\n",
             "  \"source_format\": \"safetensors\",\n",
             "  \"source_label\": \"{}\",\n",
@@ -854,6 +1031,9 @@ fn provenance(
         spec.license_id,
         spec.mapping.as_str(),
         spec.model_id,
+        layer_error_records,
+        spec.quantization_profile.as_str(),
+        quantization_records,
         source_name,
         spec.source_label,
         hash_package(source_bytes),
@@ -874,11 +1054,14 @@ fn sharded_provenance(
     tokenizer_source_name: &str,
     tokenizer_source_bytes: &[u8],
     tokenizer_source_format: &str,
+    quantization_evidence: &[TensorQuantizationEvidence],
 ) -> Result<Vec<u8>, EngineError> {
     use std::fmt::Write as _;
 
     validate_provenance_text(tokenizer_source_name, 256)?;
     validate_provenance_text(tokenizer_source_format, 64)?;
+    let quantization_records = render_quantization_evidence(quantization_evidence)?;
+    let layer_error_records = render_layer_error_evidence(quantization_evidence)?;
     let mut source_records = String::new();
     for (index, source) in sources.iter().copied().enumerate() {
         validate_provenance_text(source.name, 256)?;
@@ -903,6 +1086,13 @@ fn sharded_provenance(
             "  \"license_id\": \"{}\",\n",
             "  \"mapping\": \"{}\",\n",
             "  \"model_id\": \"{}\",\n",
+            "  \"quantization_layer_errors\": [\n",
+            "{}",
+            "  ],\n",
+            "  \"quantization_profile\": \"{}\",\n",
+            "  \"quantization_tensors\": [\n",
+            "{}",
+            "  ],\n",
             "  \"source_files\": [\n",
             "{}",
             "  ],\n",
@@ -919,6 +1109,9 @@ fn sharded_provenance(
         spec.license_id,
         spec.mapping.as_str(),
         spec.model_id,
+        layer_error_records,
+        spec.quantization_profile.as_str(),
+        quantization_records,
         source_records,
         spec.source_label,
         tokenizer_source_name,
@@ -1267,6 +1460,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn spec() -> ImportSpec {
+        spec_with_profile(QuantizationProfile::ReferenceF32)
+    }
+
+    fn spec_with_profile(profile: QuantizationProfile) -> ImportSpec {
         ImportSpec::new(
             ModelId::new("synthetic-import").expect("model ID must validate"),
             SourceMapping::LlamaSafetensorsV1,
@@ -1282,6 +1479,7 @@ mod tests {
             false,
             "synthetic-local-fixture",
             "test-only",
+            profile,
         )
         .expect("spec must validate")
     }
@@ -1495,6 +1693,109 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    fn load_cpu_profile(profile: QuantizationProfile) -> personalai_engine_server::LoadedCpuModel {
+        let root = temporary_root(&format!("cpu-{}", profile.as_str()));
+        let store = root.join("models");
+        let runtime = root.join("runtime");
+        let package_path = store.join("synthetic-import.paimodel");
+        fs::create_dir(&root).expect("profile root must create");
+        fs::create_dir(&store).expect("profile store must create");
+        fs::create_dir(&runtime).expect("profile runtime must create");
+        create_private_directory(&package_path).expect("profile package must create");
+        for directory in [&root, &store, &runtime] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("profile directory mode must set");
+        }
+        let (source, tokenizer) = source_and_tokenizer();
+        let spec = spec_with_profile(profile);
+        let key_id = SignerKeyId::from_bytes([0x45; 16]).expect("profile key ID must validate");
+        let mut seed = [0x46; 32];
+        let package =
+            build_package(&spec, "model.safetensors", &source, &tokenizer, key_id, &mut seed)
+                .expect("profile package must build");
+        write_package_files(&package_path, &package).expect("profile package must write");
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o500))
+            .expect("profile store must seal");
+        let trusted = TrustedSigner::active(key_id, package.signer_public_key())
+            .expect("profile signer must validate");
+        let config = ServiceConfig::new(&store, &runtime, runtime.join("engine.sock"))
+            .expect("profile service config must validate");
+        let mut service = EngineService::new(
+            config,
+            SchedulerLimits::new(8, 1, 1 << 20).expect("profile scheduler must validate"),
+        )
+        .expect("profile service must construct");
+        service
+            .register_configured_model(
+                spec.model_id().clone(),
+                "synthetic-import.paimodel",
+                package.package_hash(),
+                trusted,
+            )
+            .expect("profile package must register");
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+        let model = service
+            .load_registered_cpu_model(spec.model_id(), &budget, &mut |_| {})
+            .expect("profile CPU model must load");
+        remove_sealed_store(&root, &store, &package_path);
+        model
+    }
+
+    #[cfg(unix)]
+    fn profile_logits(
+        model: &personalai_engine_server::LoadedCpuModel,
+        request_value: u128,
+        sequence_value: u64,
+    ) -> Vec<f32> {
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+        let mut session = model
+            .model()
+            .start_session(
+                &budget,
+                RequestId::new(request_value).expect("request ID must validate"),
+                SequenceId::new(sequence_value).expect("sequence ID must validate"),
+            )
+            .expect("profile session must start");
+        let logits = session.prefill(&[65, 66]).expect("profile prefill must execute");
+        (0..usize::try_from(logits.shape().element_count()).expect("logits must be addressable"))
+            .map(|index| logits.f32_value(index).expect("logit must read"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn profile_tokens(
+        model: &personalai_engine_server::LoadedCpuModel,
+        request_value: u128,
+        sequence_value: u64,
+    ) -> Vec<u32> {
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+        let request = GenerationRequest::new(
+            RequestId::new(request_value).expect("request ID must validate"),
+            spec().model_id().clone(),
+            "AB",
+            4,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("profile generation request must validate");
+        let mut tokens = Vec::new();
+        model
+            .generate_greedy(
+                &request,
+                SequenceId::new(sequence_value).expect("sequence ID must validate"),
+                &std::sync::atomic::AtomicBool::new(false),
+                |event| {
+                    if let GenerationEvent::Token { token_id, .. } = event {
+                        tokens.push(token_id.get());
+                    }
+                    Ok(())
+                },
+            )
+            .expect("profile generation must complete");
+        tokens
+    }
+
     const REGISTRY_V2: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/model-foundry-registry-v2/positive-0002.registry.json"
@@ -1687,8 +1988,8 @@ mod tests {
         assert_eq!(
             first.package_hash(),
             ModelPackageHash::from_sha384_hex(
-                "24c0d89c9a04166200cda5fdd29647fed34d81a4b662ca195a0148182b840072\
-                 b0859828f89d78003ddb5d44907d10a4",
+                "6879ff670b27095c8adcf50286ae1cd1af1da8c34e622da9f8bbd472eef04a8c\
+                 6f77eebb520efe4f4de917642b3a0c22",
             )
             .expect("fixture package hash must parse"),
         );
@@ -1700,30 +2001,12 @@ mod tests {
                 0x17, 0x7d, 0x7e, 0xb7,
             ],
         );
-        let expected_files = [
-            (
-                "hashes.aiph",
-                528,
-                "24c0d89c9a04166200cda5fdd29647fed34d81a4b662ca195a0148182b840072\
-                 b0859828f89d78003ddb5d44907d10a4",
-            ),
+        let unchanged_data_files = [
             (
                 "manifest.aipm",
                 4_608,
                 "6a2a5349c18916a515b3afac4253ae5240e45d0e3fb808bf5a8093d7c45cc469\
                  b45fbdf6ad95f88e94f7d93a1d62941d",
-            ),
-            (
-                "provenance.json",
-                720,
-                "d55e94e28620461d21bd1103e695d2e4c6c62470984a9f2912d1fc566bafecdb\
-                 11c5725a4bd5009441e224044094affc",
-            ),
-            (
-                "signature.ed25519",
-                96,
-                "6292cef765d385e5c796b9533a2bc98fca7300d668ac75558c5bb1e650044f6f\
-                 695d888a3afeddf6e80dc6e714a394af",
             ),
             (
                 "tensors-0000.aipt",
@@ -1738,7 +2021,7 @@ mod tests {
                  84f0928d55d375e82e4c25be3163abce4",
             ),
         ];
-        for (name, expected_length, expected_hash) in expected_files {
+        for (name, expected_length, expected_hash) in unchanged_data_files {
             let bytes = first.files().get(name).expect("fixture file must exist");
             assert_eq!(bytes.len(), expected_length);
             assert_eq!(
@@ -1760,6 +2043,198 @@ mod tests {
                 "tokenizer.aiptok",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn quantized_packages_are_deterministic_signed_loadable_measured_and_accounted() {
+        for (profile, expected_format) in [
+            (QuantizationProfile::BalancedQ8, Quantization::AipQ8V1),
+            (QuantizationProfile::CompactQ4, Quantization::AipQ4V1),
+        ] {
+            let root = temporary_root(profile.as_str());
+            let store = root.join("models");
+            let runtime = root.join("runtime");
+            let package_path = store.join("synthetic-import.paimodel");
+            fs::create_dir(&root).expect("root must create");
+            fs::create_dir(&store).expect("store must create");
+            fs::create_dir(&runtime).expect("runtime must create");
+            create_private_directory(&package_path).expect("package directory must create");
+            for directory in [&root, &store, &runtime] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                    .expect("private directory mode must set");
+            }
+            let (source, tokenizer) = source_and_tokenizer();
+            let spec = spec_with_profile(profile);
+            let key_id = SignerKeyId::from_bytes([0x35; 16]).expect("key ID must validate");
+            let mut first_seed = [0x36; 32];
+            let mut second_seed = first_seed;
+            let first = build_package(
+                &spec,
+                "model.safetensors",
+                &source,
+                &tokenizer,
+                key_id,
+                &mut first_seed,
+            )
+            .expect("quantized package must build");
+            let second = build_package(
+                &spec,
+                "model.safetensors",
+                &source,
+                &tokenizer,
+                key_id,
+                &mut second_seed,
+            )
+            .expect("repeat quantized package must build");
+            assert_eq!(first, second);
+            let manifest = DirectoryManifest::parse(
+                first.files().get("manifest.aipm").expect("manifest must exist"),
+            )
+            .expect("quantized manifest must parse");
+            assert_eq!(manifest.quantization(), expected_format);
+            assert!(manifest.tensors().iter().any(|tensor| {
+                tensor.shape().rank() == 2 && tensor.quantization() == expected_format
+            }));
+            assert!(manifest.tensors().iter().all(|tensor| {
+                tensor.shape().rank() == 2 || tensor.quantization() == Quantization::None
+            }));
+            let provenance = std::str::from_utf8(
+                first.files().get("provenance.json").expect("provenance must exist"),
+            )
+            .expect("provenance must be UTF-8");
+            assert!(
+                provenance.contains(&format!("\"quantization_profile\": \"{}\"", profile.as_str()))
+            );
+            assert!(provenance.contains("\"quantization_layer_errors\""));
+            assert!(provenance.contains("\"maximum_absolute_error\""));
+            write_package_files(&package_path, &first).expect("quantized package files must write");
+            fs::set_permissions(&store, fs::Permissions::from_mode(0o500))
+                .expect("model store must seal");
+
+            let trusted = TrustedSigner::active(key_id, first.signer_public_key())
+                .expect("trusted signer must validate");
+            let mut registry = ModelRegistry::new(&store).expect("registry must construct");
+            registry
+                .register(
+                    spec.model_id().clone(),
+                    "synthetic-import.paimodel",
+                    first.package_hash(),
+                    trusted.clone(),
+                )
+                .expect("quantized package must register");
+            let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+            let loaded = registry
+                .load_registered_directory(spec.model_id(), &budget, &mut |_| {})
+                .expect("signed quantized package must load");
+            let pool = MemoryPool::new(1 << 20).expect("model pool must validate");
+            let tensors =
+                loaded.materialize_tensors(&pool).expect("quantized tensors must materialize");
+            assert!(pool.statistics().expect("metrics must read").reserved_bytes() > 0);
+            drop(tensors);
+            assert_eq!(pool.statistics().expect("metrics must read").reserved_bytes(), 0);
+
+            let config = ServiceConfig::new(&store, &runtime, runtime.join("engine.sock"))
+                .expect("service config must validate");
+            let mut service = EngineService::new(
+                config,
+                SchedulerLimits::new(8, 1, 1 << 20).expect("scheduler limits must validate"),
+            )
+            .expect("service must construct");
+            service
+                .register_configured_model(
+                    spec.model_id().clone(),
+                    "synthetic-import.paimodel",
+                    first.package_hash(),
+                    trusted,
+                )
+                .expect("service package must register");
+            let cpu_model = service
+                .load_registered_cpu_model(spec.model_id(), &budget, &mut |_| {})
+                .expect("quantized CPU model must load");
+            let request = GenerationRequest::new(
+                RequestId::new(9).expect("request ID must validate"),
+                spec.model_id().clone(),
+                "A",
+                2,
+                ContextLimit::new(8).expect("context must validate"),
+                budget,
+            )
+            .expect("request must validate");
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            assert!(matches!(
+                cpu_model.generate_greedy(
+                    &request,
+                    SequenceId::new(9).expect("sequence ID must validate"),
+                    &cancelled,
+                    |_| Ok(()),
+                ),
+                Err(EngineError::Cancellation(_))
+            ));
+            drop(cpu_model);
+            drop(loaded);
+            remove_sealed_store(&root, &store, &package_path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quantized_transformer_logit_and_generation_divergence_is_measured() {
+        let reference = load_cpu_profile(QuantizationProfile::ReferenceF32);
+        let q8 = load_cpu_profile(QuantizationProfile::BalancedQ8);
+        let q4 = load_cpu_profile(QuantizationProfile::CompactQ4);
+        let reference_logits = profile_logits(&reference, 101, 101);
+        let q8_logits = profile_logits(&q8, 102, 102);
+        let q4_logits = profile_logits(&q4, 103, 103);
+        let measure = |observed: &[f32]| {
+            assert_eq!(reference_logits.len(), observed.len());
+            let mut maximum = 0.0_f64;
+            let mut absolute_sum = 0.0_f64;
+            let mut squared_sum = 0.0_f64;
+            for (expected, actual) in reference_logits.iter().zip(observed) {
+                assert!(expected.is_finite() && actual.is_finite());
+                let error = (f64::from(*expected) - f64::from(*actual)).abs();
+                maximum = maximum.max(error);
+                absolute_sum += error;
+                squared_sum += error * error;
+            }
+            let count = u32::try_from(observed.len()).expect("synthetic logits fit u32");
+            let divisor = f64::from(count);
+            (maximum, absolute_sum / divisor, (squared_sum / divisor).sqrt())
+        };
+        let q8_error = measure(&q8_logits);
+        let q4_error = measure(&q4_logits);
+        let reference_tokens = profile_tokens(&reference, 201, 201);
+        let q8_tokens = profile_tokens(&q8, 202, 202);
+        let q4_tokens = profile_tokens(&q4, 203, 203);
+        let divergence = |observed: &[u32]| {
+            reference_tokens
+                .iter()
+                .zip(observed)
+                .filter(|(expected, actual)| expected != actual)
+                .count()
+                + reference_tokens.len().abs_diff(observed.len())
+        };
+        let q8_divergence = divergence(&q8_tokens);
+        let q4_divergence = divergence(&q4_tokens);
+        eprintln!(
+            "synthetic quantization evidence: q8 max={:.9e} mean={:.9e} rms={:.9e} token_divergence={}/{}; q4 max={:.9e} mean={:.9e} rms={:.9e} token_divergence={}/{}",
+            q8_error.0,
+            q8_error.1,
+            q8_error.2,
+            q8_divergence,
+            reference_tokens.len().max(q8_tokens.len()),
+            q4_error.0,
+            q4_error.1,
+            q4_error.2,
+            q4_divergence,
+            reference_tokens.len().max(q4_tokens.len()),
+        );
+        assert!(q8_error.0 <= 0.003 && q8_error.2 <= 0.001);
+        assert!(q4_error.0 <= 0.04 && q4_error.2 <= 0.02);
+        assert_eq!(q8_divergence, 0);
+        assert_eq!(q4_divergence, 4);
     }
 
     #[cfg(unix)]

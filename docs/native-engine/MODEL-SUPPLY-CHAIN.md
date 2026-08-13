@@ -46,9 +46,12 @@ dimensions, sorted unique names, nonoverlapping in-bounds ranges, valid UTF-8,
 no trailing data, no recursion, no compression, and no ambiguous integer
 encoding. Required unknown flags and unsupported optional sections fail closed.
 
-The initial importer emits one 64-byte-aligned F32 destination shard for each
-canonical source shard, quantization `None`, RoPE scaling `1.0`, and the
-first-party AIPTok Byte-Level BPE v1 tokenizer.
+The importer emits one 64-byte-aligned destination shard for each canonical
+source shard, RoPE scaling `1.0`, and the first-party AIPTok Byte-Level BPE v1
+tokenizer. It requires one explicit profile: `reference-f32`, `balanced-q8`, or
+`compact-q4`. Version one quantizes only rank-two reviewed weight matrices;
+normalization vectors remain F32. A package-wide profile may mix only its exact
+AIPQ format with those declared F32 exclusions. AIPQ8/AIPQ4 mixing is rejected.
 Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
 
@@ -86,8 +89,10 @@ missing, extra, duplicate, wrongly shaped, wrongly typed, non-finite, or
 out-of-range tensors are rejected against the exact internal architecture.
 F16 and BF16 source scalars use the tensor runtime's exhaustively tested
 first-party IEEE conversion and are deterministically materialized as finite
-F32 package storage for the scalar correctness backend; no dtype is silently
-reinterpreted.
+F32 values before the explicit storage profile is applied; no dtype is silently
+reinterpreted. AIPQ conversion rejects non-finite data and records canonical
+per-tensor source/destination SHA-384 plus maximum/mean/RMS/relative error and
+per-layer maxima in signed provenance. See [QUANTIZATION.md](QUANTIZATION.md).
 
 The exact tokenizer source format is `AIPTOK-METADATA-V1`, selected explicitly
 as `aiptok-metadata-v1`. It is ordered canonical ASCII, not general JSON. It
@@ -129,7 +134,8 @@ mapping.
 Admission order is catalog identity, signature, exact file set, catalog hashes,
 manifest/engine/model compatibility, fixed architecture inventory and shapes,
 tokenizer/provenance validation, shard identities/hashes, then per-tensor
-hashes. Tensor shards use private `PROT_READ` mappings without `PROT_EXEC`; only
+hashes and complete AIPQ header/block/canonical-encoding validation. Tensor
+shards use private `PROT_READ` mappings without `PROT_EXEC`; only
 immutable slices are exposed, and CPU materialization remains charged to the
 aggregate memory pool. Every failed admission emits one bounded typed
 `ModelPackageRejected` event to a mandatory caller-owned sink. No arbitrary path
@@ -145,6 +151,14 @@ out-of-bounds ranges, invalid dtype/architecture/UTF-8, wrong/missing/unexpected
 tensors, tokenizer/shard corruption, invalid/untrusted signatures, traversal,
 symlink escape, trailing data, unsupported optional features, unaudited
 overwrite, and package-budget excess.
+
+Quantized-package tests separately cover known Q8/Q4 blocks, zero/constant/tail
+blocks, non-finite source rejection, reserved encodings, corrupt/truncated
+payloads and scales, incorrect packed lengths, unsupported mixed profiles,
+deterministic signed round trips, loader materialization, aggregate accounting,
+cancellation, scalar matrix kernels, transformer-logit deviation, and generated
+token divergence. AIPQ8 passed its targeted parser/importer/loader/kernel lint
+and test gate before AIPQ4 acceptance.
 
 Dedicated bounded fuzz targets cover the directory manifest, one tensor index
 record, safetensors import parser, package-name resolution, AIPTok parser,

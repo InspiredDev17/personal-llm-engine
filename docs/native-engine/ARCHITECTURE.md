@@ -22,6 +22,7 @@ Green authority.
 | `engine-types` | bounded IDs, shapes, budgets, requests/events, errors and security-event types |
 | `engine-crypto` | SHA-384 and strict Ed25519 verification/domain separation |
 | `engine-model-format` | fixed directory-manifest, hash-catalog, signature-envelope and legacy test-fixture parsers |
+| `engine-quantization` | fixed AIPQ8/AIPQ4 validation, deterministic conversion, error measurement and safe scalar reference kernels |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
@@ -56,7 +57,9 @@ The import and production components are intentionally separate:
    any architecture mapping other than `llama-safetensors-v1`. Shard input
    order cannot affect the output: unique source filenames are sorted, the
    complete architecture inventory is validated globally, and F32, F16, or
-   BF16 source storage is converted explicitly into finite F32 package data.
+   BF16 source storage is converted explicitly into finite F32 values before an
+   explicit `reference-f32`, `balanced-q8`, or `compact-q4` profile is applied.
+   Only reviewed rank-two weights are quantized.
 2. The importer writes a staging directory and atomically installs
    `<model-id>.paimodel`. Replacement requires a bounded explicit audit note;
    the previous directory is preserved. The signing seed is exact stdin data,
@@ -77,8 +80,8 @@ The import and production components are intentionally separate:
    package budget before exposure. Each failure emits one typed event to its
    mandatory caller-owned security-event sink.
 7. Tensor shards are privately mapped `PROT_READ` without `PROT_EXEC`; immutable
-   F32, F16, or BF16 ranges are then converted into aggregate-accounted F32 CPU
-   execution tensors. No loader API
+   F32, F16, BF16, AIPQ8, or AIPQ4 ranges are then validated and converted into
+   aggregate-accounted F32 CPU execution tensors. No loader API
    accepts source formats, an arbitrary path, or an unsigned package. The old
    flat package remains only as deterministic unit-test compatibility data.
 
@@ -99,8 +102,10 @@ aggregate `MemoryPool`, so input/output aliasing is structurally excluded;
 mutable overlapping borrows remain prohibited by Rust's borrow rules.
 
 F32 is the initial execution type. Signed packages may store unquantized F32,
-IEEE binary16, or BF16 tensors; the loader performs explicit first-party
-conversion to F32 and rejects every other type. F16 handles normal, subnormal,
+IEEE binary16, BF16, AIPQ8 v1, or AIPQ4 v1 tensors; the loader performs explicit
+first-party conversion to F32 and rejects every other type. Quantized payloads
+use fixed 32-value symmetric blocks, explicit little-endian F32 scales, exact
+lengths, canonical codes and zero tail padding. F16 handles normal, subnormal,
 signed-zero, infinity, and NaN bit patterns with round-to-nearest-ties-to-even;
 BF16 narrowing also uses ties-to-even. Conversion preserves non-finite classes,
 while arithmetic rejects NaN and infinity except that softmax accepts negative
@@ -108,6 +113,13 @@ infinity only as an explicit mask. RMSNorm uses a scaled F64 sum-of-squares;
 softmax subtracts the row maximum and accumulates exponentials in F64. Scalar
 loops execute in fixed row-major order with no SIMD, threads, fusion, BLAS, or
 platform acceleration and reject non-finite arithmetic results.
+
+The AIPQ scalar kernels directly execute matrix-vector and matrix-matrix
+operations over validated payloads without materializing weight tensors. The
+current service intentionally materializes F32 weights until those direct
+kernels are integrated throughout the immutable transformer path. Exact format
+and synthetic accuracy evidence is in [QUANTIZATION.md](QUANTIZATION.md), and
+ADR-0024 records the acceptance boundary.
 
 `InferenceGraph` is immutable after validation. Nodes use the closed
 first-party `Operation` enum, explicit value IDs, static F32 shape propagation,

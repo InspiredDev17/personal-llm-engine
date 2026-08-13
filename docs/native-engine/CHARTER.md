@@ -40,6 +40,12 @@ plugins, shared libraries, Metal source, PTX, or executable configuration.
 Production activation requires a non-symlink model root, package directory,
 and trusted files with no write permission bits.
 
+Package storage may use exact F32/F16/BF16 or the reviewed first-party AIPQ8 v1
+and AIPQ4 v1 formats. The offline operator must select a named profile; the
+model cannot select conversion behavior or a kernel. Quantized bytes, source
+and destination hashes, and unaggregated error evidence are signed package
+data. No third-party quantization format or runtime is accepted.
+
 The Rust-only offline importer accepts bounded local safetensors plus strict
 `AIPTOK-METADATA-V1` tokenizer source metadata from an owner quarantine,
 converts the exact
