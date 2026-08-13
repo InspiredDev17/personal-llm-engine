@@ -1,6 +1,6 @@
 # ADR-0025: First-party Metal graph backend
 
-Status: accepted for the immutable graph; production decoder cutover pending.
+Status: accepted for the immutable graph and signed synthetic decoder; service cutover pending.
 
 ## Decision
 
@@ -52,8 +52,11 @@ and Metal KV isolation/reset/cancel/destroy/unload. These tests skip clearly
 when the process sandbox exposes no Metal device; a separate direct-hardware
 run is required for release evidence.
 
-This ADR does not mark Metal model execution complete. The production signed
-decoder and local service still select the CPU implementation. Activation
-requires a signed tiny AIPack to tokenize, prefill, decode, sample, and stream
-through Metal with matching CPU output, followed by service-level cancellation
-and model-unload tests and release-mode latency measurements.
+The fixed decoder now loads only a registered signed package, uploads validated
+F32 weights once into model-scoped device buffers, tokenizes, prefills, performs
+cached decode, samples, and streams through Metal. Hardware tests compare all
+259 logits with the scalar oracle, exercise cancellation, reject active unload,
+invalidate weights and KV on idle unload, and record release-mode latency and
+transfer metrics. The public UDS daemon still selects CPU; production activation
+requires trusted configuration, Go canary/rollback, production-size model
+evidence, and driver-pressure qualification.

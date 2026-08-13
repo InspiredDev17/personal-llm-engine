@@ -43,6 +43,30 @@ sandbox can hide the Metal device; tests detect that condition and skip rather
 than emulating a GPU. Release evidence must always include a direct-hardware
 run where the six suites execute.
 
+The signed-decoder hardware suite additionally loads the deterministic signed
+259-token, two-layer GQA fixture through registered package identity, uploads
+all validated weights once into model-scoped device buffers, compares every
+prefill logit against scalar CPU, performs cached Metal decode, greedy sampling,
+and typed output streaming, rejects unload while a sequence is active, clears
+cancellation state, unloads only when idle, and rejects sessions after unload.
+The importer round-trip suite repeats the path from local data-only source to a
+signed directory package and production directory loader before Metal execution.
+
+## End-to-end release measurement
+
+On the recorded host, the optimized release test with Metal API Validation and
+shader validation enabled reported:
+
+```text
+metal-decoder-tiny prompt_tokens=2 output_tokens=2 cpu_prefill_ns=57834 metal_prefill_ns=66807292 metal_generation_ns=92106208 dispatches=185 h2d_bytes=13696 d2h_bytes=8396 peak_device_bytes=11020
+```
+
+This is a deterministic synthetic correctness fixture, not a useful throughput
+benchmark. Metal prefill was about 1,155 times slower than scalar CPU for this
+tiny workload. Each unfused kernel is synchronously completed and bounded
+intermediates still cross the host/device boundary; this demonstrates real GPU
+execution, accounting, and lifecycle correctness, not acceleration.
+
 ## Numerical policy
 
 Elementwise exact cases require exact equality. F32 reductions use absolute

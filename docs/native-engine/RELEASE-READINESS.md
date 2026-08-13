@@ -27,9 +27,10 @@ documentation exception.
 2. The repository does not declare an owner-selected license for its own Rust
    workspace crates. `cargo-deny` therefore cannot produce a clean complete
    license verdict without either a real license decision or an unsafe ignore.
-3. Production transformer/service routing remains CPU-backed. Metal operation
-   parity exists on synthetic fixtures, but a signed complete decoder package
-   has not run end-to-end through a device-resident Metal generation path.
+3. A registered signed synthetic package now runs end-to-end through persistent
+   Metal weights, device KV, sampling, and typed streaming with scalar parity.
+   Production UDS/Go routing remains CPU-backed pending trusted configuration,
+   reversible canary, production-size qualification, and rollback evidence.
 4. No legally approved production model, production tokenizer vectors,
    production-size context soak, quality evaluation, or thermal/tokens-per-
    second evidence exists.

@@ -99,6 +99,20 @@ impl MetalKvCache {
         &self.model_id
     }
 
+    /// Returns the validated immutable device-cache layout.
+    pub const fn plan(&self) -> &KvCachePlan {
+        &self.plan
+    }
+
+    /// Returns committed positions for one live sequence.
+    pub fn token_count(&self, handle: MetalKvSequenceHandle) -> Result<u32, EngineError> {
+        let state = self.lock()?;
+        ensure_loaded(&state)?;
+        let sequence = sequence(&state, handle)?;
+        ensure_active(sequence)?;
+        Ok(sequence.tokens)
+    }
+
     /// Allocates one zeroed, request-bound device sequence.
     pub fn create_sequence(
         &self,

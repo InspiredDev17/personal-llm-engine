@@ -22,8 +22,9 @@
   license/provenance review, tokenizer conformance corpus, long-context quality,
   or generated-output acceptance evidence exists.
 - Scalar CPU is the correctness oracle. ARM64 and Metal operation tests pass
-  documented synthetic tolerances, but production generation remains CPU-
-  backed and persistent device-resident model execution is absent.
+  documented synthetic tolerances. Metal now has persistent device-resident
+  weights and complete signed synthetic-model generation, but the UDS daemon
+  and Go adapter remain CPU-selected pending canary configuration and rollback.
 - The measured 128x128 Metal matvec is a microbenchmark, not production token
   throughput. Prior recorded methodology and numbers remain in [METAL.md](METAL.md).
 - AIPQ8/AIPQ4 synthetic error evidence does not establish real-model quality.
@@ -34,7 +35,10 @@
   KV is not implemented.
 - Continuous batching, distributed execution, speculative decoding, beam
   search, grammar decoding, and remote serving are intentionally absent.
-- Metal driver reset, GPU exhaustion under production-size loads, prolonged
+- The correctness-first Metal decoder synchronizes and transfers intermediates
+  between operations; it is not command-buffer batched or fused and is much
+  slower than CPU on the tiny fixture. Device KV history currently crosses
+  bounded host tensors for attention dispatch. Metal driver reset, GPU exhaustion under production-size loads, prolonged
   thermal behavior, and days-long restart/cancellation soak are unqualified.
 - Security telemetry is bounded and content-free. It cannot currently report
   installed engine binary mismatch, installed metallib mismatch, downgrade

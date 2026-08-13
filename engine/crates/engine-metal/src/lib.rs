@@ -22,6 +22,8 @@ use personalai_engine_tensor::{Device, Tensor};
 #[cfg(personalai_metal_native)]
 use personalai_engine_types::DType;
 use personalai_engine_types::{BackendId, EngineError};
+#[cfg(personalai_metal_native)]
+use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(personalai_metal_native)]
 use std::sync::Mutex;
@@ -73,8 +75,12 @@ impl MetalCancellation {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
+    /// Reports whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
     fn check(&self) -> Result<(), EngineError> {
-        if self.0.load(Ordering::Acquire) { Err(EngineError::cancellation(None)) } else { Ok(()) }
+        if self.is_cancelled() { Err(EngineError::cancellation(None)) } else { Ok(()) }
     }
 }
 
@@ -122,6 +128,51 @@ pub struct MetalStatistics {
 struct Allocation {
     native: ffi::NativeBuffer,
     _reservation: MemoryReservation,
+}
+
+#[cfg(personalai_metal_native)]
+#[derive(Debug)]
+struct ResidentWeight {
+    allocation: Option<Allocation>,
+    shape: TensorShape,
+}
+
+/// Model-scoped immutable device buffers loaded only from validated host tensors.
+#[cfg(personalai_metal_native)]
+#[derive(Debug)]
+pub struct MetalModelWeights {
+    backend: MetalBackend,
+    weights: BTreeMap<String, ResidentWeight>,
+}
+
+#[cfg(personalai_metal_native)]
+impl Drop for MetalModelWeights {
+    fn drop(&mut self) {
+        for weight in self.weights.values_mut() {
+            if let Some(allocation) = weight.allocation.take() {
+                let _ = self.backend.release(allocation);
+            }
+        }
+    }
+}
+
+#[cfg(personalai_metal_native)]
+impl MetalModelWeights {
+    fn get(&self, backend: &MetalBackend, name: &str) -> Result<&ResidentWeight, EngineError> {
+        if !Arc::ptr_eq(&self.backend.inner, &backend.inner) {
+            return Err(EngineError::invalid_input("Metal weight set belongs to another device"));
+        }
+        self.weights
+            .get(name)
+            .ok_or_else(|| EngineError::internal_invariant("resident Metal weight is missing"))
+    }
+}
+
+#[cfg(personalai_metal_native)]
+impl ResidentWeight {
+    fn native(&self) -> &ffi::NativeBuffer {
+        &self.allocation.as_ref().expect("resident weight is live").native
+    }
 }
 #[cfg(personalai_metal_native)]
 struct Inner {
@@ -269,6 +320,147 @@ impl MetalBackend {
         {
             Err(EngineError::not_implemented("Metal backend requires macOS"))
         }
+    }
+
+    /// Uploads a complete validated F32 model once into immutable device buffers.
+    #[cfg(personalai_metal_native)]
+    pub fn load_model_weights(
+        &self,
+        weights: &BTreeMap<String, Tensor>,
+    ) -> Result<MetalModelWeights, EngineError> {
+        let mut resident = BTreeMap::new();
+        for (name, tensor) in weights {
+            if tensor.dtype() != DType::F32 || !tensor.metadata().layout().is_contiguous() {
+                return Err(EngineError::not_implemented(
+                    "Metal resident weights require contiguous F32 tensors",
+                ));
+            }
+            let allocation = self.acquire(tensor.as_bytes().len())?;
+            if let Err(error) = allocation.native.upload(tensor.as_bytes()) {
+                let _ = self.release(allocation);
+                return Err(error);
+            }
+            resident.insert(
+                name.clone(),
+                ResidentWeight { allocation: Some(allocation), shape: tensor.shape().clone() },
+            );
+        }
+        Ok(MetalModelWeights { backend: self.clone(), weights: resident })
+    }
+
+    /// Executes embedding lookup from one model-scoped immutable device buffer.
+    #[cfg(personalai_metal_native)]
+    pub fn resident_embedding(
+        &self,
+        weights: &MetalModelWeights,
+        name: &str,
+        token: u32,
+        pool: &MemoryPool,
+        cancel: &MetalCancellation,
+    ) -> Result<Tensor, EngineError> {
+        let weight = weights.get(self, name)?;
+        if weight.shape.rank() != 2 {
+            return Err(EngineError::internal_invariant("Metal embedding weight rank differs"));
+        }
+        let rows = u32::try_from(weight.shape.dimensions()[0])
+            .map_err(|_| EngineError::resource_exhaustion("Metal embedding rows exceed u32"))?;
+        let columns = u32::try_from(weight.shape.dimensions()[1])
+            .map_err(|_| EngineError::resource_exhaustion("Metal embedding width exceeds u32"))?;
+        if token >= rows {
+            return Err(EngineError::invalid_input("Metal embedding token is out of range"));
+        }
+        self.raw_resident(
+            Kernel::Embedding,
+            &[weight.native()],
+            &[],
+            checked_usize_product(columns, 4, "Metal embedding bytes overflow")?,
+            ffi::RawParams { position: token, columns, ..Default::default() },
+            [columns, 1, 1],
+            cancel,
+        )
+        .and_then(|bytes| {
+            Self::tensor_from_bytes(TensorShape::new([u64::from(columns)])?, bytes, pool)
+        })
+    }
+
+    /// Executes matrix-vector multiplication without re-uploading model weights.
+    #[cfg(personalai_metal_native)]
+    pub fn resident_matrix_vector(
+        &self,
+        weights: &MetalModelWeights,
+        name: &str,
+        input: &Tensor,
+        pool: &MemoryPool,
+        cancel: &MetalCancellation,
+    ) -> Result<Tensor, EngineError> {
+        let weight = weights.get(self, name)?;
+        if weight.shape.rank() != 2 || input.dtype() != DType::F32 || input.shape().rank() != 1 {
+            return Err(EngineError::invalid_input("Metal resident matvec shape is invalid"));
+        }
+        let rows = u32::try_from(weight.shape.dimensions()[0])
+            .map_err(|_| EngineError::resource_exhaustion("Metal resident rows exceed u32"))?;
+        let columns = u32::try_from(weight.shape.dimensions()[1])
+            .map_err(|_| EngineError::resource_exhaustion("Metal resident columns exceed u32"))?;
+        if input.shape().dimensions()[0] != u64::from(columns) {
+            return Err(EngineError::invalid_input("Metal resident matvec dimensions differ"));
+        }
+        self.raw_resident(
+            Kernel::MatVec,
+            &[weight.native()],
+            &[input.as_bytes()],
+            checked_usize_product(rows, 4, "Metal resident output bytes overflow")?,
+            ffi::RawParams { rows, columns, ..Default::default() },
+            [rows, 1, 1],
+            cancel,
+        )
+        .and_then(|bytes| {
+            Self::tensor_from_bytes(TensorShape::new([u64::from(rows)])?, bytes, pool)
+        })
+    }
+
+    /// Executes RMS normalization with a resident immutable scale vector.
+    #[cfg(personalai_metal_native)]
+    pub fn resident_rms_norm(
+        &self,
+        weights: &MetalModelWeights,
+        name: &str,
+        input: &Tensor,
+        epsilon: f32,
+        pool: &MemoryPool,
+        cancel: &MetalCancellation,
+    ) -> Result<Tensor, EngineError> {
+        let weight = weights.get(self, name)?;
+        if weight.shape.rank() != 1
+            || input.dtype() != DType::F32
+            || input.shape().rank() == 0
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+        {
+            return Err(EngineError::invalid_input("Metal resident RMSNorm input is invalid"));
+        }
+        let columns = u32::try_from(weight.shape.dimensions()[0])
+            .map_err(|_| EngineError::resource_exhaustion("Metal RMS width exceeds u32"))?;
+        let count = u32::try_from(input.shape().element_count())
+            .map_err(|_| EngineError::resource_exhaustion("Metal RMS count exceeds u32"))?;
+        if input.shape().dimensions().last() != Some(&u64::from(columns)) {
+            return Err(EngineError::invalid_input("Metal resident RMSNorm dimensions differ"));
+        }
+        self.raw_resident_ordered(
+            Kernel::RmsNorm,
+            input.as_bytes(),
+            weight.native(),
+            usize::try_from(input.shape().byte_len(DType::F32)?)
+                .map_err(|_| EngineError::resource_exhaustion("Metal RMS bytes overflow"))?,
+            ffi::RawParams {
+                rows: count / columns,
+                columns,
+                scalar0: epsilon,
+                ..Default::default()
+            },
+            [count / columns, 1, 1],
+            cancel,
+        )
+        .and_then(|bytes| Self::tensor_from_bytes(input.shape().clone(), bytes, pool))
     }
 
     /// Multiplies an explicitly little-endian IEEE F16 matrix and vector.
@@ -499,6 +691,82 @@ impl MetalBackend {
         match (result, release_error) {
             (Ok(bytes), None) => Ok(bytes),
             (Err(error), _) | (Ok(_), Some(error)) => Err(error),
+        }
+    }
+
+    #[cfg(personalai_metal_native)]
+    #[allow(clippy::too_many_arguments)]
+    fn raw_resident(
+        &self,
+        kernel: Kernel,
+        resident: &[&ffi::NativeBuffer],
+        host: &[&[u8]],
+        output_len: usize,
+        params: ffi::RawParams,
+        grid: [u32; 3],
+        cancel: &MetalCancellation,
+    ) -> Result<Vec<u8>, EngineError> {
+        cancel.check()?;
+        let mut transient = Vec::new();
+        for input in host {
+            let buffer = self.acquire(input.len())?;
+            buffer.native.upload(input)?;
+            transient.push(buffer);
+        }
+        let output = self.acquire(output_len)?;
+        transient.push(output);
+        let mut refs = resident.to_vec();
+        refs.extend(transient.iter().map(|allocation| &allocation.native));
+        let result = self
+            .inner
+            .context
+            .dispatch(kernel as i32, &refs, &params, grid)
+            .and_then(|()| cancel.check())
+            .and_then(|()| transient.last().expect("output exists").native.download());
+        let mut release_error = None;
+        for allocation in transient {
+            if let Err(error) = self.release(allocation) {
+                release_error = Some(error);
+            }
+        }
+        match (result, release_error) {
+            (Ok(bytes), None) => Ok(bytes),
+            (Err(error), _) | (Ok(_), Some(error)) => Err(error),
+        }
+    }
+
+    #[cfg(personalai_metal_native)]
+    #[allow(clippy::too_many_arguments)]
+    fn raw_resident_ordered(
+        &self,
+        kernel: Kernel,
+        first_host: &[u8],
+        second_resident: &ffi::NativeBuffer,
+        output_len: usize,
+        params: ffi::RawParams,
+        grid: [u32; 3],
+        cancel: &MetalCancellation,
+    ) -> Result<Vec<u8>, EngineError> {
+        cancel.check()?;
+        let input = self.acquire(first_host.len())?;
+        input.native.upload(first_host)?;
+        let output = self.acquire(output_len)?;
+        let result = self
+            .inner
+            .context
+            .dispatch(
+                kernel as i32,
+                &[&input.native, second_resident, &output.native],
+                &params,
+                grid,
+            )
+            .and_then(|()| cancel.check())
+            .and_then(|()| output.native.download());
+        let first_release = self.release(input);
+        let second_release = self.release(output);
+        match (result, first_release, second_release) {
+            (Ok(bytes), Ok(()), Ok(())) => Ok(bytes),
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
         }
     }
     #[cfg(personalai_metal_native)]

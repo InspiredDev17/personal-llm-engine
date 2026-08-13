@@ -975,7 +975,7 @@ fn write_capabilities(output: &mut impl Write) -> Result<(), CliError> {
     )
     .and_then(|()| writeln!(output, "cpu-reference=deterministic-decoder-execution"))
     .and_then(|()| writeln!(output, "arm64=not-implemented"))
-    .and_then(|()| writeln!(output, "metal=not-implemented"))
+    .and_then(|()| writeln!(output, "metal=not-enabled-in-cli-service"))
     .and_then(|()| writeln!(output, "cuda=not-implemented"))
     .and_then(|()| writeln!(output, "model-loading=signed-first-party-package"))
     .map_err(|_| CliError::Io)

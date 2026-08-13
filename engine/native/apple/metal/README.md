@@ -1,6 +1,6 @@
 # Apple Metal backend boundary
 
-Status: **GRAPH BACKEND IMPLEMENTED / MODEL-SERVICE CUTOVER PENDING**.
+Status: **SIGNED SYNTHETIC DECODER IMPLEMENTED / UDS-GO CUTOVER PENDING**.
 
 The `personalai-engine-metal` crate owns the safe Rust integration. This
 directory owns one minimal Objective-C++ bridge and first-party MSL kernels.
@@ -28,7 +28,9 @@ cancellation, destruction, pooling, or model unload. This implementation is a
 correctness-first device cache; paged KV and fused attention remain future
 performance work.
 
-The generic immutable graph runs on Metal and hardware differential tests pass
-on the recorded Apple M1 host. The production decoder/service is not yet
-wired to select this graph backend, so Metal must not yet be advertised as a
-complete model-execution backend.
+The generic immutable graph and fixed decoder run on Metal, and hardware
+differential tests pass on the recorded Apple M1 host. Validated weights are
+uploaded once into model-scoped buffers; signed synthetic packages complete
+prefill, cached decode, sampling, and typed streaming. Metal model execution is
+advertised only by direct trusted composition. The public UDS daemon and Go
+adapter remain CPU-selected pending canary and rollback configuration.

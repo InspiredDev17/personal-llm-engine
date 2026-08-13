@@ -1455,7 +1455,7 @@ mod tests {
     use personalai_engine_server::{EngineService, ServiceConfig};
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{
-        GenerationEvent, GenerationRequest, RequestId, ResourceBudget, SequenceId,
+        GenerationEvent, GenerationRequest, RequestId, ResourceBudget, SecurityEvent, SequenceId,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1674,6 +1674,49 @@ mod tests {
         assert!(usage.output_tokens() > 0);
         assert!(events.iter().any(|event| matches!(event, GenerationEvent::Token { .. })));
         assert!(matches!(events.last(), Some(GenerationEvent::Completed { .. })));
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    fn assert_signed_metal_generation(
+        service: &EngineService,
+        budget: ResourceBudget,
+        service_events: &mut Vec<SecurityEvent>,
+    ) {
+        if !personalai_engine_server::MetalBackend::devices()
+            .is_ok_and(|devices| !devices.is_empty())
+        {
+            return;
+        }
+        let backend = personalai_engine_server::MetalBackend::new(0, 1 << 28, 16)
+            .expect("Metal backend must construct");
+        let metal_model = service
+            .load_registered_metal_model(
+                spec().model_id(),
+                &budget,
+                backend.clone(),
+                &mut |event| service_events.push(event),
+            )
+            .expect("signed imported directory package must load for Metal");
+        let request = GenerationRequest::new(
+            RequestId::new(91).expect("request ID must validate"),
+            spec().model_id().clone(),
+            "A",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("Metal request must validate");
+        let usage = metal_model
+            .generate_greedy(
+                &request,
+                SequenceId::new(91).expect("sequence ID must validate"),
+                &std::sync::atomic::AtomicBool::new(false),
+                |_| Ok(()),
+            )
+            .expect("signed imported package must generate through Metal");
+        assert_eq!(usage.output_tokens(), 2);
+        assert!(backend.statistics().expect("Metal metrics must read").dispatch_count > 0);
+        assert!(service_events.is_empty());
     }
 
     fn write_import_sources(quarantine: &Path, source: &[u8]) -> Vec<u8> {
@@ -2661,6 +2704,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn importer_to_directory_loader_round_trip_is_signed_and_byte_exact() {
         let root = temporary_root("roundtrip");
         let quarantine = root.join("quarantine");
@@ -2759,6 +2803,9 @@ mod tests {
         assert_eq!(cpu_model.model_id(), spec().model_id());
         assert!(service_events.is_empty());
         assert_signed_cpu_generation(&cpu_model, budget);
+
+        #[cfg(target_os = "macos")]
+        assert_signed_metal_generation(&service, budget, &mut service_events);
 
         assert_live_mapping_change_is_reported(
             &loaded,

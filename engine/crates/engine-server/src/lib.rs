@@ -57,6 +57,10 @@ use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, Scheduler
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{IncrementalDecoder, Tokenizer, build_tokenizer};
+#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+pub use personalai_engine_transformer::MetalBackend;
+#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+use personalai_engine_transformer::MetalDecoderModel;
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_transformer::{CpuDecoderModel, CpuDecoderSession, TransformerConfig};
@@ -334,6 +338,196 @@ pub struct LoadedCpuModel {
     model_id: ModelId,
     model: CpuDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+}
+
+/// Fully loaded, signed model whose complete decoder executes through Metal.
+#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+#[derive(Clone)]
+pub struct LoadedMetalModel {
+    model_id: ModelId,
+    model: MetalDecoderModel,
+    tokenizer: Arc<dyn Tokenizer>,
+}
+
+#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+impl LoadedMetalModel {
+    /// Returns the configuration-owned model identifier.
+    pub const fn model_id(&self) -> &ModelId {
+        &self.model_id
+    }
+
+    /// Returns the executable Metal decoder.
+    pub const fn model(&self) -> &MetalDecoderModel {
+        &self.model
+    }
+
+    /// Returns the package tokenizer.
+    pub fn tokenizer(&self) -> &dyn Tokenizer {
+        self.tokenizer.as_ref()
+    }
+
+    /// Runs deterministic greedy generation through the Metal decoder.
+    pub fn generate_greedy(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
+        emit: impl FnMut(InferenceEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        self.generate(request, sequence_id, SamplingConfig::greedy(), cancelled, emit)
+    }
+
+    /// Runs tokenize, Metal prefill/decode, sampling, and typed streaming.
+    pub fn generate(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(InferenceEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        emit(InferenceEvent::RequestAccepted { request_id: request.request_id(), sequence_id })?;
+        let result = self.generate_inner(request, sequence_id, sampling, cancelled, &mut emit);
+        if let Err(error) = &result {
+            let event = match error {
+                EngineError::Cancellation(_) => InferenceEvent::RequestCancelled {
+                    request_id: request.request_id(),
+                    sequence_id,
+                },
+                EngineError::ResourceExhaustion(_) => InferenceEvent::ResourceLimitReached {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+                EngineError::BackendFailure(_) => InferenceEvent::BackendError {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+                _ => InferenceEvent::ModelError {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    error: error.clone(),
+                },
+            };
+            emit(event)?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn generate_inner(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+        cancelled: &AtomicBool,
+        emit: &mut impl FnMut(InferenceEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationUsage, EngineError> {
+        if request.model_id() != &self.model_id {
+            return Err(EngineError::invalid_input(
+                "generation request model differs from the loaded Metal model",
+            ));
+        }
+        if request.context_limit().get() > self.model.config().context_limit().get() {
+            return Err(EngineError::resource_exhaustion(
+                "request context exceeds the loaded Metal model context",
+            ));
+        }
+        check_cancelled(cancelled, request.request_id())?;
+        let input_tokens = self.tokenizer.encode(request.input_text())?;
+        let input_count = u32::try_from(input_tokens.len())
+            .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
+        request.validate_tokenized_input(input_count)?;
+        emit(InferenceEvent::PromptTokenized {
+            request_id: request.request_id(),
+            sequence_id,
+            token_count: input_count,
+        })?;
+        emit(InferenceEvent::PrefillStarted { request_id: request.request_id(), sequence_id })?;
+        let mut session = self.model.start_session(
+            &request.resource_budget(),
+            request.request_id(),
+            sequence_id,
+        )?;
+        let cancellation = session.cancellation();
+        let mut logits = session.prefill(&input_tokens)?;
+        emit(InferenceEvent::PrefillCompleted { request_id: request.request_id(), sequence_id })?;
+        let retained_tokens = input_tokens
+            .len()
+            .checked_add(usize::try_from(request.max_output_tokens()).map_err(|_| {
+                EngineError::resource_exhaustion("output token count is not addressable")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("generation history overflows"))?;
+        let retained_bytes = retained_tokens
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| EngineError::resource_exhaustion("generation history bytes overflow"))?;
+        let history_pool =
+            self.model.memory_pool().scoped(MemoryOwner::Sampling(request.request_id()));
+        let _history_reservation = history_pool.reserve(retained_bytes)?;
+        let mut history = input_tokens;
+        history
+            .try_reserve_exact(usize::try_from(request.max_output_tokens()).map_err(|_| {
+                EngineError::resource_exhaustion("output token count is not addressable")
+            })?)
+            .map_err(|_| {
+                EngineError::resource_exhaustion("generation history allocation failed")
+            })?;
+        let mut sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
+        let mut decoder = IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer));
+        let mut generated = 0_u32;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                cancellation.cancel();
+                session.cancel()?;
+                return Err(EngineError::cancellation(Some(request.request_id())));
+            }
+            let token = sampler.sample(&logits, &history)?;
+            generated = generated
+                .checked_add(1)
+                .ok_or_else(|| EngineError::internal_invariant("generated count overflows"))?;
+            history.push(token);
+            let text = decoder.push(token)?;
+            emit(InferenceEvent::TokenGenerated {
+                request_id: request.request_id(),
+                sequence_id,
+                token_id: TokenId::new(token)?,
+                text: TextChunk::new(text)?,
+            })?;
+            let stop = if token == self.tokenizer.spec().end_of_sequence_token() {
+                Some(GenerationStopReason::EndOfSequence)
+            } else if sampler.config().is_stop_token(token) {
+                Some(GenerationStopReason::ConfiguredToken)
+            } else if generated >= request.max_output_tokens()
+                || generated >= sampler.config().maximum_generated_tokens()
+            {
+                Some(GenerationStopReason::MaximumGeneratedTokens)
+            } else {
+                None
+            };
+            if let Some(reason) = stop {
+                if decoder.has_pending_bytes() {
+                    return Err(EngineError::backend_failure(
+                        "generation ended with incomplete UTF-8",
+                    ));
+                }
+                emit(InferenceEvent::StopConditionReached {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    reason,
+                })?;
+                let usage = GenerationUsage::for_request(request, input_count, generated)?;
+                emit(InferenceEvent::RequestCompleted {
+                    request_id: request.request_id(),
+                    sequence_id,
+                    usage,
+                })?;
+                return Ok(usage);
+            }
+            logits = session.decode(token)?;
+        }
+    }
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -3167,6 +3361,116 @@ impl EngineService {
         result
     }
 
+    /// Opens one registered signed directory package for complete Metal execution.
+    ///
+    /// The caller selects an already-created local Metal device backend. Clients
+    /// still provide only `ModelId`; package paths, shaders, and kernel names are
+    /// never accepted by this boundary.
+    #[cfg(all(unix, feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+    pub fn load_registered_metal_model(
+        &self,
+        model_id: &ModelId,
+        budget: &personalai_engine_types::ResourceBudget,
+        backend: MetalBackend,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<LoadedMetalModel, EngineError> {
+        let verified = self.registry.load_registered_directory(model_id, budget, events)?;
+        let result = (|| {
+            let pool = MemoryPool::from_budget(budget)?;
+            let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
+            let tokenizer =
+                Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
+            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+                return Err(EngineError::corrupt_model_package(
+                    "manifest and tokenizer vocabulary sizes differ",
+                ));
+            }
+            let weights = verified.materialize_tensors(&pool)?.into_tensors();
+            let model = MetalDecoderModel::new_registered(
+                model_id.clone(),
+                config,
+                weights,
+                &pool,
+                backend,
+            )?;
+            Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer })
+        })();
+        if let Err(error) = &result {
+            let reason = match error {
+                EngineError::UnsupportedArchitecture(_) | EngineError::NotImplemented(_) => {
+                    ModelPackageRejection::UnsupportedArchitecture
+                }
+                EngineError::UnsupportedTokenizer(_) => ModelPackageRejection::UnsupportedTokenizer,
+                EngineError::ResourceExhaustion(_) => ModelPackageRejection::SizeLimit,
+                _ => ModelPackageRejection::Corrupt,
+            };
+            events.emit(SecurityEvent::ModelPackageRejected { model_id: model_id.clone(), reason });
+        }
+        result
+    }
+
+    /// Verifies a signed legacy test fixture before constructing the Metal decoder.
+    #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos", test))]
+    pub fn load_registered_metal_model_bytes(
+        &self,
+        model_id: &ModelId,
+        package_bytes: &[u8],
+        budget: &personalai_engine_types::ResourceBudget,
+        backend: MetalBackend,
+    ) -> Result<LoadedMetalModel, EngineError> {
+        let registration = self.registry.resolve(model_id)?;
+        let package_length = u64::try_from(package_bytes.len()).map_err(|_| {
+            EngineError::resource_exhaustion("legacy Metal fixture length is not representable")
+        })?;
+        if package_length == 0 || package_length > budget.max_memory_bytes() {
+            return Err(EngineError::resource_exhaustion(
+                "legacy Metal fixture exceeds its test memory budget",
+            ));
+        }
+        if hash_package(package_bytes) != *registration.expected_hash() {
+            return Err(EngineError::signature_failure(
+                "legacy Metal fixture digest differs from registration",
+            ));
+        }
+        let parsed = ParsedModelPackage::parse(package_bytes)?;
+        let signed_range = parsed.header().signed_content_range()?;
+        let digest = hash_signed_content(&package_bytes[signed_range]);
+        verify_package_signature(
+            registration.trusted_signer(),
+            parsed.signature().key_id(),
+            &digest,
+            parsed.signature().signature(),
+        )?;
+        let pool = MemoryPool::from_budget(budget)?;
+        let config = TransformerConfig::from_manifest(parsed.manifest())?;
+        let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(
+            parsed.tokenizer_data(package_bytes)?,
+            &pool,
+        )?);
+        if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+            return Err(EngineError::corrupt_model_package(
+                "manifest and tokenizer vocabulary sizes differ",
+            ));
+        }
+        let mut weights = BTreeMap::new();
+        for record in parsed.tensors() {
+            let tensor = Tensor::copy_from_bytes(
+                record.dtype(),
+                record.shape().clone(),
+                parsed.tensor_data(package_bytes, record)?,
+                &pool,
+            )?;
+            if weights.insert(record.name().as_str().to_owned(), tensor).is_some() {
+                return Err(EngineError::internal_invariant(
+                    "legacy Metal fixture contains duplicate tensor names",
+                ));
+            }
+        }
+        let model =
+            MetalDecoderModel::new_registered(model_id.clone(), config, weights, &pool, backend)?;
+        Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer })
+    }
+
     /// Activates and runs the next queued request on an already loaded model.
     #[cfg(feature = "cpu-reference")]
     pub fn run_next_greedy(
@@ -3683,6 +3987,118 @@ mod tests {
         let logits = logits.expect("prompt must contain at least one token");
         assert_eq!(logits.shape().dimensions(), &[259]);
         assert_eq!(session.token_count(), 2);
+    }
+
+    #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn signed_decoder_executes_and_streams_through_real_metal() {
+        let Ok(devices) = MetalBackend::devices() else { return };
+        if devices.is_empty() {
+            return;
+        }
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-metal").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-metal.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 25, 1 << 20, 1).expect("budget must validate");
+        let cpu = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("CPU oracle must load");
+        let backend = MetalBackend::new(0, 1 << 24, 16).expect("Metal backend must construct");
+        let metal = service
+            .load_registered_metal_model_bytes(&model_id, fixture.bytes(), &budget, backend.clone())
+            .expect("signed model must load for Metal");
+        let tokens = metal.tokenizer().encode("A").expect("prompt must tokenize");
+        let mut cpu_session = cpu
+            .model()
+            .start_session(&budget, RequestId::new(701).unwrap(), SequenceId::new(701).unwrap())
+            .expect("CPU session must start");
+        let mut metal_session = metal
+            .model()
+            .start_session(&budget, RequestId::new(702).unwrap(), SequenceId::new(702).unwrap())
+            .expect("Metal session must start");
+        let cpu_started = Instant::now();
+        let cpu_logits = cpu_session.prefill(&tokens).expect("CPU prefill must execute");
+        let cpu_prefill = cpu_started.elapsed();
+        let metal_started = Instant::now();
+        let metal_logits = metal_session.prefill(&tokens).expect("Metal prefill must execute");
+        let metal_prefill = metal_started.elapsed();
+        for index in 0..259 {
+            let expected = cpu_logits.f32_value(index).expect("CPU logit must read");
+            let actual = metal_logits.f32_value(index).expect("Metal logit must read");
+            let tolerance = 1.0e-4_f32.max(expected.abs() * 1.0e-4);
+            assert!((actual - expected).abs() <= tolerance, "logit {index} differs");
+        }
+        assert!(matches!(metal.model().unload_if_idle(), Err(EngineError::ResourceExhaustion(_))));
+        drop(cpu_session);
+        drop(metal_session);
+
+        let request = GenerationRequest::new(
+            RequestId::new(703).expect("request ID must validate"),
+            model_id,
+            "A",
+            2,
+            ContextLimit::new(8).expect("context must validate"),
+            budget,
+        )
+        .expect("request must validate");
+        let mut events = Vec::new();
+        let generation_started = Instant::now();
+        let usage = metal
+            .generate(
+                &request,
+                SequenceId::new(703).expect("sequence ID must validate"),
+                SamplingConfig::greedy(),
+                &AtomicBool::new(false),
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("Metal generation must stream");
+        let generation_elapsed = generation_started.elapsed();
+        assert_eq!(usage.output_tokens(), 2);
+        assert!(events.iter().any(|event| matches!(event, InferenceEvent::TokenGenerated { .. })));
+        assert!(matches!(events.last(), Some(InferenceEvent::RequestCompleted { .. })));
+        let statistics = backend.statistics().expect("statistics must read");
+        assert!(statistics.dispatch_count > 0);
+        println!(
+            "metal-decoder-tiny prompt_tokens={} output_tokens={} cpu_prefill_ns={} metal_prefill_ns={} metal_generation_ns={} dispatches={} h2d_bytes={} d2h_bytes={} peak_device_bytes={}",
+            tokens.len(),
+            usage.output_tokens(),
+            cpu_prefill.as_nanos(),
+            metal_prefill.as_nanos(),
+            generation_elapsed.as_nanos(),
+            statistics.dispatch_count,
+            statistics.host_to_device_bytes,
+            statistics.device_to_host_bytes,
+            statistics.peak_allocated_bytes,
+        );
+
+        let mut cancelled = metal
+            .model()
+            .start_session(&budget, RequestId::new(704).unwrap(), SequenceId::new(704).unwrap())
+            .expect("cancellation session must start");
+        cancelled.cancellation().cancel();
+        assert!(matches!(cancelled.decode(tokens[0]), Err(EngineError::Cancellation(_))));
+        assert_eq!(metal.model().kv_cache_metrics().unwrap().active_sequence_count, 0);
+        assert!(metal.model().unload_if_idle().is_ok());
+        assert!(matches!(
+            metal.model().start_session(
+                &budget,
+                RequestId::new(705).unwrap(),
+                SequenceId::new(705).unwrap()
+            ),
+            Err(EngineError::BackendFailure(_))
+        ));
     }
 
     #[cfg(feature = "cpu-reference")]
