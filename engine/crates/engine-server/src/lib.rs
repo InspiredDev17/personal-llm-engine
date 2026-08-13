@@ -98,6 +98,8 @@ pub const MAX_PENDING_EVENTS_PER_CONNECTION: usize = 8;
 #[cfg(all(unix, feature = "cpu-reference"))]
 pub const MAX_PENDING_SECURITY_EVENTS: usize = 256;
 #[cfg(all(unix, feature = "cpu-reference"))]
+pub(crate) const SECURITY_PATTERN_THRESHOLD: u64 = 8;
+#[cfg(all(unix, feature = "cpu-reference"))]
 const CANCELLATION_WATCHER_STACK_BYTES: usize = 256 * 1_024;
 #[cfg(all(unix, feature = "cpu-reference"))]
 const OUTPUT_WRITER_STACK_BYTES: usize = 256 * 1_024;
@@ -1498,6 +1500,17 @@ fn record_runtime_error_parts(
         _ => SecurityEvent::ProtocolViolation { request_id: Some(request_id) },
     };
     retain_security_event(events, event);
+    if matches!(error, EngineError::AuthenticationFailure(_))
+        && metrics.authentication_failures % SECURITY_PATTERN_THRESHOLD == 0
+    {
+        retain_security_event(events, SecurityEvent::RepeatedAuthenticationFailure);
+    }
+    if matches!(error, EngineError::ResourceExhaustion(_))
+        && metrics.rejected_requests % SECURITY_PATTERN_THRESHOLD == 0
+    {
+        retain_security_event(events, SecurityEvent::ResourceExhaustionPattern);
+        retain_security_event(events, SecurityEvent::RepeatedRejectedRequests);
+    }
     Ok(())
 }
 
@@ -4882,9 +4895,71 @@ mod tests {
         assert_eq!(summary.accepted_connections(), 1);
         assert_eq!(summary.authenticated_commands(), 0);
         assert_eq!(summary.failed_connections(), 1);
+        assert_eq!(fixture.runtime.metrics().expect("metrics").authentication_failures, 1);
+        assert_eq!(fixture.runtime.drain_security_events(), [SecurityEvent::UnauthorizedClient]);
         assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
         assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
         fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn continuous_invalid_ingress_emits_exact_typed_security_telemetry() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        fn assert_event(label: &str, encoded: Vec<u8>, expected: SecurityEvent) {
+            let mut fixture = BatchRuntimeFixture::new(label, 1);
+            let socket = fixture.socket_path();
+            let shutdown = ContinuousShutdown::new();
+            let request_shutdown = shutdown.clone();
+            let client = thread::spawn(move || {
+                let mut stream = UnixStream::connect(socket).expect("client must connect");
+                configure_runtime_test_client(&stream);
+                stream.write_all(&encoded).expect("invalid frame must write");
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).expect("rejection must close the stream");
+                request_shutdown.request();
+                response
+            });
+            let summary = fixture
+                .runtime
+                .serve_continuous(
+                    &fixture.listener,
+                    ContinuousServeLimits::new(1).expect("continuous limits must validate"),
+                    &shutdown,
+                )
+                .expect("invalid ingress must remain connection-local");
+            assert!(client.join().expect("client must finish").is_empty());
+            assert_eq!(summary.accepted_connections(), 1);
+            assert_eq!(summary.authenticated_commands(), 0);
+            assert_eq!(summary.failed_connections(), 1);
+            assert_eq!(fixture.runtime.metrics().expect("metrics").protocol_violations, 1);
+            assert_eq!(fixture.runtime.drain_security_events(), [expected]);
+            fixture.cleanup();
+        }
+
+        let mut malformed = vec![0_u8; FRAME_HEADER_BYTES + 1];
+        malformed[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        assert_event("continuous-malformed", malformed, SecurityEvent::MalformedFrame);
+
+        let mut wrong_version = Frame::new(FrameKind::Capability, vec![1])
+            .expect("frame")
+            .encode()
+            .expect("encoded frame");
+        wrong_version[4..6].copy_from_slice(&99_u16.to_le_bytes());
+        assert_event("continuous-version", wrong_version, SecurityEvent::UnknownProtocolVersion);
+
+        let mut oversized = vec![0_u8; FRAME_HEADER_BYTES];
+        oversized[..4].copy_from_slice(&personalai_engine_protocol::FRAME_MAGIC);
+        oversized[4..6].copy_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
+        oversized[6..8].copy_from_slice(&PROTOCOL_MINOR.to_le_bytes());
+        oversized[8] = FrameKind::Capability as u8;
+        let declared = u32::try_from(personalai_engine_protocol::MAX_FRAME_PAYLOAD_BYTES + 1)
+            .expect("frame cap must fit u32");
+        oversized[12..16].copy_from_slice(&declared.to_le_bytes());
+        assert_event("continuous-oversized", oversized, SecurityEvent::OversizedFrame);
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]

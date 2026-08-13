@@ -232,6 +232,17 @@ continues serving authorized neighbors. This is an independent prefilter:
 Ed25519 control authentication and durable replay admission remain mandatory.
 There is no TCP listener or network client.
 
+The continuous runtime accounts pre-request failures without trusting a
+request ID. Kernel identity or message-authentication rejection enqueues
+`UnauthorizedClient`; malformed, oversized, and unknown-version frames map to
+their closed event variants; backend failures remain typed. Every eighth
+authentication failure emits `RepeatedAuthenticationFailure`, and every eighth
+resource rejection emits both `ResourceExhaustionPattern` and
+`RepeatedRejectedRequests`. The in-process queue remains capped at 256 events
+for Go-owned draining and contains no prompt, output, path, key, or model bytes.
+`CrashLoopIndication` is supervisor-owned because a terminated process cannot
+truthfully observe its own restart history.
+
 The Rust data plane is permanently offline; this is not a runtime option that
 a request, model, or operator flag can relax. Its exact dependency graph has no
 network client, and architecture tests reject Internet socket APIs, raw socket

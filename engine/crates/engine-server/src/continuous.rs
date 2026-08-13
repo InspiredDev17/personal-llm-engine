@@ -6,12 +6,12 @@ use super::{
     EngineResponseSigner, EngineService, Frame, GenerationEvent, GenerationRequest,
     GenerationRoundRobin, InboundCommand, LoadedCpuModel, MAX_CONCURRENT_CONNECTION_BATCH,
     MAX_PENDING_EVENTS_PER_CONNECTION, OUTBOUND_PIPELINE_RESERVED_BYTES, OUTPUT_WRITER_STACK_BYTES,
-    RequestId, RuntimeMetrics, SequenceId, ServeOutcome, SyncSender, TrustedControlPlaneKeys,
-    UnixFrameConnection, UnixFrameListener, activate_queued_request, admit_durable_nonce,
-    enqueue_outbound_frame, generation_event_frame, handle_service_request_parts,
-    record_generation_timing, record_generation_usage, record_runtime_error_parts,
-    service_response_frame, terminal_connection_result, watch_generation_cancellation,
-    write_queued_events,
+    RequestId, RuntimeMetrics, SECURITY_PATTERN_THRESHOLD, SequenceId, ServeOutcome, SyncSender,
+    TrustedControlPlaneKeys, UnixFrameConnection, UnixFrameListener, activate_queued_request,
+    admit_durable_nonce, enqueue_outbound_frame, generation_event_frame,
+    handle_service_request_parts, record_generation_timing, record_generation_usage,
+    record_runtime_error_parts, retain_security_event, service_response_frame,
+    terminal_connection_result, watch_generation_cancellation, write_queued_events,
 };
 use personalai_engine_protocol::ServiceResponseBody;
 use personalai_engine_types::SignerKeyId;
@@ -295,6 +295,7 @@ impl ContinuousState<'_> {
                     accepted = true;
                     increment(&mut self.summary.accepted_connections, "accepted connection count")?;
                     increment(&mut self.summary.failed_connections, "failed connection count")?;
+                    self.record_peer_authentication_failure()?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -345,12 +346,81 @@ impl ContinuousState<'_> {
                 .map_err(|_| EngineError::internal_invariant("ingress worker panicked"))?;
             match result {
                 Ok(authenticated) if !draining => self.accept_authenticated(authenticated)?,
-                Ok(_) | Err(_) => {
+                Ok(_) => {
+                    increment(&mut self.summary.failed_connections, "failed connection count")?;
+                }
+                Err(_error) if draining => {
+                    increment(&mut self.summary.failed_connections, "failed connection count")?;
+                }
+                Err(error) => {
+                    self.record_ingress_error(&error)?;
                     increment(&mut self.summary.failed_connections, "failed connection count")?;
                 }
             }
         }
         Ok(progressed)
+    }
+
+    fn record_peer_authentication_failure(&mut self) -> Result<(), EngineError> {
+        increment(&mut self.metrics.authentication_failures, "authentication failure counter")?;
+        retain_security_event(self.security_events, SecurityEvent::UnauthorizedClient);
+        if self.metrics.authentication_failures % SECURITY_PATTERN_THRESHOLD == 0 {
+            retain_security_event(
+                self.security_events,
+                SecurityEvent::RepeatedAuthenticationFailure,
+            );
+        }
+        Ok(())
+    }
+
+    fn record_ingress_error(&mut self, error: &EngineError) -> Result<(), EngineError> {
+        match error {
+            EngineError::AuthenticationFailure(_) => self.record_peer_authentication_failure(),
+            EngineError::ProtocolViolation(detail) => {
+                increment(&mut self.metrics.protocol_violations, "protocol violation counter")?;
+                let event = match detail.as_str() {
+                    "frame protocol version is unsupported" => {
+                        SecurityEvent::UnknownProtocolVersion
+                    }
+                    "declared Unix frame payload is outside hard bounds"
+                    | "frame payload length is outside hard bounds" => {
+                        SecurityEvent::OversizedFrame
+                    }
+                    _ => SecurityEvent::MalformedFrame,
+                };
+                retain_security_event(self.security_events, event);
+                Ok(())
+            }
+            EngineError::ResourceExhaustion(_) => {
+                increment(&mut self.metrics.rejected_requests, "rejected request counter")?;
+                if self.metrics.rejected_requests % SECURITY_PATTERN_THRESHOLD == 0 {
+                    retain_security_event(
+                        self.security_events,
+                        SecurityEvent::ResourceExhaustionPattern,
+                    );
+                    retain_security_event(
+                        self.security_events,
+                        SecurityEvent::RepeatedRejectedRequests,
+                    );
+                }
+                Ok(())
+            }
+            EngineError::BackendFailure(_) => {
+                increment(&mut self.metrics.backend_failures, "backend failure counter")?;
+                retain_security_event(
+                    self.security_events,
+                    SecurityEvent::BackendFailure { request_id: None, backend: None },
+                );
+                Ok(())
+            }
+            _ => {
+                retain_security_event(
+                    self.security_events,
+                    SecurityEvent::ProtocolViolation { request_id: None },
+                );
+                Ok(())
+            }
+        }
     }
 
     fn accept_authenticated(

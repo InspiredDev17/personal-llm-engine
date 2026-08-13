@@ -70,6 +70,14 @@ one registered ID and returns one signed response containing the load,
 capability, health, and scheduler-accounting values used for resource routing;
 the request never carries a path.
 
+Continuous ingress failures are request-local and enter the bounded sanitized
+security-event queue before the connection is retired. Kernel or signature
+authentication failures, malformed/oversized/unknown-version frames, resource
+patterns, and backend failures have closed event variants. Repeated
+authentication and rejection events use an exact threshold of eight. Crash-loop
+classification remains with the owner supervisor, which alone observes restart
+history.
+
 The admission scheduler uses three queues and the repeating deterministic
 dispatch cycle `interactive, standard, interactive, background, interactive,
 standard, interactive`. This 4:2:1 cycle provides bounded service to every
