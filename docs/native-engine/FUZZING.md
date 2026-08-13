@@ -29,6 +29,7 @@ reproducible.
 | `tensor_index_parser` | one fixed directory tensor-index record | 192 bytes |
 | `safetensors_import` | offline importer's bounded safetensors parser | 8 MiB campaign input |
 | `package_path_resolution` | safe direct-child `.paimodel` name parser | 1,024 bytes |
+| `model_registry_v2` | canonical signed Model Foundry registry V2 parser | 64 KiB |
 
 The input ceiling is a campaign resource bound, not a reduction of the parser's
 documented format limit. Deterministic unit and mutation tests continue to
@@ -61,7 +62,8 @@ cargo +nightly-2026-08-01 fuzz run \
 Replace the target and corpus directory for any table entry and use its exact
 table ceiling (`max_len` is 192 for `tensor_index_parser`, 1,024 for
 `package_path_resolution`, 65,536 for `aiptok_encode`, or 262,144 for either
-AIPTok token-sequence target; `service_envelope` uses 65,538). Copy a
+AIPTok token-sequence target; `service_envelope` uses 65,538 and
+`model_registry_v2` uses 65,536). Copy a
 checked-in corpus to a temporary directory when the run must not retain newly
 discovered coverage inputs.
 
@@ -79,6 +81,13 @@ campaign on 2026-08-13 completed 16,092 inputs in six wall-clock seconds,
 reached 1,269 coverage counters and 1,777 features, stayed below 82 MiB RSS,
 and produced no crash, sanitizer, timeout, or resource-limit artifact. The same
 non-fatal local `atos` symbolizer warning occurred.
+
+The new `model_registry_v2` target received a separate bounded 1,000-run macOS
+ARM64 smoke campaign on 2026-08-13 using a temporary copy of its deterministic
+corpus. It reached 393 coverage counters and 731 features, stayed below 43 MiB
+RSS, and produced no crash, sanitizer, timeout, or resource-limit artifact.
+Non-fatal local `atos` symbolizer warnings did not stop the campaign. This is
+smoke evidence only, not a completeness claim.
 
 ## Continuous campaign
 

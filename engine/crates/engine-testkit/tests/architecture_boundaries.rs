@@ -152,6 +152,7 @@ fn defensive_fuzz_workflow_covers_owned_parser_boundaries() {
         "aiptok_decode",
         "aiptok_incremental",
         "service_envelope",
+        "model_registry_v2",
         "-max_total_time=60",
         "-max_len=192",
         "-max_len=1024",

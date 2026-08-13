@@ -7,6 +7,7 @@
 
 mod directory;
 mod hash_catalog;
+mod registry;
 
 pub use directory::{
     DIRECTORY_DECODER_ARCHITECTURE_ID, DIRECTORY_MANIFEST_HEADER_BYTES, DIRECTORY_MANIFEST_MAGIC,
@@ -17,6 +18,11 @@ pub use directory::{
 pub use hash_catalog::{
     HASH_CATALOG_MAGIC, HASH_CATALOG_MAX_ENTRIES, HASH_CATALOG_RECORD_BYTES, HashCatalog,
     HashCatalogEntry, PackageFileKind,
+};
+pub use registry::{
+    DIRECTORY_ENGINE_COMPATIBILITY, MODEL_REGISTRY_MAX_BYTES,
+    MODEL_REGISTRY_MINIMUM_ENGINE_VERSION, MODEL_REGISTRY_SCHEMA_V2, ModelRegistryEntryV2,
+    SignedModelRegistryEntryV2,
 };
 
 use personalai_engine_types::{

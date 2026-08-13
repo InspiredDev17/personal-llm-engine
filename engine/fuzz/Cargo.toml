@@ -106,6 +106,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "model_registry_v2"
+path = "fuzz_targets/model_registry_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "generate-corpus"
 path = "src/bin/generate-corpus.rs"
 test = false

@@ -249,6 +249,7 @@ fn load_inner(
 ) -> Result<VerifiedDirectoryPackage, EngineError> {
     let registration = registry.resolve(model_id)?.clone();
     validate_root(registry.model_root())?;
+    let artifact_metadata = validate_registry_artifact_parent(registry, &registration)?;
     let package_metadata = fs::symlink_metadata(registration.package_path())
         .map_err(|_| EngineError::invalid_input("registered directory package is unavailable"))?;
     if !package_metadata.is_dir()
@@ -303,6 +304,13 @@ fn load_inner(
         ));
     }
     validate_architecture(&manifest)?;
+    if let Some(binding) = registration.registry_binding() {
+        if manifest.context_limit().get() != binding.context_capacity {
+            return Err(EngineError::authentication_failure(
+                "directory manifest context differs from the signed registry decision",
+            ));
+        }
+    }
     total_bytes = checked_total(total_bytes, manifest_bytes.len(), budget)?;
 
     let tokenizer_entry = required_entry(&catalog, "tokenizer.aiptok")?;
@@ -311,11 +319,25 @@ fn load_inner(
     if hash_package(&tokenizer) != manifest.tokenizer_hash() {
         return Err(corrupt("directory tokenizer hash differs from manifest"));
     }
+    if let Some(binding) = registration.registry_binding() {
+        if manifest.tokenizer_hash() != binding.tokenizer_hash {
+            return Err(EngineError::authentication_failure(
+                "directory tokenizer identity differs from the signed registry decision",
+            ));
+        }
+    }
     total_bytes = checked_total(total_bytes, tokenizer.len(), budget)?;
     let provenance_entry = required_entry(&catalog, "provenance.json")?;
     ensure_entry_budget(total_bytes, provenance_entry.byte_length(), budget)?;
     let provenance = read_catalog_file(registration.package_path(), provenance_entry)?;
     validate_provenance(&provenance)?;
+    if let Some(binding) = registration.registry_binding() {
+        if hash_package(&provenance) != binding.provenance_hash {
+            return Err(EngineError::authentication_failure(
+                "directory provenance identity differs from the signed registry decision",
+            ));
+        }
+    }
     total_bytes = checked_total(total_bytes, provenance.len(), budget)?;
 
     if manifest.shards().len()
@@ -354,6 +376,19 @@ fn load_inner(
         }
         shards.push(VerifiedShard { map, expected_hash: shard.content_hash() });
     }
+    if let Some(binding) = registration.registry_binding() {
+        let mut observed = manifest
+            .shards()
+            .iter()
+            .map(personalai_engine_model_format::DirectoryShardRecord::content_hash)
+            .collect::<Vec<_>>();
+        observed.sort_unstable();
+        if observed != binding.tensor_shard_hashes {
+            return Err(EngineError::authentication_failure(
+                "directory tensor-shard identities differ from the signed registry decision",
+            ));
+        }
+    }
     let package =
         VerifiedDirectoryPackage { registration, manifest, tokenizer, provenance, shards };
     validate_tensor_hashes(&package)?;
@@ -362,8 +397,52 @@ fn load_inner(
     if after.dev() != package_metadata.dev() || after.ino() != package_metadata.ino() {
         return Err(EngineError::authentication_failure("package directory changed during load"));
     }
+    if let Some(before) = artifact_metadata {
+        let artifact =
+            package.registration.package_path().parent().ok_or_else(|| {
+                EngineError::internal_invariant("registry artifact parent is absent")
+            })?;
+        let after = fs::symlink_metadata(artifact)
+            .map_err(|_| EngineError::authentication_failure("artifact directory changed"))?;
+        if after.dev() != before.dev() || after.ino() != before.ino() {
+            return Err(EngineError::authentication_failure(
+                "artifact directory changed during package load",
+            ));
+        }
+    }
     let _ = total_bytes;
     Ok(package)
+}
+
+fn validate_registry_artifact_parent(
+    registry: &ModelRegistry,
+    registration: &RegisteredModel,
+) -> Result<Option<fs::Metadata>, EngineError> {
+    let Some(binding) = registration.registry_binding() else {
+        return Ok(None);
+    };
+    let artifact = registry.model_root().join(&binding.artifact_id);
+    let expected_package = artifact.join(format!(
+        "{}.{}",
+        registration.model_id().as_str(),
+        crate::MODEL_PACKAGE_EXTENSION
+    ));
+    if registration.package_path() != expected_package {
+        return Err(EngineError::internal_invariant(
+            "registry-backed package path is not canonically derived",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&artifact)
+        .map_err(|_| EngineError::invalid_input("registry artifact directory is unavailable"))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o222 != 0
+    {
+        return Err(EngineError::authentication_failure(
+            "registry artifact must be a protected non-symlink directory",
+        ));
+    }
+    Ok(Some(metadata))
 }
 
 fn validate_root(root: &Path) -> Result<(), EngineError> {

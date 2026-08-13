@@ -10,6 +10,7 @@ memory, and audit. The engine is inference-only and is not a second AI platform.
 The workspace implements a signed directory-backed data-only `.paimodel`
 format, a Rust-only quarantine safetensors importer, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
+an explicit exact-owner-selected Model Foundry registry V2 admission mode,
 no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
 tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
@@ -24,7 +25,8 @@ per-stream bounded output queues, a caller-shutdown continuous reference driver,
 and an owner CLI. The CLI also exposes an explicit one-shot `generate` command
 that admits a registered signed package by model ID and never accepts a URL or
 arbitrary package path. The CLI exposes the continuous driver only through an explicit
-bounded mode and translates owner-process `SIGINT`/`SIGTERM` into the existing
+bounded mode, requires an explicit owner-pinned or Model Foundry V2 registration
+mode, and translates owner-process `SIGINT`/`SIGTERM` into the existing
 stop-admit, cancel, and drain path. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
 a pinned weekly/manual workflow is configured to repeat that bounded test eight
@@ -68,6 +70,11 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 - no model training, Python, TypeScript, TCP listener, outbound connection,
   download, updater, dynamic-library discovery, or model-supplied code;
 - clients send a registered `ModelId`, never a path;
+- registry-backed admission verifies the exact owner-selected signed V2 entry
+  before package access, derives the approved path from signed identities, and
+  never chooses `latest` or falls back to owner-pinned registration;
+- registry and package signing identities must be distinct from each other and
+  from Go control/engine response identities;
 - Go signs control requests; Rust signs every response with a separate
   owner-provisioned response identity whose seed enters only through stdin and
   is zeroized after construction;

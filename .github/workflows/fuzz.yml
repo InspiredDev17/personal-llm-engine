@@ -116,6 +116,13 @@ jobs:
           --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
           package_path_resolution "$RUNNER_TEMP/personalai-fuzz-corpus/package_path_resolution"
           -- -max_total_time=60 -max_len=1024 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz Model Foundry registry V2 parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          model_registry_v2 "$RUNNER_TEMP/personalai-fuzz-corpus/model_registry_v2"
+          -- -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=1024
       - name: Preserve crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

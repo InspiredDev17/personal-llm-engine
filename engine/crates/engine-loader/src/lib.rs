@@ -1,17 +1,24 @@
 //! Registered-model resolution and cryptographic package admission.
 //!
-//! Requests contain only a [`ModelId`]. Local configuration exclusively owns
-//! the relative package name, expected package digest, and trusted signer. This
-//! crate verifies already-bounded bytes and performs no filesystem access.
+//! Requests contain only a [`ModelId`]. Owner configuration either pins the
+//! exact package identity directly or selects one exact signed Model Foundry V2
+//! decision. Registry-backed paths are derived only after strict verification;
+//! request data never supplies paths, hashes, or trust identities.
 
 #[cfg(unix)]
 mod directory_loader;
 #[cfg(unix)]
 mod read_only_map;
+mod registry_v2;
 
 #[cfg(unix)]
 pub use directory_loader::{
     DirectorySecurityEventSink, LoadedDirectoryTensors, VerifiedDirectoryPackage,
+};
+#[cfg(unix)]
+use registry_v2::read_verified_registry_selection_v2;
+pub use registry_v2::{
+    RegistrySelectionV2, VerifiedRegistrySelectionV2, verify_registry_selection_v2,
 };
 
 use personalai_engine_crypto::TrustedSigner;
@@ -38,6 +45,26 @@ pub const MODEL_PACKAGE_EXTENSION: &str = "paimodel";
 /// Maximum number of model IDs in one local registry.
 pub const MAX_REGISTERED_MODELS: usize = 1_024;
 
+/// Explicit registration authority selected by owner configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationMode {
+    /// Legacy exact package identity pinned directly by owner configuration.
+    OwnerPinned,
+    /// Exact signed Model Foundry V2 decision selected by owner configuration.
+    ModelFoundryRegistryV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryBindingV2 {
+    artifact_id: String,
+    registry_sequence: u64,
+    registry_entry_hash: ModelPackageHash,
+    context_capacity: u32,
+    tokenizer_hash: ModelPackageHash,
+    provenance_hash: ModelPackageHash,
+    tensor_shard_hashes: Vec<ModelPackageHash>,
+}
+
 /// One configuration-owned model package registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredModel {
@@ -45,6 +72,8 @@ pub struct RegisteredModel {
     package_path: PathBuf,
     expected_hash: ModelPackageHash,
     trusted_signer: TrustedSigner,
+    mode: RegistrationMode,
+    registry_binding: Option<RegistryBindingV2>,
 }
 
 impl RegisteredModel {
@@ -55,8 +84,9 @@ impl RegisteredModel {
 
     /// Returns the engine-derived package path.
     ///
-    /// This path is local configuration data and must never be serialized into
-    /// model context, generation output, or security telemetry.
+    /// This path is local configuration or verified-registry-derived data and
+    /// must never be serialized into model context, generation output, or
+    /// security telemetry.
     pub fn package_path(&self) -> &Path {
         &self.package_path
     }
@@ -69,6 +99,30 @@ impl RegisteredModel {
     /// Returns the operator-configured package signer.
     pub const fn trusted_signer(&self) -> &TrustedSigner {
         &self.trusted_signer
+    }
+
+    /// Returns the explicit owner-selected admission mode.
+    pub const fn mode(&self) -> RegistrationMode {
+        self.mode
+    }
+
+    /// Returns the signed lifecycle artifact ID for registry-backed admission.
+    pub fn registry_artifact_id(&self) -> Option<&str> {
+        self.registry_binding.as_ref().map(|binding| binding.artifact_id.as_str())
+    }
+
+    /// Returns the exact selected registry sequence for registry-backed admission.
+    pub fn registry_sequence(&self) -> Option<u64> {
+        self.registry_binding.as_ref().map(|binding| binding.registry_sequence)
+    }
+
+    /// Returns the exact selected registry-envelope identity.
+    pub fn registry_entry_hash(&self) -> Option<ModelPackageHash> {
+        self.registry_binding.as_ref().map(|binding| binding.registry_entry_hash)
+    }
+
+    pub(crate) const fn registry_binding(&self) -> Option<&RegistryBindingV2> {
+        self.registry_binding.as_ref()
     }
 }
 
@@ -110,8 +164,60 @@ impl ModelRegistry {
             return Err(EngineError::invalid_input("model identifier is already registered"));
         }
         let package_path = self.model_root.join(relative_package_path);
-        let registration =
-            RegisteredModel { model_id, package_path, expected_hash, trusted_signer };
+        let registration = RegisteredModel {
+            model_id,
+            package_path,
+            expected_hash,
+            trusted_signer,
+            mode: RegistrationMode::OwnerPinned,
+            registry_binding: None,
+        };
+        self.registrations.insert(key, registration);
+        Ok(())
+    }
+
+    /// Verifies and registers one exact owner-selected Model Foundry V2 entry.
+    ///
+    /// Registry bytes are read only from the sequence-derived direct child of
+    /// `<approved>/registry/`. The package path is then derived as
+    /// `<approved>/<ArtifactId>/<ModelId>.paimodel`. Neither path can be
+    /// supplied by a request, and failure never falls back to owner-pinned mode.
+    #[cfg(unix)]
+    pub fn register_registry_v2(
+        &mut self,
+        selection: &RegistrySelectionV2,
+    ) -> Result<(), EngineError> {
+        if self.registrations.len() >= MAX_REGISTERED_MODELS {
+            return Err(EngineError::resource_exhaustion(
+                "local model registry reached its hard entry limit",
+            ));
+        }
+        let verified = read_verified_registry_selection_v2(&self.model_root, selection)?;
+        let entry = verified.entry();
+        let model_id = ModelId::new(entry.model_id())
+            .map_err(|_| EngineError::corrupt_model_package("registry model ID is invalid"))?;
+        let key = model_id.as_str().to_owned();
+        if self.registrations.contains_key(&key) {
+            return Err(EngineError::invalid_input("model identifier is already registered"));
+        }
+        let package_name = format!("{}.{}", model_id.as_str(), MODEL_PACKAGE_EXTENSION);
+        let package_path = self.model_root.join(entry.artifact_id()).join(package_name);
+        let registration = RegisteredModel {
+            model_id,
+            package_path,
+            expected_hash: entry.package_catalog_hash(),
+            trusted_signer: verified.package_signer().clone(),
+            mode: RegistrationMode::ModelFoundryRegistryV2,
+            registry_binding: Some(RegistryBindingV2 {
+                artifact_id: entry.artifact_id().to_owned(),
+                registry_sequence: entry.registry_sequence(),
+                registry_entry_hash: verified.entry_hash(),
+                context_capacity: entry.context_capacity(),
+                tokenizer_hash: entry.tokenizer_hash(),
+                provenance_hash: entry.provenance_hash(),
+                tensor_shard_hashes: entry.tensor_shard_hashes().to_vec(),
+            }),
+        };
         self.registrations.insert(key, registration);
         Ok(())
     }

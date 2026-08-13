@@ -17,6 +17,9 @@ pub const MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] = b"PersonalAI.ModelPackage.S
 /// Domain separator for directory-backed package hash catalogs.
 pub const DIRECTORY_MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.DirectoryModelPackage.Signature.v1\0";
+/// Domain separator for Model Foundry registry V2 decisions.
+pub const MODEL_FOUNDRY_REGISTRY_SIGNATURE_DOMAIN_V2: &[u8] =
+    b"PersonalAI.ModelRegistry.Entry.Signature.v2\0";
 /// Domain separator for Go control-plane request signatures.
 pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.ControlPlane.Request.Signature.v1\0";
@@ -220,6 +223,11 @@ impl TrustedSigner {
         self.key_id
     }
 
+    /// Returns the exact public verification key bytes.
+    pub const fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.public_key
+    }
+
     /// Returns whether this signer is currently active.
     pub const fn is_active(&self) -> bool {
         self.active
@@ -254,6 +262,13 @@ pub fn directory_package_signature_message(
     catalog_digest: &[u8; ModelPackageHash::BYTE_LEN],
 ) -> Result<Vec<u8>, EngineError> {
     domain_separated_message(DIRECTORY_MODEL_PACKAGE_SIGNATURE_DOMAIN_V1, catalog_digest)
+}
+
+/// Builds the bounded message signed by Model Foundry registry V2 tooling.
+pub fn model_foundry_registry_signature_message(
+    entry_digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    domain_separated_message(MODEL_FOUNDRY_REGISTRY_SIGNATURE_DOMAIN_V2, entry_digest)
 }
 
 /// Builds the bounded message signed by the Go control plane.
@@ -320,6 +335,33 @@ pub fn verify_directory_package_signature(
     verifying_key
         .verify_strict(&message, &signature)
         .map_err(|_| EngineError::signature_failure("model package signature is invalid"))
+}
+
+/// Verifies one exact Model Foundry registry V2 entry under active owner trust.
+pub fn verify_model_foundry_registry_signature(
+    signer: &TrustedSigner,
+    envelope_key_id: SignerKeyId,
+    entry_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("model registry signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "model registry signer does not match owner configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured registry key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured registry key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = model_foundry_registry_signature_message(entry_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::signature_failure("model registry signature is invalid"))
 }
 
 /// Strictly verifies one authenticated Go control-plane request body.

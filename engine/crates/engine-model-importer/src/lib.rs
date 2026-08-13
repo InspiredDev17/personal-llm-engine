@@ -814,7 +814,9 @@ fn corrupt(detail: impl AsRef<str>) -> EngineError {
 mod tests {
     use super::*;
     use personalai_engine_crypto::TrustedSigner;
-    use personalai_engine_loader::{ModelRegistry, VerifiedDirectoryPackage};
+    use personalai_engine_loader::{
+        ModelRegistry, RegistrationMode, RegistrySelectionV2, VerifiedDirectoryPackage,
+    };
     use personalai_engine_model_format::{DIRECTORY_MANIFEST_HEADER_BYTES, ParsedModelPackage};
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
@@ -970,6 +972,57 @@ mod tests {
         ))
     }
 
+    const REGISTRY_V2: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/model-foundry-registry-v2/positive-0002.registry.json"
+    ));
+
+    fn registry_v2_bytes() -> &'static [u8] {
+        REGISTRY_V2.strip_suffix(b"\n").unwrap_or(REGISTRY_V2)
+    }
+
+    fn registry_v2_selection() -> RegistrySelectionV2 {
+        RegistrySelectionV2::new(
+            ModelId::new("synthetic-import").expect("model ID"),
+            "phase0-synthetic-import",
+            hash_package(registry_v2_bytes()),
+            2,
+            2,
+            registry_v2_signer(),
+            registry_v2_package_signer(),
+        )
+        .expect("selection")
+    }
+
+    fn registry_v2_signer() -> TrustedSigner {
+        TrustedSigner::active(
+            SignerKeyId::from_bytes([0x63; 16]).expect("registry key ID"),
+            decode_public_key("2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653"),
+        )
+        .expect("registry trust")
+    }
+
+    fn registry_v2_package_signer() -> TrustedSigner {
+        TrustedSigner::active(
+            SignerKeyId::from_bytes([0x51; 16]).expect("package key ID"),
+            decode_public_key("2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7"),
+        )
+        .expect("package trust")
+    }
+
+    fn decode_public_key(value: &str) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("fixture public key is invalid"),
+            };
+            bytes[index] = (digit(pair[0]) << 4) | digit(pair[1]);
+        }
+        bytes
+    }
+
     #[cfg(unix)]
     fn with_corrupted_read_only_file(path: &Path, mutate_last_byte: bool, inspect: impl FnOnce()) {
         let original = fs::read(path).expect("file must read");
@@ -1108,6 +1161,69 @@ mod tests {
         )
         .expect("second import must succeed");
         assert_eq!(first, second);
+        assert_eq!(
+            first.package_hash(),
+            ModelPackageHash::from_sha384_hex(
+                "24c0d89c9a04166200cda5fdd29647fed34d81a4b662ca195a0148182b840072\
+                 b0859828f89d78003ddb5d44907d10a4",
+            )
+            .expect("fixture package hash must parse"),
+        );
+        assert_eq!(
+            first.signer_public_key(),
+            [
+                0x20, 0x12, 0xcb, 0x90, 0xca, 0x60, 0xe8, 0xe5, 0xd8, 0xda, 0xf6, 0x6e, 0x22, 0x72,
+                0xd2, 0x23, 0x3e, 0x04, 0x86, 0xd5, 0x57, 0xe8, 0xc6, 0x61, 0x41, 0xed, 0x89, 0x20,
+                0x17, 0x7d, 0x7e, 0xb7,
+            ],
+        );
+        let expected_files = [
+            (
+                "hashes.aiph",
+                528,
+                "24c0d89c9a04166200cda5fdd29647fed34d81a4b662ca195a0148182b840072\
+                 b0859828f89d78003ddb5d44907d10a4",
+            ),
+            (
+                "manifest.aipm",
+                4_608,
+                "6a2a5349c18916a515b3afac4253ae5240e45d0e3fb808bf5a8093d7c45cc469\
+                 b45fbdf6ad95f88e94f7d93a1d62941d",
+            ),
+            (
+                "provenance.json",
+                720,
+                "d55e94e28620461d21bd1103e695d2e4c6c62470984a9f2912d1fc566bafecdb\
+                 11c5725a4bd5009441e224044094affc",
+            ),
+            (
+                "signature.ed25519",
+                96,
+                "6292cef765d385e5c796b9533a2bc98fca7300d668ac75558c5bb1e650044f6f\
+                 695d888a3afeddf6e80dc6e714a394af",
+            ),
+            (
+                "tensors-0000.aipt",
+                9_904,
+                "b0ca20c39137666448ca362acc76abfdbc1f79fdde96729f852bda4a85d0cf83\
+                 14b9791e49ce48d83c90fb510447a4cd",
+            ),
+            (
+                "tokenizer.aiptok",
+                2_501,
+                "c366ab2a065461ce28b6456c9d8391a9e83e69fb9938f82ec5dcf6f9246c30f\
+                 84f0928d55d375e82e4c25be3163abce4",
+            ),
+        ];
+        for (name, expected_length, expected_hash) in expected_files {
+            let bytes = first.files().get(name).expect("fixture file must exist");
+            assert_eq!(bytes.len(), expected_length);
+            assert_eq!(
+                hash_package(bytes),
+                ModelPackageHash::from_sha384_hex(expected_hash)
+                    .expect("fixture file hash must parse"),
+            );
+        }
         assert_eq!(first_seed, [0; 32]);
         assert_eq!(second_seed, [0; 32]);
         assert_eq!(
@@ -1121,6 +1237,169 @@ mod tests {
                 "tokenizer.aiptok",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_v2_rejects_a_package_after_deterministic_importer_contract_drift() {
+        let root = temporary_root("registry-v2");
+        let artifact = root.join("phase0-synthetic-import");
+        let package_path = artifact.join("synthetic-import.paimodel");
+        let registry_root = root.join("registry");
+        fs::create_dir(&root).expect("approved root");
+        fs::create_dir(&artifact).expect("artifact root");
+        fs::create_dir(&package_path).expect("package root");
+        fs::create_dir(&registry_root).expect("registry root");
+
+        let (source, tokenizer) = source_and_tokenizer();
+        let package_key = SignerKeyId::from_bytes([0x51; 16]).expect("package key ID");
+        let mut seed = [0x52; 32];
+        let package = build_package(
+            &spec(),
+            "model.safetensors",
+            &source,
+            &tokenizer,
+            package_key,
+            &mut seed,
+        )
+        .expect("package must build");
+        for (name, bytes) in package.files() {
+            let path = package_path.join(name);
+            fs::write(&path, bytes).expect("package file must write");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+                .expect("package file must seal");
+        }
+        let registry_path = registry_root.join("00000000000000000002.registry.json");
+        fs::write(&registry_path, registry_v2_bytes()).expect("registry entry must write");
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o400))
+            .expect("registry entry must seal");
+        for directory in [&package_path, &artifact, &registry_root, &root] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o500))
+                .expect("approved directory must seal");
+        }
+
+        let mut wrong_owner = ModelRegistry::new(&root).expect("registry constructs");
+        let wrong_selection = RegistrySelectionV2::new(
+            ModelId::new("other-model").expect("model ID"),
+            "phase0-synthetic-import",
+            hash_package(registry_v2_bytes()),
+            2,
+            2,
+            registry_v2_signer(),
+            registry_v2_package_signer(),
+        );
+        assert!(wrong_selection.is_ok());
+        assert!(wrong_owner.register_registry_v2(&wrong_selection.expect("selection")).is_err());
+        assert!(wrong_owner.is_empty());
+
+        let selection = registry_v2_selection();
+        let mut registry = ModelRegistry::new(&root).expect("registry constructs");
+        registry.register_registry_v2(&selection).expect("exact registry selection must register");
+        let registration =
+            registry.resolve(spec().model_id()).expect("registered model must resolve");
+        assert_eq!(registration.mode(), RegistrationMode::ModelFoundryRegistryV2);
+        assert_eq!(registration.package_path(), package_path);
+        assert_eq!(registration.registry_artifact_id(), Some("phase0-synthetic-import"));
+        assert_eq!(registration.registry_sequence(), Some(2));
+        assert_eq!(registration.registry_entry_hash(), Some(hash_package(registry_v2_bytes())));
+
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget");
+        let mut events = Vec::new();
+        let result = registry.load_registered_directory(spec().model_id(), &budget, &mut |event| {
+            events.push(event);
+        });
+        assert!(matches!(result, Err(EngineError::SignatureFailure(_))));
+        assert_eq!(events.len(), 1);
+
+        for directory in [&root, &registry_root, &artifact, &package_path] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("test directory must unseal");
+        }
+        fs::remove_dir_all(root).expect("test root must clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_v2_rejects_latest_fallback_registry_symlinks_and_artifact_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("registry-v2-boundaries");
+        let registry_root = root.join("registry");
+        let selected_path = registry_root.join("00000000000000000002.registry.json");
+        let newer_path = registry_root.join("00000000000000000003.registry.json");
+        let external_entry = temporary_root("external-registry-v2");
+        let external_artifact = temporary_root("external-artifact-v2");
+        let artifact = root.join("phase0-synthetic-import");
+        fs::create_dir(&root).expect("approved root");
+        fs::create_dir(&registry_root).expect("registry root");
+        fs::write(&newer_path, registry_v2_bytes()).expect("newer registry entry must write");
+        fs::set_permissions(&newer_path, fs::Permissions::from_mode(0o400))
+            .expect("newer entry must seal");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o500))
+            .expect("registry root must seal");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500))
+            .expect("approved root must seal");
+
+        let mut latest_fallback = ModelRegistry::new(&root).expect("registry constructs");
+        assert!(latest_fallback.register_registry_v2(&registry_v2_selection()).is_err());
+        assert!(latest_fallback.is_empty());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("approved root must unseal");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o700))
+            .expect("registry root must unseal");
+        fs::write(&external_entry, registry_v2_bytes()).expect("external entry must write");
+        fs::set_permissions(&external_entry, fs::Permissions::from_mode(0o400))
+            .expect("external entry must seal");
+        symlink(&external_entry, &selected_path).expect("registry symlink must create");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o500))
+            .expect("registry root must reseal");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500))
+            .expect("approved root must reseal");
+
+        let mut symlinked_registry = ModelRegistry::new(&root).expect("registry constructs");
+        assert!(symlinked_registry.register_registry_v2(&registry_v2_selection()).is_err());
+        assert!(symlinked_registry.is_empty());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("approved root must unseal");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o700))
+            .expect("registry root must unseal");
+        fs::remove_file(&selected_path).expect("registry symlink must remove");
+        fs::write(&selected_path, registry_v2_bytes()).expect("selected entry must write");
+        fs::set_permissions(&selected_path, fs::Permissions::from_mode(0o400))
+            .expect("selected entry must seal");
+        fs::create_dir(&external_artifact).expect("external artifact must create");
+        symlink(&external_artifact, &artifact).expect("artifact symlink must create");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o500))
+            .expect("registry root must reseal");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500))
+            .expect("approved root must reseal");
+
+        let mut artifact_escape = ModelRegistry::new(&root).expect("registry constructs");
+        artifact_escape
+            .register_registry_v2(&registry_v2_selection())
+            .expect("exact registry entry must register before package access");
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget");
+        let mut events = Vec::new();
+        assert!(
+            artifact_escape
+                .load_registered_directory(spec().model_id(), &budget, &mut |event| {
+                    events.push(event);
+                })
+                .is_err()
+        );
+        assert_eq!(events.len(), 1);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("approved root must unseal");
+        fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o700))
+            .expect("registry root must unseal");
+        fs::remove_dir_all(&root).expect("test root must clean up");
+        fs::set_permissions(&external_entry, fs::Permissions::from_mode(0o600))
+            .expect("external entry must unseal");
+        fs::remove_file(external_entry).expect("external entry must clean up");
+        fs::remove_dir(external_artifact).expect("external artifact must clean up");
     }
 
     #[test]
