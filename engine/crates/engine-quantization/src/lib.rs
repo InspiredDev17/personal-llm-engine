@@ -214,6 +214,61 @@ impl<'a> QuantizedTensor<'a> {
         AIPQ_REQUIRED_ALIGNMENT
     }
 
+    /// Returns the validated number of fixed-size encoded blocks.
+    pub const fn block_count(self) -> usize {
+        self.block_count
+    }
+
+    /// Decodes one validated block into caller-owned F32 storage.
+    ///
+    /// The destination is always fully initialized. Tail padding decodes to
+    /// canonical zero and the returned length identifies the logical values.
+    pub fn decode_block(
+        self,
+        block: usize,
+        destination: &mut [f32; BLOCK_VALUES],
+    ) -> Result<usize, EngineError> {
+        let mut codes = [0_i8; BLOCK_VALUES];
+        let (used, scale) = self.decode_codes_block(block, &mut codes)?;
+        for (destination, code) in destination.iter_mut().zip(codes) {
+            *destination = f32::from(code) * scale;
+        }
+        Ok(used)
+    }
+
+    /// Decodes one validated block into signed codes and its explicit scale.
+    ///
+    /// This safe boundary is used by first-party optimized backends. Tail
+    /// padding is always initialized to zero.
+    pub fn decode_codes_block(
+        self,
+        block: usize,
+        destination: &mut [i8; BLOCK_VALUES],
+    ) -> Result<(usize, f32), EngineError> {
+        let first = u64::try_from(block)
+            .ok()
+            .and_then(|block| block.checked_mul(AIPQ_BLOCK_VALUES))
+            .ok_or_else(|| resource("AIPQ decoded block offset overflows"))?;
+        let (_, bytes) = self.block_range(block)?;
+        let remaining = self.shape.element_count().checked_sub(first).ok_or_else(|| {
+            EngineError::internal_invariant("validated AIPQ block begins past the tensor")
+        })?;
+        let used = usize::try_from(remaining.min(AIPQ_BLOCK_VALUES))
+            .map_err(|_| resource("AIPQ decoded block length is not addressable"))?;
+        destination.fill(0);
+        for (offset, value) in destination.iter_mut().take(used).enumerate() {
+            *value = match self.format {
+                Quantization::AipQ8V1 => i8::from_le_bytes([bytes[4 + offset]]),
+                Quantization::AipQ4V1 => {
+                    let packed = bytes[4 + offset / 2];
+                    decode_q4(if offset % 2 == 0 { packed & 0x0f } else { packed >> 4 })?
+                }
+                Quantization::None => return Err(corrupt("AIPQ block format is unquantized")),
+            };
+        }
+        Ok((used, read_scale(bytes)?))
+    }
+
     /// Reads one logical value through the validated block encoding.
     pub fn value(self, index: u64) -> Result<f32, EngineError> {
         if index >= self.shape.element_count() {

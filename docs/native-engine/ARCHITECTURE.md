@@ -29,7 +29,7 @@ Green authority.
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
-| `engine-arm64` | default-off immutable graph backend with isolated Advanced SIMD F32 kernels and scalar-oracle fallback |
+| `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
 | `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
@@ -391,10 +391,16 @@ and portable socket path (100 bytes).
 
 `cpu-reference` is default and implemented as a correctness path. `arm64`,
 `metal`, and `cuda` remain explicit and default-off. The ARM64 feature exposes
-a real immutable-graph backend with fixed Advanced SIMD F32 elementwise, dot,
-and matrix-vector kernels plus scalar fallback for the remaining closed
-operations. It does not yet claim transformer-service execution. Metal and
-CUDA report not-implemented and their native directories contain no kernels.
+a real immutable-graph backend with runtime Advanced SIMD detection, fixed
+elementwise, reduction, matvec/matmul, normalization, activation, RoPE,
+attention, half-conversion, and AIPQ8/AIPQ4 kernels, plus scalar fallback for
+unsupported shapes, layouts, dtypes, and operations. Its first-party worker
+pool is fixed at one to sixteen threads, requires one thread in deterministic
+mode, bounds ingress to the worker count, isolates panics, and joins cleanly.
+The generic graph executor can select ARM64 through `HostCpuBackend`; the signed
+model decoder/service path is not yet integrated and does not advertise ARM64
+model execution. Metal and CUDA report not-implemented and their native
+directories contain no kernels.
 Any backend is selected by trusted engine configuration and architecture code,
 never by model data, and must pass CPU differential and isolated unsafe/FFI
 review.
@@ -402,8 +408,9 @@ review.
 ## Unsafe and FFI boundary
 
 Workspace policy denies unsafe Rust by default. The approved exceptions are
-`engine-arm64/src/intrinsics.rs`, whose four Advanced SIMD blocks load and
-store only complete in-bounds four-element F32 chunks supplied by safe slices,
+`engine-arm64/src/intrinsics.rs`, whose twelve Advanced SIMD blocks load and
+store only complete in-bounds lane groups supplied by safe slices or fixed
+arrays,
 `engine-server/src/os_lock.rs`, which makes one checked `libc::flock` call using
 an owned valid descriptor, and `engine-cli/src/os_signal.rs`, which uses two
 documented `sigaction` blocks to install and restore owner-process handlers,

@@ -1,13 +1,16 @@
 //! Isolated ARM64 Advanced SIMD boundary.
 //!
-//! Safe callers supply equally sized, initialized F32 slices. Every intrinsic
-//! load and store remains within a four-element chunk proven by the loop bound.
-//! ARM64 requires Advanced SIMD, so no optional runtime feature is assumed.
+//! Safe callers supply validated initialized slices or fixed arrays. Every
+//! intrinsic load and store remains within a complete 4-lane F32/U16, 8-lane
+//! I8, or fixed 32-code range proven by the safe facade. ARM64 requires
+//! Advanced SIMD, which the facade also verifies at runtime.
 
 #![allow(unsafe_code)]
 
 use std::arch::aarch64::{
-    float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vld1q_f32, vmulq_f32, vst1q_f32,
+    float32x4_t, vaddq_f32, vaddq_u32, vaddvq_f32, vandq_u32, vcvtq_f32_s32, vdupq_n_f32,
+    vdupq_n_u32, vget_high_s16, vget_low_s16, vld1_s8, vld1_u16, vld1q_f32, vmovl_s8, vmovl_s16,
+    vmovl_u16, vmulq_f32, vorrq_u32, vreinterpretq_f32_u32, vrev64q_f32, vshlq_n_u32, vst1q_f32,
 };
 
 pub(super) fn dot(left: &[f32], right: &[f32]) -> f32 {
@@ -85,5 +88,199 @@ pub(super) fn scale(input: &[f32], scalar: f32, output: &mut [f32]) {
     }
     for index in vector_end..input.len() {
         output[index] = input[index] * scalar;
+    }
+}
+
+/// Scales one initialized slice in place.
+pub(super) fn scale_in_place(values: &mut [f32], scalar: f32) {
+    let vector_end = values.len() - values.len() % 4;
+    unsafe {
+        let scalar_lanes = vdupq_n_f32(scalar);
+        let mut index = 0;
+        while index < vector_end {
+            let value = vmulq_f32(vld1q_f32(values.as_ptr().add(index)), scalar_lanes);
+            vst1q_f32(values.as_mut_ptr().add(index), value);
+            index += 4;
+        }
+    }
+    for value in &mut values[vector_end..] {
+        *value *= scalar;
+    }
+}
+
+/// Computes up to four output columns for one row-major matrix row.
+pub(super) fn matrix_matrix_block(
+    left: &[f32],
+    right: &[f32],
+    columns: usize,
+    first_column: usize,
+) -> [f32; 4] {
+    debug_assert_eq!(right.len() % columns, 0);
+    debug_assert_eq!(left.len(), right.len() / columns);
+    let available = columns.saturating_sub(first_column).min(4);
+    let mut output = [0.0_f32; 4];
+    if available == 4 {
+        unsafe {
+            let mut accumulator = vdupq_n_f32(0.0);
+            for (inner, left_value) in left.iter().copied().enumerate() {
+                let right_offset = inner * columns + first_column;
+                accumulator = vaddq_f32(
+                    accumulator,
+                    vmulq_f32(vdupq_n_f32(left_value), vld1q_f32(right.as_ptr().add(right_offset))),
+                );
+            }
+            vst1q_f32(output.as_mut_ptr(), accumulator);
+        }
+    } else {
+        for (offset, destination) in output.iter_mut().take(available).enumerate() {
+            let column = first_column + offset;
+            *destination = left
+                .iter()
+                .copied()
+                .enumerate()
+                .fold(0.0, |sum, (inner, value)| sum + value * right[inner * columns + column]);
+        }
+    }
+    output
+}
+
+/// Applies the final RMSNorm multiply after the safe facade computes its robust scale.
+pub(super) fn rms_apply(input: &[f32], weight: &[f32], inverse: f32, output: &mut [f32]) {
+    debug_assert_eq!(input.len(), weight.len());
+    debug_assert_eq!(input.len(), output.len());
+    let vector_end = input.len() - input.len() % 4;
+    unsafe {
+        let inverse = vdupq_n_f32(inverse);
+        let mut index = 0;
+        while index < vector_end {
+            let value = vmulq_f32(
+                vmulq_f32(
+                    vld1q_f32(input.as_ptr().add(index)),
+                    vld1q_f32(weight.as_ptr().add(index)),
+                ),
+                inverse,
+            );
+            vst1q_f32(output.as_mut_ptr().add(index), value);
+            index += 4;
+        }
+    }
+    for index in vector_end..input.len() {
+        output[index] = input[index] * weight[index] * inverse;
+    }
+}
+
+/// Applies interleaved complex rotations to complete `(x, y)` pairs.
+pub(super) fn rope(input: &[f32], cosine: &[f32], sine: &[f32], output: &mut [f32]) {
+    debug_assert_eq!(input.len(), cosine.len());
+    debug_assert_eq!(input.len(), sine.len());
+    debug_assert_eq!(input.len(), output.len());
+    debug_assert_eq!(input.len() % 2, 0);
+    let vector_end = input.len() - input.len() % 4;
+    unsafe {
+        let signs = vld1q_f32([-1.0_f32, 1.0, -1.0, 1.0].as_ptr());
+        let mut index = 0;
+        while index < vector_end {
+            let values = vld1q_f32(input.as_ptr().add(index));
+            let rotated = vaddq_f32(
+                vmulq_f32(values, vld1q_f32(cosine.as_ptr().add(index))),
+                vmulq_f32(
+                    vmulq_f32(vrev64q_f32(values), vld1q_f32(sine.as_ptr().add(index))),
+                    signs,
+                ),
+            );
+            vst1q_f32(output.as_mut_ptr().add(index), rotated);
+            index += 4;
+        }
+    }
+    for index in (vector_end..input.len()).step_by(2) {
+        output[index] = input[index] * cosine[index] - input[index + 1] * sine[index];
+        output[index + 1] = input[index] * sine[index] + input[index + 1] * cosine[index];
+    }
+}
+
+/// Adds `weight * input` to an initialized accumulation slice.
+pub(super) fn weighted_accumulate(input: &[f32], weight: f32, output: &mut [f32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let vector_end = input.len() - input.len() % 4;
+    unsafe {
+        let weight = vdupq_n_f32(weight);
+        let mut index = 0;
+        while index < vector_end {
+            let value = vaddq_f32(
+                vld1q_f32(output.as_ptr().add(index)),
+                vmulq_f32(vld1q_f32(input.as_ptr().add(index)), weight),
+            );
+            vst1q_f32(output.as_mut_ptr().add(index), value);
+            index += 4;
+        }
+    }
+    for index in vector_end..input.len() {
+        output[index] += input[index] * weight;
+    }
+}
+
+/// Expands normal finite F16 encodings to F32. Special encodings use the scalar tail.
+pub(super) fn f16_to_f32(input: &[u16], output: &mut [f32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let mut index = 0;
+    while index + 4 <= input.len() {
+        let chunk = &input[index..index + 4];
+        if chunk.iter().all(|bits| {
+            let exponent = bits & 0x7c00;
+            exponent != 0 && exponent != 0x7c00
+        }) {
+            unsafe {
+                let half = vmovl_u16(vld1_u16(input.as_ptr().add(index)));
+                let sign = vshlq_n_u32(vandq_u32(half, vdupq_n_u32(0x8000)), 16);
+                let exponent = vshlq_n_u32(
+                    vaddq_u32(vandq_u32(half, vdupq_n_u32(0x7c00)), vdupq_n_u32(112 << 10)),
+                    13,
+                );
+                let fraction = vshlq_n_u32(vandq_u32(half, vdupq_n_u32(0x03ff)), 13);
+                let bits = vorrq_u32(sign, vorrq_u32(exponent, fraction));
+                vst1q_f32(output.as_mut_ptr().add(index), vreinterpretq_f32_u32(bits));
+            }
+        } else {
+            for offset in 0..4 {
+                output[index + offset] = personalai_engine_tensor::f16_bits_to_f32(chunk[offset]);
+            }
+        }
+        index += 4;
+    }
+    for offset in index..input.len() {
+        output[offset] = personalai_engine_tensor::f16_bits_to_f32(input[offset]);
+    }
+}
+
+/// Expands BF16 encodings by shifting their exact IEEE payload into F32 lanes.
+pub(super) fn bf16_to_f32(input: &[u16], output: &mut [f32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let vector_end = input.len() - input.len() % 4;
+    unsafe {
+        let mut index = 0;
+        while index < vector_end {
+            let widened = vmovl_u16(vld1_u16(input.as_ptr().add(index)));
+            let bits = vshlq_n_u32(widened, 16);
+            vst1q_f32(output.as_mut_ptr().add(index), vreinterpretq_f32_u32(bits));
+            index += 4;
+        }
+    }
+    for index in vector_end..input.len() {
+        output[index] = personalai_engine_tensor::bf16_bits_to_f32(input[index]);
+    }
+}
+
+/// Expands 32 signed AIPQ codes using one explicit F32 scale.
+pub(super) fn dequantize_block(codes: &[i8; 32], scale: f32, output: &mut [f32; 32]) {
+    unsafe {
+        let scale = vdupq_n_f32(scale);
+        for chunk in 0..4 {
+            let wide16 = vmovl_s8(vld1_s8(codes.as_ptr().add(chunk * 8)));
+            let lanes = [vmovl_s16(vget_low_s16(wide16)), vmovl_s16(vget_high_s16(wide16))];
+            for (quarter, values) in lanes.into_iter().enumerate() {
+                let offset = chunk * 8 + quarter * 4;
+                vst1q_f32(output.as_mut_ptr().add(offset), vmulq_f32(vcvtq_f32_s32(values), scale));
+            }
+        }
     }
 }

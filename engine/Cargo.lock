@@ -121,6 +121,8 @@ version = "0.1.0"
 dependencies = [
  "personalai-engine-cpu-reference",
  "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-quantization",
  "personalai-engine-tensor",
  "personalai-engine-types",
 ]

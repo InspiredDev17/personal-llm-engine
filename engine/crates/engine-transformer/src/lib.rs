@@ -6,7 +6,9 @@ mod cpu_decoder;
 #[cfg(feature = "cpu-reference")]
 pub use cpu_decoder::{CpuDecoderModel, CpuDecoderSession};
 #[cfg(feature = "arm64")]
-pub use personalai_engine_arm64::Arm64Backend;
+pub use personalai_engine_arm64::{
+    Arm64Backend, Arm64Capabilities, Arm64ExecutionConfig, HostCpuBackend,
+};
 
 use personalai_engine_kv_cache::{
     KvCachePlan, MAX_HEAD_DIMENSION, MAX_KV_HEAD_COUNT, MAX_LAYER_COUNT,

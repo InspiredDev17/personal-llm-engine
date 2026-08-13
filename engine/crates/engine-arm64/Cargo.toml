@@ -13,6 +13,8 @@ harness = false
 [dependencies]
 personalai-engine-cpu-reference.workspace = true
 personalai-engine-memory.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-quantization.workspace = true
 personalai-engine-tensor.workspace = true
 personalai-engine-types.workspace = true
 

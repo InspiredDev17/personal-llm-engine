@@ -453,6 +453,8 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             &[
                 "personalai-engine-cpu-reference",
                 "personalai-engine-memory",
+                "personalai-engine-model-format",
+                "personalai-engine-quantization",
                 "personalai-engine-tensor",
                 "personalai-engine-types",
             ],
@@ -644,7 +646,7 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             &source,
             &unsafe_block_marker,
             &unsafe_allow_marker,
-            4,
+            12,
             "ARM64 Advanced SIMD",
         );
         for marker in [
