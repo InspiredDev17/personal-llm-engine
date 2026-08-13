@@ -401,9 +401,9 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 17-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 18-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 17] = [
+    let allowed: [(&str, &[&str]); 18] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-model-format", &["personalai-engine-types"]),
@@ -437,6 +437,15 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             "engine-cpu-reference",
             &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
         ),
+        (
+            "engine-arm64",
+            &[
+                "personalai-engine-cpu-reference",
+                "personalai-engine-memory",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
         ("engine-memory", &["personalai-engine-types"]),
         (
             "engine-kv-cache",
@@ -445,6 +454,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
         (
             "engine-transformer",
             &[
+                "personalai-engine-arm64",
                 "personalai-engine-cpu-reference",
                 "personalai-engine-kv-cache",
                 "personalai-engine-memory",
@@ -567,6 +577,10 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
         .join("crates/engine-loader/src/read_only_map.rs")
         .canonicalize()
         .expect("approved read-only mapping FFI must exist");
+    let approved_arm64_intrinsics = root
+        .join("crates/engine-arm64/src/intrinsics.rs")
+        .canonicalize()
+        .expect("approved ARM64 intrinsic boundary must exist");
 
     for path in collect_files(&root, ".rs") {
         let canonical = path.canonicalize().expect("source path must canonicalize");
@@ -613,6 +627,15 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             3,
             "read-only model mapping FFI",
         );
+        assert_exact_unsafe_boundary(
+            &canonical,
+            &approved_arm64_intrinsics,
+            &source,
+            &unsafe_block_marker,
+            &unsafe_allow_marker,
+            4,
+            "ARM64 Advanced SIMD",
+        );
         for marker in [
             listener_marker.as_str(),
             unix_listener_marker.as_str(),
@@ -643,6 +666,11 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 continue;
             }
             if canonical == approved_read_only_mapping
+                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+            {
+                continue;
+            }
+            if canonical == approved_arm64_intrinsics
                 && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
             {
                 continue;

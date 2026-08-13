@@ -38,9 +38,12 @@ Go repository contains the corresponding `NATIVE_ENGINE` provider adapter; it
 has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
-signed synthetic model. It is not yet a useful production model. A legally
-approved real source model/package and independent numeric evidence, optimized
-ARM64, Metal, CUDA, performance qualification, and
+signed synthetic model. It is not yet a useful production model. A default-off
+ARM64 graph backend now provides bounded Advanced SIMD elementwise and
+matrix-vector kernels with scalar-oracle differential tests, but is not yet a
+complete model-service path. A legally approved real source model/package and
+independent numeric evidence, full ARM64 decoder integration, Metal, CUDA,
+performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
 existing production runtimes. Tokenizer support is intentionally limited to
 AIPTok Byte-Level BPE v1; SentencePiece, Unigram, WordPiece, tiktoken, and

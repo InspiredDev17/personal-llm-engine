@@ -8,6 +8,7 @@ members = [
     "crates/engine-tokenizer",
     "crates/engine-tensor",
     "crates/engine-cpu-reference",
+    "crates/engine-arm64",
     "crates/engine-memory",
     "crates/engine-kv-cache",
     "crates/engine-transformer",
@@ -36,6 +37,7 @@ personalai-engine-loader = { path = "crates/engine-loader" }
 personalai-engine-tokenizer = { path = "crates/engine-tokenizer" }
 personalai-engine-tensor = { path = "crates/engine-tensor" }
 personalai-engine-cpu-reference = { path = "crates/engine-cpu-reference" }
+personalai-engine-arm64 = { path = "crates/engine-arm64" }
 personalai-engine-memory = { path = "crates/engine-memory" }
 personalai-engine-kv-cache = { path = "crates/engine-kv-cache" }
 personalai-engine-transformer = { path = "crates/engine-transformer", default-features = false }

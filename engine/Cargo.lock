@@ -116,6 +116,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "personalai-engine-arm64"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-cpu-reference",
+ "personalai-engine-memory",
+ "personalai-engine-tensor",
+ "personalai-engine-types",
+]
+
+[[package]]
 name = "personalai-engine-cli"
 version = "0.1.0"
 dependencies = [
@@ -282,6 +292,7 @@ dependencies = [
 name = "personalai-engine-transformer"
 version = "0.1.0"
 dependencies = [
+ "personalai-engine-arm64",
  "personalai-engine-cpu-reference",
  "personalai-engine-kv-cache",
  "personalai-engine-memory",

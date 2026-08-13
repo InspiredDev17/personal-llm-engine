@@ -78,13 +78,14 @@ does not execute Python, Node, TypeScript, downloaded scripts, or model code.
 - No runtime dynamic-library lookup by arbitrary/configured name.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
-- Unsafe Rust is denied by default. The approved exceptions are the exact Unix
+- Unsafe Rust is denied by default. The approved exceptions are the isolated
+  ARM64 Advanced SIMD module recorded in ADR-0023 and the exact Unix
   lock module in ADR-0004, process-signal module in ADR-0011, and read-only
   peer-credential module in ADR-0013, plus the read-only shard mapping module
   in ADR-0015. They expose safe wrappers; the mapping owns the descriptor,
   pointer, and exact length and never exposes mutation or execution. Exact unsafe-block counts are enforced by
   architecture tests. Tests reject unsafe code and
-  unsafe-lint allowances everywhere else. A future FFI/backend exception
+  unsafe-lint allowances everywhere else. Any further FFI/backend exception
   requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written
   invariants, safe wrappers, platform tests, and separate approval.
 

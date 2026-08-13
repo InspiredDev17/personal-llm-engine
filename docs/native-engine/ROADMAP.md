@@ -15,7 +15,7 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
-| 0. Boundaries/workspace | COMPLETE | 17-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
+| 0. Boundaries/workspace | COMPLETE | 18-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
 | 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
 | 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for AIPTok V1 synthetic profile | First-party `AIPTOK01`, strict metadata conversion, content hash, byte fallback, ranked merges, explicit special policies, exact byte/UTF-8/incremental decode, property/malformed/fuzz tests and dependency-free benchmarks |
@@ -25,7 +25,7 @@ memory, tool, approval, or Agent Green behavior.
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
-| 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
+| 10. ARM64/Metal | IN PROGRESS / HARDWARE GATED | ARM64 graph backend has fixed Advanced SIMD elementwise/dot/matrix-vector kernels and M1 differential tests; decoder integration and all Metal work remain |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
@@ -126,7 +126,9 @@ currently included in this repository.
 
 ## Accelerator gates
 
-ARM64, Metal, and CUDA remain default-off. Each backend requires fixed
+ARM64, Metal, and CUDA remain default-off. ARM64 now has a first fixed graph
+kernel slice with isolated documented intrinsics and scalar differential tests;
+it does not yet advertise model execution. Each activated backend requires fixed
 architecture-owned kernels, isolated documented unsafe/FFI if unavoidable,
 exact device and allocation bounds, cancellation, differential tests against
 the CPU oracle, driver failure tests, soak tests, and hardware-specific

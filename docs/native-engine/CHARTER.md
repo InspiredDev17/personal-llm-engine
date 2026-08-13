@@ -109,8 +109,9 @@ and review record in an isolated FFI/backend module.
   deserialization is accepted.
 - Every incomplete capability fails with a typed unsupported/not-implemented
   error; no empty success or fake inference is allowed.
-- CPU reference is the default oracle. ARM64, Metal, and CUDA remain disabled
-  until their own hardware acceptance gates pass.
+- CPU reference is the default oracle. The ARM64 graph-kernel foundation is
+  default-off and cannot advertise model execution; ARM64 service activation,
+  Metal, and CUDA remain disabled until their hardware acceptance gates pass.
 - Inference graphs are immutable engine-owned plans built only by reviewed
   architecture code. A model package or client cannot supply operations,
   operation names, executable graphs, kernels, or backend choices.

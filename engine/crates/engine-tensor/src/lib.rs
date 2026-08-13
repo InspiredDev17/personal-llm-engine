@@ -21,6 +21,8 @@ pub const MAX_TENSOR_ALIGNMENT: u64 = 2 * 1024 * 1024;
 pub enum Device {
     /// Safe scalar host execution.
     Cpu,
+    /// First-party ARM64 Advanced SIMD host execution.
+    Arm64,
 }
 
 /// Validated logical tensor layout expressed in element strides.
