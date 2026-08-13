@@ -423,6 +423,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-crypto",
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
+                "personalai-engine-tensor",
                 "personalai-engine-tokenizer",
                 "personalai-engine-types",
             ],

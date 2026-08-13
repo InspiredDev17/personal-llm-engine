@@ -62,6 +62,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     safetensors.extend_from_slice(&u64::try_from(safetensors_header.len())?.to_le_bytes());
     safetensors.extend_from_slice(safetensors_header);
     safetensors.extend_from_slice(&1.0_f32.to_le_bytes());
+    let safetensors_f16_header = br#"{"seed":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}}"#;
+    let mut safetensors_f16 = Vec::new();
+    safetensors_f16.extend_from_slice(&u64::try_from(safetensors_f16_header.len())?.to_le_bytes());
+    safetensors_f16.extend_from_slice(safetensors_f16_header);
+    safetensors_f16.extend_from_slice(&0x3c00_u16.to_le_bytes());
+    let safetensors_bf16_header = br#"{"seed":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+    let mut safetensors_bf16 = Vec::new();
+    safetensors_bf16
+        .extend_from_slice(&u64::try_from(safetensors_bf16_header.len())?.to_le_bytes());
+    safetensors_bf16.extend_from_slice(safetensors_bf16_header);
+    safetensors_bf16.extend_from_slice(&0x3f80_u16.to_le_bytes());
     let token_sequence =
         [65_u32, 258, u32::MAX].iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
     let incremental_sequence = "世界"
@@ -107,6 +118,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     write_seed(&corpus, "tensor_index_parser", "empty", b"")?;
     write_seed(&corpus, "safetensors_import", "valid-f32.safetensors", &safetensors)?;
+    write_seed(&corpus, "safetensors_import", "valid-f16.safetensors", &safetensors_f16)?;
+    write_seed(&corpus, "safetensors_import", "valid-bf16.safetensors", &safetensors_bf16)?;
     write_seed(&corpus, "safetensors_import", "truncated-header", &[1, 0, 0])?;
     write_seed(&corpus, "package_path_resolution", "valid-package-name", b"fuzz-seed.paimodel")?;
     write_seed(&corpus, "package_path_resolution", "path-traversal", b"../x.paimodel")?;

@@ -6,9 +6,10 @@ use super::{
     EngineResponseSigner, EngineService, Frame, GenerationEvent, GenerationRequest,
     GenerationRoundRobin, InboundCommand, LoadedCpuModel, MAX_CONCURRENT_CONNECTION_BATCH,
     MAX_PENDING_EVENTS_PER_CONNECTION, OUTBOUND_PIPELINE_RESERVED_BYTES, OUTPUT_WRITER_STACK_BYTES,
-    RequestId, SequenceId, ServeOutcome, SyncSender, TrustedControlPlaneKeys, UnixFrameConnection,
-    UnixFrameListener, activate_queued_request, admit_durable_nonce, enqueue_outbound_frame,
-    generation_event_frame, terminal_connection_result, watch_generation_cancellation,
+    RequestId, RuntimeMetrics, SequenceId, ServeOutcome, SyncSender, TrustedControlPlaneKeys,
+    UnixFrameConnection, UnixFrameListener, activate_queued_request, admit_durable_nonce,
+    enqueue_outbound_frame, generation_event_frame, record_generation_timing,
+    record_generation_usage, terminal_connection_result, watch_generation_cancellation,
     write_queued_events,
 };
 use personalai_engine_types::SignerKeyId;
@@ -161,6 +162,7 @@ struct ContinuousState<'a> {
     response_signer: &'a EngineResponseSigner,
     replay_journals: Arc<BTreeMap<SignerKeyId, Arc<Mutex<DurableReplayJournal>>>>,
     models: &'a BTreeMap<String, LoadedCpuModel>,
+    metrics: &'a mut RuntimeMetrics,
     next_sequence: &'a mut u64,
     coordinator: GenerationRoundRobin<'a>,
     ingress: Vec<IngressWorker>,
@@ -218,6 +220,7 @@ impl CpuEngineRuntime {
             response_signer: &self.response_signer,
             replay_journals: Arc::new(self.replay_journals.clone()),
             models: &self.models,
+            metrics: &mut self.metrics,
             next_sequence: &mut self.next_sequence,
             coordinator,
             ingress: bounded_vec(maximum_connections, "continuous ingress")?,
@@ -451,6 +454,7 @@ impl ContinuousState<'_> {
         let Some(turn) = self.coordinator.advance_next()? else {
             return Ok(false);
         };
+        record_generation_timing(self.metrics, turn.timing())?;
         let request_id = turn.request_id();
         let position = self
             .active
@@ -462,6 +466,9 @@ impl ContinuousState<'_> {
         let Some(event) = turn.into_event() else {
             return Ok(true);
         };
+        if let GenerationEvent::Completed { usage, .. } = &event {
+            record_generation_usage(self.metrics, *usage)?;
+        }
         let terminal = terminal_connection_result(&event, self.active[position].sequence_id)?;
         let write_result =
             enqueue_active_event(&mut self.active[position], &event, self.response_signer);
@@ -492,7 +499,9 @@ impl ContinuousState<'_> {
             progressed = true;
             let request_id = self.pending[index].request.request_id();
             match self.service.scheduler.cancel(&request_id)? {
-                CancellationOutcome::Queued => {}
+                CancellationOutcome::Queued => {
+                    increment(&mut self.metrics.cancelled_requests, "cancelled request counter")?;
+                }
                 CancellationOutcome::Active | CancellationOutcome::NotFound => {
                     return Err(EngineError::internal_invariant(
                         "pending continuous cancellation lost scheduler state",
@@ -516,10 +525,12 @@ impl ContinuousState<'_> {
             self.active.iter().find(|connection| connection.request_id == request_id)
         {
             active.workers.cancelled.store(true, Ordering::Release);
+            increment(&mut self.metrics.cancelled_requests, "cancelled request counter")?;
             return Ok(());
         }
         match self.service.scheduler.cancel(&request_id)? {
             CancellationOutcome::Queued => {
+                increment(&mut self.metrics.cancelled_requests, "cancelled request counter")?;
                 let position = self
                     .pending
                     .iter()
@@ -657,7 +668,9 @@ impl ContinuousState<'_> {
         while let Some(pending) = self.pending.pop() {
             let cancellation = self.service.scheduler.cancel(&pending.request.request_id());
             match cancellation {
-                Ok(CancellationOutcome::Queued) => {}
+                Ok(CancellationOutcome::Queued) => {
+                    increment(&mut self.metrics.cancelled_requests, "cancelled request counter")?;
+                }
                 Ok(CancellationOutcome::Active | CancellationOutcome::NotFound) => {
                     self.retire_rejected(
                         pending.workers,
@@ -694,6 +707,13 @@ impl ContinuousState<'_> {
         for active in &self.active {
             active.workers.cancelled.store(true, Ordering::Release);
         }
+        let active_count = u64::try_from(self.active.len())
+            .map_err(|_| EngineError::internal_invariant("continuous active count exceeds u64"))?;
+        self.metrics.cancelled_requests = self
+            .metrics
+            .cancelled_requests
+            .checked_add(active_count)
+            .ok_or_else(|| EngineError::resource_exhaustion("cancelled request counter"))?;
         Ok(())
     }
 

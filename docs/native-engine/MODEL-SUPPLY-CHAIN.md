@@ -25,9 +25,12 @@ hashes.aiph
 signature.ed25519
 ```
 
-Additional shards, when implemented by a future importer profile, must be
-contiguous `tensors-NNNN.aipt` direct children and remain under the 1,024-shard
-ceiling. The exact-file comparison rejects every unlisted file or directory.
+The importer accepts one or more uniquely named local safetensors sources,
+sorts them by filename independently of command-line order, and emits
+contiguous `tensors-NNNN.aipt` direct children under the 1,024-shard ceiling.
+Tensor identities are unique across the complete source set and source bytes
+are aggregate-bounded. The exact-file comparison rejects every unlisted file
+or directory.
 Executables, scripts, dynamic libraries, object files, bytecode, shell/Python/
 JavaScript modules, WASM, device kernels, and executable templates therefore
 cannot be present in an admitted package.
@@ -43,8 +46,9 @@ dimensions, sorted unique names, nonoverlapping in-bounds ranges, valid UTF-8,
 no trailing data, no recursion, no compression, and no ambiguous integer
 encoding. Required unknown flags and unsupported optional sections fail closed.
 
-The initial importer emits one 64-byte-aligned F32 shard, quantization `None`,
-RoPE scaling `1.0`, and the first-party AIPTok Byte-Level BPE v1 tokenizer.
+The initial importer emits one 64-byte-aligned F32 destination shard for each
+canonical source shard, quantization `None`, RoPE scaling `1.0`, and the
+first-party AIPTok Byte-Level BPE v1 tokenizer.
 Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
 
@@ -70,7 +74,7 @@ The production engine holds only the configured public verification key.
 The importer operates on owner-selected local files only. Both source and
 tokenizer metadata must canonicalize under one absolute quarantine root. URLs and
 symlink escapes are refused. The initial source parser accepts a bounded,
-data-only F32 safetensors subset implemented in Rust: eight-byte little-endian
+data-only F32, F16, and BF16 safetensors subset implemented in Rust: eight-byte little-endian
 header length, bounded JSON object, flat tensor records, exact `dtype`, `shape`,
 and `data_offsets`, nonoverlapping contiguous data, and no trailing bytes.
 
@@ -80,6 +84,10 @@ subprocesses, Python, network sockets, downloads, registries, or dynamic
 loading. The required explicit mapping is `llama-safetensors-v1`; all unknown,
 missing, extra, duplicate, wrongly shaped, wrongly typed, non-finite, or
 out-of-range tensors are rejected against the exact internal architecture.
+F16 and BF16 source scalars use the tensor runtime's exhaustively tested
+first-party IEEE conversion and are deterministically materialized as finite
+F32 package storage for the scalar correctness backend; no dtype is silently
+reinterpreted.
 
 The exact tokenizer source format is `AIPTOK-METADATA-V1`, selected explicitly
 as `aiptok-metadata-v1`. It is ordered canonical ASCII, not general JSON. It
@@ -99,7 +107,7 @@ It contains no scripts, templates, roles, filesystem references, or code. The
 source metadata filename, format, and SHA-384 are included in signed provenance.
 
 Provenance records the architecture, license identifier, mapping, model ID,
-local source filename/label, source format/hash, tokenizer source
+sorted local source filenames/hashes, source label/format, tokenizer source
 filename/format/hash, importer identity, and version. Package bytes, ordering,
 padding, hashes, provenance, and signature
 are deterministic for identical inputs/configuration/key. A staging directory

@@ -84,6 +84,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use std::thread;
+#[cfg(feature = "cpu-reference")]
+use std::time::Instant;
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -400,6 +402,8 @@ impl LoadedCpuModel {
             started: false,
             terminal: None,
             usage: None,
+            prefill_nanoseconds: 0,
+            decode_nanoseconds: 0,
         })
     }
 
@@ -409,8 +413,19 @@ impl LoadedCpuModel {
         request: &GenerationRequest,
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
-        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+        emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
     ) -> Result<GenerationUsage, EngineError> {
+        self.generate_greedy_measured(request, sequence_id, cancelled, emit)
+            .map(|measurement| measurement.usage)
+    }
+
+    fn generate_greedy_measured(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<GenerationMeasurement, EngineError> {
         let mut generation = self.start_greedy(request, sequence_id)?;
         loop {
             match generation.advance(cancelled)? {
@@ -422,7 +437,7 @@ impl LoadedCpuModel {
                     };
                     emit(event)?;
                     if let Some(usage) = completed {
-                        return Ok(usage);
+                        return Ok(GenerationMeasurement { usage, timing: generation.timing() });
                     }
                 }
             }
@@ -756,6 +771,8 @@ pub struct GreedyGeneration<'a> {
     started: bool,
     terminal: Option<TerminalState>,
     usage: Option<GenerationUsage>,
+    prefill_nanoseconds: u64,
+    decode_nanoseconds: u64,
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -810,7 +827,9 @@ impl GreedyGeneration<'_> {
             EngineError::internal_invariant("generation decoder session disappeared")
         })?;
         let logits = if let Some(token) = self.input_tokens.get(self.next_input).copied() {
+            let started = Instant::now();
             let logits = session.forward_token(token)?;
+            add_timing(&mut self.prefill_nanoseconds, started.elapsed())?;
             self.next_input = self.next_input.checked_add(1).ok_or_else(|| {
                 EngineError::internal_invariant("generation input position overflows")
             })?;
@@ -819,7 +838,10 @@ impl GreedyGeneration<'_> {
             }
             logits
         } else if let Some(token) = self.next_generated_token.take() {
-            session.forward_token(token)?
+            let started = Instant::now();
+            let logits = session.forward_token(token)?;
+            add_timing(&mut self.decode_nanoseconds, started.elapsed())?;
+            logits
         } else {
             return Err(EngineError::internal_invariant("tokenizer produced no prompt tokens"));
         };
@@ -878,9 +900,59 @@ impl GreedyGeneration<'_> {
         self.session.as_ref().map_or(0, CpuDecoderSession::token_count)
     }
 
+    /// Returns monotonic CPU forward time split between prompt and decode work.
+    pub const fn timing(&self) -> GenerationTiming {
+        GenerationTiming {
+            prefill_nanoseconds: self.prefill_nanoseconds,
+            decode_nanoseconds: self.decode_nanoseconds,
+        }
+    }
+
     const fn concurrent_sequence_limit(&self) -> u32 {
         self.request.resource_budget().max_concurrent_sequences()
     }
+}
+
+/// Monotonic scalar decoder timing with no prompt or generated content.
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationTiming {
+    prefill_nanoseconds: u64,
+    decode_nanoseconds: u64,
+}
+
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GenerationMeasurement {
+    usage: GenerationUsage,
+    timing: GenerationTiming,
+}
+
+#[cfg(feature = "cpu-reference")]
+impl GenerationTiming {
+    /// Returns accumulated prompt-token forward time.
+    pub const fn prefill_nanoseconds(self) -> u64 {
+        self.prefill_nanoseconds
+    }
+
+    /// Returns accumulated generated-token decode forward time.
+    pub const fn decode_nanoseconds(self) -> u64 {
+        self.decode_nanoseconds
+    }
+}
+
+#[cfg(feature = "cpu-reference")]
+fn duration_nanoseconds(duration: std::time::Duration) -> Result<u64, EngineError> {
+    u64::try_from(duration.as_nanos())
+        .map_err(|_| EngineError::resource_exhaustion("generation duration exceeds u64"))
+}
+
+#[cfg(feature = "cpu-reference")]
+fn add_timing(total: &mut u64, duration: std::time::Duration) -> Result<(), EngineError> {
+    *total = total
+        .checked_add(duration_nanoseconds(duration)?)
+        .ok_or_else(|| EngineError::resource_exhaustion("generation timing overflows"))?;
+    Ok(())
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -912,6 +984,7 @@ pub struct ScheduledGenerationAdvance {
     request_id: RequestId,
     sequence_id: SequenceId,
     decoder_tokens_advanced: u32,
+    timing: GenerationTiming,
     event: Option<GenerationEvent>,
 }
 
@@ -930,6 +1003,11 @@ impl ScheduledGenerationAdvance {
     /// Returns decoder tokens committed during this turn; always zero or one.
     pub const fn decoder_tokens_advanced(&self) -> u32 {
         self.decoder_tokens_advanced
+    }
+
+    /// Returns CPU forward time accumulated during only this scheduling turn.
+    pub const fn timing(&self) -> GenerationTiming {
+        self.timing
     }
 
     /// Returns the event that must be delivered before requesting another turn.
@@ -1087,8 +1165,10 @@ impl<'a> GenerationRoundRobin<'a> {
         let request_id = scheduled.generation.request_id();
         let sequence_id = scheduled.generation.sequence_id();
         let before = scheduled.generation.processed_tokens();
+        let timing_before = scheduled.generation.timing();
         let advance = scheduled.generation.advance(&scheduled.cancelled);
         let after = scheduled.generation.processed_tokens();
+        let timing_after = scheduled.generation.timing();
         let decoder_tokens_advanced = after.checked_sub(before).ok_or_else(|| {
             EngineError::internal_invariant("round-robin decoder token count decreased")
         })?;
@@ -1119,6 +1199,20 @@ impl<'a> GenerationRoundRobin<'a> {
             request_id,
             sequence_id,
             decoder_tokens_advanced,
+            timing: GenerationTiming {
+                prefill_nanoseconds: timing_after
+                    .prefill_nanoseconds
+                    .checked_sub(timing_before.prefill_nanoseconds)
+                    .ok_or_else(|| {
+                        EngineError::internal_invariant("generation prefill timing decreased")
+                    })?,
+                decode_nanoseconds: timing_after
+                    .decode_nanoseconds
+                    .checked_sub(timing_before.decode_nanoseconds)
+                    .ok_or_else(|| {
+                        EngineError::internal_invariant("generation decode timing decreased")
+                    })?,
+            },
             event,
         }))
     }
@@ -1190,7 +1284,7 @@ pub struct RuntimeMetrics {
     pub prefill_nanoseconds: u64,
     /// Accumulated decode nanoseconds when separately measurable.
     pub decode_nanoseconds: u64,
-    /// Generated tokens per second multiplied by 1,000; zero until timed decode exists.
+    /// Generated tokens per second multiplied by 1,000 over measured CPU forward time.
     pub tokens_per_second_milli: u64,
     /// Reserved host bytes across loaded CPU model pools.
     pub host_memory_bytes: u64,
@@ -1290,6 +1384,7 @@ struct GenerationConnection {
 #[cfg(all(unix, feature = "cpu-reference"))]
 struct ConnectionBatchState<'a> {
     service: &'a mut EngineService,
+    metrics: &'a mut RuntimeMetrics,
     models: &'a BTreeMap<String, LoadedCpuModel>,
     response_signer: &'a EngineResponseSigner,
     next_sequence: &'a mut u64,
@@ -1398,6 +1493,12 @@ impl CpuEngineRuntime {
             total.checked_add(used).ok_or_else(|| {
                 EngineError::resource_exhaustion("loaded model memory metric overflows")
             })
+        })?;
+        metrics.kv_cache_bytes = self.models.values().try_fold(0_u64, |total, loaded| {
+            let reserved = loaded.model().kv_cache_metrics()?.reserved_bytes;
+            total
+                .checked_add(reserved)
+                .ok_or_else(|| EngineError::resource_exhaustion("KV-cache memory metric overflows"))
         })?;
         Ok(metrics)
     }
@@ -1766,8 +1867,11 @@ impl CpuEngineRuntime {
                             &replay_journal,
                         );
                     });
-                    let result =
-                        self.service.run_next_greedy(model, sequence_id, &cancelled, |event| {
+                    let result = self.service.run_next_greedy_measured(
+                        model,
+                        sequence_id,
+                        &cancelled,
+                        |event| {
                             let ordinal = event_ordinal;
                             event_ordinal = event_ordinal.checked_add(1).ok_or_else(|| {
                                 EngineError::resource_exhaustion(
@@ -1781,7 +1885,8 @@ impl CpuEngineRuntime {
                                 ordinal,
                                 response_signer,
                             )
-                        });
+                        },
+                    );
                     watcher_done.store(true, Ordering::Release);
                     let shutdown_result = connection.shutdown_inbound();
                     watcher.join().map_err(|_| {
@@ -1790,23 +1895,11 @@ impl CpuEngineRuntime {
                     shutdown_result?;
                     result
                 });
-                let usage = generation_result?.ok_or_else(|| {
+                let measurement = generation_result?.ok_or_else(|| {
                     EngineError::internal_invariant("admitted request was not scheduled")
                 })?;
-                self.metrics.prompt_tokens = self
-                    .metrics
-                    .prompt_tokens
-                    .checked_add(u64::from(usage.input_tokens()))
-                    .ok_or_else(|| {
-                        EngineError::resource_exhaustion("prompt token counter exhausted")
-                    })?;
-                self.metrics.generated_tokens = self
-                    .metrics
-                    .generated_tokens
-                    .checked_add(u64::from(usage.output_tokens()))
-                    .ok_or_else(|| {
-                        EngineError::resource_exhaustion("generated token counter exhausted")
-                    })?;
+                record_generation_measurement(&mut self.metrics, measurement)?;
+                let usage = measurement.usage;
                 Ok(ServeOutcome::Generated { request_id, sequence_id, usage })
             }
         }
@@ -1848,6 +1941,7 @@ impl CpuEngineRuntime {
         )?;
         let mut batch = ConnectionBatchState {
             service: &mut self.service,
+            metrics: &mut self.metrics,
             models: &self.models,
             response_signer: &self.response_signer,
             next_sequence: &mut self.next_sequence,
@@ -1866,6 +1960,7 @@ impl CpuEngineRuntime {
         }
         Self::run_connection_coordinator(
             batch.service,
+            batch.metrics,
             batch.response_signer,
             &mut coordinator,
             batch.active,
@@ -1928,6 +2023,15 @@ impl CpuEngineRuntime {
                     CancellationOutcome::NotFound => ServeOutcome::CancellationNotFound(request_id),
                 }
             };
+            if matches!(
+                outcome,
+                ServeOutcome::CancelledQueued(_) | ServeOutcome::CancelledActive(_)
+            ) {
+                batch.metrics.cancelled_requests = checked_increment(
+                    batch.metrics.cancelled_requests,
+                    "cancelled request counter",
+                )?;
+            }
             return store_connection_result(batch.results, input_index, Ok(outcome));
         };
         prepare_generation_connection(
@@ -1946,6 +2050,7 @@ impl CpuEngineRuntime {
 
     fn run_connection_coordinator(
         service: &mut EngineService,
+        metrics: &mut RuntimeMetrics,
         response_signer: &EngineResponseSigner,
         coordinator: &mut GenerationRoundRobin<'_>,
         active: &mut Vec<ActiveGenerationConnection>,
@@ -2037,6 +2142,7 @@ impl CpuEngineRuntime {
 
             let run_result = drive_generation_connections(
                 service,
+                metrics,
                 response_signer,
                 coordinator,
                 active,
@@ -2265,12 +2371,14 @@ fn prepare_output_writers(
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn drive_generation_connections(
     service: &mut EngineService,
+    metrics: &mut RuntimeMetrics,
     response_signer: &EngineResponseSigner,
     coordinator: &mut GenerationRoundRobin<'_>,
     active: &mut Vec<ActiveGenerationConnection>,
     results: &mut [Option<ConnectionServeResult>],
 ) -> Result<(), EngineError> {
     while let Some(turn) = coordinator.advance_next()? {
+        record_generation_timing(metrics, turn.timing())?;
         let request_id = turn.request_id();
         let position = active
             .iter()
@@ -2287,6 +2395,9 @@ fn drive_generation_connections(
             ));
         }
         let terminal = terminal_connection_result(&event, active[position].sequence_id)?;
+        if let GenerationEvent::Completed { usage, .. } = &event {
+            record_generation_usage(metrics, *usage)?;
+        }
         let write_result =
             write_active_generation_event(&mut active[position], &event, response_signer);
         if let Err(error) = write_result {
@@ -2712,6 +2823,65 @@ fn checked_increment(value: u64, name: &'static str) -> Result<u64, EngineError>
     value.checked_add(1).ok_or_else(|| EngineError::resource_exhaustion(name))
 }
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn record_generation_measurement(
+    metrics: &mut RuntimeMetrics,
+    measurement: GenerationMeasurement,
+) -> Result<(), EngineError> {
+    record_generation_timing(metrics, measurement.timing)?;
+    record_generation_usage(metrics, measurement.usage)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn record_generation_timing(
+    metrics: &mut RuntimeMetrics,
+    timing: GenerationTiming,
+) -> Result<(), EngineError> {
+    metrics.prefill_nanoseconds = metrics
+        .prefill_nanoseconds
+        .checked_add(timing.prefill_nanoseconds())
+        .ok_or_else(|| EngineError::resource_exhaustion("prefill timing counter exhausted"))?;
+    metrics.decode_nanoseconds = metrics
+        .decode_nanoseconds
+        .checked_add(timing.decode_nanoseconds())
+        .ok_or_else(|| EngineError::resource_exhaustion("decode timing counter exhausted"))?;
+    update_tokens_per_second(metrics)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn record_generation_usage(
+    metrics: &mut RuntimeMetrics,
+    usage: GenerationUsage,
+) -> Result<(), EngineError> {
+    metrics.prompt_tokens = metrics
+        .prompt_tokens
+        .checked_add(u64::from(usage.input_tokens()))
+        .ok_or_else(|| EngineError::resource_exhaustion("prompt token counter exhausted"))?;
+    metrics.generated_tokens = metrics
+        .generated_tokens
+        .checked_add(u64::from(usage.output_tokens()))
+        .ok_or_else(|| EngineError::resource_exhaustion("generated token counter exhausted"))?;
+    update_tokens_per_second(metrics)
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn update_tokens_per_second(metrics: &mut RuntimeMetrics) -> Result<(), EngineError> {
+    let timed_nanoseconds = metrics
+        .prefill_nanoseconds
+        .checked_add(metrics.decode_nanoseconds)
+        .ok_or_else(|| EngineError::resource_exhaustion("generation timing total exhausted"))?;
+    metrics.tokens_per_second_milli = if timed_nanoseconds == 0 {
+        0
+    } else {
+        let scaled = u128::from(metrics.generated_tokens)
+            .checked_mul(1_000_000_000_000)
+            .ok_or_else(|| EngineError::resource_exhaustion("throughput numerator overflows"))?
+            / u128::from(timed_nanoseconds);
+        u64::try_from(scaled).unwrap_or(u64::MAX)
+    };
+    Ok(())
+}
+
 #[cfg(feature = "cpu-reference")]
 fn check_cancelled(cancelled: &AtomicBool, request_id: RequestId) -> Result<(), EngineError> {
     if cancelled.load(Ordering::Acquire) {
@@ -2867,16 +3037,29 @@ impl EngineService {
         loaded: &LoadedCpuModel,
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
-        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+        emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
     ) -> Result<Option<GenerationUsage>, EngineError> {
+        self.run_next_greedy_measured(loaded, sequence_id, cancelled, emit)
+            .map(|measurement| measurement.map(|measurement| measurement.usage))
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    fn run_next_greedy_measured(
+        &mut self,
+        loaded: &LoadedCpuModel,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
+        mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<Option<GenerationMeasurement>, EngineError> {
         let Some(active) = self.scheduler.start_next(sequence_id)?.cloned() else {
             return Ok(None);
         };
         let request_id = active.request().request_id();
-        let result = loaded.generate_greedy(active.request(), sequence_id, cancelled, &mut emit);
+        let result =
+            loaded.generate_greedy_measured(active.request(), sequence_id, cancelled, &mut emit);
         self.scheduler.finish(&request_id)?;
         match result {
-            Ok(usage) => Ok(Some(usage)),
+            Ok(measurement) => Ok(Some(measurement)),
             Err(error) => {
                 emit(GenerationEvent::Failed {
                     request_id,
@@ -3285,6 +3468,52 @@ mod tests {
             enqueue_outbound_frame(&sender, frame),
             Err(EngineError::BackendFailure(_))
         ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn runtime_generation_metrics_accumulate_exact_timing_usage_and_throughput() {
+        let mut metrics = RuntimeMetrics::default();
+        record_generation_measurement(
+            &mut metrics,
+            GenerationMeasurement {
+                usage: GenerationUsage::new(2, 3).expect("usage must validate"),
+                timing: GenerationTiming {
+                    prefill_nanoseconds: 2_000_000_000,
+                    decode_nanoseconds: 1_000_000_000,
+                },
+            },
+        )
+        .expect("first measurement must record");
+        assert_eq!(metrics.prompt_tokens, 2);
+        assert_eq!(metrics.generated_tokens, 3);
+        assert_eq!(metrics.prefill_nanoseconds, 2_000_000_000);
+        assert_eq!(metrics.decode_nanoseconds, 1_000_000_000);
+        assert_eq!(metrics.tokens_per_second_milli, 1_000);
+
+        record_generation_measurement(
+            &mut metrics,
+            GenerationMeasurement {
+                usage: GenerationUsage::new(1, 1).expect("usage must validate"),
+                timing: GenerationTiming {
+                    prefill_nanoseconds: 500_000_000,
+                    decode_nanoseconds: 500_000_000,
+                },
+            },
+        )
+        .expect("second measurement must record");
+        assert_eq!(metrics.prompt_tokens, 3);
+        assert_eq!(metrics.generated_tokens, 4);
+        assert_eq!(metrics.prefill_nanoseconds, 2_500_000_000);
+        assert_eq!(metrics.decode_nanoseconds, 1_500_000_000);
+        assert_eq!(metrics.tokens_per_second_milli, 1_000);
+
+        let wire = service_metrics(metrics);
+        assert_eq!(wire.values()[5], 3);
+        assert_eq!(wire.values()[6], 4);
+        assert_eq!(wire.values()[7], 2_500_000_000);
+        assert_eq!(wire.values()[8], 1_500_000_000);
+        assert_eq!(wire.values()[9], 1_000);
     }
 
     #[cfg(feature = "cpu-reference")]

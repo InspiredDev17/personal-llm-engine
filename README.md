@@ -8,7 +8,8 @@ sole authority for model registration, routing, policy, approvals, tools,
 memory, and audit. The engine is inference-only and is not a second AI platform.
 
 The workspace implements a signed directory-backed data-only `.paimodel`
-format, a Rust-only quarantine safetensors importer, deterministic provenance,
+format, a Rust-only quarantine safetensors importer with deterministic
+multi-shard conversion, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
 an explicit exact-owner-selected Model Foundry registry V2 admission mode,
 no-follow direct-file opening, read-only non-executable shard mapping, strict

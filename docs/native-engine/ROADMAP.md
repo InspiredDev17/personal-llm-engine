@@ -24,7 +24,7 @@ memory, tool, approval, or Agent Green behavior.
 | 6. Generation | COMPLETE as scalar CPU reference | Explicit prefill/one-token decode, decoder-integrated contiguous KV with atomic all-layer commits, deterministic greedy and seeded temperature/top-k/top-p/min-p/repetition sampling, stop policies, rich typed lifecycle, and signed two-layer GQA golden generation |
 | 7. Scheduler | COMPLETE for bounded reference runtime | Count/byte admission, FIFO lifecycle, queued cancellation, resumable one-token cursors, round-robin coordination, exact-batch and continuous multi-stream execution, and bounded output isolation |
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
-| 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
+| 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
 | 10. ARM64/Metal | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
@@ -41,6 +41,12 @@ memory, tool, approval, or Agent Green behavior.
 - Deterministic fixture generation entirely in Rust.
 - Strictly separated Rust-only offline importer and production directory loader;
   source parsing/signing authority is absent from the runtime graph.
+- Deterministic multi-shard import sorts unique local source filenames,
+  enforces one global tensor inventory and aggregate byte ceiling, records every
+  source digest, and emits contiguous signed destination shards independently
+  of caller argument order. F32, F16, and BF16 source tensors are explicitly
+  validated; compact IEEE storage is converted through the first-party tensor
+  routines into finite F32 correctness-oracle package storage.
 - First-party tokenizer, tensor, immutable graph, scalar correctness backend,
   memory, KV, decoder, bounded first-party sampling,
   scheduler, mutually authenticated protocol, UDS transport, daemon composition, CLI,
@@ -90,6 +96,10 @@ memory, tool, approval, or Agent Green behavior.
   of eight repetitions passed locally. The weekly workflow is present on the
   default branch, but successful hosted execution is still absent.
   Production-size operated soak remains required.
+- CPU service metrics now accumulate checked prefill/decode forward time,
+  generated-token throughput, aggregate host reservations, and live contiguous
+  KV reservations across single and bounded multi-stream execution. These are
+  content-free operational counters, not production performance evidence.
 - The protected UDS now also carries a signed, fixed-header service-control
   envelope with the closed lifecycle/tokenize/health/metrics/model-status/
   shutdown catalog. The path-free model-status query returns one signed load,
@@ -155,3 +165,14 @@ contiguous V1. Model packages and clients will not select page layout.
 
 Hardware is not required for Stage 9 format/conversion/fuzz work. It is required
 for accepting Stages 10 and 11 and for final performance qualification.
+
+## Portable completion boundary
+
+With model acquisition and model-specific mapping excluded, no known
+host-independent reference-runtime component remains unimplemented. Further
+claims now require external evidence: a legally approved real model, target
+accelerator hardware and drivers, production service identities and filesystem
+permissions, hosted workflow execution, operated recovery drills,
+production-size soak/performance runs, and a reversible live canary through the
+Go control plane. These are explicit evidence gates, not permission to add fake
+backends, weaken verification, or move control-plane authority into Rust.

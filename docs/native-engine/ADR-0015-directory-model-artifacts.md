@@ -57,8 +57,12 @@ IDs, dtypes, quantization, or optional sections require a format revision and
 reviewed engine implementation. The legacy flat fixture format remains test-
 only and is not a production load path.
 
-The initial implementation supports one F32 shard, no quantization, and RoPE
-scaling 1.0. A real model is not approved merely because it converts; license,
+The initial implementation supports one or more deterministically ordered F32
+shards, deterministic F32/F16/BF16-source conversion to F32 package storage,
+no quantization, and RoPE scaling 1.0. Source filenames are unique and
+sorted, tensor identity is global across all shards, aggregate source/output
+bytes are bounded, and output indices are contiguous. A real model is not
+approved merely because it converts; license,
 provenance, independent numeric vectors, production-size resource evidence,
 signer custody, hardware qualification, and reversible Go activation remain
 separate release gates.

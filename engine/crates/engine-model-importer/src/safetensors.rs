@@ -353,9 +353,9 @@ impl<'a> HeaderParser<'a> {
 fn parse_dtype(value: &str) -> Result<DType, EngineError> {
     match value {
         "F32" => Ok(DType::F32),
-        _ => {
-            Err(EngineError::not_implemented("initial safetensors importer supports only F32 data"))
-        }
+        "F16" => Ok(DType::F16),
+        "BF16" => Ok(DType::BFloat16),
+        _ => Err(EngineError::not_implemented("safetensors source dtype is unsupported")),
     }
 }
 
@@ -393,18 +393,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_exact_data_only_f32_source() {
-        let header = r#"{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
-        let bytes = fixture(header, &[0; 8]);
-        let parsed = ParsedSafetensors::parse(&bytes).expect("source must parse");
-        assert_eq!(parsed.tensors().len(), 1);
-        assert_eq!(parsed.tensor_bytes(&parsed.tensors()[0]).expect("bytes must exist"), &[0; 8]);
+    fn parses_exact_data_only_supported_source_dtypes() {
+        for (dtype, data) in [("F32", &[0_u8; 8][..]), ("F16", &[0_u8; 4]), ("BF16", &[0_u8; 4])] {
+            let header = format!(
+                "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[2],\"data_offsets\":[0,{}]}}}}",
+                data.len()
+            );
+            let bytes = fixture(&header, data);
+            let parsed = ParsedSafetensors::parse(&bytes).expect("source must parse");
+            assert_eq!(parsed.tensors().len(), 1);
+            assert_eq!(parsed.tensor_bytes(&parsed.tensors()[0]).expect("bytes must exist"), data);
+        }
     }
 
     #[test]
     fn rejects_trailing_overlap_dtype_rank_and_invalid_utf8() {
         for header in [
-            r#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#,
+            r#"{"a":{"dtype":"F64","shape":[1],"data_offsets":[0,8]}}"#,
             r#"{"a":{"dtype":"F32","shape":[1,1,1,1,1,1,1,1,1],"data_offsets":[0,4]}}"#,
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[1,5]}}"#,
         ] {

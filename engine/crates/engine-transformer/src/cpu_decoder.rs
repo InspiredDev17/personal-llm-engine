@@ -2,7 +2,9 @@
 
 use crate::{FIRST_PARTY_DECODER_ARCHITECTURE_ID, TransformerConfig, TransformerPlan};
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
-use personalai_engine_kv_cache::{ContiguousKvCache, KvTokenWriter, SequenceHandle};
+use personalai_engine_kv_cache::{
+    ContiguousKvCache, KvCacheMetrics, KvTokenWriter, SequenceHandle,
+};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
@@ -84,6 +86,11 @@ impl CpuDecoderModel {
     /// Returns the aggregate pool used for request-scoped runtime accounting.
     pub const fn memory_pool(&self) -> &MemoryPool {
         &self.pool
+    }
+
+    /// Returns exact live and peak contiguous KV-cache accounting.
+    pub fn kv_cache_metrics(&self) -> Result<KvCacheMetrics, EngineError> {
+        self.cache.metrics()
     }
 
     /// Allocates one bounded sequence cache under the model's aggregate pool.

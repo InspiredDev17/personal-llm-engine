@@ -47,12 +47,15 @@ tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The import and production components are intentionally separate:
 
-1. The offline importer accepts only local `.safetensors` and strict
-   `AIPTOK-METADATA-V1` files
+1. The offline importer accepts one or more local `.safetensors` shards and a
+   strict `AIPTOK-METADATA-V1` file
    that canonicalize beneath an owner-selected quarantine. It refuses URLs,
    quarantine escapes, pickle/executable formats, unknown tensor names,
-   missing/extra tensors, unsupported dtypes, non-finite values, and any
-   architecture mapping other than `llama-safetensors-v1`.
+   missing/extra/duplicate tensors, unsupported dtypes, non-finite values, and
+   any architecture mapping other than `llama-safetensors-v1`. Shard input
+   order cannot affect the output: unique source filenames are sorted, the
+   complete architecture inventory is validated globally, and F32, F16, or
+   BF16 source storage is converted explicitly into finite F32 package data.
 2. The importer writes a staging directory and atomically installs
    `<model-id>.paimodel`. Replacement requires a bounded explicit audit note;
    the previous directory is preserved. The signing seed is exact stdin data,

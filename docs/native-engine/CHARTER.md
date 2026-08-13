@@ -119,7 +119,8 @@ and review record in an isolated FFI/backend module.
 
 ## Current completion boundary
 
-The software foundation through deterministic offline synthetic-model import,
+The software foundation through deterministic one-or-more-shard offline
+synthetic-model import,
 signed directory-package verification/mapping, mutually authenticated
 CPU-reference UDS generation and bounded continuous graceful-drain reference
 serving, strict AIPTok conversion/encoding/streaming decode, plus deterministic

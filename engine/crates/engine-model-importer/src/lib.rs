@@ -21,9 +21,10 @@ use personalai_engine_crypto::{
 use personalai_engine_memory::MemoryPool;
 use personalai_engine_model_format::{
     DIRECTORY_DECODER_ARCHITECTURE_ID, DirectoryManifestBuilder, DirectoryShardRecord,
-    DirectoryTensorRecord, HashCatalog, HashCatalogEntry, PackageFileKind, Quantization,
-    SignatureEnvelope,
+    DirectoryTensorRecord, HashCatalog, HashCatalogEntry, MAX_DIRECTORY_SHARDS, PackageFileKind,
+    Quantization, SignatureEnvelope,
 };
+use personalai_engine_tensor::{bf16_bits_to_f32, f16_bits_to_f32};
 use personalai_engine_tokenizer::{FirstPartyBpeTokenizer, Tokenizer};
 use personalai_engine_types::{
     ContextLimit, DType, EngineError, MAX_MODEL_PACKAGE_BYTES, ModelId, ModelPackageHash,
@@ -43,6 +44,38 @@ pub const LLAMA_SAFETENSORS_MAPPING_V1: &str = "llama-safetensors-v1";
 pub const MAX_PROVENANCE_BYTES: usize = 1024 * 1024;
 /// Package shard alignment used by the initial importer.
 pub const IMPORT_TENSOR_ALIGNMENT: u32 = 64;
+
+/// One immutable local safetensors source shard supplied to deterministic conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SafetensorsSource<'a> {
+    name: &'a str,
+    bytes: &'a [u8],
+}
+
+impl<'a> SafetensorsSource<'a> {
+    /// Validates one direct-child source filename and its bounded, nonempty bytes.
+    pub fn new(name: &'a str, bytes: &'a [u8]) -> Result<Self, EngineError> {
+        validate_source_name(name)?;
+        if bytes.is_empty()
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MODEL_PACKAGE_BYTES
+        {
+            return Err(EngineError::resource_exhaustion(
+                "safetensors source shard size is outside hard bounds",
+            ));
+        }
+        Ok(Self { name, bytes })
+    }
+
+    /// Returns the provenance filename.
+    pub const fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the exact source bytes.
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
 
 /// Closed source-to-canonical tensor mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +277,34 @@ pub fn build_package(
     result
 }
 
+/// Builds one deterministic signed package from one or more safetensors shards.
+///
+/// Input ordering is deliberately ignored: shards are assigned canonical output
+/// indices by ascending source filename. Tensor identities remain globally
+/// unique across every shard.
+pub fn build_package_sharded(
+    spec: &ImportSpec,
+    sources: &[SafetensorsSource<'_>],
+    tokenizer_bytes: &[u8],
+    signer_key_id: SignerKeyId,
+    signing_seed: &mut [u8; 32],
+) -> Result<ImportedPackage, EngineError> {
+    let result = build_package_sharded_inner(
+        spec,
+        sources,
+        TokenizerSourceEvidence {
+            name: "embedded-tokenizer.aiptok",
+            bytes: tokenizer_bytes,
+            format: "aiptok-byte-level-bpe-v1",
+        },
+        tokenizer_bytes,
+        signer_key_id,
+        signing_seed,
+    );
+    signing_seed.zeroize();
+    result
+}
+
 fn build_package_inner(
     spec: &ImportSpec,
     source_name: &str,
@@ -253,22 +314,90 @@ fn build_package_inner(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
-    if !source_name.ends_with(".safetensors")
-        || source_name.contains('/')
-        || source_name.contains('\\')
-    {
-        return Err(EngineError::invalid_input("source must be one local safetensors filename"));
-    }
-    let parsed = ParsedSafetensors::parse(source_bytes)?;
+    let source = SafetensorsSource::new(source_name, source_bytes)?;
+    let (shards, tensor_records) = build_shards(spec, &[source])?;
+    let provenance = provenance(
+        spec,
+        source_name,
+        source_bytes,
+        tokenizer_source.name,
+        tokenizer_source.bytes,
+        tokenizer_source.format,
+    )?;
+    finish_package(
+        spec,
+        shards,
+        tensor_records,
+        provenance,
+        tokenizer_bytes,
+        signer_key_id,
+        signing_seed,
+    )
+}
+
+fn build_package_sharded_inner(
+    spec: &ImportSpec,
+    sources: &[SafetensorsSource<'_>],
+    tokenizer_source: TokenizerSourceEvidence<'_>,
+    tokenizer_bytes: &[u8],
+    signer_key_id: SignerKeyId,
+    signing_seed: &mut [u8; 32],
+) -> Result<ImportedPackage, EngineError> {
+    let ordered = validate_and_order_sources(sources)?;
+    let (shards, tensor_records) = build_shards(spec, &ordered)?;
+    let provenance = sharded_provenance(
+        spec,
+        &ordered,
+        tokenizer_source.name,
+        tokenizer_source.bytes,
+        tokenizer_source.format,
+    )?;
+    finish_package(
+        spec,
+        shards,
+        tensor_records,
+        provenance,
+        tokenizer_bytes,
+        signer_key_id,
+        signing_seed,
+    )
+}
+
+fn finish_package(
+    spec: &ImportSpec,
+    shards: Vec<Vec<u8>>,
+    tensor_records: Vec<DirectoryTensorRecord>,
+    provenance: Vec<u8>,
+    tokenizer_bytes: &[u8],
+    signer_key_id: SignerKeyId,
+    signing_seed: &mut [u8; 32],
+) -> Result<ImportedPackage, EngineError> {
     let tokenizer_pool = MemoryPool::new(128 * 1024 * 1024)?;
     let tokenizer = FirstPartyBpeTokenizer::parse(tokenizer_bytes, &tokenizer_pool)?;
     if tokenizer.spec().vocabulary_size() != spec.vocabulary_size {
         return Err(corrupt("tokenizer vocabulary differs from the import specification"));
     }
-    let (shard, tensor_records) = build_shard(spec, &parsed)?;
-    let shard_hash = hash_package(&shard);
+    let mut shard_records = Vec::new();
+    let mut total_shard_bytes = 0_u64;
+    shard_records
+        .try_reserve_exact(shards.len())
+        .map_err(|_| EngineError::resource_exhaustion("shard metadata allocation failed"))?;
+    for (index, shard) in shards.iter().enumerate() {
+        let byte_length = usize_to_u64(shard.len())?;
+        total_shard_bytes = total_shard_bytes
+            .checked_add(byte_length)
+            .filter(|total| *total <= MAX_MODEL_PACKAGE_BYTES)
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion("aggregate output shard bytes exceed hard limit")
+            })?;
+        shard_records.push(DirectoryShardRecord::new(
+            u32::try_from(index)
+                .map_err(|_| EngineError::resource_exhaustion("shard index exceeds u32"))?,
+            byte_length,
+            hash_package(shard),
+        )?);
+    }
     let tokenizer_hash = hash_package(tokenizer_bytes);
-    let shard_record = DirectoryShardRecord::new(0, usize_to_u64(shard.len())?, shard_hash)?;
     let manifest = DirectoryManifestBuilder::new(
         spec.model_id.clone(),
         (0, 1, 0),
@@ -285,24 +414,29 @@ fn build_package_inner(
         Quantization::None,
         spec.tied_output,
         tokenizer_hash,
-        vec![shard_record],
+        shard_records,
         tensor_records,
     )?
     .build_bytes()?;
-    let provenance = provenance(
-        spec,
-        source_name,
-        source_bytes,
-        tokenizer_source.name,
-        tokenizer_source.bytes,
-        tokenizer_source.format,
-    )?;
-    let catalog = HashCatalog::new(vec![
+    let mut catalog_entries = vec![
         catalog_entry(PackageFileKind::Manifest, 0, "manifest.aipm", &manifest)?,
         catalog_entry(PackageFileKind::Tokenizer, 0, "tokenizer.aiptok", tokenizer_bytes)?,
         catalog_entry(PackageFileKind::Provenance, 0, "provenance.json", &provenance)?,
-        catalog_entry(PackageFileKind::TensorShard, 0, "tensors-0000.aipt", &shard)?,
-    ])?;
+    ];
+    catalog_entries
+        .try_reserve_exact(shards.len())
+        .map_err(|_| EngineError::resource_exhaustion("catalog allocation failed"))?;
+    for (index, shard) in shards.iter().enumerate() {
+        let index = u32::try_from(index)
+            .map_err(|_| EngineError::resource_exhaustion("shard index exceeds u32"))?;
+        catalog_entries.push(catalog_entry(
+            PackageFileKind::TensorShard,
+            index,
+            &format!("tensors-{index:04}.aipt"),
+            shard,
+        )?);
+    }
+    let catalog = HashCatalog::new(catalog_entries)?;
     let catalog_bytes = catalog.encode()?;
     let catalog_digest = hash_signed_content(&catalog_bytes);
     let message = directory_package_signature_message(&catalog_digest)?;
@@ -315,14 +449,24 @@ fn build_package_inner(
     let signature = signing_key.sign(&message).to_bytes();
     let signature = SignatureEnvelope::encode_ed25519(signer_key_id, signature)?.to_vec();
     let package_hash = hash_package(&catalog_bytes);
-    let files = BTreeMap::from([
+    let mut files = BTreeMap::from([
         ("hashes.aiph".to_owned(), catalog_bytes),
         ("manifest.aipm".to_owned(), manifest),
         ("provenance.json".to_owned(), provenance),
         ("signature.ed25519".to_owned(), signature),
-        ("tensors-0000.aipt".to_owned(), shard),
         ("tokenizer.aiptok".to_owned(), tokenizer_bytes.to_vec()),
     ]);
+    for (index, shard) in shards.into_iter().enumerate() {
+        files.insert(format!("tensors-{index:04}.aipt"), shard);
+    }
+    files.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(usize_to_u64(bytes.len())?)
+            .filter(|total| *total <= MAX_MODEL_PACKAGE_BYTES)
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion("completed package bytes exceed hard limit")
+            })
+    })?;
     Ok(ImportedPackage { files, package_hash, signer_key_id, signer_public_key })
 }
 
@@ -353,14 +497,7 @@ pub fn import_local(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| EngineError::invalid_input("tokenizer filename is invalid UTF-8"))?;
-        if !tokenizer_source_name.ends_with(".aiptokmeta")
-            || tokenizer_source_name.contains('/')
-            || tokenizer_source_name.contains('\\')
-        {
-            return Err(EngineError::invalid_input(
-                "tokenizer source must be one local .aiptokmeta filename",
-            ));
-        }
+        validate_tokenizer_source_name(tokenizer_source_name)?;
         let package = build_package_inner(
             spec,
             source_name,
@@ -386,56 +523,220 @@ pub fn import_local(
     result
 }
 
-fn build_shard(
+/// Reads multiple quarantined safetensors shards and installs one signed package.
+#[allow(clippy::too_many_arguments)]
+pub fn import_local_sharded(
+    quarantine_root: &Path,
+    source_paths: &[PathBuf],
+    tokenizer_path: &Path,
+    output_root: &Path,
     spec: &ImportSpec,
-    source: &ParsedSafetensors<'_>,
-) -> Result<(Vec<u8>, Vec<DirectoryTensorRecord>), EngineError> {
-    let mut mapped = BTreeMap::new();
-    for tensor in source.tensors() {
-        let canonical = canonical_name(spec.mapping, tensor.name(), spec.layer_count)?;
-        if mapped.insert(canonical, tensor).is_some() {
-            return Err(corrupt("source mapping produced a duplicate canonical tensor"));
+    signer_key_id: SignerKeyId,
+    signing_seed: &mut [u8; 32],
+    force_audit_note: Option<&str>,
+) -> Result<ImportReceipt, EngineError> {
+    let result = (|| {
+        if source_paths.is_empty()
+            || source_paths.len() > usize::try_from(MAX_DIRECTORY_SHARDS).unwrap_or(usize::MAX)
+        {
+            return Err(EngineError::invalid_input("source shard count is outside hard bounds"));
+        }
+        validate_local_path_text(tokenizer_path)?;
+        let mut owned_sources = Vec::new();
+        owned_sources
+            .try_reserve_exact(source_paths.len())
+            .map_err(|_| EngineError::resource_exhaustion("source shard allocation failed"))?;
+        let mut aggregate_source_bytes = 0_u64;
+        for source_path in source_paths {
+            validate_local_path_text(source_path)?;
+            let bytes =
+                read_quarantined_file(quarantine_root, source_path, MAX_MODEL_PACKAGE_BYTES)?;
+            aggregate_source_bytes = aggregate_source_bytes
+                .checked_add(usize_to_u64(bytes.len())?)
+                .filter(|total| *total <= MAX_MODEL_PACKAGE_BYTES)
+                .ok_or_else(|| {
+                    EngineError::resource_exhaustion(
+                        "aggregate safetensors source bytes exceed hard limit",
+                    )
+                })?;
+            let name = source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| EngineError::invalid_input("source filename is invalid UTF-8"))?
+                .to_owned();
+            owned_sources.push((name, bytes));
+        }
+        let tokenizer_source =
+            read_quarantined_file(quarantine_root, tokenizer_path, 64 * 1024 * 1024)?;
+        let tokenizer = convert_aiptok_metadata(&tokenizer_source)?;
+        let tokenizer_source_name = tokenizer_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EngineError::invalid_input("tokenizer filename is invalid UTF-8"))?;
+        validate_tokenizer_source_name(tokenizer_source_name)?;
+        let borrowed_sources = owned_sources
+            .iter()
+            .map(|(name, bytes)| SafetensorsSource::new(name, bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let package = build_package_sharded_inner(
+            spec,
+            &borrowed_sources,
+            TokenizerSourceEvidence {
+                name: tokenizer_source_name,
+                bytes: &tokenizer_source,
+                format: AIPTOK_METADATA_SOURCE_FORMAT,
+            },
+            &tokenizer,
+            signer_key_id,
+            signing_seed,
+        )?;
+        install_package(output_root, spec, &package, force_audit_note)?;
+        Ok(ImportReceipt {
+            package_path: output_root.join(format!("{}.paimodel", spec.model_id.as_str())),
+            package_hash: package.package_hash,
+            signer_key_id,
+            signer_public_key: package.signer_public_key,
+        })
+    })();
+    signing_seed.zeroize();
+    result
+}
+
+fn validate_and_order_sources<'a>(
+    sources: &[SafetensorsSource<'a>],
+) -> Result<Vec<SafetensorsSource<'a>>, EngineError> {
+    if sources.is_empty()
+        || sources.len() > usize::try_from(MAX_DIRECTORY_SHARDS).unwrap_or(usize::MAX)
+    {
+        return Err(EngineError::invalid_input("source shard count is outside hard bounds"));
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(sources.len())
+        .map_err(|_| EngineError::resource_exhaustion("source shard ordering failed"))?;
+    ordered.extend_from_slice(sources);
+    ordered.sort_by(|left, right| left.name.cmp(right.name));
+    let mut aggregate = 0_u64;
+    for (index, source) in ordered.iter().copied().enumerate() {
+        validate_source_name(source.name)?;
+        if source.bytes.is_empty() {
+            return Err(EngineError::resource_exhaustion("safetensors source shard is empty"));
+        }
+        aggregate = aggregate
+            .checked_add(usize_to_u64(source.bytes.len())?)
+            .filter(|total| *total <= MAX_MODEL_PACKAGE_BYTES)
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion(
+                    "aggregate safetensors source bytes exceed hard limit",
+                )
+            })?;
+        if index > 0 && ordered[index - 1].name == source.name {
+            return Err(EngineError::invalid_input("safetensors source filenames must be unique"));
         }
     }
+    Ok(ordered)
+}
+
+fn build_shards(
+    spec: &ImportSpec,
+    sources: &[SafetensorsSource<'_>],
+) -> Result<(Vec<Vec<u8>>, Vec<DirectoryTensorRecord>), EngineError> {
     let expected = expected_shapes(spec)?;
-    let mapped_names = mapped.keys().cloned().collect::<BTreeSet<_>>();
     let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
-    if mapped_names != expected_names {
-        return Err(corrupt("source tensor inventory has missing or unexpected tensors"));
-    }
-    let mut shard = Vec::new();
+    let mut seen_names = BTreeSet::new();
+    let mut shards = Vec::new();
     let mut records = Vec::new();
-    records.try_reserve_exact(mapped.len()).map_err(|_| {
+    shards
+        .try_reserve_exact(sources.len())
+        .map_err(|_| EngineError::resource_exhaustion("output shard allocation failed"))?;
+    records.try_reserve_exact(expected.len()).map_err(|_| {
         EngineError::resource_exhaustion("import tensor metadata allocation failed")
     })?;
-    for (name, tensor) in mapped {
-        if tensor.dtype() != DType::F32 || tensor.shape() != &expected[&name] {
-            return Err(corrupt("source tensor dtype or shape does not match architecture"));
+    let mut completed_output_bytes = 0_u64;
+
+    for (shard_index, source) in sources.iter().copied().enumerate() {
+        let parsed = ParsedSafetensors::parse(source.bytes)?;
+        let mut mapped = BTreeMap::new();
+        for tensor in parsed.tensors() {
+            let canonical = canonical_name(spec.mapping, tensor.name(), spec.layer_count)?;
+            if !seen_names.insert(canonical.clone()) {
+                return Err(corrupt("source shards produce a duplicate canonical tensor"));
+            }
+            if mapped.insert(canonical, tensor).is_some() {
+                return Err(corrupt("source mapping produced a duplicate canonical tensor"));
+            }
         }
-        let source_bytes = source.tensor_bytes(tensor)?;
-        validate_finite_f32(source_bytes)?;
-        let aligned =
-            align_up(shard.len(), usize::try_from(IMPORT_TENSOR_ALIGNMENT).unwrap_or(64))?;
-        if aligned > shard.len() {
-            shard.resize(aligned, 0);
+        if mapped.is_empty() {
+            return Err(corrupt("safetensors source shard contains no tensors"));
         }
-        shard
-            .try_reserve_exact(source_bytes.len())
-            .map_err(|_| EngineError::resource_exhaustion("import shard allocation failed"))?;
-        shard.extend_from_slice(source_bytes);
-        records.push(DirectoryTensorRecord::new(
-            name,
-            DType::F32,
-            tensor.shape().clone(),
-            0,
-            usize_to_u64(aligned)?,
-            usize_to_u64(source_bytes.len())?,
-            IMPORT_TENSOR_ALIGNMENT,
-            Quantization::None,
-            hash_package(source_bytes),
-        )?);
+        let mut shard = Vec::new();
+        let shard_index = u32::try_from(shard_index)
+            .map_err(|_| EngineError::resource_exhaustion("shard index exceeds u32"))?;
+        for (name, tensor) in mapped {
+            let shape = expected
+                .get(&name)
+                .ok_or_else(|| corrupt("source tensor inventory contains an unexpected tensor"))?;
+            if !matches!(tensor.dtype(), DType::F32 | DType::F16 | DType::BFloat16)
+                || tensor.shape() != shape
+            {
+                return Err(corrupt("source tensor dtype or shape does not match architecture"));
+            }
+            let source_bytes = parsed.tensor_bytes(tensor)?;
+            let aligned =
+                align_up(shard.len(), usize::try_from(IMPORT_TENSOR_ALIGNMENT).unwrap_or(64))?;
+            let destination_length = usize::try_from(tensor.shape().byte_len(DType::F32)?)
+                .map_err(|_| {
+                    EngineError::resource_exhaustion(
+                        "converted tensor length is not addressable on this host",
+                    )
+                })?;
+            let planned_shard_end = aligned.checked_add(destination_length).ok_or_else(|| {
+                EngineError::resource_exhaustion("converted output shard length overflows")
+            })?;
+            completed_output_bytes
+                .checked_add(usize_to_u64(planned_shard_end)?)
+                .filter(|total| *total <= MAX_MODEL_PACKAGE_BYTES)
+                .ok_or_else(|| {
+                    EngineError::resource_exhaustion(
+                        "aggregate converted output bytes exceed hard limit",
+                    )
+                })?;
+            let converted = convert_source_tensor_to_f32(tensor.dtype(), source_bytes)?;
+            if converted.len() != destination_length {
+                return Err(EngineError::internal_invariant(
+                    "converted tensor differs from its architecture byte plan",
+                ));
+            }
+            shard
+                .try_reserve_exact(planned_shard_end - shard.len())
+                .map_err(|_| EngineError::resource_exhaustion("import shard allocation failed"))?;
+            if aligned > shard.len() {
+                shard.resize(aligned, 0);
+            }
+            shard.extend_from_slice(&converted);
+            records.push(DirectoryTensorRecord::new(
+                name,
+                DType::F32,
+                tensor.shape().clone(),
+                shard_index,
+                usize_to_u64(aligned)?,
+                usize_to_u64(converted.len())?,
+                IMPORT_TENSOR_ALIGNMENT,
+                Quantization::None,
+                hash_package(&converted),
+            )?);
+        }
+        completed_output_bytes =
+            completed_output_bytes.checked_add(usize_to_u64(shard.len())?).ok_or_else(|| {
+                EngineError::resource_exhaustion("aggregate converted output bytes overflow")
+            })?;
+        shards.push(shard);
     }
-    Ok((shard, records))
+    if seen_names != expected_names {
+        return Err(corrupt("source tensor inventory has missing tensors"));
+    }
+    records.sort_by(|left, right| left.name().cmp(right.name()));
+    Ok((shards, records))
 }
 
 fn expected_shapes(spec: &ImportSpec) -> Result<BTreeMap<String, TensorShape>, EngineError> {
@@ -556,6 +857,70 @@ fn provenance(
         source_name,
         spec.source_label,
         hash_package(source_bytes),
+        tokenizer_source_name,
+        tokenizer_source_format,
+        hash_package(tokenizer_source_bytes),
+        env!("CARGO_PKG_VERSION"),
+    );
+    if document.len() > MAX_PROVENANCE_BYTES {
+        return Err(EngineError::resource_exhaustion("provenance exceeds its hard limit"));
+    }
+    Ok(document.into_bytes())
+}
+
+fn sharded_provenance(
+    spec: &ImportSpec,
+    sources: &[SafetensorsSource<'_>],
+    tokenizer_source_name: &str,
+    tokenizer_source_bytes: &[u8],
+    tokenizer_source_format: &str,
+) -> Result<Vec<u8>, EngineError> {
+    use std::fmt::Write as _;
+
+    validate_provenance_text(tokenizer_source_name, 256)?;
+    validate_provenance_text(tokenizer_source_format, 64)?;
+    let mut source_records = String::new();
+    for (index, source) in sources.iter().copied().enumerate() {
+        validate_provenance_text(source.name, 256)?;
+        writeln!(
+            &mut source_records,
+            "    {{\"file\": \"{}\", \"sha384\": \"{}\"}}{}",
+            source.name,
+            hash_package(source.bytes),
+            if index + 1 == sources.len() { "" } else { "," },
+        )
+        .map_err(|_| EngineError::internal_invariant("provenance string write failed"))?;
+        if source_records.len() > MAX_PROVENANCE_BYTES {
+            return Err(EngineError::resource_exhaustion(
+                "provenance source list exceeds its hard limit",
+            ));
+        }
+    }
+    let document = format!(
+        concat!(
+            "{{\n",
+            "  \"architecture\": \"{}\",\n",
+            "  \"license_id\": \"{}\",\n",
+            "  \"mapping\": \"{}\",\n",
+            "  \"model_id\": \"{}\",\n",
+            "  \"source_files\": [\n",
+            "{}",
+            "  ],\n",
+            "  \"source_format\": \"safetensors-shards-v1\",\n",
+            "  \"source_label\": \"{}\",\n",
+            "  \"tokenizer_source_file\": \"{}\",\n",
+            "  \"tokenizer_source_format\": \"{}\",\n",
+            "  \"tokenizer_source_sha384\": \"{}\",\n",
+            "  \"tool\": \"personalai-engine-model-importer\",\n",
+            "  \"tool_version\": \"{}\"\n",
+            "}}\n"
+        ),
+        DIRECTORY_DECODER_ARCHITECTURE_ID,
+        spec.license_id,
+        spec.mapping.as_str(),
+        spec.model_id,
+        source_records,
+        spec.source_label,
         tokenizer_source_name,
         tokenizer_source_format,
         hash_package(tokenizer_source_bytes),
@@ -766,6 +1131,38 @@ fn validate_provenance_text(value: &str, maximum: usize) -> Result<(), EngineErr
     Ok(())
 }
 
+fn validate_source_name(name: &str) -> Result<(), EngineError> {
+    if !name.ends_with(".safetensors")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.len() > 256
+        || !name.is_ascii()
+        || name.chars().any(char::is_control)
+    {
+        return Err(EngineError::invalid_input(
+            "source must be one safe local safetensors filename",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tokenizer_source_name(name: &str) -> Result<(), EngineError> {
+    if !name.ends_with(".aiptokmeta")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.len() > 256
+        || !name.is_ascii()
+        || name.chars().any(char::is_control)
+    {
+        return Err(EngineError::invalid_input(
+            "tokenizer source must be one safe local .aiptokmeta filename",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_finite_f32(bytes: &[u8]) -> Result<(), EngineError> {
     if bytes.len() % 4 != 0 {
         return Err(corrupt("F32 tensor byte length is not scalar-aligned"));
@@ -779,6 +1176,47 @@ fn validate_finite_f32(bytes: &[u8]) -> Result<(), EngineError> {
         }
     }
     Ok(())
+}
+
+fn convert_source_tensor_to_f32(dtype: DType, bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+    let scalar_width = dtype.byte_width();
+    let scalar_count = u64::try_from(bytes.len())
+        .ok()
+        .filter(|length| *length % scalar_width == 0)
+        .map(|length| length / scalar_width)
+        .ok_or_else(|| corrupt("source tensor byte length is not scalar-aligned"))?;
+    let output_length = scalar_count
+        .checked_mul(DType::F32.byte_width())
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or_else(|| EngineError::resource_exhaustion("converted tensor length overflows"))?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_length)
+        .map_err(|_| EngineError::resource_exhaustion("converted tensor allocation failed"))?;
+    match dtype {
+        DType::F32 => output.extend_from_slice(bytes),
+        DType::F16 | DType::BFloat16 => {
+            for encoded in bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes(
+                    encoded.try_into().map_err(|_| corrupt("source tensor scalar is truncated"))?,
+                );
+                let value = if dtype == DType::F16 {
+                    f16_bits_to_f32(bits)
+                } else {
+                    bf16_bits_to_f32(bits)
+                };
+                output.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        _ => return Err(EngineError::not_implemented("safetensors source dtype is unsupported")),
+    }
+    if output.len() != output_length {
+        return Err(EngineError::internal_invariant(
+            "converted tensor length differs from its checked plan",
+        ));
+    }
+    validate_finite_f32(&output)?;
+    Ok(output)
 }
 
 fn align_up(value: usize, alignment: usize) -> Result<usize, EngineError> {
@@ -817,7 +1255,9 @@ mod tests {
     use personalai_engine_loader::{
         ModelRegistry, RegistrationMode, RegistrySelectionV2, VerifiedDirectoryPackage,
     };
-    use personalai_engine_model_format::{DIRECTORY_MANIFEST_HEADER_BYTES, ParsedModelPackage};
+    use personalai_engine_model_format::{
+        DIRECTORY_MANIFEST_HEADER_BYTES, DirectoryManifest, ParsedModelPackage,
+    };
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
@@ -879,6 +1319,89 @@ mod tests {
         source.extend_from_slice(header.as_bytes());
         source.extend_from_slice(&data);
         (source, tokenizer)
+    }
+
+    fn split_safetensors_source(source: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let parsed = ParsedSafetensors::parse(source).expect("source must parse before splitting");
+        let build = |parity: usize| {
+            let selected = parsed
+                .tensors()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % 2 == parity)
+                .map(|(_, tensor)| tensor)
+                .collect::<Vec<_>>();
+            let mut data = Vec::new();
+            let mut records = Vec::new();
+            for tensor in selected {
+                let start = data.len();
+                data.extend_from_slice(
+                    parsed.tensor_bytes(tensor).expect("split tensor bytes must exist"),
+                );
+                let dimensions = tensor
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                records.push(format!(
+                    "\"{}\":{{\"dtype\":\"F32\",\"shape\":[{dimensions}],\"data_offsets\":[{start},{}]}}",
+                    tensor.name(),
+                    data.len(),
+                ));
+            }
+            let header = format!("{{{}}}", records.join(","));
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(
+                &u64::try_from(header.len()).expect("header length must fit").to_le_bytes(),
+            );
+            encoded.extend_from_slice(header.as_bytes());
+            encoded.extend_from_slice(&data);
+            encoded
+        };
+        (build(0), build(1))
+    }
+
+    fn convert_fixture_source_dtype(source: &[u8], dtype: DType) -> Vec<u8> {
+        let parsed = ParsedSafetensors::parse(source).expect("source must parse before conversion");
+        let mut data = Vec::new();
+        let mut records = Vec::new();
+        for tensor in parsed.tensors() {
+            let start = data.len();
+            for scalar in
+                parsed.tensor_bytes(tensor).expect("source tensor bytes must exist").chunks_exact(4)
+            {
+                let value = f32::from_le_bytes(scalar.try_into().expect("f32 scalar"));
+                let bits = if dtype == DType::F16 {
+                    personalai_engine_tensor::f32_to_f16_bits(value)
+                } else {
+                    personalai_engine_tensor::f32_to_bf16_bits(value)
+                };
+                data.extend_from_slice(&bits.to_le_bytes());
+            }
+            let dimensions = tensor
+                .shape()
+                .dimensions()
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let dtype_name = if dtype == DType::F16 { "F16" } else { "BF16" };
+            records.push(format!(
+                "\"{}\":{{\"dtype\":\"{dtype_name}\",\"shape\":[{dimensions}],\"data_offsets\":[{start},{}]}}",
+                tensor.name(),
+                data.len(),
+            ));
+        }
+        let header = format!("{{{}}}", records.join(","));
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(
+            &u64::try_from(header.len()).expect("header length must fit").to_le_bytes(),
+        );
+        encoded.extend_from_slice(header.as_bytes());
+        encoded.extend_from_slice(&data);
+        encoded
     }
 
     fn source_tokenizer_metadata() -> Vec<u8> {
@@ -1237,6 +1760,174 @@ mod tests {
                 "tokenizer.aiptok",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deterministic_multishard_import_is_order_independent_and_loader_verified() {
+        let root = temporary_root("multishard");
+        let quarantine = root.join("quarantine");
+        let store = root.join("models");
+        fs::create_dir(&root).expect("root must create");
+        fs::create_dir(&quarantine).expect("quarantine must create");
+        fs::create_dir(&store).expect("store must create");
+        for directory in [&root, &quarantine, &store] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("private directory mode must set");
+        }
+
+        let (source, tokenizer) = source_and_tokenizer();
+        let (first_source, second_source) = split_safetensors_source(&source);
+        let first = SafetensorsSource::new("model-00001-of-00002.safetensors", &first_source)
+            .expect("first source must validate");
+        let second = SafetensorsSource::new("model-00002-of-00002.safetensors", &second_source)
+            .expect("second source must validate");
+        let key_id = SignerKeyId::from_bytes([0x41; 16]).expect("key ID must validate");
+        let mut forward_seed = [0x42; 32];
+        let mut reverse_seed = forward_seed;
+        let forward =
+            build_package_sharded(&spec(), &[first, second], &tokenizer, key_id, &mut forward_seed)
+                .expect("forward shard order must import");
+        let reverse =
+            build_package_sharded(&spec(), &[second, first], &tokenizer, key_id, &mut reverse_seed)
+                .expect("reverse shard order must import identically");
+        assert_eq!(forward, reverse);
+        assert_eq!(forward_seed, [0; 32]);
+        assert_eq!(reverse_seed, [0; 32]);
+        assert!(forward.files().contains_key("tensors-0000.aipt"));
+        assert!(forward.files().contains_key("tensors-0001.aipt"));
+        let manifest = DirectoryManifest::parse(
+            forward.files().get("manifest.aipm").expect("manifest must exist"),
+        )
+        .expect("multishard manifest must parse");
+        assert_eq!(manifest.shards().len(), 2);
+        assert!(manifest.tensors().iter().any(|tensor| tensor.shard_index() == 0));
+        assert!(manifest.tensors().iter().any(|tensor| tensor.shard_index() == 1));
+        let provenance = std::str::from_utf8(
+            forward.files().get("provenance.json").expect("provenance must exist"),
+        )
+        .expect("provenance must be UTF-8");
+        let first_position = provenance
+            .find("model-00001-of-00002.safetensors")
+            .expect("first source must be recorded");
+        let second_position = provenance
+            .find("model-00002-of-00002.safetensors")
+            .expect("second source must be recorded");
+        assert!(first_position < second_position);
+
+        fs::write(quarantine.join(first.name()), first.bytes()).expect("first shard must write");
+        fs::write(quarantine.join(second.name()), second.bytes()).expect("second shard must write");
+        let tokenizer_metadata = source_tokenizer_metadata();
+        fs::write(quarantine.join("tokenizer.aiptokmeta"), &tokenizer_metadata)
+            .expect("tokenizer metadata must write");
+        let mut local_seed = [0x42; 32];
+        let receipt = import_local_sharded(
+            &quarantine,
+            &[PathBuf::from(second.name()), PathBuf::from(first.name())],
+            Path::new("tokenizer.aiptokmeta"),
+            &store,
+            &spec(),
+            key_id,
+            &mut local_seed,
+            None,
+        )
+        .expect("local multishard import must succeed");
+        assert_eq!(local_seed, [0; 32]);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o500))
+            .expect("production store must seal read-only");
+        let trusted = TrustedSigner::active(key_id, receipt.signer_public_key())
+            .expect("trusted signer must validate");
+        let mut registry = ModelRegistry::new(&store).expect("registry must construct");
+        registry
+            .register(
+                spec().model_id().clone(),
+                "synthetic-import.paimodel",
+                receipt.package_hash(),
+                trusted,
+            )
+            .expect("multishard package must register");
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+        let loaded = registry
+            .load_registered_directory(spec().model_id(), &budget, &mut |_| {})
+            .expect("signed multishard package must load");
+        assert_eq!(loaded.manifest().shards().len(), 2);
+        assert_tokenizer_provenance(&loaded, &tokenizer_metadata);
+
+        remove_sealed_store(&root, &store, receipt.package_path());
+    }
+
+    #[test]
+    fn multishard_import_rejects_empty_duplicate_and_duplicate_tensor_sources() {
+        let (source, tokenizer) = source_and_tokenizer();
+        let key_id = SignerKeyId::from_bytes([0x43; 16]).expect("key ID must validate");
+        let mut empty_seed = [0x44; 32];
+        assert!(build_package_sharded(&spec(), &[], &tokenizer, key_id, &mut empty_seed).is_err());
+        assert_eq!(empty_seed, [0; 32]);
+
+        let first = SafetensorsSource::new("model-00001.safetensors", &source)
+            .expect("source must validate");
+        let duplicate_name = SafetensorsSource::new("model-00001.safetensors", &source)
+            .expect("duplicate source name is individually valid");
+        let mut duplicate_name_seed = [0x45; 32];
+        assert!(
+            build_package_sharded(
+                &spec(),
+                &[first, duplicate_name],
+                &tokenizer,
+                key_id,
+                &mut duplicate_name_seed,
+            )
+            .is_err()
+        );
+        assert_eq!(duplicate_name_seed, [0; 32]);
+
+        let duplicate_tensor = SafetensorsSource::new("model-00002.safetensors", &source)
+            .expect("second source must validate");
+        let mut duplicate_tensor_seed = [0x46; 32];
+        assert!(
+            build_package_sharded(
+                &spec(),
+                &[first, duplicate_tensor],
+                &tokenizer,
+                key_id,
+                &mut duplicate_tensor_seed,
+            )
+            .is_err()
+        );
+        assert_eq!(duplicate_tensor_seed, [0; 32]);
+    }
+
+    #[test]
+    fn f16_and_bf16_sources_convert_to_finite_f32_package_storage() {
+        let (source, tokenizer) = source_and_tokenizer();
+        let key_id = SignerKeyId::from_bytes([0x47; 16]).expect("key ID must validate");
+        for (dtype, seed_byte) in [(DType::F16, 0x48), (DType::BFloat16, 0x49)] {
+            let converted_source = convert_fixture_source_dtype(&source, dtype);
+            let mut seed = [seed_byte; 32];
+            let package = build_package(
+                &spec(),
+                "model.safetensors",
+                &converted_source,
+                &tokenizer,
+                key_id,
+                &mut seed,
+            )
+            .expect("supported compact source dtype must convert");
+            assert_eq!(seed, [0; 32]);
+            let manifest = DirectoryManifest::parse(
+                package.files().get("manifest.aipm").expect("manifest must exist"),
+            )
+            .expect("manifest must parse");
+            assert!(manifest.tensors().iter().all(|tensor| tensor.dtype() == DType::F32));
+            let shard = package.files().get("tensors-0000.aipt").expect("shard must exist");
+            for tensor in manifest.tensors() {
+                let start = usize::try_from(tensor.byte_offset()).expect("offset must fit");
+                let end = start
+                    .checked_add(usize::try_from(tensor.byte_length()).expect("length must fit"))
+                    .expect("range must fit");
+                validate_finite_f32(&shard[start..end]).expect("converted tensor must be finite");
+            }
+        }
     }
 
     #[cfg(unix)]

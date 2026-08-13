@@ -2,7 +2,7 @@
 
 use personalai_engine_model_format::DIRECTORY_DECODER_ARCHITECTURE_ID;
 use personalai_engine_model_importer::{
-    AIPTOK_METADATA_SOURCE_FORMAT, ImportSpec, SourceMapping, import_local,
+    AIPTOK_METADATA_SOURCE_FORMAT, ImportSpec, SourceMapping, import_local, import_local_sharded,
 };
 use personalai_engine_types::{ContextLimit, EngineError, ModelId, SignerKeyId};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use zeroize::Zeroize;
 
 const USAGE: &str = "usage: personalai-engine-model-importer import \
-  --quarantine-root PATH --source PATH --tokenizer PATH --output-root PATH \
+  --quarantine-root PATH --source PATH [--source PATH ...] --tokenizer PATH --output-root PATH \
   --model-id ID --architecture decoder-rms-rope-swiglu-gqa-v1 \
   --mapping llama-safetensors-v1 --tokenizer-source-format aiptok-metadata-v1 \
   --context-limit U32 --vocabulary-size U32 \
@@ -50,6 +50,7 @@ fn run(
         return Err(EngineError::invalid_input("import command is required"));
     }
     let mut values = BTreeMap::new();
+    let mut sources = Vec::new();
     while let Some(flag) = arguments.next() {
         let flag = flag
             .into_string()
@@ -60,9 +61,14 @@ fn run(
         let value = arguments
             .next()
             .ok_or_else(|| EngineError::invalid_input("import flag requires a value"))?;
-        if values.insert(flag, value).is_some() {
+        if flag == "--source" {
+            sources.push(PathBuf::from(value));
+        } else if values.insert(flag, value).is_some() {
             return Err(EngineError::invalid_input("import flag may appear only once"));
         }
+    }
+    if sources.is_empty() {
+        return Err(EngineError::invalid_input("at least one source shard is required"));
     }
     let architecture = text(take(&mut values, "--architecture")?)?;
     if architecture != DIRECTORY_DECODER_ARCHITECTURE_ID {
@@ -93,7 +99,6 @@ fn run(
     let signer_key_id =
         SignerKeyId::from_bytes(parse_hex(&text(take(&mut values, "--signer-key-id")?)?)?)?;
     let quarantine_root = PathBuf::from(take(&mut values, "--quarantine-root")?);
-    let source = PathBuf::from(take(&mut values, "--source")?);
     let tokenizer = PathBuf::from(take(&mut values, "--tokenizer")?);
     let output_root = PathBuf::from(take(&mut values, "--output-root")?);
     let force_note = values.remove("--force-audit-note").map(text).transpose()?;
@@ -115,16 +120,29 @@ fn run(
             "signing seed input must contain exactly 32 bytes",
         ));
     }
-    import_local(
-        &quarantine_root,
-        &source,
-        &tokenizer,
-        &output_root,
-        &spec,
-        signer_key_id,
-        &mut seed,
-        force_note.as_deref(),
-    )
+    if sources.len() == 1 {
+        import_local(
+            &quarantine_root,
+            &sources[0],
+            &tokenizer,
+            &output_root,
+            &spec,
+            signer_key_id,
+            &mut seed,
+            force_note.as_deref(),
+        )
+    } else {
+        import_local_sharded(
+            &quarantine_root,
+            &sources,
+            &tokenizer,
+            &output_root,
+            &spec,
+            signer_key_id,
+            &mut seed,
+            force_note.as_deref(),
+        )
+    }
 }
 
 fn take(values: &mut BTreeMap<String, OsString>, key: &str) -> Result<OsString, EngineError> {

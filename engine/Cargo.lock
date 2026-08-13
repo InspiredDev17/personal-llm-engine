@@ -194,6 +194,7 @@ dependencies = [
  "personalai-engine-model-format",
  "personalai-engine-scheduler",
  "personalai-engine-server",
+ "personalai-engine-tensor",
  "personalai-engine-testkit",
  "personalai-engine-tokenizer",
  "personalai-engine-types",

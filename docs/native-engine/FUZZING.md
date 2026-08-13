@@ -36,10 +36,11 @@ documented format limit. Deterministic unit and mutation tests continue to
 exercise declared hard-limit behavior.
 
 The corpus generator is Rust-only and additionally produces valid directory
-manifest/tensor-record/safetensors/package-name seeds plus malformed boundary
-seeds. It retains the decoder package, tokenizer, and frame seeds. The decoder
-seed is generated from the current two-layer grouped-query-attention fixture,
-so corpus verification catches stale fixture bytes:
+manifest/tensor-record/F32-F16-BF16 safetensors/package-name seeds plus
+malformed boundary seeds. It retains the decoder package, tokenizer, and frame
+seeds. The decoder seed is generated from the current two-layer
+grouped-query-attention fixture, so corpus verification catches stale fixture
+bytes:
 
 ```sh
 cd /tmp
@@ -88,6 +89,14 @@ corpus. It reached 393 coverage counters and 731 features, stayed below 43 MiB
 RSS, and produced no crash, sanitizer, timeout, or resource-limit artifact.
 Non-fatal local `atos` symbolizer warnings did not stop the campaign. This is
 smoke evidence only, not a completeness claim.
+
+After adding valid F16 and BF16 source coverage, the `safetensors_import`
+target received a separate bounded 1,000-run macOS ARM64 smoke campaign on
+2026-08-13 using a temporary corpus copy. It reached 329 coverage counters and
+460 features, stayed at or below 42 MiB RSS, and produced no crash, sanitizer,
+timeout, or resource-limit artifact. Non-fatal local `atos` symbolizer warnings
+did not stop the campaign. This is smoke evidence only, not a completeness
+claim.
 
 ## Continuous campaign
 

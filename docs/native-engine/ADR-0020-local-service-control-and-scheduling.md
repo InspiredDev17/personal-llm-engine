@@ -58,8 +58,12 @@ owner-controlled process signal may begin graceful drain. `ShutdownAccepted`
 is reserved for a future separately authenticated administrative endpoint.
 
 Metrics are fixed-order unsigned counters and never contain prompts, generated
-content, paths, keys, or model bytes. Health is `ready`, `degraded` (no loaded
-model), or `draining`. Load uses an owner-installed budget for a statically
+content, paths, keys, or model bytes. The CPU reference path accumulates
+monotonic prompt-forward and generated-token decode nanoseconds, derives
+generated tokens per second with checked integer arithmetic, and reports exact
+live host-pool and contiguous KV reservations. Device memory remains exactly
+zero for CPU. Health is `ready`, `degraded` (no loaded model), or `draining`.
+Load uses an owner-installed budget for a statically
 registered ID. Unload rejects queued or active ownership. Package failures
 produce bounded typed security events for Go polling. `ModelStatus` resolves
 one registered ID and returns one signed response containing the load,
@@ -93,7 +97,8 @@ The exact single-command reference path serves the complete service-control
 catalog. The continuous path currently admits generation/cancellation streams;
 general control requests use short separate connections through the same
 authenticated listener. CPU generation remains scalar and one token per
-round-robin quantum; continuous batching is not claimed. Prefill/decode timing,
-tokens-per-second, device memory, and aggregate active KV bytes are present in
-the fixed metrics schema but remain zero until those measurements can be
-collected without weakening ownership or determinism.
+round-robin quantum; continuous batching is not claimed. CPU timings are
+operational observability, not benchmark evidence: clock resolution, host load,
+and scalar fixture size can yield zero-duration individual turns. Accelerator
+backends must supply separate device-memory and timing accounting before they
+can report implemented status.

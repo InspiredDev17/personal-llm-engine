@@ -13,7 +13,7 @@ pub use directory::{
     DIRECTORY_DECODER_ARCHITECTURE_ID, DIRECTORY_MANIFEST_HEADER_BYTES, DIRECTORY_MANIFEST_MAGIC,
     DIRECTORY_MANIFEST_MAX_BYTES, DIRECTORY_MANIFEST_VERSION, DIRECTORY_SHARD_RECORD_BYTES,
     DIRECTORY_TENSOR_RECORD_BYTES, DirectoryManifest, DirectoryManifestBuilder,
-    DirectoryShardRecord, DirectoryTensorRecord, Quantization,
+    DirectoryShardRecord, DirectoryTensorRecord, MAX_DIRECTORY_SHARDS, Quantization,
 };
 pub use hash_catalog::{
     HASH_CATALOG_MAGIC, HASH_CATALOG_MAX_ENTRIES, HASH_CATALOG_RECORD_BYTES, HashCatalog,
