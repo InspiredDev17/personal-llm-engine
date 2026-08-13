@@ -160,7 +160,9 @@ Before the native runtime becomes mandatory:
   defense-in-depth while a signed App Sandbox release design remains required;
 - require Go's platform-wide local-only mode to reject every remote primary,
   fallback, verifier, and manual override before sovereign cutover;
-- complete Agent Green telemetry mapping in Go, never in the model or engine;
+- operate and qualify the implemented Go Agent Green telemetry mapping,
+  durable sender continuity, and duplicate-delivery handling; mapping remains
+  outside the model and engine;
 - canary the provider behind Go routing and preserve instant rollback;
 - retire third-party runtimes only after equivalent production evidence.
 

@@ -18,9 +18,10 @@ pub use service::{
     ServiceMessageKind, attach_service_signature, encode_signed_service_response,
 };
 pub use service_payload::{
-    MAX_SERVICE_REGISTERED_MODELS, SERVICE_METRIC_COUNT, SERVICE_MODEL_STATUS_BYTES,
-    ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMetrics,
-    ServiceModelStatus, ServiceRequestBody, ServiceResponseBody, ShutdownRejectionReason,
+    MAX_SERVICE_REGISTERED_MODELS, MAX_SERVICE_SECURITY_EVENTS, SERVICE_METRIC_COUNT,
+    SERVICE_MODEL_STATUS_BYTES, ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus,
+    ServiceMetrics, ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody,
+    ServiceResponseBody, ServiceSecurityEvent, ServiceSecurityEventKind, ShutdownRejectionReason,
 };
 
 use personalai_engine_types::{EngineError, MAX_FRAME_BYTES, MAX_REQUEST_BYTES};

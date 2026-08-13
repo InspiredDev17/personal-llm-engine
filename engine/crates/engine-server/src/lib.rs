@@ -44,8 +44,9 @@ use personalai_engine_protocol::{
     AuthenticatedServiceRequest, CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind,
     GENERATION_EVENT_AUTH_BYTES, GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind,
-    ServiceMetrics, ServiceModelStatus, ServiceRequestBody, ServiceResponseBody,
-    ShutdownRejectionReason, encode_signed_service_response,
+    ServiceMetrics, ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody,
+    ServiceResponseBody, ServiceSecurityEvent, ShutdownRejectionReason,
+    encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -1559,6 +1560,53 @@ fn load_registered_model_parts(
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn model_status_parts(
+    service: &EngineService,
+    models: &BTreeMap<String, LoadedCpuModel>,
+    draining: bool,
+    model_id: &ModelId,
+) -> Result<ServiceResponseBody, EngineError> {
+    service.registry.resolve(model_id)?;
+    let limits = service.scheduler.limits();
+    let status = ServiceModelStatus::new(
+        models.contains_key(model_id.as_str()),
+        service_health_status(runtime_health(draining, models)),
+        service_capabilities()?,
+        u32::try_from(service.scheduler.active_len())
+            .map_err(|_| EngineError::internal_invariant("active scheduler count exceeds u32"))?,
+        u32::try_from(service.scheduler.queued_len())
+            .map_err(|_| EngineError::internal_invariant("queued scheduler count exceeds u32"))?,
+        limits.maximum_active(),
+        u32::try_from(limits.maximum_queued())
+            .map_err(|_| EngineError::internal_invariant("queued scheduler limit exceeds u32"))?,
+        u64::try_from(service.scheduler.queued_bytes())
+            .map_err(|_| EngineError::internal_invariant("queued scheduler bytes exceed u64"))?,
+        u64::try_from(limits.maximum_queued_bytes()).map_err(|_| {
+            EngineError::internal_invariant("queued scheduler byte limit exceeds u64")
+        })?,
+    )?;
+    Ok(ServiceResponseBody::ModelStatus(status))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn model_descriptor_parts(
+    service: &EngineService,
+    models: &BTreeMap<String, LoadedCpuModel>,
+    model_id: &ModelId,
+) -> Result<ServiceResponseBody, EngineError> {
+    let registration = service.registry.resolve(model_id)?;
+    let loaded = models
+        .get(model_id.as_str())
+        .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
+    Ok(ServiceResponseBody::ModelDescriptor(ServiceModelDescriptor::new(
+        *registration.expected_hash(),
+        loaded.model().config().architecture_id().clone(),
+        BackendId::new("cpu-reference")?,
+        loaded.model().config().context_limit(),
+    )))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn handle_service_request_parts(
     service: &mut EngineService,
     models: &mut BTreeMap<String, LoadedCpuModel>,
@@ -1594,6 +1642,10 @@ fn handle_service_request_parts(
             Ok(ServiceResponseBody::RegisteredModels(registered))
         }
         ServiceRequestBody::LoadModel(model_id) => {
+            service.registry.resolve(model_id)?;
+            if models.contains_key(model_id.as_str()) {
+                return Ok(ServiceResponseBody::ModelLoaded);
+            }
             let budget = model_load_budgets.get(model_id.as_str()).copied().ok_or_else(|| {
                 EngineError::authentication_failure(
                     "registered model has no owner-configured load budget",
@@ -1636,30 +1688,30 @@ fn handle_service_request_parts(
             ShutdownRejectionReason::AdministrativeAuthorizationRequired,
         )),
         ServiceRequestBody::ModelStatus(model_id) => {
-            service.registry.resolve(model_id)?;
-            let limits = service.scheduler.limits();
-            let status = ServiceModelStatus::new(
-                models.contains_key(model_id.as_str()),
-                service_health_status(runtime_health(draining, models)),
-                service_capabilities()?,
-                u32::try_from(service.scheduler.active_len()).map_err(|_| {
-                    EngineError::internal_invariant("active scheduler count exceeds u32")
-                })?,
-                u32::try_from(service.scheduler.queued_len()).map_err(|_| {
-                    EngineError::internal_invariant("queued scheduler count exceeds u32")
-                })?,
-                limits.maximum_active(),
-                u32::try_from(limits.maximum_queued()).map_err(|_| {
-                    EngineError::internal_invariant("queued scheduler limit exceeds u32")
-                })?,
-                u64::try_from(service.scheduler.queued_bytes()).map_err(|_| {
-                    EngineError::internal_invariant("queued scheduler bytes exceed u64")
-                })?,
-                u64::try_from(limits.maximum_queued_bytes()).map_err(|_| {
-                    EngineError::internal_invariant("queued scheduler byte limit exceeds u64")
-                })?,
-            )?;
-            Ok(ServiceResponseBody::ModelStatus(status))
+            model_status_parts(service, models, draining, model_id)
+        }
+        ServiceRequestBody::SecurityEvents { maximum } => {
+            let count = usize::from(*maximum).min(security_events.len());
+            let events = security_events
+                .iter()
+                .take(count)
+                .cloned()
+                .map(ServiceSecurityEvent::from_event)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServiceResponseBody::SecurityEvents(events))
+        }
+        ServiceRequestBody::ModelDescriptor(model_id) => {
+            model_descriptor_parts(service, models, model_id)
+        }
+        ServiceRequestBody::AcknowledgeSecurityEvents { count } => {
+            let count = usize::from(*count);
+            if count > security_events.len() {
+                return Err(EngineError::protocol_violation(
+                    "security event acknowledgement exceeds the queued prefix",
+                ));
+            }
+            security_events.drain(..count);
+            Ok(ServiceResponseBody::SecurityEventsAcknowledged)
         }
     }
 }
@@ -5320,6 +5372,65 @@ mod tests {
             }) if returned == request_id
         ));
         client.join().expect("client must finish");
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn security_event_poll_is_non_destructive_until_exact_acknowledgement() {
+        let mut fixture = BatchRuntimeFixture::new("service-security-events", 1);
+        fixture.runtime.security_events.push_back(SecurityEvent::UnauthorizedClient);
+        fixture.runtime.security_events.push_back(SecurityEvent::MalformedFrame);
+
+        let decode = |fixture: &BatchRuntimeFixture, nonce: u64, body: ServiceRequestBody| {
+            let request_id = RequestId::new(u128::from(nonce)).expect("request ID");
+            let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+                request_id,
+                nonce,
+                fixture.control_key_id,
+                &body,
+            )
+            .expect("request encode");
+            let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+            let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+            let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+            let trusted = TrustedControlPlaneKeys::single(
+                TrustedControlPlaneKey::active(
+                    fixture.control_key_id,
+                    fixture.control_signing_key.verifying_key().to_bytes(),
+                )
+                .expect("trusted key"),
+            )
+            .expect("trusted keys");
+            AuthenticatedServiceRequest::decode(&payload, &trusted).expect("request decode")
+        };
+
+        let poll = decode(&fixture, 1, ServiceRequestBody::SecurityEvents { maximum: 1 });
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&poll),
+            Ok(ServiceResponseBody::SecurityEvents(events)) if events.len() == 1
+        ));
+        assert_eq!(fixture.runtime.security_events.len(), 2);
+
+        let acknowledge =
+            decode(&fixture, 2, ServiceRequestBody::AcknowledgeSecurityEvents { count: 1 });
+        assert_eq!(
+            fixture.runtime.handle_service_request(&acknowledge),
+            Ok(ServiceResponseBody::SecurityEventsAcknowledged)
+        );
+        assert_eq!(fixture.runtime.security_events.len(), 1);
+
+        let excessive =
+            decode(&fixture, 3, ServiceRequestBody::AcknowledgeSecurityEvents { count: 2 });
+        assert!(fixture.runtime.handle_service_request(&excessive).is_err());
+        assert_eq!(fixture.runtime.security_events.len(), 1);
+
+        let idempotent_load =
+            decode(&fixture, 4, ServiceRequestBody::LoadModel(fixture.model_id.clone()));
+        assert_eq!(
+            fixture.runtime.handle_service_request(&idempotent_load),
+            Ok(ServiceResponseBody::ModelLoaded)
+        );
         fixture.cleanup();
     }
 

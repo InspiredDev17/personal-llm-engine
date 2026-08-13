@@ -239,7 +239,12 @@ their closed event variants; backend failures remain typed. Every eighth
 authentication failure emits `RepeatedAuthenticationFailure`, and every eighth
 resource rejection emits both `ResourceExhaustionPattern` and
 `RepeatedRejectedRequests`. The in-process queue remains capped at 256 events
-for Go-owned draining and contains no prompt, output, path, key, or model bytes.
+for Go-owned delivery and contains no prompt, output, path, key, or model bytes.
+Authenticated `SecurityEvents` polls are non-destructive. Go delivers each
+returned prefix through its separate Agent Green boundary and then sends
+`AcknowledgeSecurityEvents`; failed delivery leaves the prefix available for
+retry. This is at-least-once delivery, so a lost acknowledgement response can
+produce a duplicate and downstream correlation must remain idempotent.
 `CrashLoopIndication` is supervisor-owned because a terminated process cannot
 truthfully observe its own restart history.
 

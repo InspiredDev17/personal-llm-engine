@@ -50,8 +50,9 @@ canonical corpus.
 The closed service catalog is `Hello`, `HelloAccepted`, `HelloRejected`,
 `ListCapabilities`, `ListRegisteredModels`, `LoadModel`, `UnloadModel`,
 `Tokenize`, `Generate`, `Cancel`, `GenerationEvent`, `Health`, `Metrics`,
-`Error`, `ShutdownRequest`, `ShutdownRejected`, `ShutdownAccepted`, and
-`ModelStatus`.
+`Error`, `ShutdownRequest`, `ShutdownRejected`, `ShutdownAccepted`,
+`ModelStatus`, `ModelDescriptor`, `SecurityEvents`, and
+`AcknowledgeSecurityEvents`.
 Generation, cancellation, and events remain their specialized streams. Normal
 data-plane authentication always returns `ShutdownRejected`; only the
 owner-controlled process signal may begin graceful drain. `ShutdownAccepted`
@@ -63,12 +64,16 @@ monotonic prompt-forward and generated-token decode nanoseconds, derives
 generated tokens per second with checked integer arithmetic, and reports exact
 live host-pool and contiguous KV reservations. Device memory remains exactly
 zero for CPU. Health is `ready`, `degraded` (no loaded model), or `draining`.
-Load uses an owner-installed budget for a statically
-registered ID. Unload rejects queued or active ownership. Package failures
+Initial load uses an owner-installed budget for a statically registered ID.
+A repeat load of that exact verified resident model is idempotent so the Go
+client can reconnect safely. Unload rejects queued or active ownership. Package failures
 produce bounded typed security events for Go polling. `ModelStatus` resolves
 one registered ID and returns one signed response containing the load,
 capability, health, and scheduler-accounting values used for resource routing;
-the request never carries a path.
+the request never carries a path. `ModelDescriptor` returns the verified
+SHA-384 package digest, reviewed architecture, executing backend, and context
+limit. Security polling is non-destructive; Go acknowledges a delivered prefix
+only after its own audit and Agent Green boundary accept it.
 
 Continuous ingress failures are request-local and enter the bounded sanitized
 security-event queue before the connection is retired. Kernel or signature

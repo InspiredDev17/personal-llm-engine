@@ -6,7 +6,9 @@
 
 use crate::ServiceMessageKind;
 use personalai_engine_types::{
-    EngineCapability, EngineError, MAX_REQUEST_BYTES, MAX_TOKEN_COUNT, ModelId, TokenId,
+    ArchitectureId, BackendId, ContextLimit, EngineCapability, EngineError, ForbiddenOperation,
+    MAX_REQUEST_BYTES, MAX_TOKEN_COUNT, ModelHashAlgorithm, ModelId, ModelPackageHash,
+    ModelPackageRejection, RequestId, ResourceKind, SecurityEvent, TokenId,
 };
 
 /// Maximum registered model identifiers carried in one response.
@@ -15,6 +17,8 @@ pub const MAX_SERVICE_REGISTERED_MODELS: usize = 1_024;
 pub const SERVICE_METRIC_COUNT: usize = 17;
 /// Exact bytes in an atomic model-status response.
 pub const SERVICE_MODEL_STATUS_BYTES: usize = 44;
+/// Maximum sanitized security events returned by one authenticated poll.
+pub const MAX_SERVICE_SECURITY_EVENTS: usize = 128;
 
 const KNOWN_CAPABILITY_BITS: u64 = 0b11_1111;
 
@@ -51,6 +55,18 @@ pub enum ServiceRequestBody {
     ShutdownRequest,
     /// Query one statically registered model's load and scheduler status.
     ModelStatus(ModelId),
+    /// Poll a bounded batch of sanitized security events without removing it.
+    SecurityEvents {
+        /// Positive batch bound no greater than [`MAX_SERVICE_SECURITY_EVENTS`].
+        maximum: u16,
+    },
+    /// Query path-free identity for one registered and loaded model.
+    ModelDescriptor(ModelId),
+    /// Remove an exact delivered prefix from the security event queue.
+    AcknowledgeSecurityEvents {
+        /// Positive prefix length no greater than [`MAX_SERVICE_SECURITY_EVENTS`].
+        count: u16,
+    },
 }
 
 impl ServiceRequestBody {
@@ -67,6 +83,9 @@ impl ServiceRequestBody {
             Self::Metrics => ServiceMessageKind::Metrics,
             Self::ShutdownRequest => ServiceMessageKind::ShutdownRequest,
             Self::ModelStatus(_) => ServiceMessageKind::ModelStatus,
+            Self::SecurityEvents { .. } => ServiceMessageKind::SecurityEvents,
+            Self::ModelDescriptor(_) => ServiceMessageKind::ModelDescriptor,
+            Self::AcknowledgeSecurityEvents { .. } => ServiceMessageKind::AcknowledgeSecurityEvents,
         }
     }
 
@@ -78,11 +97,19 @@ impl ServiceRequestBody {
             | Self::Health
             | Self::Metrics
             | Self::ShutdownRequest => Ok(Vec::new()),
-            Self::LoadModel(model_id) | Self::UnloadModel(model_id) => {
-                Ok(model_id.as_str().as_bytes().to_vec())
-            }
-            Self::ModelStatus(model_id) => Ok(model_id.as_str().as_bytes().to_vec()),
+            Self::LoadModel(model_id)
+            | Self::UnloadModel(model_id)
+            | Self::ModelStatus(model_id)
+            | Self::ModelDescriptor(model_id) => Ok(model_id.as_str().as_bytes().to_vec()),
             Self::Tokenize { model_id, text } => encode_tokenize(model_id, text),
+            Self::SecurityEvents { maximum } => {
+                validate_security_event_maximum(*maximum)?;
+                Ok(maximum.to_le_bytes().to_vec())
+            }
+            Self::AcknowledgeSecurityEvents { count } => {
+                validate_security_event_maximum(*count)?;
+                Ok(count.to_le_bytes().to_vec())
+            }
         }
     }
 
@@ -116,8 +143,143 @@ impl ServiceRequestBody {
                 Ok(Self::ShutdownRequest)
             }
             ServiceMessageKind::ModelStatus => Ok(Self::ModelStatus(decode_model_id(payload)?)),
+            ServiceMessageKind::SecurityEvents => {
+                require_length(payload, 2)?;
+                let maximum = read_u16(payload, 0)?;
+                validate_security_event_maximum(maximum)?;
+                Ok(Self::SecurityEvents { maximum })
+            }
+            ServiceMessageKind::ModelDescriptor => {
+                Ok(Self::ModelDescriptor(decode_model_id(payload)?))
+            }
+            ServiceMessageKind::AcknowledgeSecurityEvents => {
+                require_length(payload, 2)?;
+                let count = read_u16(payload, 0)?;
+                validate_security_event_maximum(count)?;
+                Ok(Self::AcknowledgeSecurityEvents { count })
+            }
             _ => Err(EngineError::protocol_violation("message type has no service request body")),
         }
+    }
+}
+
+/// Authenticated, path-free identity of one loaded model execution target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceModelDescriptor {
+    package_hash: ModelPackageHash,
+    architecture_id: ArchitectureId,
+    backend_id: BackendId,
+    context_limit: ContextLimit,
+}
+
+impl ServiceModelDescriptor {
+    /// Creates a validated descriptor from engine-owned metadata.
+    pub const fn new(
+        package_hash: ModelPackageHash,
+        architecture_id: ArchitectureId,
+        backend_id: BackendId,
+        context_limit: ContextLimit,
+    ) -> Self {
+        Self { package_hash, architecture_id, backend_id, context_limit }
+    }
+
+    /// Returns the verified configured package hash.
+    pub const fn package_hash(&self) -> &ModelPackageHash {
+        &self.package_hash
+    }
+
+    /// Returns the reviewed architecture identifier.
+    pub const fn architecture_id(&self) -> &ArchitectureId {
+        &self.architecture_id
+    }
+
+    /// Returns the executing backend identifier.
+    pub const fn backend_id(&self) -> &BackendId {
+        &self.backend_id
+    }
+
+    /// Returns the loaded model context limit.
+    pub const fn context_limit(&self) -> ContextLimit {
+        self.context_limit
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, EngineError> {
+        if self.package_hash.algorithm() != ModelHashAlgorithm::Sha384 {
+            return Err(EngineError::internal_invariant(
+                "service model hash algorithm is unsupported",
+            ));
+        }
+        let architecture = self.architecture_id.as_str().as_bytes();
+        let backend = self.backend_id.as_str().as_bytes();
+        let architecture_length = u16::try_from(architecture.len())
+            .map_err(|_| EngineError::internal_invariant("architecture identifier exceeds u16"))?;
+        let backend_length = u16::try_from(backend.len())
+            .map_err(|_| EngineError::internal_invariant("backend identifier exceeds u16"))?;
+        let capacity = 1_usize
+            .checked_add(ModelPackageHash::BYTE_LEN)
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(2 + architecture.len()))
+            .and_then(|value| value.checked_add(2 + backend.len()))
+            .ok_or_else(|| EngineError::internal_invariant("model descriptor length overflow"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.push(1); // SHA-384
+        bytes.extend_from_slice(self.package_hash.as_bytes());
+        bytes.extend_from_slice(&self.context_limit.get().to_le_bytes());
+        bytes.extend_from_slice(&architecture_length.to_le_bytes());
+        bytes.extend_from_slice(architecture);
+        bytes.extend_from_slice(&backend_length.to_le_bytes());
+        bytes.extend_from_slice(backend);
+        Ok(bytes)
+    }
+
+    fn decode(payload: &[u8]) -> Result<Self, EngineError> {
+        const FIXED: usize = 1 + ModelPackageHash::BYTE_LEN + 4;
+        if payload.len() < FIXED + 4 || payload[0] != 1 {
+            return Err(EngineError::protocol_violation("model descriptor header is invalid"));
+        }
+        let mut digest = [0_u8; ModelPackageHash::BYTE_LEN];
+        digest.copy_from_slice(&payload[1..=ModelPackageHash::BYTE_LEN]);
+        let context_limit = ContextLimit::new(read_u32(payload, 1 + ModelPackageHash::BYTE_LEN)?)
+            .map_err(|_| {
+            EngineError::protocol_violation("model descriptor context is invalid")
+        })?;
+        let mut cursor = FIXED;
+        let architecture_length = usize::from(read_u16(payload, cursor)?);
+        cursor = cursor
+            .checked_add(2)
+            .ok_or_else(|| EngineError::protocol_violation("model descriptor length overflow"))?;
+        let architecture_end = cursor
+            .checked_add(architecture_length)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| {
+                EngineError::protocol_violation("model descriptor architecture is truncated")
+            })?;
+        let architecture =
+            std::str::from_utf8(&payload[cursor..architecture_end]).map_err(|_| {
+                EngineError::protocol_violation("model descriptor architecture is invalid UTF-8")
+            })?;
+        cursor = architecture_end;
+        let backend_length = usize::from(read_u16(payload, cursor)?);
+        cursor = cursor
+            .checked_add(2)
+            .ok_or_else(|| EngineError::protocol_violation("model descriptor length overflow"))?;
+        let backend_end =
+            cursor.checked_add(backend_length).filter(|end| *end == payload.len()).ok_or_else(
+                || EngineError::protocol_violation("model descriptor backend length is invalid"),
+            )?;
+        let backend = std::str::from_utf8(&payload[cursor..backend_end]).map_err(|_| {
+            EngineError::protocol_violation("model descriptor backend is invalid UTF-8")
+        })?;
+        Ok(Self::new(
+            ModelPackageHash::from_sha384_bytes(digest),
+            ArchitectureId::new(architecture).map_err(|_| {
+                EngineError::protocol_violation("model descriptor architecture is invalid")
+            })?,
+            BackendId::new(backend).map_err(|_| {
+                EngineError::protocol_violation("model descriptor backend is invalid")
+            })?,
+            context_limit,
+        ))
     }
 }
 
@@ -394,6 +556,203 @@ impl ServiceModelStatus {
     }
 }
 
+/// Closed sanitized security-event categories exported to the Go control plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ServiceSecurityEventKind {
+    /// Kernel peer or service authentication denied a client.
+    UnauthorizedClient = 1,
+    /// The bounded authentication-failure threshold was reached.
+    RepeatedAuthenticationFailure = 2,
+    /// A frame violated the fixed grammar.
+    MalformedFrame = 3,
+    /// A frame exceeded a hard byte ceiling.
+    OversizedFrame = 4,
+    /// A peer used an unsupported protocol version.
+    UnknownProtocolVersion = 5,
+    /// A syntactically invalid model identifier was supplied.
+    InvalidModelId = 6,
+    /// A registered model package signature failed.
+    ModelSignatureFailure = 7,
+    /// A registered model package hash failed.
+    ModelHashFailure = 8,
+    /// Descriptor-safe model resolution detected a path escape.
+    ModelPathEscapeAttempt = 9,
+    /// Repeated resource exhaustion crossed its threshold.
+    ResourceExhaustionPattern = 10,
+    /// The owner supervisor reported a crash-loop indication.
+    CrashLoopIndication = 11,
+    /// Repeated rejected requests crossed their threshold.
+    RepeatedRejectedRequests = 12,
+    /// A request failed authentication.
+    AuthenticationFailure = 13,
+    /// A request violated the local protocol.
+    ProtocolViolation = 14,
+    /// A well-formed but unregistered model was requested.
+    UnregisteredModelRequested = 15,
+    /// A configured data-only model package was rejected.
+    ModelPackageRejected = 16,
+    /// A finite engine resource limit was exceeded.
+    ResourceLimitExceeded = 17,
+    /// An inference backend failed.
+    BackendFailure = 18,
+    /// A forbidden authority operation was attempted.
+    ForbiddenOperationAttempt = 19,
+    /// A verified internal invariant failed closed.
+    InternalInvariantViolation = 20,
+}
+
+impl ServiceSecurityEventKind {
+    fn decode(value: u8) -> Result<Self, EngineError> {
+        match value {
+            1 => Ok(Self::UnauthorizedClient),
+            2 => Ok(Self::RepeatedAuthenticationFailure),
+            3 => Ok(Self::MalformedFrame),
+            4 => Ok(Self::OversizedFrame),
+            5 => Ok(Self::UnknownProtocolVersion),
+            6 => Ok(Self::InvalidModelId),
+            7 => Ok(Self::ModelSignatureFailure),
+            8 => Ok(Self::ModelHashFailure),
+            9 => Ok(Self::ModelPathEscapeAttempt),
+            10 => Ok(Self::ResourceExhaustionPattern),
+            11 => Ok(Self::CrashLoopIndication),
+            12 => Ok(Self::RepeatedRejectedRequests),
+            13 => Ok(Self::AuthenticationFailure),
+            14 => Ok(Self::ProtocolViolation),
+            15 => Ok(Self::UnregisteredModelRequested),
+            16 => Ok(Self::ModelPackageRejected),
+            17 => Ok(Self::ResourceLimitExceeded),
+            18 => Ok(Self::BackendFailure),
+            19 => Ok(Self::ForbiddenOperationAttempt),
+            20 => Ok(Self::InternalInvariantViolation),
+            _ => Err(EngineError::protocol_violation("security event kind is unsupported")),
+        }
+    }
+}
+
+/// One bounded, content-free security event suitable for authenticated polling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceSecurityEvent {
+    kind: ServiceSecurityEventKind,
+    detail: u8,
+    request_id: Option<RequestId>,
+    identifier: Option<String>,
+}
+
+impl ServiceSecurityEvent {
+    /// Converts one internal typed event without exposing diagnostics or paths.
+    pub fn from_event(event: SecurityEvent) -> Result<Self, EngineError> {
+        let (kind, detail, request_id, identifier) = match event {
+            SecurityEvent::UnauthorizedClient => {
+                (ServiceSecurityEventKind::UnauthorizedClient, 0, None, None)
+            }
+            SecurityEvent::RepeatedAuthenticationFailure => {
+                (ServiceSecurityEventKind::RepeatedAuthenticationFailure, 0, None, None)
+            }
+            SecurityEvent::MalformedFrame => {
+                (ServiceSecurityEventKind::MalformedFrame, 0, None, None)
+            }
+            SecurityEvent::OversizedFrame => {
+                (ServiceSecurityEventKind::OversizedFrame, 0, None, None)
+            }
+            SecurityEvent::UnknownProtocolVersion => {
+                (ServiceSecurityEventKind::UnknownProtocolVersion, 0, None, None)
+            }
+            SecurityEvent::InvalidModelId { request_id } => {
+                (ServiceSecurityEventKind::InvalidModelId, 0, request_id, None)
+            }
+            SecurityEvent::ModelSignatureFailure { model_id } => (
+                ServiceSecurityEventKind::ModelSignatureFailure,
+                0,
+                None,
+                Some(model_id.as_str().to_owned()),
+            ),
+            SecurityEvent::ModelHashFailure { model_id } => (
+                ServiceSecurityEventKind::ModelHashFailure,
+                0,
+                None,
+                Some(model_id.as_str().to_owned()),
+            ),
+            SecurityEvent::ModelPathEscapeAttempt { model_id } => (
+                ServiceSecurityEventKind::ModelPathEscapeAttempt,
+                0,
+                None,
+                model_id.map(|value| value.as_str().to_owned()),
+            ),
+            SecurityEvent::ResourceExhaustionPattern => {
+                (ServiceSecurityEventKind::ResourceExhaustionPattern, 0, None, None)
+            }
+            SecurityEvent::CrashLoopIndication => {
+                (ServiceSecurityEventKind::CrashLoopIndication, 0, None, None)
+            }
+            SecurityEvent::RepeatedRejectedRequests => {
+                (ServiceSecurityEventKind::RepeatedRejectedRequests, 0, None, None)
+            }
+            SecurityEvent::AuthenticationFailure { request_id } => {
+                (ServiceSecurityEventKind::AuthenticationFailure, 0, request_id, None)
+            }
+            SecurityEvent::ProtocolViolation { request_id } => {
+                (ServiceSecurityEventKind::ProtocolViolation, 0, request_id, None)
+            }
+            SecurityEvent::UnregisteredModelRequested { request_id, model_id } => (
+                ServiceSecurityEventKind::UnregisteredModelRequested,
+                0,
+                Some(request_id),
+                Some(model_id.as_str().to_owned()),
+            ),
+            SecurityEvent::ModelPackageRejected { model_id, reason } => (
+                ServiceSecurityEventKind::ModelPackageRejected,
+                package_rejection_code(reason)?,
+                None,
+                Some(model_id.as_str().to_owned()),
+            ),
+            SecurityEvent::ResourceLimitExceeded { request_id, resource, .. } => (
+                ServiceSecurityEventKind::ResourceLimitExceeded,
+                resource_kind_code(resource)?,
+                request_id,
+                None,
+            ),
+            SecurityEvent::BackendFailure { request_id, backend } => (
+                ServiceSecurityEventKind::BackendFailure,
+                0,
+                request_id,
+                backend.map(|value| value.as_str().to_owned()),
+            ),
+            SecurityEvent::ForbiddenOperationAttempt { request_id, operation } => (
+                ServiceSecurityEventKind::ForbiddenOperationAttempt,
+                forbidden_operation_code(operation)?,
+                request_id,
+                None,
+            ),
+            SecurityEvent::InternalInvariantViolation { request_id } => {
+                (ServiceSecurityEventKind::InternalInvariantViolation, 0, request_id, None)
+            }
+            _ => return Err(EngineError::not_implemented("security event has no wire mapping")),
+        };
+        Ok(Self { kind, detail, request_id, identifier })
+    }
+
+    /// Returns the closed event category.
+    pub const fn kind(&self) -> ServiceSecurityEventKind {
+        self.kind
+    }
+
+    /// Returns a category-specific closed detail code, or zero when absent.
+    pub const fn detail(&self) -> u8 {
+        self.detail
+    }
+
+    /// Returns the safe request correlation identifier when available.
+    pub const fn request_id(&self) -> Option<RequestId> {
+        self.request_id
+    }
+
+    /// Returns a configuration-owned model/backend identifier when available.
+    pub fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
+}
+
 /// Closed response payload catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceResponseBody {
@@ -427,6 +786,12 @@ pub enum ServiceResponseBody {
     Metrics(ServiceMetrics),
     /// Atomic status for one registered model and scheduler.
     ModelStatus(ServiceModelStatus),
+    /// Sanitized engine telemetry polled for Go-owned audit and delivery.
+    SecurityEvents(Vec<ServiceSecurityEvent>),
+    /// Verified identity of one registered and loaded model.
+    ModelDescriptor(ServiceModelDescriptor),
+    /// One delivered event prefix was removed.
+    SecurityEventsAcknowledged,
     /// Stable failure category without sensitive diagnostics.
     Error(ServiceErrorCode),
     /// Shutdown lacks separate administrative authorization.
@@ -449,6 +814,9 @@ impl ServiceResponseBody {
             Self::Health(_) => ServiceMessageKind::Health,
             Self::Metrics(_) => ServiceMessageKind::Metrics,
             Self::ModelStatus(_) => ServiceMessageKind::ModelStatus,
+            Self::SecurityEvents(_) => ServiceMessageKind::SecurityEvents,
+            Self::ModelDescriptor(_) => ServiceMessageKind::ModelDescriptor,
+            Self::SecurityEventsAcknowledged => ServiceMessageKind::AcknowledgeSecurityEvents,
             Self::Error(_) => ServiceMessageKind::Error,
             Self::ShutdownRejected(_) => ServiceMessageKind::ShutdownRejected,
             Self::ShutdownAccepted => ServiceMessageKind::ShutdownAccepted,
@@ -462,7 +830,10 @@ impl ServiceResponseBody {
             }
             Self::Capabilities(capabilities) => Ok(capabilities.bits().to_le_bytes().to_vec()),
             Self::RegisteredModels(models) => encode_registered_models(models),
-            Self::ModelLoaded | Self::ModelUnloaded | Self::ShutdownAccepted => Ok(Vec::new()),
+            Self::ModelLoaded
+            | Self::ModelUnloaded
+            | Self::ShutdownAccepted
+            | Self::SecurityEventsAcknowledged => Ok(Vec::new()),
             Self::Tokenized(tokens) => encode_tokens(tokens),
             Self::Health(state) => Ok(vec![*state as u8]),
             Self::Metrics(metrics) => {
@@ -473,6 +844,8 @@ impl ServiceResponseBody {
                 Ok(encoded)
             }
             Self::ModelStatus(status) => Ok(status.encode().to_vec()),
+            Self::SecurityEvents(events) => encode_security_events(events),
+            Self::ModelDescriptor(descriptor) => descriptor.encode(),
             Self::Error(code) => Ok(vec![*code as u8]),
             Self::ShutdownRejected(reason) => Ok(vec![*reason as u8]),
         }
@@ -521,6 +894,16 @@ impl ServiceResponseBody {
             ServiceMessageKind::ModelStatus => {
                 Ok(Self::ModelStatus(ServiceModelStatus::decode(payload)?))
             }
+            ServiceMessageKind::SecurityEvents => {
+                Ok(Self::SecurityEvents(decode_security_events(payload)?))
+            }
+            ServiceMessageKind::ModelDescriptor => {
+                Ok(Self::ModelDescriptor(ServiceModelDescriptor::decode(payload)?))
+            }
+            ServiceMessageKind::AcknowledgeSecurityEvents => {
+                require_empty(payload)?;
+                Ok(Self::SecurityEventsAcknowledged)
+            }
             ServiceMessageKind::Error => {
                 require_length(payload, 1)?;
                 Ok(Self::Error(ServiceErrorCode::decode(payload[0])?))
@@ -543,6 +926,212 @@ impl ServiceResponseBody {
             }
             _ => Err(EngineError::protocol_violation("message type has no service response body")),
         }
+    }
+}
+
+fn validate_security_event_maximum(maximum: u16) -> Result<(), EngineError> {
+    if maximum == 0 || usize::from(maximum) > MAX_SERVICE_SECURITY_EVENTS {
+        return Err(EngineError::protocol_violation(
+            "security event batch limit is outside bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_security_events(events: &[ServiceSecurityEvent]) -> Result<Vec<u8>, EngineError> {
+    if events.len() > MAX_SERVICE_SECURITY_EVENTS {
+        return Err(EngineError::resource_exhaustion(
+            "security event response exceeds its count bound",
+        ));
+    }
+    let count = u16::try_from(events.len())
+        .map_err(|_| EngineError::resource_exhaustion("security event count exceeds u16"))?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for event in events {
+        validate_service_security_event(event)?;
+        let mut flags = 0_u8;
+        if event.request_id.is_some() {
+            flags |= 1;
+        }
+        if event.identifier.is_some() {
+            flags |= 2;
+        }
+        encoded.extend_from_slice(&[event.kind as u8, event.detail, flags, 0]);
+        if let Some(request_id) = event.request_id {
+            encoded.extend_from_slice(&request_id.to_bytes());
+        }
+        if let Some(identifier) = &event.identifier {
+            let length = u16::try_from(identifier.len())
+                .map_err(|_| EngineError::resource_exhaustion("security identifier exceeds u16"))?;
+            encoded.extend_from_slice(&length.to_le_bytes());
+            encoded.extend_from_slice(identifier.as_bytes());
+        }
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(EngineError::resource_exhaustion(
+                "security event response exceeds the request byte bound",
+            ));
+        }
+    }
+    Ok(encoded)
+}
+
+fn decode_security_events(payload: &[u8]) -> Result<Vec<ServiceSecurityEvent>, EngineError> {
+    if payload.len() < 2 {
+        return Err(EngineError::protocol_violation("security event response is truncated"));
+    }
+    let count = usize::from(read_u16(payload, 0)?);
+    if count > MAX_SERVICE_SECURITY_EVENTS {
+        return Err(EngineError::protocol_violation(
+            "security event response exceeds its count bound",
+        ));
+    }
+    let mut cursor = 2_usize;
+    let mut events = Vec::new();
+    events
+        .try_reserve_exact(count)
+        .map_err(|_| EngineError::resource_exhaustion("security event allocation failed"))?;
+    for _ in 0..count {
+        let header_end = cursor
+            .checked_add(4)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| EngineError::protocol_violation("security event header is truncated"))?;
+        let kind = ServiceSecurityEventKind::decode(payload[cursor])?;
+        let detail = payload[cursor + 1];
+        let flags = payload[cursor + 2];
+        if flags & !0b11 != 0 || payload[cursor + 3] != 0 {
+            return Err(EngineError::protocol_violation("security event flags are invalid"));
+        }
+        cursor = header_end;
+        let request_id =
+            if flags & 1 != 0 {
+                let end = cursor.checked_add(16).filter(|end| *end <= payload.len()).ok_or_else(
+                    || EngineError::protocol_violation("security request ID is truncated"),
+                )?;
+                let bytes: [u8; 16] = payload[cursor..end].try_into().map_err(|_| {
+                    EngineError::protocol_violation("security request ID is invalid")
+                })?;
+                cursor = end;
+                Some(RequestId::from_bytes(bytes).map_err(|_| {
+                    EngineError::protocol_violation("security request ID is invalid")
+                })?)
+            } else {
+                None
+            };
+        let identifier = if flags & 2 != 0 {
+            let length = usize::from(read_u16(payload, cursor)?);
+            cursor = cursor.checked_add(2).ok_or_else(|| {
+                EngineError::protocol_violation("security identifier offset overflows")
+            })?;
+            let end = cursor.checked_add(length).filter(|end| *end <= payload.len()).ok_or_else(
+                || EngineError::protocol_violation("security identifier is truncated"),
+            )?;
+            let value = std::str::from_utf8(&payload[cursor..end])
+                .map_err(|_| EngineError::protocol_violation("security identifier is not UTF-8"))?;
+            let validated = ModelId::new(value)
+                .map_err(|_| EngineError::protocol_violation("security identifier is invalid"))?;
+            cursor = end;
+            Some(validated.as_str().to_owned())
+        } else {
+            None
+        };
+        let event = ServiceSecurityEvent { kind, detail, request_id, identifier };
+        validate_service_security_event(&event)?;
+        events.push(event);
+    }
+    if cursor != payload.len() {
+        return Err(EngineError::protocol_violation(
+            "security event response contains trailing data",
+        ));
+    }
+    Ok(events)
+}
+
+fn validate_service_security_event(event: &ServiceSecurityEvent) -> Result<(), EngineError> {
+    let has_request = event.request_id.is_some();
+    let has_identifier = event.identifier.is_some();
+    let valid_shape = match event.kind {
+        ServiceSecurityEventKind::UnauthorizedClient
+        | ServiceSecurityEventKind::RepeatedAuthenticationFailure
+        | ServiceSecurityEventKind::MalformedFrame
+        | ServiceSecurityEventKind::OversizedFrame
+        | ServiceSecurityEventKind::UnknownProtocolVersion
+        | ServiceSecurityEventKind::ResourceExhaustionPattern
+        | ServiceSecurityEventKind::CrashLoopIndication
+        | ServiceSecurityEventKind::RepeatedRejectedRequests => !has_request && !has_identifier,
+        ServiceSecurityEventKind::InvalidModelId
+        | ServiceSecurityEventKind::AuthenticationFailure
+        | ServiceSecurityEventKind::ProtocolViolation
+        | ServiceSecurityEventKind::ResourceLimitExceeded
+        | ServiceSecurityEventKind::ForbiddenOperationAttempt
+        | ServiceSecurityEventKind::InternalInvariantViolation => !has_identifier,
+        ServiceSecurityEventKind::ModelSignatureFailure
+        | ServiceSecurityEventKind::ModelHashFailure
+        | ServiceSecurityEventKind::ModelPackageRejected => !has_request && has_identifier,
+        ServiceSecurityEventKind::ModelPathEscapeAttempt => !has_request,
+        ServiceSecurityEventKind::UnregisteredModelRequested => has_request && has_identifier,
+        ServiceSecurityEventKind::BackendFailure => true,
+    };
+    let valid_detail = match event.kind {
+        ServiceSecurityEventKind::ModelPackageRejected => (1..=6).contains(&event.detail),
+        ServiceSecurityEventKind::ResourceLimitExceeded => (1..=14).contains(&event.detail),
+        ServiceSecurityEventKind::ForbiddenOperationAttempt => (1..=9).contains(&event.detail),
+        _ => event.detail == 0,
+    };
+    if !valid_shape || !valid_detail {
+        return Err(EngineError::protocol_violation("security event fields are inconsistent"));
+    }
+    if let Some(identifier) = &event.identifier {
+        ModelId::new(identifier.as_str())
+            .map_err(|_| EngineError::protocol_violation("security identifier is invalid"))?;
+    }
+    Ok(())
+}
+
+fn package_rejection_code(reason: ModelPackageRejection) -> Result<u8, EngineError> {
+    match reason {
+        ModelPackageRejection::Corrupt => Ok(1),
+        ModelPackageRejection::SignatureFailure => Ok(2),
+        ModelPackageRejection::UnsupportedArchitecture => Ok(3),
+        ModelPackageRejection::UnsupportedTokenizer => Ok(4),
+        ModelPackageRejection::UnregisteredModel => Ok(5),
+        ModelPackageRejection::SizeLimit => Ok(6),
+        _ => Err(EngineError::not_implemented("model rejection has no wire code")),
+    }
+}
+
+fn resource_kind_code(resource: ResourceKind) -> Result<u8, EngineError> {
+    match resource {
+        ResourceKind::ModelPackageBytes => Ok(1),
+        ResourceKind::TensorCount => Ok(2),
+        ResourceKind::TensorRank => Ok(3),
+        ResourceKind::TensorDimension => Ok(4),
+        ResourceKind::TensorElements => Ok(5),
+        ResourceKind::TensorBytes => Ok(6),
+        ResourceKind::TokenCount => Ok(7),
+        ResourceKind::VocabularySize => Ok(8),
+        ResourceKind::ContextTokens => Ok(9),
+        ResourceKind::RequestBytes => Ok(10),
+        ResourceKind::FrameBytes => Ok(11),
+        ResourceKind::MemoryBytes => Ok(12),
+        ResourceKind::ConcurrentSequences => Ok(13),
+        ResourceKind::SequenceIdentifiers => Ok(14),
+        _ => Err(EngineError::not_implemented("resource kind has no wire code")),
+    }
+}
+
+fn forbidden_operation_code(operation: ForbiddenOperation) -> Result<u8, EngineError> {
+    match operation {
+        ForbiddenOperation::ToolExecution => Ok(1),
+        ForbiddenOperation::ApprovalDecision => Ok(2),
+        ForbiddenOperation::MemoryMutation => Ok(3),
+        ForbiddenOperation::ArbitraryFileAccess => Ok(4),
+        ForbiddenOperation::ModelDownload => Ok(5),
+        ForbiddenOperation::SelfUpdate => Ok(6),
+        ForbiddenOperation::OutboundNetwork => Ok(7),
+        ForbiddenOperation::ModelExecutableCode => Ok(8),
+        ForbiddenOperation::ModelDefinedKernel => Ok(9),
+        _ => Err(EngineError::not_implemented("forbidden operation has no wire code")),
     }
 }
 
@@ -790,6 +1379,9 @@ mod tests {
             ServiceRequestBody::Metrics,
             ServiceRequestBody::ShutdownRequest,
             ServiceRequestBody::ModelStatus(model("tiny-status")),
+            ServiceRequestBody::SecurityEvents { maximum: 32 },
+            ServiceRequestBody::ModelDescriptor(model("tiny-descriptor")),
+            ServiceRequestBody::AcknowledgeSecurityEvents { count: 1 },
         ];
         for body in bodies {
             let encoded = body.encode().expect("request body must encode");
@@ -835,6 +1427,27 @@ mod tests {
                 )
                 .expect("model status"),
             ),
+            ServiceResponseBody::SecurityEvents(vec![
+                ServiceSecurityEvent::from_event(SecurityEvent::UnauthorizedClient)
+                    .expect("event mapping"),
+                ServiceSecurityEvent::from_event(SecurityEvent::UnregisteredModelRequested {
+                    request_id: RequestId::new(7).expect("request ID"),
+                    model_id: model("unknown-model"),
+                })
+                .expect("event mapping"),
+                ServiceSecurityEvent::from_event(SecurityEvent::ModelPackageRejected {
+                    model_id: model("bad-package"),
+                    reason: ModelPackageRejection::SignatureFailure,
+                })
+                .expect("event mapping"),
+            ]),
+            ServiceResponseBody::ModelDescriptor(ServiceModelDescriptor::new(
+                ModelPackageHash::from_sha384_bytes([0x55; ModelPackageHash::BYTE_LEN]),
+                ArchitectureId::new("decoder-rms-rope-swiglu-gqa-v1").expect("architecture"),
+                BackendId::new("cpu-reference").expect("backend"),
+                ContextLimit::new(8_192).expect("context"),
+            )),
+            ServiceResponseBody::SecurityEventsAcknowledged,
             ServiceResponseBody::Error(ServiceErrorCode::ProtocolViolation),
             ServiceResponseBody::ShutdownRejected(
                 ShutdownRejectionReason::AdministrativeAuthorizationRequired,
@@ -856,6 +1469,20 @@ mod tests {
         assert!(ServiceResponseBody::decode(ServiceMessageKind::Health, &[]).is_err());
         assert!(ServiceResponseBody::decode(ServiceMessageKind::Health, &[1, 0]).is_err());
         assert!(ServiceResponseBody::decode(ServiceMessageKind::ShutdownAccepted, &[0]).is_err());
+        assert!(ServiceRequestBody::decode(ServiceMessageKind::SecurityEvents, &[0, 0]).is_err());
+        assert!(
+            ServiceRequestBody::decode(ServiceMessageKind::AcknowledgeSecurityEvents, &[0, 0])
+                .is_err()
+        );
+        assert!(
+            ServiceRequestBody::decode(
+                ServiceMessageKind::SecurityEvents,
+                &u16::try_from(MAX_SERVICE_SECURITY_EVENTS + 1)
+                    .expect("test bound fits u16")
+                    .to_le_bytes(),
+            )
+            .is_err()
+        );
         assert!(
             ServiceResponseBody::decode(
                 ServiceMessageKind::ModelStatus,
@@ -895,6 +1522,17 @@ mod tests {
         inconsistent[36..44].copy_from_slice(&1_u64.to_le_bytes());
         assert!(
             ServiceResponseBody::decode(ServiceMessageKind::ModelStatus, &inconsistent).is_err()
+        );
+        let mut invalid_security = ServiceResponseBody::SecurityEvents(vec![
+            ServiceSecurityEvent::from_event(SecurityEvent::UnauthorizedClient)
+                .expect("event mapping"),
+        ])
+        .encode()
+        .expect("security response");
+        invalid_security[3] = 1;
+        assert!(
+            ServiceResponseBody::decode(ServiceMessageKind::SecurityEvents, &invalid_security)
+                .is_err()
         );
     }
 

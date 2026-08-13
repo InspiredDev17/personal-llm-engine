@@ -60,6 +60,12 @@ pub enum ServiceMessageKind {
     ShutdownAccepted = 17,
     /// Query one registered model's atomic load and scheduler status.
     ModelStatus = 18,
+    /// Poll a bounded batch of sanitized security events for the Go control plane.
+    SecurityEvents = 19,
+    /// Query authenticated, path-free identity for one loaded model.
+    ModelDescriptor = 20,
+    /// Acknowledge delivery of a previously polled security-event prefix.
+    AcknowledgeSecurityEvents = 21,
 }
 
 impl ServiceMessageKind {
@@ -83,6 +89,9 @@ impl ServiceMessageKind {
             16 => Ok(Self::ShutdownRejected),
             17 => Ok(Self::ShutdownAccepted),
             18 => Ok(Self::ModelStatus),
+            19 => Ok(Self::SecurityEvents),
+            20 => Ok(Self::ModelDescriptor),
+            21 => Ok(Self::AcknowledgeSecurityEvents),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -100,6 +109,9 @@ impl ServiceMessageKind {
                 | Self::Metrics
                 | Self::ShutdownRequest
                 | Self::ModelStatus
+                | Self::SecurityEvents
+                | Self::ModelDescriptor
+                | Self::AcknowledgeSecurityEvents
         )
     }
 
@@ -119,6 +131,9 @@ impl ServiceMessageKind {
                 | Self::ShutdownRejected
                 | Self::ShutdownAccepted
                 | Self::ModelStatus
+                | Self::SecurityEvents
+                | Self::ModelDescriptor
+                | Self::AcknowledgeSecurityEvents
         )
     }
 }
