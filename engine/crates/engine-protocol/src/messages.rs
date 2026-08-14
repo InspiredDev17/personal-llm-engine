@@ -78,11 +78,7 @@ impl GenerationRequestEnvelope {
         let dynamic_length = model_length
             .checked_add(input_length)
             .ok_or_else(|| EngineError::protocol_violation("request dynamic length overflows"))?;
-        if GENERATION_REQUEST_FIXED_BYTES
-            .checked_add(dynamic_length)
-            .filter(|end| *end == signed_length)
-            .is_none()
-        {
+        if GENERATION_REQUEST_FIXED_BYTES.checked_add(dynamic_length) != Some(signed_length) {
             return Err(EngineError::protocol_violation(
                 "generation request lengths do not match the payload",
             ));

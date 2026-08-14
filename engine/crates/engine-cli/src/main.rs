@@ -1441,10 +1441,6 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
-    #[expect(
-        clippy::zombie_processes,
-        reason = "the bounded poll reaps success with try_wait and timeout with kill plus wait"
-    )]
     fn operating_system_termination_signal_reaches_the_bridge() {
         use std::io::BufRead;
         use std::process::{Command, Stdio};

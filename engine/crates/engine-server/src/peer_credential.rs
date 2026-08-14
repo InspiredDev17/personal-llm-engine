@@ -54,7 +54,8 @@ pub(crate) fn peer_effective_user_id(stream: &UnixStream) -> Result<u32, EngineE
     // SAFETY: the descriptor is borrowed from a live connected `UnixStream`.
     // Both outputs point to initialized values of the exact ABI types and the
     // call retains neither pointer.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut user_id, &mut group_id) };
+    let result =
+        unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut user_id, &raw mut group_id) };
     if result != 0 {
         return Err(EngineError::authentication_failure("Unix peer credentials are unavailable"));
     }

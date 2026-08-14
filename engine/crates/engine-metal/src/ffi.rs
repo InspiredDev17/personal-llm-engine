@@ -185,7 +185,7 @@ pub fn device_info(index: usize) -> Result<DeviceInfo, EngineError> {
         reserved: 0,
         name: [0; 128],
     };
-    status(None, unsafe { pai_metal_device_info(index, &mut raw) })?;
+    status(None, unsafe { pai_metal_device_info(index, &raw mut raw) })?;
     let length = raw.name.iter().position(|v| *v == 0).unwrap_or(raw.name.len());
     let bytes = raw.name[..length].iter().map(|value| value.to_ne_bytes()[0]).collect::<Vec<_>>();
     let name = String::from_utf8(bytes)
@@ -204,7 +204,7 @@ pub fn device_info(index: usize) -> Result<DeviceInfo, EngineError> {
 pub fn create_context(index: usize, library: &[u8]) -> Result<Arc<NativeContext>, EngineError> {
     let mut raw = std::ptr::null_mut();
     status(None, unsafe {
-        pai_metal_context_create(index, library.as_ptr(), library.len(), &mut raw)
+        pai_metal_context_create(index, library.as_ptr(), library.len(), &raw mut raw)
     })?;
     if raw.is_null() {
         return Err(EngineError::backend_failure("Metal context creation returned null"));
@@ -223,7 +223,13 @@ impl NativeContext {
     ) -> Result<NativeBuffer, EngineError> {
         let mut raw = std::ptr::null_mut();
         status(Some(self), unsafe {
-            pai_metal_buffer_create(self.pointer(), length, alignment, i32::from(private), &mut raw)
+            pai_metal_buffer_create(
+                self.pointer(),
+                length,
+                alignment,
+                i32::from(private),
+                &raw mut raw,
+            )
         })?;
         if raw.is_null() {
             return Err(EngineError::backend_failure("Metal buffer creation returned null"));
@@ -240,7 +246,7 @@ impl NativeContext {
     }
     pub fn statistics(&self) -> Result<Statistics, EngineError> {
         let mut raw = RawStatistics::default();
-        status(Some(self), unsafe { pai_metal_statistics(self.pointer(), &mut raw) })?;
+        status(Some(self), unsafe { pai_metal_statistics(self.pointer(), &raw mut raw) })?;
         Ok(Statistics {
             current_bytes: raw.current,
             peak_bytes: raw.peak,

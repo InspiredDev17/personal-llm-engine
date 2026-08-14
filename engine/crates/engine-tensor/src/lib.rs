@@ -57,7 +57,7 @@ impl TensorLayout {
         storage_elements: u64,
     ) -> Result<Self, TensorError> {
         let strides = strides.into();
-        if strides.len() != shape.rank() || strides.iter().any(|stride| *stride == 0) {
+        if strides.len() != shape.rank() || strides.contains(&0) {
             return Err(EngineError::invalid_input("tensor strides are invalid"));
         }
         let layout = Self { shape, strides, offset_elements };

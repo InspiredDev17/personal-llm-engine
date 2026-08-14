@@ -32,17 +32,25 @@ impl ProcessSignalGuard {
         // has C ABI, retains no pointer, and performs only an atomic store.
         let installed = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = record_shutdown as libc::sighandler_t;
+            action.sa_sigaction = record_shutdown as *const () as libc::sighandler_t;
             action.sa_flags = libc::SA_RESTART;
-            if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            if libc::sigemptyset(&raw mut action.sa_mask) != 0 {
                 None
             } else {
                 let mut previous_interrupt = MaybeUninit::<libc::sigaction>::uninit();
                 let mut previous_terminate = MaybeUninit::<libc::sigaction>::uninit();
-                if libc::sigaction(libc::SIGINT, &action, previous_interrupt.as_mut_ptr()) != 0 {
+                if libc::sigaction(
+                    libc::SIGINT,
+                    &raw const action,
+                    previous_interrupt.as_mut_ptr(),
+                ) != 0
+                {
                     None
-                } else if libc::sigaction(libc::SIGTERM, &action, previous_terminate.as_mut_ptr())
-                    != 0
+                } else if libc::sigaction(
+                    libc::SIGTERM,
+                    &raw const action,
+                    previous_terminate.as_mut_ptr(),
+                ) != 0
                 {
                     let _restore_result = libc::sigaction(
                         libc::SIGINT,
@@ -85,9 +93,17 @@ impl ProcessSignalGuard {
         // pointers request restoration without exposing kernel-written data.
         let restored = unsafe {
             let interrupt =
-                libc::sigaction(libc::SIGINT, &self.previous_interrupt, std::ptr::null_mut());
+                libc::sigaction(
+                    libc::SIGINT,
+                    &raw const self.previous_interrupt,
+                    std::ptr::null_mut(),
+                );
             let terminate =
-                libc::sigaction(libc::SIGTERM, &self.previous_terminate, std::ptr::null_mut());
+                libc::sigaction(
+                    libc::SIGTERM,
+                    &raw const self.previous_terminate,
+                    std::ptr::null_mut(),
+                );
             interrupt == 0 && terminate == 0
         };
         self.active = false;

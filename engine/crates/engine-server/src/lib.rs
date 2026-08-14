@@ -134,20 +134,14 @@ pub const FOUNDATION_STATUS: &str = "signed-package-trusted-backend-uds";
 /// This value is constructed only from startup configuration. It is never
 /// decoded from a client request or model package.
 #[cfg(feature = "cpu-reference")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum RuntimeBackend {
     /// Deterministic scalar correctness backend.
+    #[default]
     CpuReference,
     /// Reviewed Apple Metal backend and its fixed device allocation policy.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal(MetalBackend),
-}
-
-#[cfg(feature = "cpu-reference")]
-impl Default for RuntimeBackend {
-    fn default() -> Self {
-        Self::CpuReference
-    }
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -5182,7 +5176,7 @@ mod tests {
         let event_kinds = client.join().expect("client must finish");
         assert_eq!(event_kinds.first(), Some(&1));
         assert_eq!(event_kinds.last(), Some(&3));
-        assert!(event_kinds.iter().any(|kind| *kind == 2));
+        assert!(event_kinds.contains(&2));
 
         let replay_client_path = socket_path.clone();
         let (release_replay_client, hold_replay_client) = mpsc::sync_channel(0);
