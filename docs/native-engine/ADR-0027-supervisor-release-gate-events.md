@@ -29,7 +29,10 @@ restart to that marker, so a subsequent start reruns verification rather than
 reusing stale success.
 
 Before returning a verification failure, the verifier writes one fixed-width
-`PAIRSEV1` record to a 64-slot root-owned ring. Records contain only version,
+`PAIRSEV1` record to a 64-slot root-owned ring. The canonical V1 byte contract
+and golden mutation vectors are owned by Sovereign-AI-Contracts commit
+`1b28edaebb6ff1ab1b84b7e5b8aa694d21476ec8`; this repository pins those exact
+vectors in an independent producer test. Records contain only version,
 closed event kind, nonzero sequence, and an optional already-verified release
 generation plus SHA-384 manifest digest. They contain no path, diagnostic,
 prompt, model output, credential, or key. Atomic replacement and directory
