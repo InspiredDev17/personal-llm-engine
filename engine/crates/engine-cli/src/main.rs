@@ -18,10 +18,14 @@ use personalai_engine_server::EngineService;
 use personalai_engine_server::InferenceEvent;
 #[cfg(all(unix, feature = "metal", target_os = "macos"))]
 use personalai_engine_server::MetalBackend;
+use personalai_engine_server::{
+    ArtifactAuthorityId, LogicalModelId, MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS, RuntimeInstanceId,
+    RuntimeReservationManager,
+};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_server::{
     ContinuousServeLimits, ContinuousServeSummary, ContinuousShutdown, CpuEngineRuntime,
-    RuntimeBackend, UnixFrameListener,
+    RuntimeBackend, RuntimeV3ServiceConfig, UnixFrameListener,
 };
 use personalai_engine_server::{
     FOUNDATION_STATUS, ProtocolDescriptor, RegistrySelectionV2, ServiceConfig,
@@ -66,6 +70,8 @@ const USAGE: &str = "usage:
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
     [--execution-backend cpu-reference|arm64]
+  optionally enable canonical runtime-v3 admission for the primary model with:
+    --runtime-v3 'LOGICAL_MODEL_ID|ARTIFACT_ID|BACKEND_VERSION|BACKEND_INSTANCE|ENGINE_INSTANCE|MAX_ACTIVE|MAX_INFERENCE_MEMORY_BYTES|AVAILABILITY_TTL_MILLIS'
   owner-pinned serving may repeat this option up to 127 times to register cold models:
     --additional-owner-model 'ID|BASENAME.paimodel|SHA384_HEX96|SIGNER_KEY_ID_HEX32|SIGNER_PUBLIC_KEY_HEX64|MAX_MEMORY|MAX_KV|MAX_SEQUENCES'
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
@@ -138,6 +144,20 @@ struct ServeConfig {
     additional_models: Vec<AdditionalOwnerModel>,
     backend: ServeBackend,
     mode: ServeMode,
+    runtime_v3: Option<RuntimeV3CliConfig>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
+struct RuntimeV3CliConfig {
+    logical_model_id: LogicalModelId,
+    artifact_id: ArtifactAuthorityId,
+    backend_version: RuntimeInstanceId,
+    backend_instance_id: RuntimeInstanceId,
+    engine_instance_id: RuntimeInstanceId,
+    maximum_active_reservations: usize,
+    maximum_inference_memory_bytes: u64,
+    availability_ttl_millis: u64,
 }
 
 #[derive(Debug)]
@@ -223,10 +243,12 @@ struct RawServeConfig {
     max_device_memory_bytes: Option<u64>,
     max_metal_buffers: Option<usize>,
     additional_models: Vec<AdditionalOwnerModel>,
+    runtime_v3: Option<RuntimeV3CliConfig>,
 }
 
 const MAX_ADDITIONAL_MODELS: usize = 127;
 const MAX_ADDITIONAL_MODEL_SPEC_BYTES: usize = 512;
+const MAX_RUNTIME_V3_SPEC_BYTES: usize = 512;
 
 #[derive(Debug)]
 enum CliError {
@@ -503,6 +525,9 @@ fn parse_serve(
             {
                 config.additional_models.push(parse_additional_owner_model(text)?);
             }
+            "--runtime-v3" if config.runtime_v3.is_none() => {
+                config.runtime_v3 = Some(parse_runtime_v3(text)?);
+            }
             "--model-root"
             | "--runtime-root"
             | "--socket"
@@ -532,7 +557,8 @@ fn parse_serve(
             | "--execution-backend"
             | "--metal-device-index"
             | "--max-device-memory-bytes"
-            | "--max-metal-buffers" => {
+            | "--max-metal-buffers"
+            | "--runtime-v3" => {
                 return Err(CliError::InvalidArguments("serve flag may appear only once"));
             }
             "--additional-owner-model" => {
@@ -577,6 +603,53 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         additional_models: config.additional_models,
         backend,
         mode,
+        runtime_v3: config.runtime_v3,
+    })
+}
+
+fn parse_runtime_v3(value: &str) -> Result<RuntimeV3CliConfig, CliError> {
+    if value.len() > MAX_RUNTIME_V3_SPEC_BYTES {
+        return Err(CliError::InvalidArguments("runtime v3 configuration exceeds its byte limit"));
+    }
+    let fields = value.split('|').collect::<Vec<_>>();
+    let [
+        logical_model_id,
+        artifact_id,
+        backend_version,
+        backend_instance_id,
+        engine_instance_id,
+        maximum_active,
+        maximum_memory,
+        availability_ttl,
+    ] = fields.as_slice()
+    else {
+        return Err(CliError::InvalidArguments(
+            "runtime v3 configuration must contain exactly eight fields",
+        ));
+    };
+    let maximum_active_reservations = parse_usize(maximum_active)?;
+    let maximum_inference_memory_bytes = parse_u64(maximum_memory)?;
+    let availability_ttl_millis = parse_u64(availability_ttl)?;
+    let _validated_limits = RuntimeReservationManager::new(
+        maximum_active_reservations,
+        maximum_inference_memory_bytes,
+    )?;
+    if availability_ttl_millis == 0
+        || availability_ttl_millis > MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS
+    {
+        return Err(CliError::InvalidArguments(
+            "runtime v3 availability TTL is outside canonical bounds",
+        ));
+    }
+    Ok(RuntimeV3CliConfig {
+        logical_model_id: LogicalModelId::new(*logical_model_id)?,
+        artifact_id: ArtifactAuthorityId::new(*artifact_id)?,
+        backend_version: RuntimeInstanceId::new(*backend_version)?,
+        backend_instance_id: RuntimeInstanceId::new(*backend_instance_id)?,
+        engine_instance_id: RuntimeInstanceId::new(*engine_instance_id)?,
+        maximum_active_reservations,
+        maximum_inference_memory_bytes,
+        availability_ttl_millis,
     })
 }
 
@@ -1070,6 +1143,7 @@ fn serve(
     for model in &config.additional_models {
         runtime.configure_model_load_budget(&model.model_id, model.budget)?;
     }
+    configure_runtime_v3(&mut runtime, config.runtime_v3, &config.model_id)?;
     let mut event_write_failed = false;
     let mut package_events = |event: personalai_engine_types::SecurityEvent| {
         if writeln!(errors, "native-engine security event: {event:?}").is_err() {
@@ -1098,6 +1172,31 @@ fn serve(
             .map_err(|_| CliError::Io)
         }
     }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn configure_runtime_v3(
+    runtime: &mut CpuEngineRuntime,
+    config: Option<RuntimeV3CliConfig>,
+    provider_model_id: &ModelId,
+) -> Result<(), CliError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    runtime.enable_runtime_v3(RuntimeV3ServiceConfig::new(
+        config.backend_version,
+        config.backend_instance_id,
+        config.engine_instance_id,
+        config.maximum_active_reservations,
+        config.maximum_inference_memory_bytes,
+        config.availability_ttl_millis,
+    )?)?;
+    runtime.configure_runtime_v3_registered_model(
+        config.logical_model_id,
+        provider_model_id.clone(),
+        config.artifact_id,
+    )?;
+    Ok(())
 }
 
 #[cfg(all(unix, any(feature = "cpu-reference", test)))]
@@ -1452,6 +1551,52 @@ mod tests {
             parse_command(registry.into_iter()),
             Err(CliError::InvalidArguments(
                 "additional owner models require owner-pinned registration mode"
+            ))
+        ));
+    }
+
+    #[test]
+    fn runtime_v3_serving_requires_one_exact_bounded_owner_configuration() {
+        let mut arguments = complete_serve_arguments();
+        arguments.push(OsString::from("--runtime-v3"));
+        arguments.push(OsString::from(
+            "mdl_decoder-v1|art_decoder-v1|version.1|backend.instance-1|engine.instance-1|2|2097152|30000",
+        ));
+        let Command::Serve(config) =
+            parse_command(arguments.into_iter()).expect("runtime v3 serve must parse")
+        else {
+            panic!("runtime v3 command changed kind");
+        };
+        let runtime_v3 = config.runtime_v3.as_ref().expect("runtime v3 must enable");
+        assert_eq!(runtime_v3.logical_model_id.as_str(), "mdl_decoder-v1");
+        assert_eq!(runtime_v3.artifact_id.as_str(), "art_decoder-v1");
+
+        let mut malformed = complete_serve_arguments();
+        malformed.push(OsString::from("--runtime-v3"));
+        malformed.push(OsString::from("mdl_only|art_only"));
+        assert!(matches!(
+            parse_command(malformed.into_iter()),
+            Err(CliError::InvalidArguments(
+                "runtime v3 configuration must contain exactly eight fields"
+            ))
+        ));
+
+        let mut unbounded = complete_serve_arguments();
+        unbounded.push(OsString::from("--runtime-v3"));
+        unbounded.push(OsString::from(
+            "mdl_decoder-v1|art_decoder-v1|version.1|backend.instance-1|engine.instance-1|0|2097152|300001",
+        ));
+        assert!(matches!(parse_command(unbounded.into_iter()), Err(CliError::Engine(_))));
+
+        let mut stale = complete_serve_arguments();
+        stale.push(OsString::from("--runtime-v3"));
+        stale.push(OsString::from(
+            "mdl_decoder-v1|art_decoder-v1|version.1|backend.instance-1|engine.instance-1|2|2097152|300001",
+        ));
+        assert!(matches!(
+            parse_command(stale.into_iter()),
+            Err(CliError::InvalidArguments(
+                "runtime v3 availability TTL is outside canonical bounds"
             ))
         ));
     }

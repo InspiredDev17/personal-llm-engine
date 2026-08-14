@@ -14,6 +14,8 @@ use std::sync::Mutex;
 pub const INFERENCE_RUNTIME_V3_CONTRACT_COMMIT: &str = "138128520dea7a602c0cf2ea905fa32396917db8";
 /// Exact canonical contract version implemented by this lifecycle.
 pub const INFERENCE_RUNTIME_V3_CONTRACT_VERSION: &str = "3.0.0";
+/// Maximum freshness window accepted by canonical runtime-v3 availability.
+pub const MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS: u64 = 300_000;
 /// Maximum active and historical reservation records retained in memory.
 pub const MAX_RUNTIME_RESERVATION_RECORDS: usize = 16_384;
 const MAX_AUTHORITY_ID_BYTES: usize = 128;
@@ -414,6 +416,16 @@ impl RuntimeReservationManager {
                 reserved_memory_bytes: 0,
             }),
         })
+    }
+
+    /// Returns the configured concurrent reservation ceiling.
+    pub const fn maximum_active(&self) -> usize {
+        self.maximum_active
+    }
+
+    /// Returns the configured inference-memory reservation ceiling.
+    pub const fn maximum_memory_bytes(&self) -> u64 {
+        self.maximum_memory_bytes
     }
 
     /// Evaluates and records one request. Exact idempotent replays return the

@@ -54,9 +54,12 @@ engine state machine, revalidates engine-owned identity before reservation and
 consumption, and emits canonical decision/result documents. The in-memory state
 machine enforces exact identity/correlation, finite capacity, idempotent replay,
 single consumption, cancellation, release, expiry, terminal identity, and
-resource ceilings. Mapping those documents into the authenticated service and
-durable reservation recovery remain incomplete and therefore cannot be
-reported as an operated v3 service.
+resource ceilings. The existing signed, replay-journaled, same-user UDS service
+now carries bounded canonical availability, reservation, cancellation, and
+release documents without assigning them authentication authority. Exact
+execution request/result transport and durable recovery of accepted
+reservations remain incomplete, so this is not yet an operated v3 inference
+service.
 
 ## Engine release trust flow
 

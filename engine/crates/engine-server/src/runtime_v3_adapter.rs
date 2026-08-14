@@ -97,25 +97,40 @@ impl AdmittedRuntimeExecution {
 /// Bounded bridge from canonical Sovereign Contracts documents to the
 /// engine-owned runtime reservation state machine.
 #[derive(Debug)]
-pub struct RuntimeV3ContractAdapter<A> {
+pub struct RuntimeV3ContractAdapter {
     reservations: RuntimeReservationManager,
-    identity_authority: A,
     state: Mutex<AdapterState>,
 }
 
-impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
+impl RuntimeV3ContractAdapter {
     /// Constructs an empty adapter with explicit engine-wide reservation
-    /// limits and one engine-owned identity authority.
-    pub fn new(
-        maximum_active: usize,
-        maximum_memory_bytes: u64,
-        identity_authority: A,
-    ) -> Result<Self, EngineError> {
+    /// limits. Callers must supply the current engine-owned identity authority
+    /// at each admission and finalization boundary.
+    pub fn new(maximum_active: usize, maximum_memory_bytes: u64) -> Result<Self, EngineError> {
         Ok(Self {
             reservations: RuntimeReservationManager::new(maximum_active, maximum_memory_bytes)?,
-            identity_authority,
             state: Mutex::new(AdapterState { records: BTreeMap::new(), next_status_revision: 1 }),
         })
+    }
+
+    /// Expires stale reservations using the authenticated service clock.
+    pub fn expire(&self, now_unix_millis: u64) -> Result<usize, EngineError> {
+        self.reservations.expire(now_unix_millis)
+    }
+
+    /// Returns content-free reservation counters for availability reporting.
+    pub fn reservation_statistics(&self) -> Result<crate::ReservationStatistics, EngineError> {
+        self.reservations.statistics()
+    }
+
+    /// Returns the configured concurrent reservation ceiling.
+    pub const fn maximum_active(&self) -> usize {
+        self.reservations.maximum_active()
+    }
+
+    /// Returns the configured inference-memory reservation ceiling.
+    pub const fn maximum_memory_bytes(&self) -> u64 {
+        self.reservations.maximum_memory_bytes()
     }
 
     /// Strictly decodes, identity-checks, and evaluates one canonical
@@ -124,6 +139,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
         &self,
         source: &[u8],
         now_unix_millis: u64,
+        identity_authority: &impl RuntimeIdentityAuthority,
     ) -> Result<Vec<u8>, EngineError> {
         let request = decode_reservation(source)?;
         let created = contract_result(request.created_unix_millis())?;
@@ -136,7 +152,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
         }
 
         let mapped = map_reservation(&request, expires)?;
-        self.identity_authority.revalidate(mapped.identity())?;
+        identity_authority.revalidate(mapped.identity())?;
 
         let mut state = self.lock_state()?;
         if let Some(existing) = state.records.get(mapped.reservation_id()) {
@@ -185,6 +201,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
         &self,
         source: &[u8],
         now_unix_millis: u64,
+        identity_authority: &impl RuntimeIdentityAuthority,
     ) -> Result<AdmittedRuntimeExecution, EngineError> {
         check_document_bound(source)?;
         let request = contract_result(decode_inference_execution_request_v3(source))?;
@@ -214,7 +231,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
                 "runtime execution changed reserved identity or correlation",
             ));
         }
-        self.identity_authority.revalidate(&mapped_identity)?;
+        identity_authority.revalidate(&mapped_identity)?;
         self.reservations.consume(
             &reservation_id,
             mapped_request,
@@ -310,6 +327,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
         admitted: &AdmittedRuntimeExecution,
         result: &InferenceExecutionResultV3,
         now_unix_millis: u64,
+        identity_authority: &impl RuntimeIdentityAuthority,
     ) -> Result<Vec<u8>, EngineError> {
         let mut state = self.lock_state()?;
         let record = state.records.get_mut(&admitted.reservation_id).ok_or_else(|| {
@@ -343,7 +361,7 @@ impl<A: RuntimeIdentityAuthority> RuntimeV3ContractAdapter<A> {
             result.status,
             sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::Succeeded
         ) {
-            if let Err(error) = self.identity_authority.revalidate(&record.identity) {
+            if let Err(error) = identity_authority.revalidate(&record.identity) {
                 let _ = self.reservations.release(
                     &record.reservation_id,
                     record.request_id,
@@ -737,16 +755,11 @@ mod tests {
         }
     }
 
-    fn adapter()
-    -> (RuntimeV3ContractAdapter<Arc<ExactIdentityAuthority>>, Arc<ExactIdentityAuthority>) {
+    fn adapter() -> (RuntimeV3ContractAdapter, Arc<ExactIdentityAuthority>) {
         let expected = map_identity(&identity()).expect("map fixture identity");
         let authority =
             Arc::new(ExactIdentityAuthority { expected, available: AtomicBool::new(true) });
-        (
-            RuntimeV3ContractAdapter::new(2, 2_048, Arc::clone(&authority))
-                .expect("construct adapter"),
-            authority,
-        )
+        (RuntimeV3ContractAdapter::new(2, 2_048).expect("construct adapter"), authority)
     }
 
     fn successful_result(execution: &InferenceExecutionRequestV3) -> InferenceExecutionResultV3 {
@@ -828,26 +841,35 @@ mod tests {
 
     #[test]
     fn exact_reservation_replay_and_single_execution_are_enforced() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        let first = adapter.reserve_document(&source, now).expect("reserve exact identity");
-        assert_eq!(adapter.reserve_document(&source, now + 1).expect("exact replay"), first);
+        let first =
+            adapter.reserve_document(&source, now, &authority).expect("reserve exact identity");
+        assert_eq!(
+            adapter.reserve_document(&source, now + 1, &authority).expect("exact replay"),
+            first
+        );
         let decision = decode_inference_reservation_decision_v3(&first).expect("decode decision");
         assert_eq!(decision.decision, ReservationDecisionV3::Accepted);
 
         let execution = execution(&reservation);
         let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
         let admitted = adapter
-            .admit_execution_document(&source, execution.created_unix_millis().expect("created"))
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
             .expect("admit once");
         assert_eq!(admitted.request(), &execution);
         assert!(
             adapter
                 .admit_execution_document(
                     &source,
-                    execution.created_unix_millis().expect("created")
+                    execution.created_unix_millis().expect("created"),
+                    &authority,
                 )
                 .is_err()
         );
@@ -859,58 +881,71 @@ mod tests {
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
         let execution = execution(&reservation);
         let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
 
         authority.available.store(false, Ordering::SeqCst);
-        assert!(adapter.admit_execution_document(&source, now + 1).is_err());
+        assert!(adapter.admit_execution_document(&source, now + 1, &authority).is_err());
         authority.available.store(true, Ordering::SeqCst);
         adapter
-            .admit_execution_document(&source, now + 1)
+            .admit_execution_document(&source, now + 1, &authority)
             .expect("reservation was not consumed by failed identity proof");
     }
 
     #[test]
     fn terminal_result_is_identity_bound_budgeted_and_idempotent() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
         let execution = execution(&reservation);
         let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
         let admitted = adapter
-            .admit_execution_document(&source, execution.created_unix_millis().expect("created"))
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
             .expect("admit");
         let result = successful_result(&execution);
         let completed = result.completed_unix_millis().expect("completed");
-        let encoded =
-            adapter.finalize_execution_result(&admitted, &result, completed).expect("finalize");
+        let encoded = adapter
+            .finalize_execution_result(&admitted, &result, completed, &authority)
+            .expect("finalize");
         assert_eq!(decode_inference_execution_result_v3(&encoded).expect("decode result"), result);
         assert_eq!(
             adapter
-                .finalize_execution_result(&admitted, &result, completed)
+                .finalize_execution_result(&admitted, &result, completed, &authority)
                 .expect("exact result replay"),
             encoded
         );
 
         let mut substituted = result;
         substituted.identity.backend_instance_id = "backend.instance-2".to_owned();
-        assert!(adapter.finalize_execution_result(&admitted, &substituted, completed).is_err());
+        assert!(
+            adapter
+                .finalize_execution_result(&admitted, &substituted, completed, &authority)
+                .is_err()
+        );
     }
 
     #[test]
     fn terminal_result_cannot_exceed_reserved_resource_accounting() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
         let execution = execution(&reservation);
         let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
         let admitted = adapter
-            .admit_execution_document(&source, execution.created_unix_millis().expect("created"))
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
             .expect("admit");
         let mut result = successful_result(&execution);
         result.resource_usage[0].units = 1_025;
@@ -919,7 +954,8 @@ mod tests {
                 .finalize_execution_result(
                     &admitted,
                     &result,
-                    result.completed_unix_millis().expect("completed")
+                    result.completed_unix_millis().expect("completed"),
+                    &authority,
                 )
                 .is_err()
         );
@@ -927,27 +963,27 @@ mod tests {
 
     #[test]
     fn artifact_substitution_and_noncanonical_request_ids_fail_closed() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
         let mut execution = execution(&reservation);
         execution.identity.artifact_digest = "08".repeat(48);
         let source =
             encode_inference_execution_request_v3(&execution).expect("encode substitution");
-        assert!(adapter.admit_execution_document(&source, now + 1).is_err());
+        assert!(adapter.admit_execution_document(&source, now + 1, &authority).is_err());
         assert!(map_request_id("req_short").is_err());
         assert!(map_request_id("req_00000000000000000000000000000000").is_err());
     }
 
     #[test]
     fn cancellation_and_release_are_exact_and_idempotent() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
 
         let cancellation = RuntimeCancellationRequestV3 {
             contract_version: InferenceRuntimeContractVersionV3,
@@ -983,15 +1019,19 @@ mod tests {
 
     #[test]
     fn cancelled_execution_accepts_only_a_bound_cancelled_terminal_result() {
-        let (adapter, _) = adapter();
+        let (adapter, authority) = adapter();
         let reservation = reservation();
         let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
         let now = reservation.created_unix_millis().expect("created") + 1;
-        adapter.reserve_document(&source, now).expect("reserve");
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
         let execution = execution(&reservation);
         let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
         let admitted = adapter
-            .admit_execution_document(&source, execution.created_unix_millis().expect("created"))
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
             .expect("admit");
 
         let cancellation = RuntimeCancellationRequestV3 {
@@ -1013,12 +1053,12 @@ mod tests {
         let result = cancelled_result(&execution);
         let completed = result.completed_unix_millis().expect("completed");
         let encoded = adapter
-            .finalize_execution_result(&admitted, &result, completed)
+            .finalize_execution_result(&admitted, &result, completed, &authority)
             .expect("finalize cancellation");
         assert_eq!(decode_inference_execution_result_v3(&encoded).expect("decode result"), result);
         assert_eq!(
             adapter
-                .finalize_execution_result(&admitted, &result, completed)
+                .finalize_execution_result(&admitted, &result, completed, &authority)
                 .expect("exact result replay"),
             encoded
         );

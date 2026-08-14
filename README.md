@@ -25,7 +25,9 @@ protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
 an inference-runtime-v3 semantic reservation state machine pinned to the
-canonical Sovereign AI Contracts commit,
+canonical Sovereign AI Contracts commit, canonical availability/reservation/
+cancellation/release documents carried by the existing signed,
+replay-journaled UDS service,
 an owner CLI, and a separate release-only signer/verifier with a monotonic
 installed-version ledger. The CLI also exposes an explicit one-shot `generate`
 command that admits a registered signed package by model ID and never accepts a
@@ -87,6 +89,10 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   budget, expiry, and idempotency key; exact replay is idempotent while
   substitution, theft, double consumption, overcommit, and outward budget
   escalation fail closed;
+- runtime-v3 service composition is owner-enabled and model identities are
+  owner-bound to registered package/backend state before signed availability or
+  reservation is exposed; canonical execution request/result transport and
+  restart recovery of accepted reservations remain disabled release gates;
 - registry-backed admission verifies the exact owner-selected signed V2 entry
   before package access, derives the approved path from signed identities, and
   never chooses `latest` or falls back to owner-pinned registration;

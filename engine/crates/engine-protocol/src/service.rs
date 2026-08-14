@@ -66,6 +66,14 @@ pub enum ServiceMessageKind {
     ModelDescriptor = 20,
     /// Acknowledge delivery of a previously polled security-event prefix.
     AcknowledgeSecurityEvents = 21,
+    /// Query canonical inference-runtime-v3 availability.
+    RuntimeV3Availability = 22,
+    /// Evaluate one canonical inference-runtime-v3 reservation request.
+    RuntimeV3Reserve = 23,
+    /// Apply one canonical inference-runtime-v3 cancellation request.
+    RuntimeV3Cancel = 24,
+    /// Apply one canonical inference-runtime-v3 reservation release.
+    RuntimeV3Release = 25,
 }
 
 impl ServiceMessageKind {
@@ -92,6 +100,10 @@ impl ServiceMessageKind {
             19 => Ok(Self::SecurityEvents),
             20 => Ok(Self::ModelDescriptor),
             21 => Ok(Self::AcknowledgeSecurityEvents),
+            22 => Ok(Self::RuntimeV3Availability),
+            23 => Ok(Self::RuntimeV3Reserve),
+            24 => Ok(Self::RuntimeV3Cancel),
+            25 => Ok(Self::RuntimeV3Release),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -112,6 +124,10 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::RuntimeV3Availability
+                | Self::RuntimeV3Reserve
+                | Self::RuntimeV3Cancel
+                | Self::RuntimeV3Release
         )
     }
 
@@ -134,6 +150,10 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::RuntimeV3Availability
+                | Self::RuntimeV3Reserve
+                | Self::RuntimeV3Cancel
+                | Self::RuntimeV3Release
         )
     }
 }

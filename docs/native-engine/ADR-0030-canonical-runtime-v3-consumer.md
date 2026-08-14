@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for source-code integration. Operated service composition remains
-pending an authenticated runtime-v3 service dispatch and deployment evidence.
+Accepted for authenticated admission integration. Operated inference execution
+and deployment evidence remain pending.
 
 ## Context
 
@@ -34,6 +34,15 @@ and exact idempotent result replay. Canonical documents themselves are not an
 authentication mechanism. They may be dispatched only inside the existing
 signed, replay-journaled, same-user Unix-domain-socket service envelope.
 
+The closed service catalog now carries availability, reservation,
+cancellation, and release documents as bounded opaque payloads. The server
+decodes them only through the pinned Contracts implementation, binds
+owner-configured logical/artifact correlations to live registered package and
+backend state, and revalidates that state before reservation. Availability
+revisions derive monotonically from the authenticated service clock; a clock
+rollback therefore makes cached consumers reject status instead of accepting
+an older revision.
+
 The native consumer profile intentionally narrows canonical request IDs to
 `req_` plus exactly 32 lowercase hexadecimal characters so they map losslessly
 to the engine's nonzero 128-bit request identity. A broader canonical ID is
@@ -46,8 +55,9 @@ valid Contracts data but unsupported by this native runtime profile.
   memory, approvals, and Agent Green authority.
 - Serde/JSON and the Contracts SHA-256 stack enlarge the reviewed offline graph;
   exact versions, sources, vendor contents, and SPDX entries are enforced.
-- The adapter and deterministic tests are source-code evidence only. Until the
-  signed service dispatcher and a control-plane transport are composed, this is
-  not an operated inference-runtime-v3 service.
+- Signed UDS admission is integration-tested with synthetic packages and
+  development keys. Canonical execution request/result dispatch, control-plane
+  transport composition, and durable accepted-reservation recovery remain
+  required before this is an operated inference-runtime-v3 service.
 - Production model, hardware, latency, throughput, resource-pressure, and soak
   evidence remain separate deployment gates.

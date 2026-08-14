@@ -169,6 +169,7 @@ struct ContinuousState<'a> {
     model_load_budgets: &'a BTreeMap<String, ResourceBudget>,
     security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
+    runtime_v3: &'a mut Option<super::runtime_v3_service::RuntimeV3ServiceState>,
     next_sequence: &'a mut u64,
     coordinator: GenerationRoundRobin,
     ingress: Vec<IngressWorker>,
@@ -230,6 +231,7 @@ impl CpuEngineRuntime {
             model_load_budgets: &self.model_load_budgets,
             security_events: &mut self.security_events,
             metrics: &mut self.metrics,
+            runtime_v3: &mut self.runtime_v3,
             next_sequence: &mut self.next_sequence,
             coordinator,
             ingress: bounded_vec(maximum_connections, "continuous ingress")?,
@@ -499,6 +501,7 @@ impl ContinuousState<'_> {
             self.security_events,
             self.metrics,
             false,
+            self.runtime_v3,
             request,
         ) {
             Ok(response) => response,

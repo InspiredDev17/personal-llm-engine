@@ -17,6 +17,8 @@ mod peer_credential;
 mod replay;
 mod runtime_reservations;
 mod runtime_v3_adapter;
+#[cfg(all(unix, feature = "cpu-reference"))]
+mod runtime_v3_service;
 #[cfg(unix)]
 mod transport;
 
@@ -29,13 +31,15 @@ pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 pub use runtime_reservations::{
     ArtifactAuthorityId, INFERENCE_RUNTIME_V3_CONTRACT_COMMIT,
     INFERENCE_RUNTIME_V3_CONTRACT_VERSION, LogicalModelId, MAX_RUNTIME_RESERVATION_RECORDS,
-    ReservationDecision, ReservationDenial, ReservationId, ReservationStatistics,
-    ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId, RuntimeReservationManager,
-    RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
+    MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS, ReservationDecision, ReservationDenial, ReservationId,
+    ReservationStatistics, ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId,
+    RuntimeReservationManager, RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
 };
 pub use runtime_v3_adapter::{
     AdmittedRuntimeExecution, RuntimeIdentityAuthority, RuntimeV3ContractAdapter,
 };
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub use runtime_v3_service::RuntimeV3ServiceConfig;
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 
@@ -110,6 +114,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
 #[cfg(feature = "cpu-reference")]
 use std::time::Instant;
+#[cfg(all(unix, feature = "cpu-reference"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -1923,6 +1929,7 @@ pub struct CpuEngineRuntime {
     metrics: RuntimeMetrics,
     draining: bool,
     next_sequence: u64,
+    runtime_v3: Option<runtime_v3_service::RuntimeV3ServiceState>,
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2152,6 +2159,7 @@ fn model_descriptor_parts(
 #[cfg(all(unix, feature = "cpu-reference"))]
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "one internal service dispatcher borrows disjoint bounded runtime state without granting a combined authority object"
 )]
 fn handle_service_request_parts(
@@ -2162,8 +2170,21 @@ fn handle_service_request_parts(
     security_events: &mut VecDeque<SecurityEvent>,
     metrics: &mut RuntimeMetrics,
     draining: bool,
+    runtime_v3: &mut Option<runtime_v3_service::RuntimeV3ServiceState>,
     request: &AuthenticatedServiceRequest,
 ) -> Result<ServiceResponseBody, EngineError> {
+    if let Some(state) = runtime_v3.as_mut() {
+        if let Some(response) = state.handle(
+            service,
+            models,
+            backend,
+            draining,
+            request.body(),
+            runtime_v3_now_unix_millis()?,
+        )? {
+            return Ok(response);
+        }
+    }
     match request.body() {
         ServiceRequestBody::Hello { major, minor } => {
             if *major == PROTOCOL_MAJOR && *minor == PROTOCOL_MINOR {
@@ -2262,7 +2283,22 @@ fn handle_service_request_parts(
             security_events.drain(..count);
             Ok(ServiceResponseBody::SecurityEventsAcknowledged)
         }
+        ServiceRequestBody::RuntimeV3Availability
+        | ServiceRequestBody::RuntimeV3Reserve(_)
+        | ServiceRequestBody::RuntimeV3Cancel(_)
+        | ServiceRequestBody::RuntimeV3Release(_) => Err(EngineError::not_implemented(
+            "runtime v3 authenticated service is not enabled by owner configuration",
+        )),
     }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn runtime_v3_now_unix_millis() -> Result<u64, EngineError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EngineError::internal_invariant("system clock is before the Unix epoch"))?;
+    u64::try_from(elapsed.as_millis())
+        .map_err(|_| EngineError::resource_exhaustion("system clock exceeds runtime v3 range"))
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2330,7 +2366,53 @@ impl CpuEngineRuntime {
             metrics: RuntimeMetrics::default(),
             draining: false,
             next_sequence: 1,
+            runtime_v3: None,
         })
+    }
+
+    /// Enables canonical runtime-v3 status and reservation handling.
+    ///
+    /// This owner-only startup method is not reachable from the client
+    /// protocol and does not qualify or register any model.
+    pub fn enable_runtime_v3(&mut self, config: RuntimeV3ServiceConfig) -> Result<(), EngineError> {
+        if self.runtime_v3.is_some() {
+            return Err(EngineError::invalid_input("runtime v3 service is already enabled"));
+        }
+        self.runtime_v3 = Some(runtime_v3_service::RuntimeV3ServiceState::new(config)?);
+        Ok(())
+    }
+
+    /// Binds one owner-approved control-plane identity to an already
+    /// registered engine model. This does not manufacture qualification.
+    pub fn configure_runtime_v3_model(
+        &mut self,
+        identity: RuntimeIdentityBinding,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .configure_model(&self.service, &self.backend, identity)
+    }
+
+    /// Derives engine-owned package/backend identity from one registered model
+    /// and binds only the control-plane logical/artifact correlations supplied
+    /// by owner startup configuration.
+    pub fn configure_runtime_v3_registered_model(
+        &mut self,
+        logical_model_id: LogicalModelId,
+        provider_model_id: ModelId,
+        artifact_id: ArtifactAuthorityId,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .configure_registered_model(
+                &self.service,
+                &self.backend,
+                logical_model_id,
+                provider_model_id,
+                artifact_id,
+            )
     }
 
     /// Installs a trusted load budget for one statically registered model.
@@ -2393,6 +2475,7 @@ impl CpuEngineRuntime {
             &mut self.security_events,
             &mut self.metrics,
             self.draining,
+            &mut self.runtime_v3,
             request,
         )
     }
@@ -4143,12 +4226,21 @@ mod tests {
     };
     use personalai_engine_protocol::{
         AuthenticatedServiceRequest, AuthenticatedServiceResponse, CancellationEnvelope,
-        GenerationRequestEnvelope, ServiceMessageKind, attach_cancellation_signature,
-        attach_generation_signature, attach_service_signature,
+        GenerationRequestEnvelope, RuntimeV3Document, ServiceMessageKind,
+        attach_cancellation_signature, attach_generation_signature, attach_service_signature,
     };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{ContextLimit, ModelHashAlgorithm, ResourceBudget, SignerKeyId};
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    use sovereign_ai_contracts::inference_runtime_v3::{
+        InferenceReservationReleaseV3, InferenceReservationRequestV3,
+        InferenceRuntimeContractVersionV3, ReservationDecisionV3, ReservationReleaseKindV3,
+        ReservationRequestKindV3, RuntimeResourceBudgetV3,
+        decode_inference_reservation_decision_v3, decode_runtime_availability_v3,
+        encode_inference_reservation_release_v3, encode_inference_reservation_request_v3,
+        runtime_v3_timestamp_from_unix_millis,
+    };
 
     #[test]
     fn config_requires_distinct_normal_local_paths() {
@@ -6449,6 +6541,70 @@ mod tests {
             self.listener.socket_path().to_path_buf()
         }
 
+        fn runtime_v3_identity(&self) -> RuntimeIdentityBinding {
+            let registration = self
+                .runtime
+                .service
+                .registry
+                .resolve(&self.model_id)
+                .expect("fixture registration");
+            RuntimeIdentityBinding::new(
+                LogicalModelId::new("mdl_runtime-fixture").expect("logical model ID"),
+                self.model_id.clone(),
+                ArtifactAuthorityId::new("art_runtime-fixture").expect("artifact ID"),
+                *registration.expected_hash(),
+                self.runtime.backend.backend_id().expect("backend ID"),
+                RuntimeInstanceId::new("version.1").expect("backend version"),
+                RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+                RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+            )
+        }
+
+        fn enable_runtime_v3(&mut self) -> RuntimeIdentityBinding {
+            let identity = self.runtime_v3_identity();
+            let config = RuntimeV3ServiceConfig::new(
+                RuntimeInstanceId::new("version.1").expect("backend version"),
+                RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+                RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+                2,
+                2 << 20,
+                30_000,
+            )
+            .expect("runtime v3 config");
+            self.runtime.enable_runtime_v3(config).expect("enable runtime v3");
+            self.runtime
+                .configure_runtime_v3_model(identity.clone())
+                .expect("configure runtime v3 model");
+            identity
+        }
+
+        fn authenticated_service_request(
+            &self,
+            nonce: u64,
+            body: &ServiceRequestBody,
+        ) -> AuthenticatedServiceRequest {
+            let request_id = RequestId::new(u128::from(nonce)).expect("request ID");
+            let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+                request_id,
+                nonce,
+                self.control_key_id,
+                body,
+            )
+            .expect("request encode");
+            let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+            let signature = self.control_signing_key.sign(&transcript).to_bytes();
+            let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+            let trusted = TrustedControlPlaneKeys::single(
+                TrustedControlPlaneKey::active(
+                    self.control_key_id,
+                    self.control_signing_key.verifying_key().to_bytes(),
+                )
+                .expect("trusted key"),
+            )
+            .expect("trusted keys");
+            AuthenticatedServiceRequest::decode(&payload, &trusted).expect("request decode")
+        }
+
         fn cleanup(self) {
             use std::fs;
 
@@ -6459,6 +6615,161 @@ mod tests {
             fs::remove_file(replay_path).expect("replay journal must clean");
             fs::remove_dir(self.runtime_root).expect("runtime root must clean");
         }
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_runtime_v3_availability_reservation_and_release_are_exact() {
+        let mut fixture = BatchRuntimeFixture::new("runtime-v3-contract", 1);
+        let identity = fixture.enable_runtime_v3();
+
+        let availability_request =
+            fixture.authenticated_service_request(41, &ServiceRequestBody::RuntimeV3Availability);
+        let ServiceResponseBody::RuntimeV3Availability(document) = fixture
+            .runtime
+            .handle_service_request(&availability_request)
+            .expect("availability response")
+        else {
+            panic!("runtime v3 availability response kind changed");
+        };
+        let availability =
+            decode_runtime_availability_v3(document.as_bytes()).expect("availability contract");
+        assert_eq!(availability.engine_instance_id, identity.engine_instance_id().as_str());
+        assert_eq!(availability.models.len(), 1);
+        assert_eq!(availability.models[0].identity.provider_model_id, fixture.model_id.as_str());
+
+        let now = runtime_v3_now_unix_millis().expect("service time");
+        let reservation = InferenceReservationRequestV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationRequestKindV3::ReservationRequest,
+            reservation_id: "rsv_service-fixture".to_owned(),
+            request_id: sovereign_ai_contracts::identity::RequestId::new(
+                "req_11111111111111111111111111111111",
+            )
+            .expect("contract request ID"),
+            task_id: sovereign_ai_contracts::identity::TaskId::new("tsk_service-fixture")
+                .expect("contract task ID"),
+            identity: availability.models[0].identity.clone(),
+            budget: RuntimeResourceBudgetV3 {
+                maximum_input_tokens: 1_024,
+                maximum_output_tokens: 64,
+                maximum_inference_memory_bytes: 1 << 20,
+                maximum_execution_millis: 5_000,
+            },
+            idempotency_key: "11".repeat(32),
+            created_at: runtime_v3_timestamp_from_unix_millis(now).expect("created time"),
+            expires_at: runtime_v3_timestamp_from_unix_millis(now + 10_000).expect("expiry time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let reserve_body = ServiceRequestBody::RuntimeV3Reserve(
+            RuntimeV3Document::new(
+                encode_inference_reservation_request_v3(&reservation).expect("reservation"),
+            )
+            .expect("bounded reservation"),
+        );
+        let reserve = fixture.authenticated_service_request(42, &reserve_body);
+        let ServiceResponseBody::RuntimeV3Reservation(document) =
+            fixture.runtime.handle_service_request(&reserve).expect("reservation response")
+        else {
+            panic!("runtime v3 reservation response kind changed");
+        };
+        let decision = decode_inference_reservation_decision_v3(document.as_bytes())
+            .expect("reservation decision");
+        assert_eq!(decision.decision, ReservationDecisionV3::Accepted);
+
+        let release = InferenceReservationReleaseV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationReleaseKindV3::ReservationRelease,
+            reservation_id: reservation.reservation_id,
+            request_id: reservation.request_id,
+            task_id: reservation.task_id,
+            reason_code: "owner_release".to_owned(),
+            requested_at: runtime_v3_timestamp_from_unix_millis(now + 1).expect("release time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let release_body = ServiceRequestBody::RuntimeV3Release(
+            RuntimeV3Document::new(
+                encode_inference_reservation_release_v3(&release).expect("release"),
+            )
+            .expect("bounded release"),
+        );
+        let release = fixture.authenticated_service_request(43, &release_body);
+        assert_eq!(
+            fixture.runtime.handle_service_request(&release),
+            Ok(ServiceResponseBody::RuntimeV3Released)
+        );
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_runtime_v3_availability_round_trips_over_protected_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut fixture = BatchRuntimeFixture::new("runtime-v3-uds", 1);
+        let identity = fixture.enable_runtime_v3();
+        let request_id = RequestId::new(0x5353).expect("request ID");
+        let nonce = 51;
+        let body = ServiceRequestBody::RuntimeV3Availability;
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            request_id,
+            nonce,
+            fixture.control_key_id,
+            &body,
+        )
+        .expect("service request");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+        let encoded = Frame::new(FrameKind::ServiceRequest, payload)
+            .expect("service frame")
+            .encode()
+            .expect("encoded service frame");
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let expected_engine_instance = identity.engine_instance_id().as_str().to_owned();
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            stream.write_all(&encoded).expect("request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length");
+            let mut frame = header.to_vec();
+            frame.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("response payload");
+            let response = Frame::decode_outbound_exact(&frame).expect("response frame");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            let verified = AuthenticatedServiceResponse::decode(
+                response.payload(),
+                request_id,
+                nonce,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("service response must verify");
+            let ServiceResponseBody::RuntimeV3Availability(document) = verified.body() else {
+                panic!("runtime v3 availability response kind changed");
+            };
+            let availability = decode_runtime_availability_v3(document.as_bytes())
+                .expect("canonical availability");
+            assert_eq!(availability.engine_instance_id, expected_engine_instance);
+            assert_eq!(availability.models.len(), 1);
+        });
+        assert!(matches!(
+            fixture.runtime.serve_one(&fixture.listener),
+            Ok(ServeOutcome::ServiceResponded {
+                request_id: returned,
+                kind: ServiceMessageKind::RuntimeV3Availability,
+            }) if returned == request_id
+        ));
+        client.join().expect("client must finish");
+        fixture.cleanup();
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
