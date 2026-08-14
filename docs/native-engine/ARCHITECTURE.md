@@ -406,6 +406,18 @@ counts/limits, and queued-byte accounting under one signed correlation rather
 than making the Go router combine independent observations. ADR-0020 defines
 the format and deterministic 4:2:1 scheduler.
 
+The production owner-pinned CLI registers one backward-compatible keep-hot
+primary plus at most 127 additional cold packages. Cold records are bounded,
+path-relative, hash/signer-pinned, uniquely identified, and assigned fixed load
+budgets before the listener opens. They become resident only after an
+authenticated exact-ID load command. Go separately declares `KEEP_HOT` or
+`LOAD_ON_DEMAND`, verifies every registered identity, and publishes a cold
+model to routing only after load, authenticated descriptor pinning, and fresh
+resource evidence. Explicit unload never substitutes another package and the
+engine rejects it while scheduler or sequence state owns the target. ADR-0028
+defines this execution-only residency boundary; cognitive selection and future
+eviction policy remain Go-owned.
+
 Target service confinement is independent of Rust configuration. Linux uses
 the checked-in systemd unit with `AF_UNIX` and all-IP denial. macOS development
 and operated qualification may use the deny-by-default exact-socket Seatbelt

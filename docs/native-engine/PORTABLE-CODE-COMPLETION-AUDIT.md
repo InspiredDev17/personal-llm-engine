@@ -42,7 +42,7 @@ work, acceptance, dependencies, order, and status.
 | F-01 | AI-Avenger `internal/model/providers/nativeengine` and PostgreSQL migration | Supervisor cursor is durable, source-bound, monotonic, compare-and-swap protected, and advances only after Agent Green delivery plus audit. Tests cover startup, restart, gaps, rollback, ring wrap/overwrite, database/audit/delivery failure, replay, and concurrent advancement. | An earlier in-memory cursor could lose distinction after a 64-slot overwrite or Go restart, producing false acknowledgement. | A | Durable cursor migration/store and fail-visible recovery were implemented and tested. | Operated PostgreSQL backup/restore and live Agent Green delivery remain F-10/F-11. | Must precede production bridge activation. | Complete in source. |
 | F-02 | Rust release supervisor, Go native provider | Rust retains monotonic release-event identity; Go persists provider quarantine and exact-revision audited owner recovery. Model output cannot recover the provider. | Release failure must inhibit routing across restart without creating model, tool, memory, or Agent Green authority. | A | Monotonic sequence, cold-start source, durable quarantine, routing guard, and owner-only recovery tests are present. | Live supervisor crash/restart/recovery drill remains F-11. | F-01 and canonical event contract. | Complete in source. |
 | F-03 | Sovereign-AI-Contracts `PAIRSEV1`, Rust producer, Go consumer | Canonical 76-byte content-free V1 record, Go/Rust strict bindings, accepted vectors, single-byte mutations, truncation, unknown-version, sequence and identity vectors are pinned. Go consumes the canonical decoder. | Competing parsers could drift or accept ambiguous records. | A | Canonical fixtures and both language suites pass; Rust independently pins the full canonical commit. | None beyond ordinary release CI reproduction. | Precedes operated bridge. | Complete in source. |
-| F-04 | AI-Avenger native composition | One protected engine endpoint now composes a sorted closed population of 1–64 statically configured models. Every model is negotiated, registered-ID checked, loaded, descriptor-pinned, refreshed, and required for readiness. Refresh is deterministic and sequential. Cognitive labels are absent. | Earlier Go startup composed exactly one model, preventing heterogeneous qualified populations even though Rust already supported multiple resident models. | A | Strict bounded JSON, legacy single-model compatibility, duplicate/order/unknown-field rejection, per-model budgets, multi-model construction/readiness tests, race tests, and vet. | Real population capacity and routing quality remain F-09/F-13. | Control-plane registry and Rust multi-model lifecycle. | Complete in source. |
+| F-04 | Rust CLI/service and AI-Avenger native composition | One protected endpoint represents a sorted closed population of 1–128 static models. Rust loads one primary and registers bounded cold packages with exact identity/budgets; Go applies `KEEP_HOT` or `LOAD_ON_DEMAND`, pins descriptors after load, refreshes status, and explicitly unloads exact IDs. Cognitive labels are absent. | Earlier CLI registration was singular and Go loaded every configured model, making the whole population permanently resident and readiness-critical. | A | Closed Rust cold-registration grammar, duplicate/key-role denial, independent residency/unload test, strict Go JSON policy, cold activation/deactivation, unknown-ID denial, descriptor mismatch cleanup, resource freshness, race tests and vet. | Real population capacity, eviction thresholds and routing quality remain external/deferred. | Control-plane registry, authenticated lifecycle protocol and per-model Rust maps. | Complete in source. |
 | F-05 | Rust ARM64 transformer/server/CLI; Go backend pin | Owner-selected `arm64` now loads a registered signed package, executes full prefill/cached decode/sampling/streaming through the closed ARM64 backend, reports authenticated backend identity, and retains scalar operation fallback. Go accepts and pins `arm64`. | Kernels previously existed only at immutable-graph level while service truthfully reported model execution unavailable. | B | Full transformer differential prefill/decode and signed authenticated UDS streaming tests run on AArch64. CLI selection is compile/target gated. | Production-size model parity, performance, thermal, pressure, long cancellation/soak, and CPU rollback on each supported Apple SKU. | Scalar oracle and signed package path were prerequisites. | Source complete; external qualification open. |
 | F-06 | Rust Metal backend/service; Go backend pin | Complete signed synthetic decoder execution and owner-selected UDS path exist with exact descriptor pin and CPU fallback plan. | Synthetic and microbenchmark evidence cannot establish production model quality or operational stability. | B | Deterministic scalar parity, package, service, cancellation, unload, and memory tests exist. | Production package, driver-pressure/reset, thermal, throughput, soak, and operated CPU rollback. | F-09 qualified model and macOS target. | Source complete; external qualification open. |
 | F-07 | Rust release verifier, ledger, systemd unit, operations docs | Source has signed release manifests, exact installed-artifact verification, monotonic rollback ledger, secure-path checks, Linux pre-launch unit binding, explicit recovery/rollback commands, and content-free failure events. No updater exists. | Source cannot authenticate its own installation or prove root ownership, unit semantics, atomic install, or rollback on the deployment host. | B | Static layouts, mutation tests, path/permission checks, rollback-ledger tests, and unit-text assertions exist. | Trusted installer/package, root-owned release/state/event roots, target systemd verification, tamper/upgrade/rollback drill. | Release key custody F-08 and Linux host F-11. | Portable implementation complete. |
@@ -56,6 +56,9 @@ work, acceptance, dependencies, order, and status.
 | F-15 | Paged KV, continuous batching, speculative/beam/grammar/distributed execution | Contiguous KV and deterministic bounded fair scheduling are correct and isolated. Unsupported features fail explicitly. | Premature complexity would increase memory/cancellation/isolation risk without measured need. | D | Measure production workload first; introduce separate ADRs and scalar correctness models if justified. | Production workload traces and acceptance thresholds. | F-09 and operated measurements. | Intentionally deferred. |
 | F-16 | Fuzzing, sanitizers and supply chain | All requested local parser boundaries have deterministic corpus/target support and bounded smoke evidence; vendored dependencies, exact lockfile, dependency inventory and offline checks exist. | Five-second smoke runs, local ASan/UBSan, and a cached advisory database are not sustained hosted assurance or a fresh release SBOM/advisory attestation. | B | Targets and CI definitions are source-complete; findings must remain release blocking. | Scheduled long campaigns, supported sanitizers/Miri where available, fresh advisory DB, release SBOM and license scan tied to exact artifact. | Hosted runners/tool availability. | Portable implementation complete. |
 | F-17 | Rust workspace licensing | Dependency licenses are inventoried, but the repository's first-party Rust crates have no owner-selected license declaration. | Codex cannot choose the owner's legal distribution terms; inventing a license would create authority and could conflict with Creator OS commercialization plans. | C | No source algorithm gap exists. Add the owner-approved license text and package metadata only after the decision. | Written owner/legal decision covering private use, source distribution and any bundled Creator OS release. | Owner/legal authority. | External decision required. |
+| F-18 | Go cold-model orchestration | The control plane now has tested exact-ID activation/deactivation mechanics and cold models remain non-routable until authenticated descriptor/resource verification. No ordinary chat policy automatically activates or evicts a cold model. | Automatically loading all cold candidates would recreate permanent residency; guessing one from cognitive labels would move unresolved routing policy into lifecycle code. | D | Keep the explicit lifecycle primitive. Connect it to a future reviewed route/qualification decision that names an exact package; define deterministic pressure/eviction ordering only after measurements. | Qualified population, routing contract, pressure thresholds, cancellation/unload soak, and operator rollback. | AI-Avenger routing owner and Model Foundry qualification. | Portable primitive complete; automatic policy intentionally deferred. |
+| F-19 | Multi-entry Model Foundry promotion | The CLI accepts one exact signed Model Foundry V2 selection or a bounded owner-pinned population; it does not combine independently signed registry choices into an invented set. | A local multi-entry format would compete with the canonical Foundry/Contracts truth and could weaken sequence/rollback semantics. | D | Specify a canonical signed registry-set contract with bounded entries, set identity, monotonic generation, removal/replacement rules and cross-language fixtures before implementation. | Model Foundry and Sovereign Contracts approval plus rotation/rollback rehearsal. | F-03 canonical contracts and selected production population. | Intentionally deferred. |
+| F-20 | Per-model authenticated capacity detail | Signed `ModelStatus` identifies exact load state and global scheduler capacity; aggregate metrics report host/device/KV memory. In-process ownership remains per-model, but wire status does not expose per-model resident bytes or a restart epoch. | Extending the local wire independently would create protocol drift; Go must not infer package capacity from aggregate data. | D | Add these fields only in a canonical backward-compatible protocol version with freshness/epoch semantics and Rust/Go vectors. Until then, unavailable/saturated status fails closed and no client overrides limits. | Sovereign Contracts version decision and operated restart/resource validation. | F-13 descriptor evolution. | Current V1 safe; richer status deferred. |
 
 ## Heterogeneous execution assessment
 
@@ -77,6 +80,54 @@ decoder/text execution profile, potentially with different weights, contexts,
 quantization and demonstrated Foundry capabilities. It does **not** mean that
 vision, audio, embedding, reranking, encoder-only, encoder-decoder, arbitrary
 tokenizer graphs, or model-defined operations are implemented.
+
+## Boundary-by-boundary investigation result
+
+- **Registry and scale:** Rust uses bounded `BTreeMap` registries keyed by
+  validated `ModelId` and caps the internal registry at 1,024. The production
+  CLI and Go composition cap one service population at 128. Stored facts are
+  package identity, signer, architecture/backend/context, resource envelope and
+  lifecycle state; neither side stores cognitive ranking, personality, agent
+  role, tool authority or memory authority.
+- **Architecture and tokenizer:** packages select only the closed
+  `decoder-rms-rope-swiglu-gqa-v1` implementation and AIPTok Byte-Level BPE V1.
+  Unknown architectures, operations, tokenizer graphs, executable templates,
+  unsupported quantization and malformed inventories fail closed. Chat
+  formatting remains Go-owned. New model-family mappings are F-09/F-14, not
+  generic package code.
+- **Generation:** greedy, bounded seeded sampling, temperature/top-k/top-p/
+  min-p/repetition controls, stop tokens, streaming, backpressure, deadlines,
+  disconnect cancellation and cleanup have deterministic coverage. Sampling
+  accepts no cognitive policy and unsupported combinations fail explicitly.
+- **Non-generative and multimodal:** canonical platform types can describe
+  modalities, but the Rust service wire remains intentionally text-generation
+  specific. No image/audio/file-path/network-fetch or arbitrary tensor request
+  is accepted. Compatibility-preserving contract evolution waits for one
+  qualified architecture and bounded preprocessing design under F-13/F-14.
+- **Resource and failure isolation:** package and tensor validation precede
+  residency; model maps, immutable handles, memory pools and KV ownership are
+  model/sequence scoped. Queue count/bytes, active sequences, per-model
+  concurrency, request budgets and deadlines are bounded. Load inserts only
+  after full success; unload is idle-only; cursor/error/disconnect paths remove
+  scheduler and sequence state. Aggregate process OOM/panic remains an
+  unavoidable in-process residual addressed by bounds, fail-fast validation,
+  sanitizers and operated soak rather than fake isolation.
+- **Backend selection:** CPU reference, ARM64 and Metal are trusted compiled
+  implementations chosen by owner configuration. Authenticated descriptors
+  report the actual selected backend. Unsupported operations use reviewed
+  scalar fallback inside that backend contract; CUDA remains an explicit
+  unsupported capability. Packages and clients supply no kernels or backend
+  paths.
+- **Go execution identity:** routing binds logical/provider IDs to pinned model
+  version, package SHA-384, architecture, backend version/instance and fresh
+  registry resource revision. Invocation revalidates that binding and response
+  attribution; local failure cannot masquerade as cloud execution. Automatic
+  cloud fallback remains disabled.
+- **Cancellation and authority:** cancellation propagates through signed
+  protocol, scheduler, generation cursor, backend checks, output writer and
+  cleanup. The engine has no shell/process/browser/tool dispatch, general
+  filesystem mutation, external network client, memory persistence or Agent
+  Green control path. All privileged execution remains Action Broker-owned.
 
 ## External completion register
 

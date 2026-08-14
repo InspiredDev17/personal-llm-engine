@@ -6010,6 +6010,41 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
+    fn multiple_registered_models_have_independent_residency_and_unload_state() {
+        let mut fixture = BatchRuntimeFixture::new("multi-model-residency", 2);
+        let second_fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture");
+        let second_id = ModelId::new("decoder-cold").expect("second model ID");
+        fixture
+            .runtime
+            .service
+            .register_configured_model(
+                second_id.clone(),
+                "decoder-cold.paimodel",
+                second_fixture.package_hash(),
+                second_fixture.trusted_signer().clone(),
+            )
+            .expect("second model must register");
+        fixture
+            .runtime
+            .load_registered_model_bytes(&second_id, second_fixture.bytes(), &fixture.budget)
+            .expect("second model must load independently");
+        assert_eq!(fixture.runtime.metrics().expect("metrics").loaded_models, 2);
+        assert!(fixture.runtime.models.contains_key(fixture.model_id.as_str()));
+        assert!(fixture.runtime.models.contains_key(second_id.as_str()));
+
+        fixture.runtime.unload_model(&second_id).expect("second model must unload");
+        assert_eq!(fixture.runtime.metrics().expect("metrics").loaded_models, 1);
+        assert!(fixture.runtime.models.contains_key(fixture.model_id.as_str()));
+        assert!(!fixture.runtime.models.contains_key(second_id.as_str()));
+        assert!(matches!(
+            fixture.runtime.unload_model(&second_id),
+            Err(EngineError::InvalidInput(_))
+        ));
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
     fn continuous_shutdown_interrupts_an_incomplete_authenticated_ingress_read() {
         use std::io::Read;
         use std::os::unix::net::UnixStream;

@@ -66,6 +66,8 @@ const USAGE: &str = "usage:
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
     [--execution-backend cpu-reference|arm64]
+  owner-pinned serving may repeat this option up to 127 times to register cold models:
+    --additional-owner-model 'ID|BASENAME.paimodel|SHA384_HEX96|SIGNER_KEY_ID_HEX32|SIGNER_PUBLIC_KEY_HEX64|MAX_MEMORY|MAX_KV|MAX_SEQUENCES'
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
     --registration-mode owner-pinned --model-id ID \
     --package BASENAME.paimodel --package-sha384 HEX96 \
@@ -133,8 +135,20 @@ struct ServeConfig {
     previous_control_key: Option<(SignerKeyId, [u8; 32])>,
     response_key_id: SignerKeyId,
     budget: ResourceBudget,
+    additional_models: Vec<AdditionalOwnerModel>,
     backend: ServeBackend,
     mode: ServeMode,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
+struct AdditionalOwnerModel {
+    model_id: ModelId,
+    package_name: PathBuf,
+    package_hash: ModelPackageHash,
+    signer_key_id: SignerKeyId,
+    signer_public_key: [u8; 32],
+    budget: ResourceBudget,
 }
 
 #[derive(Debug)]
@@ -208,7 +222,11 @@ struct RawServeConfig {
     metal_device_index: Option<usize>,
     max_device_memory_bytes: Option<u64>,
     max_metal_buffers: Option<usize>,
+    additional_models: Vec<AdditionalOwnerModel>,
 }
+
+const MAX_ADDITIONAL_MODELS: usize = 127;
+const MAX_ADDITIONAL_MODEL_SPEC_BYTES: usize = 512;
 
 #[derive(Debug)]
 enum CliError {
@@ -480,6 +498,11 @@ fn parse_serve(
             "--max-metal-buffers" if config.max_metal_buffers.is_none() => {
                 config.max_metal_buffers = Some(parse_usize(text)?);
             }
+            "--additional-owner-model"
+                if config.additional_models.len() < MAX_ADDITIONAL_MODELS =>
+            {
+                config.additional_models.push(parse_additional_owner_model(text)?);
+            }
             "--model-root"
             | "--runtime-root"
             | "--socket"
@@ -512,6 +535,11 @@ fn parse_serve(
             | "--max-metal-buffers" => {
                 return Err(CliError::InvalidArguments("serve flag may appear only once"));
             }
+            "--additional-owner-model" => {
+                return Err(CliError::InvalidArguments(
+                    "at most 127 additional owner-pinned models may be configured",
+                ));
+            }
             _ => return Err(CliError::InvalidArguments("unknown serve flag")),
         }
     }
@@ -521,6 +549,7 @@ fn parse_serve(
 fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<ServeConfig, CliError> {
     let model_id = required(config.model_id.clone(), "--model-id is required")?;
     let registration = finish_registration(&config, &model_id)?;
+    validate_additional_models(&config, &model_id)?;
     let backend = finish_serve_backend(&config)?;
     let service = ServiceConfig::new(
         required(config.model_root, "--model-root is required")?,
@@ -545,9 +574,76 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         previous_control_key,
         response_key_id: required(config.response_key_id, "--response-key-id is required")?,
         budget,
+        additional_models: config.additional_models,
         backend,
         mode,
     })
+}
+
+fn parse_additional_owner_model(value: &str) -> Result<AdditionalOwnerModel, CliError> {
+    if value.len() > MAX_ADDITIONAL_MODEL_SPEC_BYTES {
+        return Err(CliError::InvalidArguments("additional owner model exceeds its byte limit"));
+    }
+    let mut parts = value.split('|');
+    let fields = [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ];
+    if fields.iter().any(|field| field.is_none_or(str::is_empty)) || parts.next().is_some() {
+        return Err(CliError::InvalidArguments(
+            "additional owner model must contain exactly eight nonempty pipe-delimited fields",
+        ));
+    }
+    let fields = fields.map(Option::unwrap);
+    Ok(AdditionalOwnerModel {
+        model_id: ModelId::new(fields[0])?,
+        package_name: PathBuf::from(fields[1]),
+        package_hash: ModelPackageHash::from_sha384_hex(fields[2])?,
+        signer_key_id: SignerKeyId::from_bytes(parse_hex(fields[3])?)?,
+        signer_public_key: parse_hex(fields[4])?,
+        budget: ResourceBudget::new(
+            parse_u64(fields[5])?,
+            parse_u64(fields[6])?,
+            parse_u32(fields[7])?,
+        )?,
+    })
+}
+
+fn validate_additional_models(
+    config: &RawServeConfig,
+    primary_model_id: &ModelId,
+) -> Result<(), CliError> {
+    if config.additional_models.is_empty() {
+        return Ok(());
+    }
+    if config.registration_mode != Some(RegistrationMode::OwnerPinned) {
+        return Err(CliError::InvalidArguments(
+            "additional owner models require owner-pinned registration mode",
+        ));
+    }
+    for (index, model) in config.additional_models.iter().enumerate() {
+        if &model.model_id == primary_model_id
+            || config.additional_models[..index]
+                .iter()
+                .any(|prior| prior.model_id == model.model_id)
+        {
+            return Err(CliError::InvalidArguments("configured model identifiers must be unique"));
+        }
+        if config.package_name.as_ref() == Some(&model.package_name)
+            || config.additional_models[..index]
+                .iter()
+                .any(|prior| prior.package_name == model.package_name)
+        {
+            return Err(CliError::InvalidArguments("configured package basenames must be unique"));
+        }
+    }
+    Ok(())
 }
 
 fn finish_registration(
@@ -921,6 +1017,12 @@ fn serve(
     let response_signer =
         EngineResponseSigner::from_seed(config.response_key_id, &mut response_seed)?;
     validate_registration_key_roles(&config.registration, &control_keys, &response_signer)?;
+    validate_additional_model_key_roles(
+        &config.additional_models,
+        &config.registration,
+        &control_keys,
+        &response_signer,
+    )?;
     let mut service = EngineService::new(
         config.service,
         SchedulerLimits::new(128, config.budget.max_concurrent_sequences(), 64 << 20)?,
@@ -941,6 +1043,14 @@ fn serve(
             service.register_model_foundry_registry_v2(&selection)?;
         }
     }
+    for model in &config.additional_models {
+        service.register_configured_model(
+            model.model_id.clone(),
+            model.package_name.clone(),
+            model.package_hash,
+            TrustedSigner::active(model.signer_key_id, model.signer_public_key)?,
+        )?;
+    }
     let backend = match config.backend {
         ServeBackend::CpuReference => RuntimeBackend::CpuReference,
         #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
@@ -956,6 +1066,10 @@ fn serve(
         response_signer,
         backend,
     )?;
+    runtime.configure_model_load_budget(&config.model_id, config.budget)?;
+    for model in &config.additional_models {
+        runtime.configure_model_load_budget(&model.model_id, model.budget)?;
+    }
     let mut event_write_failed = false;
     let mut package_events = |event: personalai_engine_types::SecurityEvent| {
         if writeln!(errors, "native-engine security event: {event:?}").is_err() {
@@ -992,19 +1106,64 @@ fn validate_registration_key_roles(
     control_keys: &TrustedControlPlaneKeys,
     response_signer: &EngineResponseSigner,
 ) -> Result<(), CliError> {
-    let RegistrationConfig::ModelFoundryRegistryV2(selection) = registration else {
-        return Ok(());
+    let conflict = match registration {
+        RegistrationConfig::OwnerPinned { signer_key_id, signer_public_key, .. } => {
+            control_keys
+                .configured_keys()
+                .any(|key| key.key_id() == *signer_key_id || key.public_key() == *signer_public_key)
+                || response_signer.key_id() == *signer_key_id
+                || response_signer.public_key() == *signer_public_key
+        }
+        RegistrationConfig::ModelFoundryRegistryV2(selection) => {
+            control_keys
+                .configured_keys()
+                .any(|key| selection.conflicts_with_identity(key.key_id(), key.public_key()))
+                || selection
+                    .conflicts_with_identity(response_signer.key_id(), response_signer.public_key())
+        }
     };
-    let control_conflict = control_keys
-        .configured_keys()
-        .any(|key| selection.conflicts_with_identity(key.key_id(), key.public_key()));
-    if control_conflict
-        || selection.conflicts_with_identity(response_signer.key_id(), response_signer.public_key())
-    {
+    if conflict {
         return Err(EngineError::authentication_failure(
-            "registry, package, control-plane, and response identities must be distinct",
+            "package, registry, control-plane, and response identities must be distinct",
         )
         .into());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn validate_additional_model_key_roles(
+    models: &[AdditionalOwnerModel],
+    primary: &RegistrationConfig,
+    control_keys: &TrustedControlPlaneKeys,
+    response_signer: &EngineResponseSigner,
+) -> Result<(), CliError> {
+    for (index, model) in models.iter().enumerate() {
+        let control_conflict = control_keys.configured_keys().any(|key| {
+            key.key_id() == model.signer_key_id || key.public_key() == model.signer_public_key
+        });
+        let package_conflict = models[..index].iter().any(|prior| {
+            prior.signer_key_id == model.signer_key_id
+                || prior.signer_public_key == model.signer_public_key
+        }) || matches!(
+            primary,
+            RegistrationConfig::OwnerPinned {
+                signer_key_id,
+                signer_public_key,
+                ..
+            } if *signer_key_id == model.signer_key_id
+                || *signer_public_key == model.signer_public_key
+        );
+        if control_conflict
+            || package_conflict
+            || response_signer.key_id() == model.signer_key_id
+            || response_signer.public_key() == model.signer_public_key
+        {
+            return Err(EngineError::authentication_failure(
+                "package, control-plane, and response identities must be distinct",
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1131,7 +1290,17 @@ fn write_capabilities(output: &mut impl Write) -> Result<(), CliError> {
         protocol.major, protocol.minor, protocol.maximum_frame_bytes, protocol.listener_implemented
     )
     .and_then(|()| writeln!(output, "cpu-reference=deterministic-decoder-execution"))
-    .and_then(|()| writeln!(output, "arm64=not-implemented"))
+    .and_then(|()| {
+        writeln!(
+            output,
+            "arm64={}",
+            if cfg!(all(feature = "arm64", target_arch = "aarch64")) {
+                "trusted-startup-selection"
+            } else {
+                "not-compiled"
+            }
+        )
+    })
     .and_then(|()| {
         writeln!(
             output,
@@ -1165,9 +1334,20 @@ mod tests {
         )
         .expect("version must work");
         assert!(
-            String::from_utf8(output).expect("output must be UTF-8").contains(FOUNDATION_STATUS)
+            std::str::from_utf8(&output).expect("output must be UTF-8").contains(FOUNDATION_STATUS)
         );
         assert!(errors.is_empty());
+
+        output.clear();
+        run(
+            [OsString::from("capabilities")].into_iter(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut output,
+            &mut errors,
+        )
+        .expect("capabilities must work");
+        let capabilities = String::from_utf8(output).expect("capabilities must be UTF-8");
+        assert!(!capabilities.contains("arm64=not-implemented"));
     }
 
     #[test]
@@ -1222,6 +1402,58 @@ mod tests {
         let mut invalid = complete_serve_arguments();
         invalid.extend(["--max-device-memory-bytes", "1048576"].map(OsString::from));
         assert!(matches!(parse_command(invalid.into_iter()), Err(CliError::InvalidArguments(_))));
+    }
+
+    #[test]
+    fn owner_pinned_service_accepts_bounded_cold_model_registrations() {
+        let mut arguments = complete_serve_arguments();
+        let additional = format!(
+            "decoder-v2|decoder-v2.paimodel|{}|{}|{}|2097152|1048576|2",
+            "05".repeat(48),
+            "08".repeat(16),
+            "09".repeat(32),
+        );
+        arguments.extend([OsString::from("--additional-owner-model"), OsString::from(additional)]);
+        let Command::Serve(config) =
+            parse_command(arguments.into_iter()).expect("cold registration must parse")
+        else {
+            panic!("cold registration changed command kind");
+        };
+        assert_eq!(config.additional_models.len(), 1);
+        assert_eq!(config.additional_models[0].model_id.as_str(), "decoder-v2");
+        assert_eq!(config.additional_models[0].budget.max_memory_bytes(), 2_097_152);
+
+        let mut duplicate = complete_serve_arguments();
+        duplicate.extend([
+            OsString::from("--additional-owner-model"),
+            OsString::from(format!(
+                "decoder-v1|decoder-v2.paimodel|{}|{}|{}|2097152|1048576|2",
+                "05".repeat(48),
+                "08".repeat(16),
+                "09".repeat(32),
+            )),
+        ]);
+        assert!(matches!(
+            parse_command(duplicate.into_iter()),
+            Err(CliError::InvalidArguments("configured model identifiers must be unique"))
+        ));
+
+        let mut registry = complete_registry_serve_arguments();
+        registry.extend([
+            OsString::from("--additional-owner-model"),
+            OsString::from(format!(
+                "decoder-v2|decoder-v2.paimodel|{}|{}|{}|2097152|1048576|2",
+                "05".repeat(48),
+                "08".repeat(16),
+                "09".repeat(32),
+            )),
+        ]);
+        assert!(matches!(
+            parse_command(registry.into_iter()),
+            Err(CliError::InvalidArguments(
+                "additional owner models require owner-pinned registration mode"
+            ))
+        ));
     }
 
     #[test]

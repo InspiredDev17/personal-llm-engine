@@ -60,6 +60,15 @@ status, metrics, and security events only through authenticated protocol
 messages. Ordinary data-plane shutdown requests are always rejected; stop with
 the supervisor's OS-authorized signal and wait for bounded drain/join cleanup.
 
+An owner-pinned process may register up to 127 additional cold models with the
+repeatable `--additional-owner-model` record documented by CLI usage. The
+primary loads at startup; additional packages remain unavailable until Go sends
+an authenticated exact-ID load after applying its static residency policy.
+Unload only through that same lifecycle path and treat active/queued ownership
+rejection as expected backpressure. Do not automate eviction or retry with a
+different package. Model Foundry V2 currently selects one exact signed entry;
+do not emulate a multi-entry registry with unreviewed local metadata.
+
 ## Release signing and pre-launch verification
 
 Assemble a dedicated release directory containing only the engine binary,
