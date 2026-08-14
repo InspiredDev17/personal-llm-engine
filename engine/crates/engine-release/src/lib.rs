@@ -25,6 +25,8 @@ pub const RELEASE_SIGNATURE_MAGIC: [u8; 8] = *b"PAIRSIG1";
 pub const ROLLBACK_LEDGER_MAGIC: [u8; 8] = *b"PAIRLDG1";
 /// Exact supervisor security-event magic.
 pub const SUPERVISOR_EVENT_MAGIC: [u8; 8] = *b"PAIRSEV1";
+/// Exact supervisor security-event sequence-checkpoint magic.
+pub const SUPERVISOR_SEQUENCE_MAGIC: [u8; 8] = *b"PAIRSEQ1";
 /// Supported format version.
 pub const RELEASE_FORMAT_VERSION: u16 = 1;
 /// Maximum encoded manifest bytes.
@@ -49,6 +51,7 @@ pub const SUPERVISOR_EVENT_SLOTS: usize = 64;
 const SIGNATURE_ENVELOPE_BYTES: usize = 8 + 2 + 2 + 16 + ED25519_SIGNATURE_BYTES;
 const LEDGER_BYTES: usize = 8 + 2 + 2 + 8 + ModelPackageHash::BYTE_LEN;
 const SUPERVISOR_EVENT_BYTES: usize = 8 + 2 + 1 + 1 + 8 + 8 + ModelPackageHash::BYTE_LEN;
+const SUPERVISOR_SEQUENCE_BYTES: usize = 8 + 2 + 2 + 8;
 const SIGNATURE_ALGORITHM_ED25519: u16 = 1;
 const MANIFEST_FLAGS: u16 = 0;
 
@@ -230,14 +233,50 @@ impl SupervisorSecurityEventJournal {
         manifest_digest: [u8; ModelPackageHash::BYTE_LEN],
     ) -> Result<SupervisorSecurityEvent, EngineError> {
         let _lock = LedgerLock::acquire(&self.state_root.join("release-security-event-v1.lock"))?;
-        let mut maximum_sequence = 0_u64;
+        let checkpoint_path = self.state_root.join("release-security-event-v1.sequence");
+        let checkpoint = read_supervisor_sequence(&checkpoint_path)?;
+        let mut maximum_ring_sequence = 0_u64;
+        let mut ring_sequences = BTreeSet::new();
         for slot in 0..SUPERVISOR_EVENT_SLOTS {
             let path = self.event_root.join(supervisor_event_filename(slot));
             let Some(event) = read_supervisor_event(&path)? else {
                 continue;
             };
-            maximum_sequence = maximum_sequence.max(event.sequence());
+            let expected_slot = usize::try_from(
+                (event.sequence() - 1) % SUPERVISOR_EVENT_SLOTS as u64,
+            )
+            .map_err(|_| EngineError::internal_invariant("supervisor event slot overflowed"))?;
+            if expected_slot != slot || !ring_sequences.insert(event.sequence()) {
+                return Err(EngineError::authentication_failure(
+                    "supervisor security-event ring identity is inconsistent",
+                ));
+            }
+            maximum_ring_sequence = maximum_ring_sequence.max(event.sequence());
         }
+        let mut previous = None;
+        for sequence in ring_sequences {
+            if previous.is_some_and(|prior| sequence != prior + 1) {
+                return Err(EngineError::authentication_failure(
+                    "supervisor security-event ring is discontinuous",
+                ));
+            }
+            previous = Some(sequence);
+        }
+        let maximum_sequence = match checkpoint {
+            Some(checkpoint) if maximum_ring_sequence > checkpoint => {
+                if maximum_ring_sequence != checkpoint.saturating_add(1) {
+                    return Err(EngineError::authentication_failure(
+                        "supervisor security-event ring is ahead of its sequence checkpoint",
+                    ));
+                }
+                // A valid next ring record can exist without its checkpoint only
+                // after interruption between the two durable writes. Adopt it;
+                // never reuse its sequence or event identity.
+                maximum_ring_sequence
+            }
+            Some(checkpoint) => checkpoint,
+            None => maximum_ring_sequence,
+        };
         let sequence = maximum_sequence.checked_add(1).ok_or_else(|| {
             EngineError::resource_exhaustion("supervisor security-event sequence exhausted")
         })?;
@@ -261,7 +300,8 @@ impl SupervisorSecurityEventJournal {
             fs::rename(&temporary, &target).map_err(|_| {
                 EngineError::internal_invariant("supervisor security-event activation failed")
             })?;
-            sync_directory(&self.event_root)
+            sync_directory(&self.event_root)?;
+            write_supervisor_sequence(&self.state_root, &checkpoint_path, sequence)
         })() {
             let _ = fs::remove_file(&temporary);
             return Err(error);
@@ -1050,6 +1090,97 @@ fn read_supervisor_event(path: &Path) -> Result<Option<SupervisorSecurityEvent>,
         .map_err(|_| EngineError::authentication_failure("supervisor event is invalid"))
 }
 
+fn encode_supervisor_sequence(sequence: u64) -> [u8; SUPERVISOR_SEQUENCE_BYTES] {
+    let mut bytes = [0_u8; SUPERVISOR_SEQUENCE_BYTES];
+    bytes[0..8].copy_from_slice(&SUPERVISOR_SEQUENCE_MAGIC);
+    bytes[8..10].copy_from_slice(&RELEASE_FORMAT_VERSION.to_le_bytes());
+    bytes[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    bytes[12..20].copy_from_slice(&sequence.to_le_bytes());
+    bytes
+}
+
+fn read_supervisor_sequence(path: &Path) -> Result<Option<u64>, EngineError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(EngineError::authentication_failure(
+                "supervisor sequence checkpoint is not a regular non-symlink file",
+            ));
+        }
+        Ok(metadata) if metadata.len() != SUPERVISOR_SEQUENCE_BYTES as u64 => {
+            return Err(EngineError::authentication_failure(
+                "supervisor sequence checkpoint has the wrong length",
+            ));
+        }
+        Ok(metadata) if metadata.permissions().mode() & 0o022 != 0 => {
+            return Err(EngineError::authentication_failure(
+                "supervisor sequence checkpoint is group or world writable",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(EngineError::authentication_failure(
+                "supervisor sequence checkpoint metadata is unavailable",
+            ));
+        }
+    }
+    let mut file = open_readonly_regular_no_follow(path)?;
+    let mut bytes = [0_u8; SUPERVISOR_SEQUENCE_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|_| EngineError::authentication_failure("supervisor sequence is truncated"))?;
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|_| EngineError::authentication_failure("supervisor sequence read failed"))?
+        != 0
+    {
+        return Err(EngineError::authentication_failure(
+            "supervisor sequence checkpoint has trailing data",
+        ));
+    }
+    if bytes[0..8] != SUPERVISOR_SEQUENCE_MAGIC
+        || u16::from_le_bytes([bytes[8], bytes[9]]) != RELEASE_FORMAT_VERSION
+        || u16::from_le_bytes([bytes[10], bytes[11]]) != 0
+    {
+        return Err(EngineError::authentication_failure(
+            "supervisor sequence checkpoint header is invalid",
+        ));
+    }
+    let sequence = u64::from_le_bytes(
+        bytes[12..20]
+            .try_into()
+            .map_err(|_| EngineError::internal_invariant("supervisor sequence width changed"))?,
+    );
+    if sequence == 0 {
+        return Err(EngineError::authentication_failure("supervisor sequence checkpoint is zero"));
+    }
+    Ok(Some(sequence))
+}
+
+fn write_supervisor_sequence(
+    state_root: &Path,
+    checkpoint_path: &Path,
+    sequence: u64,
+) -> Result<(), EngineError> {
+    let bytes = encode_supervisor_sequence(sequence);
+    let temporary = state_root.join("release-security-event-v1.sequence.new");
+    let mut file = open_new_private(&temporary)?;
+    if let Err(error) = (|| {
+        file.write_all(&bytes)
+            .map_err(|_| EngineError::internal_invariant("supervisor sequence write failed"))?;
+        file.sync_all()
+            .map_err(|_| EngineError::internal_invariant("supervisor sequence sync failed"))?;
+        fs::rename(&temporary, checkpoint_path).map_err(|_| {
+            EngineError::internal_invariant("supervisor sequence activation failed")
+        })?;
+        sync_directory(state_root)
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn write_new_readonly(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -1521,6 +1652,89 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(sequences.first(), Some(&4));
         assert_eq!(sequences.last(), Some(&(SUPERVISOR_EVENT_SLOTS as u64 + 3)));
+        assert_eq!(
+            read_supervisor_sequence(&state_root.join("release-security-event-v1.sequence"))
+                .expect("sequence checkpoint reads"),
+            Some(SUPERVISOR_EVENT_SLOTS as u64 + 3),
+        );
+        for path in events {
+            fs::remove_file(path).expect("event slot removes");
+        }
+        let after_ring_reset = journal
+            .append(
+                SupervisorSecurityEventKind::ReleaseVerifierFailure,
+                0,
+                [0; ModelPackageHash::BYTE_LEN],
+            )
+            .expect("sequence checkpoint must prevent identity reuse");
+        assert_eq!(after_ring_reset.sequence(), SUPERVISOR_EVENT_SLOTS as u64 + 4);
+        fs::remove_dir_all(state_root).expect("state root remove");
+        fs::remove_dir_all(event_root).expect("event root remove");
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))
+            .expect("cleanup mode");
+        fs::remove_dir_all(release_root).expect("release root remove");
+        fs::remove_dir_all(runtime_root).expect("runtime root remove");
+    }
+
+    #[test]
+    fn supervisor_sequence_checkpoint_rejects_corruption_and_adopts_one_interrupted_record() {
+        let state_root = temporary_root("event-sequence-state");
+        let event_root = temporary_root("event-sequence-ring");
+        let release_root = temporary_root("event-sequence-release");
+        let runtime_root = temporary_root("event-sequence-runtime");
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o500))
+            .expect("release root must be read only");
+        let journal = SupervisorSecurityEventJournal::open(
+            &state_root,
+            &event_root,
+            &release_root,
+            &runtime_root,
+        )
+        .expect("journal must open");
+        let first = journal
+            .append(
+                SupervisorSecurityEventKind::ReleaseIntegrityFailure,
+                0,
+                [0; ModelPackageHash::BYTE_LEN],
+            )
+            .expect("first event appends");
+        assert_eq!(first.sequence(), 1);
+
+        let interrupted = SupervisorSecurityEvent::new(
+            SupervisorSecurityEventKind::ReleaseLedgerFailure,
+            2,
+            0,
+            [0; ModelPackageHash::BYTE_LEN],
+        )
+        .expect("interrupted event validates");
+        let interrupted_path = event_root.join(supervisor_event_filename(1));
+        write_new_readonly(&interrupted_path, &interrupted.encode())
+            .expect("interrupted event writes");
+        let recovered = journal
+            .append(
+                SupervisorSecurityEventKind::ReleaseVerifierFailure,
+                0,
+                [0; ModelPackageHash::BYTE_LEN],
+            )
+            .expect("one interrupted record must be adopted");
+        assert_eq!(recovered.sequence(), 3);
+
+        let checkpoint = state_root.join("release-security-event-v1.sequence");
+        let mut corrupt = encode_supervisor_sequence(3);
+        corrupt[0] ^= 0xff;
+        fs::set_permissions(&checkpoint, fs::Permissions::from_mode(0o600))
+            .expect("checkpoint mode permits corruption fixture");
+        fs::write(&checkpoint, corrupt).expect("checkpoint corruption writes");
+        assert!(
+            journal
+                .append(
+                    SupervisorSecurityEventKind::ReleaseVerifierFailure,
+                    0,
+                    [0; ModelPackageHash::BYTE_LEN],
+                )
+                .is_err()
+        );
+
         fs::remove_dir_all(state_root).expect("state root remove");
         fs::remove_dir_all(event_root).expect("event root remove");
         fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))

@@ -46,8 +46,11 @@
   thermal behavior, and days-long restart/cancellation soak are unqualified.
 - Security telemetry is bounded and content-free. The verifier rejects
   binary/metallib mismatch and downgrade and retains bounded pre-launch
-  categories for Go/Agent Green delivery. The source bridge is not yet
-  operated/qualified, and supervisor model quarantine remains absent.
+  categories for Go/Agent Green delivery. A root-owned monotonic sequence
+  checkpoint prevents ring reset from reusing event identity. Go integration
+  `1951a42` now persists provider quarantine and exact-revision audited owner
+  recovery, but the source bridge, quarantine, and recovery workflow are not
+  yet operated or qualified on the production host.
 
 ## Tooling gaps
 

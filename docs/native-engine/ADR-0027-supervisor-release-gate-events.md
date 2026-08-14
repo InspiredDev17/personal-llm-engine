@@ -35,6 +35,12 @@ generation plus SHA-384 manifest digest. They contain no path, diagnostic,
 prompt, model output, credential, or key. Atomic replacement and directory
 synchronization publish a slot. A separate protected create-new lock
 serializes writers. If event retention itself fails, launch still fails closed.
+A fixed-width `PAIRSEQ1` checkpoint in the disjoint root-owned state directory
+retains the highest issued event sequence. The verifier writes the ring record
+before advancing that checkpoint, adopts at most one valid interrupted record,
+and never reuses its sequence. Clearing or rolling back the bounded ring alone
+therefore cannot restart event identity at one. Corrupt, writable, malformed,
+or excessively advanced checkpoint/ring state fails closed.
 
 The inference service has write access to neither rollback nor event state and
 cannot read the private rollback ledger. Under the current reviewed same-group
@@ -50,6 +56,10 @@ and content-free audit. This downstream durability does not give Rust, Go,
 Agent Green, clients, or models write authority over supervisor evidence.
 The nonzero supervisor sequence also maps to one stable content-free Go event
 and audit correlation UUID, so a retry does not acquire a new logical identity.
+Go integration `1951a42` additionally persists a source-bound provider
+quarantine before exposing each supervisor event, blocks native admission and
+calls across restarts, and permits only exact-revision owner recovery after the
+durable delivery cursor has acknowledged the trigger.
 
 ## Bounds and failure behavior
 
@@ -57,6 +67,8 @@ and audit correlation UUID, so a retry does not acquire a new logical identity.
 - retained slots: 64;
 - event kinds: seven closed pre-launch categories;
 - sequence: nonzero `u64`, checked and never wrapped;
+- sequence checkpoint: fixed 20-byte `PAIRSEQ1` state, written durably outside
+  the ring and engine runtime;
 - unknown release identity: exactly zero generation and all-zero digest;
 - verified identity: nonzero generation and nonzero digest;
 - unknown files, kinds, versions, flags, duplicates, discontinuities, unsafe
@@ -73,9 +85,11 @@ approve, update, or launch a release.
 
 ## Consequences
 
-The repository now provides the Linux pre-launch binding and typed event
-bridge in source. It does not prove OS authentication of the verifier binary,
-release-key custody, systemd behavior on the target host, service-account/group
-provisioning, owner-authorized cursor/ring recovery, event delivery while Go is
-offline, or operated upgrade/tamper/
-rollback evidence. Those remain release qualification gates.
+The repository now provides the Linux pre-launch binding, monotonic event
+identity checkpoint, and typed event bridge in source. The Go control plane now
+provides durable provider quarantine and audited owner recovery in source. This
+does not prove OS authentication of the verifier binary, release-key custody,
+systemd behavior on the target host, service-account/group provisioning,
+owner-authorized ring/cursor disaster recovery, operated Agent Green delivery,
+or operated upgrade/tamper/rollback evidence. Those remain release
+qualification gates.

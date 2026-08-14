@@ -11,7 +11,7 @@ documentation exception.
 | Gate | Evidence |
 | --- | --- |
 | Rust correctness | Rust 1.85.0 workspace tests, all targets/features, Clippy with warnings denied, formatting, documentation tests, and documentation build passed on the Apple Silicon host |
-| Go boundary | `go test ./...`, `go test -race ./...`, `go vet ./...`, and `go mod verify` passed for Go integration baseline `3c7c082` |
+| Go boundary | `go test ./...`, `go test -race ./...`, `go vet ./...`, and `go mod verify` passed for Go integration baseline `1951a42`; its PostgreSQL cursor/quarantine migration and concurrent recovery integration tests also passed against an isolated local database |
 | Parser smoke fuzzing | All nine requested parsing/validation boundaries ran for five seconds each; no crash, timeout, sanitizer, or resource artifact was produced |
 | Metal correctness | Six direct-GPU suites passed with Metal API Validation and GPU Validation enabled |
 | Native bridge | Objective-C++ vector-add lifecycle passed with AddressSanitizer and UndefinedBehaviorSanitizer; macOS LeakSanitizer was unavailable |
@@ -42,9 +42,11 @@ documentation exception.
    macOS host. macOS `sandbox-exec` is deprecated and remains a development
    proof, not a signed production App Sandbox/launcher qualification.
 6. Miri could not run because the pinned nightly lacks the Miri component.
-7. The release verifier rejects binary/metallib mismatch and downgrade and the
-   source-complete root-owned ring feeds Go's existing Agent Green path, but
-   operated event delivery and model quarantine are not qualified.
+7. The release verifier rejects binary/metallib mismatch and downgrade; its
+   root-owned ring now has a separate monotonic event-sequence checkpoint. Go
+   integration `1951a42` adds durable provider quarantine and audited owner
+   recovery after acknowledged delivery. Operated event delivery, quarantine,
+   recovery, and database-restore evidence remain unqualified.
 8. The audited published Go integration baseline and the separate local Go
    security history must be deliberately reconciled and retested as one exact
    release revision; this audit does not silently merge divergent histories.

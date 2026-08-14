@@ -19,7 +19,7 @@ process limits, threat coverage, and these evidence records.
 | R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete Metal prefill/decode/sampling/streaming with scalar parity and persistent weights; owner-selected UDS execution and exact Go descriptor pinning are implemented, while operated canary/rollback and production-size qualification remain |
 | R-04 | P1 operations | Open | Linux confinement and crash-loop telemetry lack operated-host proof; macOS Seatbelt proof is transitional |
 | R-05 | P2 tooling | Open | Miri component is unavailable for the pinned nightly; pure-Rust Miri evidence is absent |
-| R-06 | P2 telemetry | Reduced | The verifier retains bounded content-free installed-artifact/downgrade failures in a root-owned ring consumed by Go; operated bridge qualification and model-quarantine policy remain absent |
+| R-06 | P2 telemetry | Reduced | The verifier retains bounded content-free installed-artifact/downgrade failures in a root-owned ring with a separate monotonic sequence checkpoint; Go integration `1951a42` persists source-bound provider quarantine and audited owner recovery; operated bridge/quarantine qualification remains |
 | R-07 | P2 release | Open | Published Go integration and separate local Go security commits are divergent and need deliberate reconciliation |
 | F-01 | P2 tooling | Fixed | Missing explicit fuzz targets for configuration import, authenticated generation requests, and sampling parameters |
 | F-02 | P2 operations | Fixed | Linux service profile lacked explicit core, descriptor, process, task, memory/swap, home, namespace, and common secret-environment limits |
