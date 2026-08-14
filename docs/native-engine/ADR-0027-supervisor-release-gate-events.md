@@ -43,9 +43,11 @@ root-owned directory or files and gains no launch or acknowledgement authority.
 A Go control-plane adapter reads the group-readable, root-owned event ring,
 validate owner, mode, identity, grammar, and sequence, and deliver the mapped
 category through its existing audit and Agent Green boundary. Go never writes
-or removes the ring. Its acknowledgement cursor is in memory, so process
-restart may replay retained events; Agent Green's authenticated replay controls
-remain the durable receiver boundary.
+or removes the ring. The Go control plane now persists only the fixed source ID
+and last completed sequence in PostgreSQL. It loads that cursor before a new
+scan and advances it by exact compare-and-swap only after Agent Green delivery
+and content-free audit. This downstream durability does not give Rust, Go,
+Agent Green, clients, or models write authority over supervisor evidence.
 
 ## Bounds and failure behavior
 
@@ -58,11 +60,12 @@ remain the durable receiver boundary.
 - unknown files, kinds, versions, flags, duplicates, discontinuities, unsafe
   ownership/modes, symlinks, truncation, and trailing bytes fail closed.
 
-During one Go process lifetime, ring overrun before acknowledgement is reported
-as a lost sequence and is not silently skipped. Because the Go cursor is not
-yet durable, more than 64 failures while Go is stopped can overwrite older
-records without proving whether they were previously delivered; that remains
-an operated retention gate. The ring is defensive telemetry, not authorization:
+Ring overrun before acknowledgement is reported as a lost sequence and is not
+silently skipped, including across Go restarts. Empty/reset state after an
+acknowledgement, sequence rollback, a missing exact successor, database failure,
+and concurrent cursor advancement all fail visibly. A crash after authenticated
+delivery but before cursor commit can repeat one event under the explicit
+at-least-once contract. The ring is defensive telemetry, not authorization:
 neither Go, Agent Green, the client, nor a model can use it to install, select,
 approve, update, or launch a release.
 
@@ -71,5 +74,6 @@ approve, update, or launch a release.
 The repository now provides the Linux pre-launch binding and typed event
 bridge in source. It does not prove OS authentication of the verifier binary,
 release-key custody, systemd behavior on the target host, service-account/group
-provisioning, crash recovery, event delivery while Go is offline, or operated
-upgrade/tamper/rollback evidence. Those remain release qualification gates.
+provisioning, stable duplicate-delivery identity, owner-authorized cursor/ring
+recovery, event delivery while Go is offline, or operated upgrade/tamper/
+rollback evidence. Those remain release qualification gates.

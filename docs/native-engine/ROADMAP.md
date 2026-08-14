@@ -39,7 +39,9 @@ memory, tool, approval, or Agent Green behavior.
   rejects signed rollback or same-generation substitution without giving the
   inference service install or self-update authority. The checked-in Linux
   supervisor gate retains bounded content-free failures for Go without giving
-  Rust, clients, or models control-plane authority.
+  Rust, clients, or models control-plane authority. Go now persists only the
+  last completed supervisor sequence and detects restart loss, ring overwrite,
+  reset, rollback, and concurrent advancement without writing the root ring.
 - Exact, non-recursive, data-only package structures with no arbitrary
   deserialization, compression, plugins, paths, code, or kernel selection.
 - Mature audited cryptographic primitives only; package/control private keys
