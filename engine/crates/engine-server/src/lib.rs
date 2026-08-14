@@ -15,6 +15,7 @@ mod os_lock;
 mod peer_credential;
 #[cfg(unix)]
 mod replay;
+mod runtime_reservations;
 #[cfg(unix)]
 mod transport;
 
@@ -24,6 +25,13 @@ pub use continuous::{
 };
 #[cfg(unix)]
 pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
+pub use runtime_reservations::{
+    ArtifactAuthorityId, INFERENCE_RUNTIME_V3_CONTRACT_COMMIT,
+    INFERENCE_RUNTIME_V3_CONTRACT_VERSION, LogicalModelId, MAX_RUNTIME_RESERVATION_RECORDS,
+    ReservationDecision, ReservationDenial, ReservationId, ReservationStatistics,
+    ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId, RuntimeReservationManager,
+    RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
+};
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 

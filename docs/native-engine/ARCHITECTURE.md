@@ -36,7 +36,7 @@ Green authority.
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
-| `engine-server` | service composition, protected UDS and owner-selected CPU/Metal runtime |
+| `engine-server` | service composition, protected UDS, owner-selected CPU/Metal runtime, and the bounded inference-runtime-v3 semantic reservation lifecycle |
 | `engine-cli` | owner configuration, explicit backend policy and daemon entrypoint |
 | `engine-testkit` | deterministic non-production signed fixtures and boundary tests |
 
@@ -45,6 +45,15 @@ dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
 constants used by Unix no-follow openers, the isolated nonblocking `flock`
 call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no third-party AI, tensor,
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
+
+The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
+commit `77f987c3c1c61153fc17698336d25b95edaf2304`. It does not define or parse a
+second wire format. It consumes values only after a future authenticated
+adapter validates canonical v3 documents. The in-memory state machine enforces
+exact identity/correlation, finite capacity, idempotent replay, single
+consumption, cancellation, release, and expiry. Authenticated transport mapping
+and durable reservation recovery remain incomplete and therefore cannot be
+reported as an operated v3 service.
 
 ## Engine release trust flow
 
