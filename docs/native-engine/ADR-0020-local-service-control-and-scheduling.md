@@ -1,6 +1,6 @@
 # ADR-0020: Local service control and bounded scheduling
 
-Status: accepted for the CPU reference service.
+Status: accepted for the CPU reference and trusted owner-selected Metal service.
 
 ## Decision
 
@@ -59,11 +59,12 @@ owner-controlled process signal may begin graceful drain. `ShutdownAccepted`
 is reserved for a future separately authenticated administrative endpoint.
 
 Metrics are fixed-order unsigned counters and never contain prompts, generated
-content, paths, keys, or model bytes. The CPU reference path accumulates
+content, paths, keys, or model bytes. The selected execution path accumulates
 monotonic prompt-forward and generated-token decode nanoseconds, derives
 generated tokens per second with checked integer arithmetic, and reports exact
-live host-pool and contiguous KV reservations. Device memory remains exactly
-zero for CPU. Health is `ready`, `degraded` (no loaded model), or `draining`.
+live host-pool and contiguous KV reservations. Device memory is zero for CPU
+and is read once from the shared bounded Metal backend rather than double-counted
+per model. Health is `ready`, `degraded` (no loaded model), or `draining`.
 Initial load uses an owner-installed budget for a statically registered ID.
 A repeat load of that exact verified resident model is idempotent so the Go
 client can reconnect safely. Unload rejects queued or active ownership. Package failures
@@ -72,7 +73,9 @@ one registered ID and returns one signed response containing the load,
 capability, health, and scheduler-accounting values used for resource routing;
 the request never carries a path. `ModelDescriptor` returns the verified
 SHA-384 package digest, reviewed architecture, executing backend, and context
-limit. Security polling is non-destructive; Go acknowledges a delivered prefix
+limit. CPU is the startup default; Metal requires an explicit device index,
+byte ceiling and buffer ceiling in owner CLI configuration. Clients and packages
+cannot select or change it. Security polling is non-destructive; Go acknowledges a delivered prefix
 only after its own audit and Agent Green boundary accept it.
 
 Continuous ingress failures are request-local and enter the bounded sanitized

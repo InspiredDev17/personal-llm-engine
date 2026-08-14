@@ -27,9 +27,9 @@ pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 
-use personalai_engine_crypto::{
-    EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
-};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_crypto::EngineResponseSigner;
+use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -41,29 +41,34 @@ use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_model_format::ParsedModelPackage;
 use personalai_engine_protocol::{
-    AuthenticatedServiceRequest, CancellationEnvelope, FRAME_HEADER_BYTES, Frame, FrameKind,
-    GENERATION_EVENT_AUTH_BYTES, GenerationRequestEnvelope, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-    ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind,
-    ServiceMetrics, ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody,
-    ServiceResponseBody, ServiceSecurityEvent, ShutdownRejectionReason,
-    encode_signed_service_response,
+    AuthenticatedServiceRequest, CancellationEnvelope, Frame, FrameKind, GenerationRequestEnvelope,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_protocol::{
+    FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES, ServiceCapabilitySet, ServiceErrorCode,
+    ServiceHealthStatus, ServiceMessageKind, ServiceMetrics, ServiceModelDescriptor,
+    ServiceModelStatus, ServiceRequestBody, ServiceResponseBody, ServiceSecurityEvent,
+    ShutdownRejectionReason, encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::CancellationOutcome;
-use personalai_engine_scheduler::{MAX_QUEUED_REQUEST_BYTES, Scheduler, SchedulerLimits};
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_scheduler::MAX_QUEUED_REQUEST_BYTES;
+use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{IncrementalDecoder, Tokenizer, build_tokenizer};
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 pub use personalai_engine_transformer::MetalBackend;
-#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
-use personalai_engine_transformer::MetalDecoderModel;
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_transformer::{CpuDecoderModel, CpuDecoderSession, TransformerConfig};
+#[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
+use personalai_engine_transformer::{MetalDecoderModel, MetalDecoderSession};
 use personalai_engine_types::{
     BackendId, EngineError, GenerationRequest, MAX_FRAME_BYTES, ModelId, ModelPackageHash,
     RequestId,
@@ -122,7 +127,61 @@ const OUTBOUND_PIPELINE_RESERVED_BYTES: usize =
 #[cfg(all(unix, feature = "cpu-reference"))]
 const _: () = assert!(MAX_OUTBOUND_EVENT_FRAME_BYTES <= MAX_FRAME_BYTES);
 /// Human-readable status for the current reference runtime.
-pub const FOUNDATION_STATUS: &str = "signed-package-cpu-reference-uds";
+pub const FOUNDATION_STATUS: &str = "signed-package-trusted-backend-uds";
+
+/// Owner-selected execution backend for the protected local service.
+///
+/// This value is constructed only from startup configuration. It is never
+/// decoded from a client request or model package.
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone, Debug)]
+pub enum RuntimeBackend {
+    /// Deterministic scalar correctness backend.
+    CpuReference,
+    /// Reviewed Apple Metal backend and its fixed device allocation policy.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(MetalBackend),
+}
+
+#[cfg(feature = "cpu-reference")]
+impl Default for RuntimeBackend {
+    fn default() -> Self {
+        Self::CpuReference
+    }
+}
+
+#[cfg(feature = "cpu-reference")]
+impl RuntimeBackend {
+    /// Returns the protocol identity pinned by the Go control plane.
+    pub fn backend_id(&self) -> Result<BackendId, EngineError> {
+        match self {
+            Self::CpuReference => BackendId::new("cpu-reference"),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => BackendId::new("metal"),
+        }
+    }
+
+    fn capabilities(&self) -> Result<ServiceCapabilitySet, EngineError> {
+        let mut capabilities = vec![
+            EngineCapability::CpuReference,
+            EngineCapability::StreamingGeneration,
+            EngineCapability::UnixDomainSocket,
+        ];
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if matches!(self, Self::Metal(_)) {
+            capabilities.push(EngineCapability::Metal);
+        }
+        ServiceCapabilitySet::from_capabilities(capabilities)
+    }
+
+    fn device_memory_bytes(&self) -> Result<u64, EngineError> {
+        match self {
+            Self::CpuReference => Ok(0),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(backend) => Ok(backend.statistics()?.current_allocated_bytes),
+        }
+    }
+}
 
 /// Validated local service configuration that does not open any resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +408,158 @@ pub struct LoadedMetalModel {
     tokenizer: Arc<dyn Tokenizer>,
 }
 
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone)]
+enum LoadedRuntimeModel {
+    Cpu(LoadedCpuModel),
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(LoadedMetalModel),
+}
+
+#[cfg(feature = "cpu-reference")]
+impl LoadedRuntimeModel {
+    fn tokenizer(&self) -> &dyn Tokenizer {
+        match self {
+            Self::Cpu(loaded) => loaded.tokenizer(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.tokenizer(),
+        }
+    }
+
+    fn start_greedy(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+    ) -> Result<GreedyGeneration, EngineError> {
+        match self {
+            Self::Cpu(loaded) => loaded.start_greedy(request, sequence_id),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.start_greedy(request, sequence_id),
+        }
+    }
+
+    fn memory_pool(&self) -> &MemoryPool {
+        match self {
+            Self::Cpu(loaded) => loaded.model().memory_pool(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.model().memory_pool(),
+        }
+    }
+
+    fn kv_cache_bytes(&self) -> Result<u64, EngineError> {
+        match self {
+            Self::Cpu(loaded) => Ok(loaded.model().kv_cache_metrics()?.reserved_bytes),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => Ok(loaded.model().kv_cache_metrics()?.reserved_bytes),
+        }
+    }
+
+    fn architecture_id(&self) -> &personalai_engine_types::ArchitectureId {
+        match self {
+            Self::Cpu(loaded) => loaded.model().config().architecture_id(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.model().config().architecture_id(),
+        }
+    }
+
+    fn context_limit(&self) -> personalai_engine_types::ContextLimit {
+        match self {
+            Self::Cpu(loaded) => loaded.model().config().context_limit(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.model().config().context_limit(),
+        }
+    }
+
+    fn backend_id(&self) -> Result<BackendId, EngineError> {
+        match self {
+            Self::Cpu(_) => BackendId::new("cpu-reference"),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => BackendId::new("metal"),
+        }
+    }
+
+    fn unload_if_idle(&self) -> Result<(), EngineError> {
+        match self {
+            Self::Cpu(_) => Ok(()),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.model().unload_if_idle().map(|_| ()),
+        }
+    }
+}
+
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone)]
+enum RuntimeDecoderModel {
+    Cpu(CpuDecoderModel),
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(MetalDecoderModel),
+}
+
+#[cfg(feature = "cpu-reference")]
+enum RuntimeDecoderSession {
+    Cpu(CpuDecoderSession),
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(MetalDecoderSession),
+}
+
+#[cfg(feature = "cpu-reference")]
+impl RuntimeDecoderModel {
+    fn config(&self) -> &TransformerConfig {
+        match self {
+            Self::Cpu(model) => model.config(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(model) => model.config(),
+        }
+    }
+
+    fn memory_pool(&self) -> &MemoryPool {
+        match self {
+            Self::Cpu(model) => model.memory_pool(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(model) => model.memory_pool(),
+        }
+    }
+
+    fn start_session(
+        &self,
+        budget: &ResourceBudget,
+        request_id: RequestId,
+        sequence_id: SequenceId,
+    ) -> Result<RuntimeDecoderSession, EngineError> {
+        match self {
+            Self::Cpu(model) => {
+                model.start_session(budget, request_id, sequence_id).map(RuntimeDecoderSession::Cpu)
+            }
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(model) => model
+                .start_session(budget, request_id, sequence_id)
+                .map(RuntimeDecoderSession::Metal),
+        }
+    }
+}
+
+#[cfg(feature = "cpu-reference")]
+impl RuntimeDecoderSession {
+    fn forward_token(
+        &mut self,
+        token: u32,
+    ) -> Result<personalai_engine_tensor::Tensor, EngineError> {
+        match self {
+            Self::Cpu(session) => session.forward_token(token),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(session) => session.decode(token),
+        }
+    }
+
+    fn token_count(&self) -> u32 {
+        match self {
+            Self::Cpu(session) => session.token_count(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(session) => session.token_count(),
+        }
+    }
+}
+
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 impl LoadedMetalModel {
     /// Returns the configuration-owned model identifier.
@@ -364,6 +575,22 @@ impl LoadedMetalModel {
     /// Returns the package tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// Creates one validated, resumable greedy Metal sequence for fair service scheduling.
+    pub fn start_greedy(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+    ) -> Result<GreedyGeneration, EngineError> {
+        start_generation_cursor(
+            &self.model_id,
+            RuntimeDecoderModel::Metal(self.model.clone()),
+            Arc::clone(&self.tokenizer),
+            request,
+            sequence_id,
+            SamplingConfig::greedy(),
+        )
     }
 
     /// Runs deterministic greedy generation through the Metal decoder.
@@ -567,42 +794,14 @@ impl LoadedCpuModel {
         sequence_id: SequenceId,
         sampling: SamplingConfig,
     ) -> Result<GreedyGeneration, EngineError> {
-        if request.model_id() != &self.model_id {
-            return Err(EngineError::invalid_input(
-                "generation request model differs from the loaded model",
-            ));
-        }
-        if request.context_limit().get() > self.model.config().context_limit().get() {
-            return Err(EngineError::resource_exhaustion(
-                "request context exceeds the loaded model context",
-            ));
-        }
-        let input_tokens = self.tokenizer.encode(request.input_text())?;
-        let input_count = u32::try_from(input_tokens.len())
-            .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
-        request.validate_tokenized_input(input_count)?;
-        let sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
-        let history = input_tokens.clone();
-        Ok(GreedyGeneration {
-            request: request.clone(),
+        start_generation_cursor(
+            &self.model_id,
+            RuntimeDecoderModel::Cpu(self.model.clone()),
+            Arc::clone(&self.tokenizer),
+            request,
             sequence_id,
-            model: self.model.clone(),
-            tokenizer: Arc::clone(&self.tokenizer),
-            session: None,
-            input_tokens,
-            input_count,
-            history,
-            sampler,
-            next_input: 0,
-            next_generated_token: None,
-            generated: 0,
-            stream_decoder: IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer)),
-            started: false,
-            terminal: None,
-            usage: None,
-            prefill_nanoseconds: 0,
-            decode_nanoseconds: 0,
-        })
+            sampling,
+        )
     }
 
     /// Runs deterministic greedy generation and synchronously emits bounded events.
@@ -955,9 +1154,9 @@ enum TerminalState {
 pub struct GreedyGeneration {
     request: GenerationRequest,
     sequence_id: SequenceId,
-    model: CpuDecoderModel,
+    model: RuntimeDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
-    session: Option<CpuDecoderSession>,
+    session: Option<RuntimeDecoderSession>,
     input_tokens: Vec<u32>,
     input_count: u32,
     history: Vec<u32>,
@@ -971,6 +1170,53 @@ pub struct GreedyGeneration {
     usage: Option<GenerationUsage>,
     prefill_nanoseconds: u64,
     decode_nanoseconds: u64,
+}
+
+#[cfg(feature = "cpu-reference")]
+fn start_generation_cursor(
+    model_id: &ModelId,
+    model: RuntimeDecoderModel,
+    tokenizer: Arc<dyn Tokenizer>,
+    request: &GenerationRequest,
+    sequence_id: SequenceId,
+    sampling: SamplingConfig,
+) -> Result<GreedyGeneration, EngineError> {
+    if request.model_id() != model_id {
+        return Err(EngineError::invalid_input(
+            "generation request model differs from the loaded model",
+        ));
+    }
+    if request.context_limit().get() > model.config().context_limit().get() {
+        return Err(EngineError::resource_exhaustion(
+            "request context exceeds the loaded model context",
+        ));
+    }
+    let input_tokens = tokenizer.encode(request.input_text())?;
+    let input_count = u32::try_from(input_tokens.len())
+        .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
+    request.validate_tokenized_input(input_count)?;
+    let sampler = Sampler::new(sampling, request.request_id(), model.memory_pool());
+    let history = input_tokens.clone();
+    Ok(GreedyGeneration {
+        request: request.clone(),
+        sequence_id,
+        model,
+        tokenizer: Arc::clone(&tokenizer),
+        session: None,
+        input_tokens,
+        input_count,
+        history,
+        sampler,
+        next_input: 0,
+        next_generated_token: None,
+        generated: 0,
+        stream_decoder: IncrementalDecoder::new_shared(tokenizer),
+        started: false,
+        terminal: None,
+        usage: None,
+        prefill_nanoseconds: 0,
+        decode_nanoseconds: 0,
+    })
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -1095,7 +1341,7 @@ impl GreedyGeneration {
 
     /// Returns decoder tokens committed to this request-local KV cache.
     pub fn processed_tokens(&self) -> u32 {
-        self.session.as_ref().map_or(0, CpuDecoderSession::token_count)
+        self.session.as_ref().map_or(0, RuntimeDecoderSession::token_count)
     }
 
     /// Returns monotonic CPU forward time split between prompt and decode work.
@@ -1294,6 +1540,40 @@ impl GenerationRoundRobin {
         cancelled: Arc<AtomicBool>,
         additional_retained_bytes: usize,
     ) -> Result<(), EngineError> {
+        self.submit_generation(
+            || model.start_greedy(request, sequence_id),
+            request,
+            sequence_id,
+            cancelled,
+            additional_retained_bytes,
+        )
+    }
+
+    fn submit_runtime(
+        &mut self,
+        model: &LoadedRuntimeModel,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: Arc<AtomicBool>,
+        additional_retained_bytes: usize,
+    ) -> Result<(), EngineError> {
+        self.submit_generation(
+            || model.start_greedy(request, sequence_id),
+            request,
+            sequence_id,
+            cancelled,
+            additional_retained_bytes,
+        )
+    }
+
+    fn submit_generation(
+        &mut self,
+        start_generation: impl FnOnce() -> Result<GreedyGeneration, EngineError>,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cancelled: Arc<AtomicBool>,
+        additional_retained_bytes: usize,
+    ) -> Result<(), EngineError> {
         if self.ready.iter().any(|scheduled| {
             scheduled.generation.request_id() == request.request_id()
                 || scheduled.generation.sequence_id() == sequence_id
@@ -1342,7 +1622,7 @@ impl GenerationRoundRobin {
         self.ready
             .try_reserve(1)
             .map_err(|_| EngineError::resource_exhaustion("round-robin queue allocation failed"))?;
-        let generation = model.start_greedy(request, sequence_id)?;
+        let generation = start_generation()?;
         self.ready.push_back(ScheduledGeneration { generation, cancelled, retained_bytes });
         self.retained_bytes = next_retained_bytes;
         Ok(())
@@ -1482,9 +1762,9 @@ pub struct RuntimeMetrics {
     pub prefill_nanoseconds: u64,
     /// Accumulated decode nanoseconds when separately measurable.
     pub decode_nanoseconds: u64,
-    /// Generated tokens per second multiplied by 1,000 over measured CPU forward time.
+    /// Generated tokens per second multiplied by 1,000 over measured backend forward time.
     pub tokens_per_second_milli: u64,
-    /// Reserved host bytes across loaded CPU model pools.
+    /// Reserved host bytes across loaded model pools.
     pub host_memory_bytes: u64,
     /// Reserved device bytes; zero for the CPU reference backend.
     pub device_memory_bytes: u64,
@@ -1583,14 +1863,14 @@ struct GenerationConnection {
 struct ConnectionBatchState<'a> {
     service: &'a mut EngineService,
     metrics: &'a mut RuntimeMetrics,
-    models: &'a BTreeMap<String, LoadedCpuModel>,
+    models: &'a BTreeMap<String, LoadedRuntimeModel>,
     response_signer: &'a EngineResponseSigner,
     next_sequence: &'a mut u64,
     active: &'a mut Vec<ActiveGenerationConnection>,
     results: &'a mut [Option<ConnectionServeResult>],
 }
 
-/// CPU-reference runtime joining authenticated UDS transport to loaded models.
+/// Trusted-backend runtime joining authenticated UDS transport to loaded models.
 ///
 /// Production packages enter only through [`Self::load_registered_model`]
 /// after owner configuration has registered the model identifier, digest,
@@ -1603,7 +1883,8 @@ pub struct CpuEngineRuntime {
     response_signer: EngineResponseSigner,
     replay_journals:
         BTreeMap<personalai_engine_types::SignerKeyId, Arc<Mutex<DurableReplayJournal>>>,
-    models: BTreeMap<String, LoadedCpuModel>,
+    models: BTreeMap<String, LoadedRuntimeModel>,
+    backend: RuntimeBackend,
     model_load_budgets: BTreeMap<String, ResourceBudget>,
     security_events: VecDeque<SecurityEvent>,
     metrics: RuntimeMetrics,
@@ -1614,7 +1895,8 @@ pub struct CpuEngineRuntime {
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn runtime_metrics(
     service: &EngineService,
-    models: &BTreeMap<String, LoadedCpuModel>,
+    models: &BTreeMap<String, LoadedRuntimeModel>,
+    backend: &RuntimeBackend,
     mut metrics: RuntimeMetrics,
 ) -> Result<RuntimeMetrics, EngineError> {
     metrics.loaded_models = u64::try_from(models.len())
@@ -1624,22 +1906,23 @@ fn runtime_metrics(
     metrics.queued_requests = u64::try_from(service.scheduler.queued_len())
         .map_err(|_| EngineError::internal_invariant("queued request count exceeds u64"))?;
     metrics.host_memory_bytes = models.values().try_fold(0_u64, |total, loaded| {
-        let used = loaded.model().memory_pool().used_bytes()?;
+        let used = loaded.memory_pool().used_bytes()?;
         total
             .checked_add(used)
             .ok_or_else(|| EngineError::resource_exhaustion("loaded model memory metric overflows"))
     })?;
     metrics.kv_cache_bytes = models.values().try_fold(0_u64, |total, loaded| {
-        let reserved = loaded.model().kv_cache_metrics()?.reserved_bytes;
+        let reserved = loaded.kv_cache_bytes()?;
         total
             .checked_add(reserved)
             .ok_or_else(|| EngineError::resource_exhaustion("KV-cache memory metric overflows"))
     })?;
+    metrics.device_memory_bytes = backend.device_memory_bytes()?;
     Ok(metrics)
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-fn runtime_health(draining: bool, models: &BTreeMap<String, LoadedCpuModel>) -> ServiceHealth {
+fn runtime_health(draining: bool, models: &BTreeMap<String, LoadedRuntimeModel>) -> ServiceHealth {
     if draining {
         ServiceHealth::Draining
     } else if models.is_empty() {
@@ -1661,6 +1944,7 @@ fn retain_security_event(events: &mut VecDeque<SecurityEvent>, event: SecurityEv
 fn record_runtime_error_parts(
     metrics: &mut RuntimeMetrics,
     events: &mut VecDeque<SecurityEvent>,
+    backend: &RuntimeBackend,
     request_id: RequestId,
     error: &EngineError,
 ) -> Result<(), EngineError> {
@@ -1680,7 +1964,10 @@ fn record_runtime_error_parts(
         EngineError::BackendFailure(_) => {
             metrics.backend_failures =
                 checked_increment(metrics.backend_failures, "backend failure counter")?;
-            SecurityEvent::BackendFailure { request_id: Some(request_id), backend: None }
+            SecurityEvent::BackendFailure {
+                request_id: Some(request_id),
+                backend: Some(backend.backend_id()?),
+            }
         }
         EngineError::ResourceExhaustion(detail) => {
             metrics.rejected_requests =
@@ -1712,7 +1999,7 @@ fn record_runtime_error_parts(
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn unload_model_parts(
     service: &EngineService,
-    models: &mut BTreeMap<String, LoadedCpuModel>,
+    models: &mut BTreeMap<String, LoadedRuntimeModel>,
     model_id: &ModelId,
 ) -> Result<(), EngineError> {
     if service.scheduler.has_active_model(model_id) || service.scheduler.has_queued_model(model_id)
@@ -1721,6 +2008,10 @@ fn unload_model_parts(
             "model cannot unload while a request owns scheduler state",
         ));
     }
+    let loaded = models
+        .get(model_id.as_str())
+        .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
+    loaded.unload_if_idle()?;
     if models.remove(model_id.as_str()).is_none() {
         return Err(EngineError::invalid_input("model is not loaded"));
     }
@@ -1730,7 +2021,8 @@ fn unload_model_parts(
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn load_registered_model_parts(
     service: &EngineService,
-    models: &mut BTreeMap<String, LoadedCpuModel>,
+    models: &mut BTreeMap<String, LoadedRuntimeModel>,
+    backend: &RuntimeBackend,
     metrics: &mut RuntimeMetrics,
     model_id: &ModelId,
     budget: &ResourceBudget,
@@ -1739,7 +2031,7 @@ fn load_registered_model_parts(
     if models.contains_key(model_id.as_str()) {
         return Err(EngineError::invalid_input("model is already loaded"));
     }
-    let loaded = match service.load_registered_cpu_model(model_id, budget, events) {
+    let loaded = match load_runtime_model(service, model_id, budget, backend, events) {
         Ok(loaded) => loaded,
         Err(error) => {
             metrics.package_validation_failures =
@@ -1754,9 +2046,29 @@ fn load_registered_model_parts(
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn load_runtime_model(
+    service: &EngineService,
+    model_id: &ModelId,
+    budget: &ResourceBudget,
+    backend: &RuntimeBackend,
+    events: &mut impl DirectorySecurityEventSink,
+) -> Result<LoadedRuntimeModel, EngineError> {
+    match backend {
+        RuntimeBackend::CpuReference => {
+            service.load_registered_cpu_model(model_id, budget, events).map(LoadedRuntimeModel::Cpu)
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        RuntimeBackend::Metal(metal) => service
+            .load_registered_metal_model(model_id, budget, metal.clone(), events)
+            .map(LoadedRuntimeModel::Metal),
+    }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn model_status_parts(
     service: &EngineService,
-    models: &BTreeMap<String, LoadedCpuModel>,
+    models: &BTreeMap<String, LoadedRuntimeModel>,
+    backend: &RuntimeBackend,
     draining: bool,
     model_id: &ModelId,
 ) -> Result<ServiceResponseBody, EngineError> {
@@ -1765,7 +2077,7 @@ fn model_status_parts(
     let status = ServiceModelStatus::new(
         models.contains_key(model_id.as_str()),
         service_health_status(runtime_health(draining, models)),
-        service_capabilities()?,
+        service_capabilities(backend)?,
         u32::try_from(service.scheduler.active_len())
             .map_err(|_| EngineError::internal_invariant("active scheduler count exceeds u32"))?,
         u32::try_from(service.scheduler.queued_len())
@@ -1785,7 +2097,7 @@ fn model_status_parts(
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn model_descriptor_parts(
     service: &EngineService,
-    models: &BTreeMap<String, LoadedCpuModel>,
+    models: &BTreeMap<String, LoadedRuntimeModel>,
     model_id: &ModelId,
 ) -> Result<ServiceResponseBody, EngineError> {
     let registration = service.registry.resolve(model_id)?;
@@ -1794,16 +2106,21 @@ fn model_descriptor_parts(
         .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
     Ok(ServiceResponseBody::ModelDescriptor(ServiceModelDescriptor::new(
         *registration.expected_hash(),
-        loaded.model().config().architecture_id().clone(),
-        BackendId::new("cpu-reference")?,
-        loaded.model().config().context_limit(),
+        loaded.architecture_id().clone(),
+        loaded.backend_id()?,
+        loaded.context_limit(),
     )))
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one internal service dispatcher borrows disjoint bounded runtime state without granting a combined authority object"
+)]
 fn handle_service_request_parts(
     service: &mut EngineService,
-    models: &mut BTreeMap<String, LoadedCpuModel>,
+    models: &mut BTreeMap<String, LoadedRuntimeModel>,
+    backend: &RuntimeBackend,
     model_load_budgets: &BTreeMap<String, ResourceBudget>,
     security_events: &mut VecDeque<SecurityEvent>,
     metrics: &mut RuntimeMetrics,
@@ -1825,7 +2142,7 @@ fn handle_service_request_parts(
             }
         }
         ServiceRequestBody::ListCapabilities => {
-            Ok(ServiceResponseBody::Capabilities(service_capabilities()?))
+            Ok(ServiceResponseBody::Capabilities(service_capabilities(backend)?))
         }
         ServiceRequestBody::ListRegisteredModels => {
             let registered = service
@@ -1849,6 +2166,7 @@ fn handle_service_request_parts(
             let result = load_registered_model_parts(
                 service,
                 models,
+                backend,
                 metrics,
                 model_id,
                 &budget,
@@ -1876,13 +2194,13 @@ fn handle_service_request_parts(
             Ok(ServiceResponseBody::Health(service_health_status(runtime_health(draining, models))))
         }
         ServiceRequestBody::Metrics => Ok(ServiceResponseBody::Metrics(service_metrics(
-            runtime_metrics(service, models, *metrics)?,
+            runtime_metrics(service, models, backend, *metrics)?,
         ))),
         ServiceRequestBody::ShutdownRequest => Ok(ServiceResponseBody::ShutdownRejected(
             ShutdownRejectionReason::AdministrativeAuthorizationRequired,
         )),
         ServiceRequestBody::ModelStatus(model_id) => {
-            model_status_parts(service, models, draining, model_id)
+            model_status_parts(service, models, backend, draining, model_id)
         }
         ServiceRequestBody::SecurityEvents { maximum } => {
             let count = usize::from(*maximum).min(security_events.len());
@@ -1931,6 +2249,21 @@ impl CpuEngineRuntime {
         trusted_control_keys: TrustedControlPlaneKeys,
         response_signer: EngineResponseSigner,
     ) -> Result<Self, EngineError> {
+        Self::new_with_control_keys_and_backend(
+            service,
+            trusted_control_keys,
+            response_signer,
+            RuntimeBackend::CpuReference,
+        )
+    }
+
+    /// Creates an unloaded runtime with one owner-selected execution backend.
+    pub fn new_with_control_keys_and_backend(
+        service: EngineService,
+        trusted_control_keys: TrustedControlPlaneKeys,
+        response_signer: EngineResponseSigner,
+        backend: RuntimeBackend,
+    ) -> Result<Self, EngineError> {
         for trusted_control_key in trusted_control_keys.configured_keys() {
             if trusted_control_key.key_id() == response_signer.key_id()
                 || trusted_control_key.public_key() == response_signer.public_key()
@@ -1954,6 +2287,7 @@ impl CpuEngineRuntime {
             response_signer,
             replay_journals,
             models: BTreeMap::new(),
+            backend,
             model_load_budgets: BTreeMap::new(),
             security_events: VecDeque::new(),
             metrics: RuntimeMetrics::default(),
@@ -1978,7 +2312,7 @@ impl CpuEngineRuntime {
 
     /// Returns content-free live and cumulative metrics.
     pub fn metrics(&self) -> Result<RuntimeMetrics, EngineError> {
-        runtime_metrics(&self.service, &self.models, self.metrics)
+        runtime_metrics(&self.service, &self.models, &self.backend, self.metrics)
     }
 
     /// Returns the current local health classification.
@@ -1996,7 +2330,13 @@ impl CpuEngineRuntime {
         request_id: RequestId,
         error: &EngineError,
     ) -> Result<(), EngineError> {
-        record_runtime_error_parts(&mut self.metrics, &mut self.security_events, request_id, error)
+        record_runtime_error_parts(
+            &mut self.metrics,
+            &mut self.security_events,
+            &self.backend,
+            request_id,
+            error,
+        )
     }
 
     /// Unloads one idle model. Active or queued ownership fails closed.
@@ -2011,6 +2351,7 @@ impl CpuEngineRuntime {
         handle_service_request_parts(
             &mut self.service,
             &mut self.models,
+            &self.backend,
             &self.model_load_budgets,
             &mut self.security_events,
             &mut self.metrics,
@@ -2035,7 +2376,33 @@ impl CpuEngineRuntime {
         }
         let loaded =
             self.service.load_registered_cpu_model_bytes(model_id, package_bytes, budget)?;
-        self.models.insert(model_id.as_str().to_owned(), loaded);
+        self.models.insert(model_id.as_str().to_owned(), LoadedRuntimeModel::Cpu(loaded));
+        Ok(())
+    }
+
+    /// Verifies and installs one legacy Metal fixture for service-integration tests.
+    #[cfg(all(test, feature = "metal", target_os = "macos"))]
+    pub fn load_registered_metal_model_bytes(
+        &mut self,
+        model_id: &ModelId,
+        package_bytes: &[u8],
+        budget: &ResourceBudget,
+    ) -> Result<(), EngineError> {
+        if self.models.contains_key(model_id.as_str()) {
+            return Err(EngineError::invalid_input("model is already loaded"));
+        }
+        let RuntimeBackend::Metal(backend) = &self.backend else {
+            return Err(EngineError::invalid_input(
+                "Metal fixture requires a Metal-selected runtime",
+            ));
+        };
+        let loaded = self.service.load_registered_metal_model_bytes(
+            model_id,
+            package_bytes,
+            budget,
+            backend.clone(),
+        )?;
+        self.models.insert(model_id.as_str().to_owned(), LoadedRuntimeModel::Metal(loaded));
         Ok(())
     }
 
@@ -2050,6 +2417,7 @@ impl CpuEngineRuntime {
         load_registered_model_parts(
             &self.service,
             &mut self.models,
+            &self.backend,
             &mut self.metrics,
             model_id,
             budget,
@@ -2197,7 +2565,7 @@ impl CpuEngineRuntime {
                             &replay_journal,
                         );
                     });
-                    let result = self.service.run_next_greedy_measured(
+                    let result = self.service.run_next_greedy_runtime(
                         model,
                         sequence_id,
                         &cancelled,
@@ -2541,7 +2909,7 @@ fn prepare_generation_connection(
         };
     *batch.next_sequence = following_sequence;
     let cancelled = Arc::new(AtomicBool::new(false));
-    if let Err(error) = coordinator.submit_with_retained_bytes(
+    if let Err(error) = coordinator.submit_runtime(
         model,
         &scheduled,
         sequence_id,
@@ -3089,12 +3457,8 @@ fn service_response_frame(
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-fn service_capabilities() -> Result<ServiceCapabilitySet, EngineError> {
-    ServiceCapabilitySet::from_capabilities([
-        EngineCapability::CpuReference,
-        EngineCapability::StreamingGeneration,
-        EngineCapability::UnixDomainSocket,
-    ])
+fn service_capabilities(backend: &RuntimeBackend) -> Result<ServiceCapabilitySet, EngineError> {
+    backend.capabilities()
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -3333,7 +3697,7 @@ impl EngineService {
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
-        let result = (|| {
+        let result: Result<LoadedCpuModel, EngineError> = (|| {
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3490,14 +3854,59 @@ impl EngineService {
         loaded: &LoadedCpuModel,
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
+        emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<Option<GenerationMeasurement>, EngineError> {
+        self.run_next_greedy_cursor(sequence_id, cancelled, emit, |request| {
+            loaded.start_greedy(request, sequence_id)
+        })
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    fn run_next_greedy_runtime(
+        &mut self,
+        loaded: &LoadedRuntimeModel,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
+        emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+    ) -> Result<Option<GenerationMeasurement>, EngineError> {
+        self.run_next_greedy_cursor(sequence_id, cancelled, emit, |request| {
+            loaded.start_greedy(request, sequence_id)
+        })
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    fn run_next_greedy_cursor(
+        &mut self,
+        sequence_id: SequenceId,
+        cancelled: &AtomicBool,
         mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+        start: impl FnOnce(&GenerationRequest) -> Result<GreedyGeneration, EngineError>,
     ) -> Result<Option<GenerationMeasurement>, EngineError> {
         let Some(active) = self.scheduler.start_next(sequence_id)?.cloned() else {
             return Ok(None);
         };
         let request_id = active.request().request_id();
-        let result =
-            loaded.generate_greedy_measured(active.request(), sequence_id, cancelled, &mut emit);
+        let result: Result<GenerationMeasurement, EngineError> = (|| {
+            let mut generation = start(active.request())?;
+            loop {
+                match generation.advance(cancelled)? {
+                    GreedyAdvance::Progressed => {}
+                    GreedyAdvance::Event(event) => {
+                        let completed = match &event {
+                            GenerationEvent::Completed { usage, .. } => Some(*usage),
+                            _ => None,
+                        };
+                        emit(event)?;
+                        if let Some(usage) = completed {
+                            return Ok(GenerationMeasurement {
+                                usage,
+                                timing: generation.timing(),
+                            });
+                        }
+                    }
+                }
+            }
+        })();
         self.scheduler.finish(&request_id)?;
         match result {
             Ok(measurement) => Ok(Some(measurement)),
@@ -4854,6 +5263,65 @@ mod tests {
         fixture.cleanup();
     }
 
+    #[cfg(all(unix, feature = "metal", target_os = "macos"))]
+    #[test]
+    fn authenticated_service_streams_through_owner_selected_metal_backend() {
+        let backend = MetalBackend::new(0, 1 << 24, 16).expect("Metal backend must construct");
+        let mut fixture = BatchRuntimeFixture::new_with_backend(
+            "metal-service",
+            1,
+            RuntimeBackend::Metal(backend),
+        );
+        let capabilities = service_capabilities(&fixture.runtime.backend)
+            .expect("selected capabilities must encode");
+        assert!(
+            capabilities
+                .contains(EngineCapability::CpuReference)
+                .expect("CPU capability must decode")
+        );
+        assert!(
+            capabilities.contains(EngineCapability::Metal).expect("Metal capability must decode")
+        );
+        let descriptor = model_descriptor_parts(
+            &fixture.runtime.service,
+            &fixture.runtime.models,
+            &fixture.model_id,
+        )
+        .expect("descriptor must construct");
+        let ServiceResponseBody::ModelDescriptor(descriptor) = descriptor else {
+            panic!("descriptor response kind changed");
+        };
+        assert_eq!(descriptor.backend_id().as_str(), "metal");
+        assert!(
+            fixture.runtime.metrics().expect("Metal metrics must read").device_memory_bytes > 0
+        );
+
+        let request = fixture.request(609, "A", 2);
+        let signed = signed_generation_frame(
+            &request,
+            1,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let client = spawn_ordered_runtime_test_client(
+            fixture.socket_path(),
+            signed,
+            fixture.response_public_key,
+            1,
+            3,
+        );
+        let result = fixture
+            .runtime
+            .serve_batch(&fixture.listener, 1)
+            .expect("Metal service batch must run");
+        assert!(matches!(
+            result.as_slice(),
+            [Ok(ServeOutcome::Generated { request_id, .. })] if request_id.get() == 609
+        ));
+        assert_eq!(client.join().expect("Metal client must finish").last(), Some(&3));
+        fixture.cleanup();
+    }
+
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn authenticated_batch_isolates_cancellation_and_completes_neighbor() {
@@ -5082,6 +5550,52 @@ mod tests {
         fixture.listener.set_nonblocking(false).expect("listener mode must return to blocking");
         assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
         assert_eq!(fixture.runtime.service.scheduler.active_len(), 0);
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "metal", target_os = "macos"))]
+    #[test]
+    fn continuous_service_streams_owner_selected_metal_and_drains() {
+        use std::thread;
+
+        let backend = MetalBackend::new(0, 1 << 24, 16).expect("Metal backend must construct");
+        let mut fixture = BatchRuntimeFixture::new_with_backend(
+            "continuous-metal",
+            1,
+            RuntimeBackend::Metal(backend),
+        );
+        let request = fixture.request(648, "A", 2);
+        let signed = signed_generation_frame(
+            &request,
+            60,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let client = spawn_ordered_runtime_test_client(
+            fixture.socket_path(),
+            signed,
+            fixture.response_public_key,
+            60,
+            3,
+        );
+        let shutdown = ContinuousShutdown::new();
+        let request_shutdown = shutdown.clone();
+        let shutdown_thread = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(200));
+            request_shutdown.request();
+        });
+        let summary = fixture
+            .runtime
+            .serve_continuous(
+                &fixture.listener,
+                ContinuousServeLimits::new(1).expect("continuous limit must validate"),
+                &shutdown,
+            )
+            .expect("continuous Metal service must drain");
+        shutdown_thread.join().expect("Metal shutdown request must finish");
+        assert_eq!(summary.completed_generations(), 1);
+        assert_eq!(summary.failed_connections(), 0);
+        assert_eq!(client.join().expect("Metal client must finish").last(), Some(&3));
         fixture.cleanup();
     }
 
@@ -5567,6 +6081,10 @@ mod tests {
     #[cfg(all(unix, feature = "cpu-reference"))]
     impl BatchRuntimeFixture {
         fn new(label: &str, maximum_active: u32) -> Self {
+            Self::new_with_backend(label, maximum_active, RuntimeBackend::CpuReference)
+        }
+
+        fn new_with_backend(label: &str, maximum_active: u32, backend: RuntimeBackend) -> Self {
             use std::fs;
             use std::os::unix::fs::PermissionsExt;
             use std::sync::atomic::AtomicU64;
@@ -5607,11 +6125,27 @@ mod tests {
                 .expect("budget must validate");
             let response_signer = test_response_signer();
             let response_public_key = response_signer.public_key();
-            let mut runtime = CpuEngineRuntime::new(service, trusted_key, response_signer)
-                .expect("runtime must construct");
-            runtime
-                .load_registered_model_bytes(&model_id, fixture.bytes(), &budget)
-                .expect("model must load");
+            let trusted_keys = TrustedControlPlaneKeys::single(trusted_key)
+                .expect("control key ring must validate");
+            let metal_selected =
+                backend.backend_id().expect("backend identity must validate").as_str() == "metal";
+            let mut runtime = CpuEngineRuntime::new_with_control_keys_and_backend(
+                service,
+                trusted_keys,
+                response_signer,
+                backend,
+            )
+            .expect("runtime must construct");
+            if metal_selected {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                runtime
+                    .load_registered_metal_model_bytes(&model_id, fixture.bytes(), &budget)
+                    .expect("Metal model must load");
+            } else {
+                runtime
+                    .load_registered_model_bytes(&model_id, fixture.bytes(), &budget)
+                    .expect("CPU model must load");
+            }
             let listener =
                 UnixFrameListener::bind(runtime.service().config()).expect("socket must bind");
             Self {

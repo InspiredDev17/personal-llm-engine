@@ -29,8 +29,9 @@ documentation exception.
    license verdict without either a real license decision or an unsafe ignore.
 3. A registered signed synthetic package now runs end-to-end through persistent
    Metal weights, device KV, sampling, and typed streaming with scalar parity.
-   Production UDS/Go routing remains CPU-backed pending trusted configuration,
-   reversible canary, production-size qualification, and rollback evidence.
+   Trusted UDS Metal selection and exact Go descriptor pinning are implemented,
+   but production routing remains blocked pending a reversible operated canary,
+   production-size qualification, and rollback evidence.
 4. No legally approved production model, production tokenizer vectors,
    production-size context soak, quality evaluation, or thermal/tokens-per-
    second evidence exists.

@@ -5,8 +5,8 @@
 
 ## Context
 
-The CPU reference runtime currently processes one authenticated connection and
-one generation request synchronously. Its original generation loop owns a
+The original CPU reference runtime processed one authenticated connection and
+one generation request synchronously. Its generation loop owned a
 decoder session from prompt prefill through completion, so a future scheduler
 cannot rotate between active sequences without duplicating generation,
 tokenization, UTF-8 streaming, cancellation, and usage-accounting logic.
@@ -17,12 +17,15 @@ must not select scheduling behavior, batch shape, or execution kernels.
 
 ## Decision
 
-Represent one CPU greedy generation as a request-local `GreedyGeneration`
+Represent one greedy generation as a request-local `GreedyGeneration`
 cursor. One `advance` call performs no more than one decoder token step and
 returns either bounded internal progress or exactly one typed generation event.
 The cursor owns the sequence's decoder session, KV cache, prompt position,
 generated-token count, UTF-8 prefix, terminal state, and checked usage. It
-borrows only the immutable loaded model and tokenizer and performs no I/O.
+borrows only the immutable loaded model and tokenizer and performs no I/O. The
+cursor now closes over either the scalar CPU or reviewed Metal model/session;
+the scheduler does not branch on backend and neither package nor request can
+select one.
 
 The existing synchronous `generate_greedy` API remains as a compatibility
 wrapper that advances the cursor until completion. An engine-owned

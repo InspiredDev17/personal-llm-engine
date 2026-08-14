@@ -1,6 +1,6 @@
 # ADR-0025: First-party Metal graph backend
 
-Status: accepted for the immutable graph and signed synthetic decoder; service cutover pending.
+Status: accepted for the immutable graph, signed synthetic decoder, and trusted local service path; operated canary pending.
 
 ## Decision
 

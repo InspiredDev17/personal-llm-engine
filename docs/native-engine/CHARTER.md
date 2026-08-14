@@ -117,9 +117,10 @@ and review record in an isolated FFI/backend module.
   error; no empty success or fake inference is allowed.
 - CPU reference is the default oracle. The optimized ARM64 and Metal graph
   backends are default-off, runtime-checked, and bounded. Metal may advertise
-  model execution only in direct trusted composition after registered signed-
-  package admission; UDS/Go Metal selection, ARM64 decoder activation, and CUDA
-  remain disabled until their remaining acceptance gates pass.
+  model execution only after registered signed-package admission and complete
+  owner startup configuration; the UDS scheduler now supports that path and Go
+  must pin the signed Metal descriptor. ARM64 decoder activation and CUDA remain
+  disabled until their remaining acceptance gates pass.
 - Inference graphs are immutable engine-owned plans built only by reviewed
   architecture code. A model package or client cannot supply operations,
   operation names, executable graphs, kernels, or backend choices.

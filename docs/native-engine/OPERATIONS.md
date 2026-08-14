@@ -39,6 +39,10 @@ requires recorded capacity review.
    preserves approvals, Action Broker, memory, audit, and Agent Green boundaries.
 5. Run direct-host Metal validation if Metal will be enabled; a skipped GPU
    test is not release evidence.
+   Start Metal only with `--execution-backend metal` plus explicit device index,
+   device-memory ceiling and buffer-count ceiling. Omission selects CPU
+   reference. Confirm Go pins `PERSONALAI_NATIVE_ENGINE_BACKEND_ID=metal` and
+   rejects any signed descriptor mismatch before registering the provider.
 6. On Linux, run `systemd-analyze security` and an operated UDS-success plus
    IPv4/IPv6-denial test. On macOS, run `verify-sandbox.sh`; treat it only as a
    transitional development proof.
@@ -83,3 +87,11 @@ runtime, reject lower generations even when correctly signed, and require a
 separate owner-authorized emergency recovery record for any downgrade. Model
 registry activation already selects an exact signed package entry and must not
 fall back to older or unregistered content.
+
+Backend rollback is configuration-only and does not weaken package identity:
+drain and stop Rust, restart it with `--execution-backend cpu-reference`, set
+Go's pinned backend identity to `cpu-reference`, then restart Go and require its
+full signed health, capability, registration, load and descriptor preflight.
+There is no in-process automatic Metal-to-CPU model switch and no client
+override. This reversible restart procedure is source-complete but still needs
+an operated canary/rollback record on the target deployment.

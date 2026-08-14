@@ -35,8 +35,8 @@ Green authority.
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
-| `engine-server` | service composition, protected UDS and CPU runtime |
-| `engine-cli` | owner configuration and daemon entrypoint |
+| `engine-server` | service composition, protected UDS and owner-selected CPU/Metal runtime |
+| `engine-cli` | owner configuration, explicit backend policy and daemon entrypoint |
 | `engine-testkit` | deterministic non-production signed fixtures and boundary tests |
 
 Internal dependencies are checked against an explicit DAG. The only external
@@ -427,9 +427,12 @@ an embedded SHA-384-identified first-party metallib, a closed 19-kernel C ABI,
   into model-scoped immutable device buffers and executes the complete reviewed
   architecture through closed kernels. The registered production directory
   loader can construct it only after signature, hash, tokenizer, and tensor
-  validation. Direct composition advertises Metal model execution; the UDS
-  daemon remains CPU-selected pending trusted configuration and Go rollout.
-  CUDA remains not implemented.
+  validation. The UDS daemon now selects CPU reference by default or Metal only
+  through complete owner startup configuration. The same fair cursor,
+  cancellation, replay, signed streaming, load/unload and descriptor path is
+  used for either backend; requests and packages cannot choose it. Go pins the
+  signed descriptor backend and rejects a mismatch. CUDA remains not
+  implemented.
 Any backend is selected by trusted engine configuration and architecture code,
 never by model data, and must pass CPU differential and isolated unsafe/FFI
 review.

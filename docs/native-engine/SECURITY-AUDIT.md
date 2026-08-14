@@ -16,7 +16,7 @@ process limits, threat coverage, and these evidence records.
 | --- | --- | --- | --- |
 | R-01 | P0 release | Open | Engine binary/metallib release artifacts are not signed or rollback-protected; production release is prohibited |
 | R-02 | P1 release | Open | Repository-owned Rust crates have no declared owner license, so complete machine license policy cannot pass honestly |
-| R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete Metal prefill/decode/sampling/streaming with scalar parity and persistent weights; UDS/Go cutover and production-size qualification remain |
+| R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete Metal prefill/decode/sampling/streaming with scalar parity and persistent weights; owner-selected UDS execution and exact Go descriptor pinning are implemented, while operated canary/rollback and production-size qualification remain |
 | R-04 | P1 operations | Open | Linux confinement and crash-loop telemetry lack operated-host proof; macOS Seatbelt proof is transitional |
 | R-05 | P2 tooling | Open | Miri component is unavailable for the pinned nightly; pure-Rust Miri evidence is absent |
 | R-06 | P2 telemetry | Open | Installed binary/metallib/downgrade/quarantine verifier events cannot be emitted until the release verifier/supervisor exists |

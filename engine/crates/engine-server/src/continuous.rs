@@ -4,7 +4,7 @@ use super::{
     AuthenticatedControlSession, BTreeMap, CANCELLATION_WATCHER_STACK_BYTES, CancellationOutcome,
     ConnectionServeResult, CpuEngineRuntime, DurableReplayJournal, EngineError,
     EngineResponseSigner, EngineService, Frame, GenerationEvent, GenerationRequest,
-    GenerationRoundRobin, InboundCommand, LoadedCpuModel, MAX_CONCURRENT_CONNECTION_BATCH,
+    GenerationRoundRobin, InboundCommand, LoadedRuntimeModel, MAX_CONCURRENT_CONNECTION_BATCH,
     MAX_PENDING_EVENTS_PER_CONNECTION, OUTBOUND_PIPELINE_RESERVED_BYTES, OUTPUT_WRITER_STACK_BYTES,
     RequestId, RuntimeMetrics, SECURITY_PATTERN_THRESHOLD, SequenceId, ServeOutcome, SyncSender,
     TrustedControlPlaneKeys, UnixFrameConnection, UnixFrameListener, activate_queued_request,
@@ -164,7 +164,8 @@ struct ContinuousState<'a> {
     trusted_control_keys: Arc<TrustedControlPlaneKeys>,
     response_signer: &'a EngineResponseSigner,
     replay_journals: Arc<BTreeMap<SignerKeyId, Arc<Mutex<DurableReplayJournal>>>>,
-    models: &'a mut BTreeMap<String, LoadedCpuModel>,
+    models: &'a mut BTreeMap<String, LoadedRuntimeModel>,
+    backend: &'a super::RuntimeBackend,
     model_load_budgets: &'a BTreeMap<String, ResourceBudget>,
     security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
@@ -225,6 +226,7 @@ impl CpuEngineRuntime {
             response_signer: &self.response_signer,
             replay_journals: Arc::new(self.replay_journals.clone()),
             models: &mut self.models,
+            backend: &self.backend,
             model_load_budgets: &self.model_load_budgets,
             security_events: &mut self.security_events,
             metrics: &mut self.metrics,
@@ -409,7 +411,10 @@ impl ContinuousState<'_> {
                 increment(&mut self.metrics.backend_failures, "backend failure counter")?;
                 retain_security_event(
                     self.security_events,
-                    SecurityEvent::BackendFailure { request_id: None, backend: None },
+                    SecurityEvent::BackendFailure {
+                        request_id: None,
+                        backend: Some(self.backend.backend_id()?),
+                    },
                 );
                 Ok(())
             }
@@ -489,6 +494,7 @@ impl ContinuousState<'_> {
         let body = match handle_service_request_parts(
             self.service,
             self.models,
+            self.backend,
             self.model_load_budgets,
             self.security_events,
             self.metrics,
@@ -497,7 +503,13 @@ impl ContinuousState<'_> {
         ) {
             Ok(response) => response,
             Err(error) => {
-                record_runtime_error_parts(self.metrics, self.security_events, request_id, &error)?;
+                record_runtime_error_parts(
+                    self.metrics,
+                    self.security_events,
+                    self.backend,
+                    request_id,
+                    &error,
+                )?;
                 ServiceResponseBody::Error(super::service_error_code(&error))
             }
         };
@@ -523,7 +535,7 @@ impl ContinuousState<'_> {
             let (sequence_id, scheduled, following_sequence) =
                 activate_queued_request(self.service, *self.next_sequence, request_id)?;
             *self.next_sequence = following_sequence;
-            let submission = self.coordinator.submit_with_retained_bytes(
+            let submission = self.coordinator.submit_runtime(
                 model,
                 &scheduled,
                 sequence_id,

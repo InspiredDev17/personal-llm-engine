@@ -26,7 +26,7 @@ memory, tool, approval, or Agent Green behavior.
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
 | 9a. Quantized package storage | COMPLETE for AIPQ8/AIPQ4 synthetic evidence | Explicit profiles, canonical fixed-block payloads, signed source/destination/error evidence, secure loading, scalar kernels, and F32/Q8/Q4 transformer divergence regression |
-| 10. ARM64/Metal | METAL DECODER COMPLETE / SERVICE CUTOVER PENDING | Metal has signed-directory loading, persistent device weights, complete tiny-model prefill/decode/sampling/streaming, device KV, cancellation/unload, hardware parity and metrics; ARM64 decoder integration and UDS/Go Metal selection remain |
+| 10. ARM64/Metal | METAL SERVICE PATH COMPLETE / OPERATED CANARY PENDING | Metal has signed-directory loading, persistent device weights, complete tiny-model prefill/decode/sampling/streaming, device KV, cancellation/unload, hardware parity and metrics; trusted startup selection now joins it to the protected UDS scheduler and Go pins the signed descriptor; ARM64 decoder integration and operated production-size Metal canary remain |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
@@ -139,8 +139,9 @@ kernels, bounded reuse, explicit transfer/dispatch metrics, and contiguous
   sequence-isolated device KV storage with Apple M1 differential evidence. A
   registered signed synthetic package now runs complete prefill, cached decode,
   greedy sampling, and typed streaming through persistent Metal weights;
-  cancellation and idle-only unload invalidate device state. UDS/Go selection,
-  production-size qualification, and reversible rollout remain open. Each
+  cancellation and idle-only unload invalidate device state. Owner-selected
+  UDS execution and exact Go descriptor pinning are complete; production-size
+  qualification and an operated reversible rollout remain open. Each
 activated backend requires fixed
 architecture-owned kernels, isolated documented unsafe/FFI if unavoidable,
 exact device and allocation bounds, cancellation, differential tests against

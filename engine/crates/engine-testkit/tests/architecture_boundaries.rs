@@ -516,6 +516,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-protocol",
                 "personalai-engine-sampling",
                 "personalai-engine-scheduler",
+                "personalai-engine-tensor",
                 "personalai-engine-tokenizer",
                 "personalai-engine-transformer",
                 "personalai-engine-types",

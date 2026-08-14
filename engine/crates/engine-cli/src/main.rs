@@ -1,39 +1,51 @@
 //! Owner-facing CLI for diagnostics and the local CPU-reference service.
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 mod os_signal;
 
+use personalai_engine_crypto::TrustedSigner;
+#[cfg(all(unix, any(feature = "cpu-reference", test)))]
 use personalai_engine_crypto::{
-    EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner,
+    EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys,
 };
+#[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_sampling::SamplingConfig;
+#[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::SchedulerLimits;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_server::EngineService;
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_server::InferenceEvent;
+#[cfg(all(unix, feature = "metal", target_os = "macos"))]
+use personalai_engine_server::MetalBackend;
+#[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_server::{
     ContinuousServeLimits, ContinuousServeSummary, ContinuousShutdown, CpuEngineRuntime,
-    UnixFrameListener,
+    RuntimeBackend, UnixFrameListener,
 };
 use personalai_engine_server::{
-    EngineService, FOUNDATION_STATUS, InferenceEvent, ProtocolDescriptor, RegistrySelectionV2,
-    ServiceConfig,
+    FOUNDATION_STATUS, ProtocolDescriptor, RegistrySelectionV2, ServiceConfig,
+};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_types::{
+    ContextLimit, EngineErrorKind, GenerationRequest, RequestId, SequenceId,
 };
 use personalai_engine_types::{
-    ContextLimit, EngineError, EngineErrorKind, GenerationRequest, ModelId, ModelPackageHash,
-    RequestId, ResourceBudget, SequenceId, SignerKeyId,
+    EngineError, ModelId, ModelPackageHash, ResourceBudget, SignerKeyId,
 };
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::thread::{self, JoinHandle};
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 use std::time::Instant;
 
 const USAGE: &str = "usage:
@@ -52,7 +64,8 @@ const USAGE: &str = "usage:
     --control-key-id HEX32 --control-public-key HEX64 \
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
-    --max-memory-bytes U64 --max-kv-cache-bytes U64
+    --max-memory-bytes U64 --max-kv-cache-bytes U64 \
+    [--execution-backend cpu-reference]
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
     --registration-mode owner-pinned --model-id ID \
     --package BASENAME.paimodel --package-sha384 HEX96 \
@@ -61,7 +74,11 @@ const USAGE: &str = "usage:
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
-    --max-active-sequences U32 --max-connections U32
+    --max-active-sequences U32 --max-connections U32 \
+    [--execution-backend cpu-reference]
+  to select Metal in a macOS binary built with --features metal, replace the backend option with:
+    --execution-backend metal --metal-device-index USIZE \
+    --max-device-memory-bytes U64 --max-metal-buffers USIZE
   replace the owner-pinned package flags in either serving command with:
     --registration-mode model-foundry-registry-v2 --model-id ID \
     --artifact-id ID --registry-sequence U64 --minimum-registry-sequence U64 \
@@ -81,6 +98,7 @@ enum Command {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
 struct GenerateConfig {
     service: ServiceConfig,
     model_id: ModelId,
@@ -96,13 +114,15 @@ struct GenerateConfig {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
 enum ServeMode {
     Single,
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     Continuous(ContinuousServeLimits),
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
 struct ServeConfig {
     service: ServiceConfig,
     model_id: ModelId,
@@ -112,10 +132,30 @@ struct ServeConfig {
     previous_control_key: Option<(SignerKeyId, [u8; 32])>,
     response_key_id: SignerKeyId,
     budget: ResourceBudget,
+    backend: ServeBackend,
     mode: ServeMode,
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
+enum ServeBackend {
+    CpuReference,
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal {
+        device_index: usize,
+        memory_bytes: u64,
+        maximum_buffers: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeBackendKind {
+    CpuReference,
+    Metal,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
 enum RegistrationConfig {
     OwnerPinned {
         package_name: PathBuf,
@@ -160,6 +200,10 @@ struct RawServeConfig {
     max_kv_cache_bytes: Option<u64>,
     max_active_sequences: Option<u32>,
     max_connections: Option<u32>,
+    execution_backend: Option<ServeBackendKind>,
+    metal_device_index: Option<usize>,
+    max_device_memory_bytes: Option<u64>,
+    max_metal_buffers: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -420,6 +464,18 @@ fn parse_serve(
             "--max-connections" if config.max_connections.is_none() => {
                 config.max_connections = Some(parse_u32(text)?);
             }
+            "--execution-backend" if config.execution_backend.is_none() => {
+                config.execution_backend = Some(parse_serve_backend(text)?);
+            }
+            "--metal-device-index" if config.metal_device_index.is_none() => {
+                config.metal_device_index = Some(parse_usize(text)?);
+            }
+            "--max-device-memory-bytes" if config.max_device_memory_bytes.is_none() => {
+                config.max_device_memory_bytes = Some(parse_u64(text)?);
+            }
+            "--max-metal-buffers" if config.max_metal_buffers.is_none() => {
+                config.max_metal_buffers = Some(parse_usize(text)?);
+            }
             "--model-root"
             | "--runtime-root"
             | "--socket"
@@ -445,7 +501,11 @@ fn parse_serve(
             | "--max-memory-bytes"
             | "--max-kv-cache-bytes"
             | "--max-active-sequences"
-            | "--max-connections" => {
+            | "--max-connections"
+            | "--execution-backend"
+            | "--metal-device-index"
+            | "--max-device-memory-bytes"
+            | "--max-metal-buffers" => {
                 return Err(CliError::InvalidArguments("serve flag may appear only once"));
             }
             _ => return Err(CliError::InvalidArguments("unknown serve flag")),
@@ -457,6 +517,7 @@ fn parse_serve(
 fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<ServeConfig, CliError> {
     let model_id = required(config.model_id.clone(), "--model-id is required")?;
     let registration = finish_registration(&config, &model_id)?;
+    let backend = finish_serve_backend(&config)?;
     let service = ServiceConfig::new(
         required(config.model_root, "--model-root is required")?,
         required(config.runtime_root, "--runtime-root is required")?,
@@ -480,6 +541,7 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         previous_control_key,
         response_key_id: required(config.response_key_id, "--response-key-id is required")?,
         budget,
+        backend,
         mode,
     })
 }
@@ -566,6 +628,55 @@ fn parse_registration_mode(value: &str) -> Result<RegistrationMode, CliError> {
     }
 }
 
+fn parse_serve_backend(value: &str) -> Result<ServeBackendKind, CliError> {
+    match value {
+        "cpu-reference" => Ok(ServeBackendKind::CpuReference),
+        "metal" => Ok(ServeBackendKind::Metal),
+        _ => Err(CliError::InvalidArguments("execution backend must be cpu-reference or metal")),
+    }
+}
+
+fn finish_serve_backend(config: &RawServeConfig) -> Result<ServeBackend, CliError> {
+    match config.execution_backend.unwrap_or(ServeBackendKind::CpuReference) {
+        ServeBackendKind::CpuReference => {
+            if config.metal_device_index.is_some()
+                || config.max_device_memory_bytes.is_some()
+                || config.max_metal_buffers.is_some()
+            {
+                return Err(CliError::InvalidArguments(
+                    "Metal limits require --execution-backend metal",
+                ));
+            }
+            Ok(ServeBackend::CpuReference)
+        }
+        ServeBackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                Ok(ServeBackend::Metal {
+                    device_index: required(
+                        config.metal_device_index,
+                        "--metal-device-index is required for Metal",
+                    )?,
+                    memory_bytes: required(
+                        config.max_device_memory_bytes,
+                        "--max-device-memory-bytes is required for Metal",
+                    )?,
+                    maximum_buffers: required(
+                        config.max_metal_buffers,
+                        "--max-metal-buffers is required for Metal",
+                    )?,
+                })
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Err(CliError::InvalidArguments(
+                    "Metal serving requires a macOS build with the metal feature",
+                ))
+            }
+        }
+    }
+}
+
 fn serve_budget(
     max_memory_bytes: Option<u64>,
     max_kv_cache_bytes: Option<u64>,
@@ -592,7 +703,7 @@ fn serve_mode(
         }
         return Ok((1, ServeMode::Single));
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     {
         let maximum_active_sequences =
             required(max_active_sequences, "--max-active-sequences is required")?;
@@ -605,11 +716,11 @@ fn serve_mode(
         }
         Ok((maximum_active_sequences, ServeMode::Continuous(limits)))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "cpu-reference")))]
     {
         let _limits = (max_active_sequences, max_connections);
         Err(CliError::Engine(EngineError::not_implemented(
-            "continuous native engine serving requires a Unix platform",
+            "continuous native engine serving requires a Unix CPU-reference build",
         )))
     }
 }
@@ -635,6 +746,12 @@ fn parse_u64(value: &str) -> Result<u64, CliError> {
     value
         .parse()
         .map_err(|_| CliError::InvalidArguments("serve byte budget must be an unsigned integer"))
+}
+
+fn parse_usize(value: &str) -> Result<usize, CliError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| CliError::InvalidArguments("serve count must be an unsigned integer"))
 }
 
 fn parse_u32(value: &str) -> Result<u32, CliError> {
@@ -667,7 +784,7 @@ const fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn generate(
     config: GenerateConfig,
     output: &mut impl Write,
@@ -748,18 +865,18 @@ fn generate(
     .map_err(|_| CliError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "cpu-reference")))]
 fn generate(
     _config: GenerateConfig,
     _output: &mut impl Write,
     _errors: &mut impl Write,
 ) -> Result<(), CliError> {
     Err(CliError::Engine(EngineError::not_implemented(
-        "signed directory-package generation requires a Unix platform",
+        "signed directory-package generation requires a Unix CPU-reference build",
     )))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn serve(
     config: ServeConfig,
     secrets: &mut impl Read,
@@ -797,8 +914,19 @@ fn serve(
             service.register_model_foundry_registry_v2(&selection)?;
         }
     }
-    let mut runtime =
-        CpuEngineRuntime::new_with_control_keys(service, control_keys, response_signer)?;
+    let backend = match config.backend {
+        ServeBackend::CpuReference => RuntimeBackend::CpuReference,
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        ServeBackend::Metal { device_index, memory_bytes, maximum_buffers } => {
+            RuntimeBackend::Metal(MetalBackend::new(device_index, memory_bytes, maximum_buffers)?)
+        }
+    };
+    let mut runtime = CpuEngineRuntime::new_with_control_keys_and_backend(
+        service,
+        control_keys,
+        response_signer,
+        backend,
+    )?;
     let mut event_write_failed = false;
     let mut package_events = |event: personalai_engine_types::SecurityEvent| {
         if writeln!(errors, "native-engine security event: {event:?}").is_err() {
@@ -829,7 +957,7 @@ fn serve(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(feature = "cpu-reference", test)))]
 fn validate_registration_key_roles(
     registration: &RegistrationConfig,
     control_keys: &TrustedControlPlaneKeys,
@@ -852,7 +980,7 @@ fn validate_registration_key_roles(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn serve_single(
     runtime: &mut CpuEngineRuntime,
     listener: &UnixFrameListener,
@@ -874,7 +1002,7 @@ fn serve_single(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn serve_continuous(
     runtime: &mut CpuEngineRuntime,
     listener: &UnixFrameListener,
@@ -904,7 +1032,7 @@ fn serve_continuous(
     Ok(summary)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cpu-reference"))]
 fn spawn_shutdown_watcher(
     shutdown: ContinuousShutdown,
     stop: Arc<AtomicBool>,
@@ -924,14 +1052,14 @@ fn spawn_shutdown_watcher(
         .map_err(|_| EngineError::backend_failure("process shutdown watcher creation failed"))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "cpu-reference")))]
 fn serve(
     _config: ServeConfig,
     _secrets: &mut impl Read,
     _errors: &mut impl Write,
 ) -> Result<(), CliError> {
     Err(CliError::Engine(EngineError::not_implemented(
-        "native engine serving requires a Unix platform",
+        "native engine serving requires a Unix CPU-reference build",
     )))
 }
 
@@ -975,7 +1103,17 @@ fn write_capabilities(output: &mut impl Write) -> Result<(), CliError> {
     )
     .and_then(|()| writeln!(output, "cpu-reference=deterministic-decoder-execution"))
     .and_then(|()| writeln!(output, "arm64=not-implemented"))
-    .and_then(|()| writeln!(output, "metal=not-enabled-in-cli-service"))
+    .and_then(|()| {
+        writeln!(
+            output,
+            "metal={}",
+            if cfg!(all(feature = "metal", target_os = "macos")) {
+                "trusted-startup-selection"
+            } else {
+                "not-compiled"
+            }
+        )
+    })
     .and_then(|()| writeln!(output, "cuda=not-implemented"))
     .and_then(|()| writeln!(output, "model-loading=signed-first-party-package"))
     .map_err(|_| CliError::Io)
@@ -1041,6 +1179,62 @@ mod tests {
             Err(CliError::InvalidArguments("--model-id is required"))
         ));
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn service_backend_defaults_to_cpu_and_rejects_unscoped_metal_limits() {
+        let Command::Serve(config) =
+            parse_command(complete_serve_arguments().into_iter()).expect("CPU serve must parse")
+        else {
+            panic!("serve command changed kind");
+        };
+        assert!(matches!(config.backend, ServeBackend::CpuReference));
+
+        let mut invalid = complete_serve_arguments();
+        invalid.extend(["--max-device-memory-bytes", "1048576"].map(OsString::from));
+        assert!(matches!(parse_command(invalid.into_iter()), Err(CliError::InvalidArguments(_))));
+    }
+
+    #[test]
+    fn metal_service_selection_is_explicit_complete_and_build_gated() {
+        let mut incomplete = complete_serve_arguments();
+        incomplete.extend(["--execution-backend", "metal"].map(OsString::from));
+        assert!(matches!(
+            parse_command(incomplete.into_iter()),
+            Err(CliError::InvalidArguments(_))
+        ));
+
+        let mut complete = complete_serve_arguments();
+        complete.extend(
+            [
+                "--execution-backend",
+                "metal",
+                "--metal-device-index",
+                "0",
+                "--max-device-memory-bytes",
+                "16777216",
+                "--max-metal-buffers",
+                "16",
+            ]
+            .map(OsString::from),
+        );
+        let result = parse_command(complete.into_iter());
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let Command::Serve(config) = result.expect("complete Metal serve must parse") else {
+                panic!("Metal serve command changed kind");
+            };
+            assert!(matches!(
+                config.backend,
+                ServeBackend::Metal {
+                    device_index: 0,
+                    memory_bytes: 16_777_216,
+                    maximum_buffers: 16
+                }
+            ));
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        assert!(matches!(result, Err(CliError::InvalidArguments(_))));
     }
 
     #[test]
@@ -1183,7 +1377,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn continuous_serve_requires_explicit_bounded_limits() {
         let mut missing = complete_serve_arguments();
@@ -1212,7 +1406,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn continuous_active_limit_cannot_exceed_owned_connections() {
         let mut arguments = complete_serve_arguments();
@@ -1229,7 +1423,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn process_signal_bridge_requests_existing_graceful_shutdown() {
         let signals = os_signal::ProcessSignalGuard::install()
@@ -1245,7 +1439,7 @@ mod tests {
         signals.restore().expect("test process signal handlers must restore");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     #[expect(
         clippy::zombie_processes,
@@ -1315,7 +1509,7 @@ mod tests {
         ready_reader.join().expect("signal helper readiness reader must join");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn signal_subprocess_helper() {
         if std::env::var_os("PERSONALAI_SIGNAL_HELPER").is_none() {
