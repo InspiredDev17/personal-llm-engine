@@ -48,6 +48,8 @@ and last completed sequence in PostgreSQL. It loads that cursor before a new
 scan and advances it by exact compare-and-swap only after Agent Green delivery
 and content-free audit. This downstream durability does not give Rust, Go,
 Agent Green, clients, or models write authority over supervisor evidence.
+The nonzero supervisor sequence also maps to one stable content-free Go event
+and audit correlation UUID, so a retry does not acquire a new logical identity.
 
 ## Bounds and failure behavior
 
@@ -74,6 +76,6 @@ approve, update, or launch a release.
 The repository now provides the Linux pre-launch binding and typed event
 bridge in source. It does not prove OS authentication of the verifier binary,
 release-key custody, systemd behavior on the target host, service-account/group
-provisioning, stable duplicate-delivery identity, owner-authorized cursor/ring
-recovery, event delivery while Go is offline, or operated upgrade/tamper/
+provisioning, owner-authorized cursor/ring recovery, event delivery while Go is
+offline, or operated upgrade/tamper/
 rollback evidence. Those remain release qualification gates.
