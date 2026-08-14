@@ -1,0 +1,20 @@
+[package]
+name = "personalai-engine-release"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Offline signed release-manifest verification and monotonic rollback protection"
+
+[[bin]]
+name = "personalai-engine-release"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+personalai-engine-crypto.workspace = true
+personalai-engine-types.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

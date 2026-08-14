@@ -156,6 +156,7 @@ fn defensive_fuzz_workflow_covers_owned_parser_boundaries() {
         "configuration_importer",
         "generation_request",
         "sampling_parameters",
+        "release_manifest",
         "-max_total_time=60",
         "-max_len=192",
         "-max_len=1024",
@@ -414,11 +415,12 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 20-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 21-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 20] = [
+    let allowed: [(&str, &[&str]); 21] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
+        ("engine-release", &["personalai-engine-crypto", "personalai-engine-types"]),
         ("engine-model-format", &["personalai-engine-types"]),
         (
             "engine-quantization",

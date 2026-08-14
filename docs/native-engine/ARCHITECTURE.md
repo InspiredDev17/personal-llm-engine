@@ -21,6 +21,7 @@ Green authority.
 | --- | --- |
 | `engine-types` | bounded IDs, shapes, budgets, requests/events, errors and security-event types |
 | `engine-crypto` | SHA-384 and strict Ed25519 verification/domain separation |
+| `engine-release` | offline release-only signing, exact installed-artifact verification and monotonic rollback ledger |
 | `engine-model-format` | fixed directory-manifest, hash-catalog, signature-envelope and legacy test-fixture parsers |
 | `engine-quantization` | fixed AIPQ8/AIPQ4 validation, deterministic conversion, error measurement and safe scalar reference kernels |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
@@ -44,6 +45,25 @@ dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
 constants used by Unix no-follow openers, the isolated nonblocking `flock`
 call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no third-party AI, tensor,
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
+
+## Engine release trust flow
+
+Engine releases and model packages use separate signatures and roles. The
+offline `personalai-engine-release sign` command records a nonzero monotonic
+generation, release/target/toolchain identifiers, and the exact SHA-384 and
+length of the engine binary, SBOM, Cargo.lock, and any explicitly declared
+metallib/notices. It produces canonical `engine-release.pairm` and
+`engine-release.ed25519` files without overwriting an approval.
+
+Before launch, an owner-controlled supervisor invokes
+`personalai-engine-release verify` against a fixed read-only release root. The
+verifier accepts no URL and no client/model path, requires the exact closed
+direct-child file set, rejects symlinks and writable installed content, verifies
+the release-only Ed25519 identity and every artifact, then advances a locked,
+durable monotonic ledger outside the engine runtime. The release crate has no
+dependency edge into the inference server, so it confers no update, install,
+launch, model, tool, or network authority. ADR-0026 defines the format and
+remaining supervisor/installer assumptions.
 
 ## Package and loading flow
 

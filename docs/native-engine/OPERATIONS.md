@@ -31,8 +31,12 @@ requires recorded capacity review.
 
 1. Verify the exact source revision, Rust/Go/Apple compiler versions, target,
    release flags, lockfiles, vendor tree, SPDX SBOM, and advisory snapshot.
-2. Verify release signatures once a release-signing system exists. Until then,
-   deployment is prohibited by [RELEASE-READINESS.md](RELEASE-READINESS.md).
+2. Invoke `personalai-engine-release verify` with the fixed read-only release
+   root, release-only public key, protected ledger root, and disjoint engine
+   runtime root. The supervisor must stop before launch on every nonzero exit.
+   This source-complete verifier is not evidence that an installer or target
+   supervisor has been qualified; deployment remains prohibited by
+   [RELEASE-READINESS.md](RELEASE-READINESS.md) until that evidence exists.
 3. Verify the configured package ID/hash/signer/minimum engine version and
    read-only, no-symlink model/runtime parent properties.
 4. Verify the Go provider has cloud fallback disabled for the local route and
@@ -54,6 +58,41 @@ runtime model paths or trust keys from a client. Read health, capability, model
 status, metrics, and security events only through authenticated protocol
 messages. Ordinary data-plane shutdown requests are always rejected; stop with
 the supervisor's OS-authorized signal and wait for bounded drain/join cleanup.
+
+## Release signing and pre-launch verification
+
+Assemble a dedicated release directory containing only the engine binary,
+`Cargo.lock`, `native-engine.spdx`, and any explicitly declared metallib or
+notices. From an offline signing environment, pipe exactly 32 binary seed bytes
+to:
+
+```sh
+personalai-engine-release sign \
+  --release-root RELEASE_ROOT --generation NONZERO_U64 \
+  --release-id RELEASE_ID --target TARGET --rust-toolchain TOOLCHAIN \
+  --signer-key-id KEY_ID --engine-binary personalai-engine \
+  --sbom native-engine.spdx --cargo-lock Cargo.lock
+```
+
+Record the printed public key and manifest SHA-384 through the owner approval
+process, then make the directory and every child read-only. The private seed
+must never enter the repository, package, command line, environment, logs, or
+production host.
+
+The trusted pre-launch environment runs:
+
+```sh
+personalai-engine-release verify \
+  --release-root RELEASE_ROOT --ledger-root LEDGER_ROOT \
+  --engine-runtime-root RUNTIME_ROOT --signer-key-id KEY_ID \
+  --signer-public-key PUBLIC_KEY
+```
+
+The release root is a fixed owner path, not a client input. The ledger root is
+writable only by the trusted verifier/supervisor identity and is disjoint from
+the service-writable runtime. A nonzero exit prohibits launch. The verifier
+binary itself must be authenticated by the OS installer/package trust path;
+self-verification would be circular.
 
 ## Monitoring and privacy
 
@@ -80,13 +119,16 @@ dumps. Collect only bounded structured diagnostics.
 
 ## Rollback
 
-There is currently no enforceable installed-engine rollback ledger; therefore
-production deployment is blocked. The required future policy is monotonic:
-store the highest approved release generation outside the writable engine
-runtime, reject lower generations even when correctly signed, and require a
-separate owner-authorized emergency recovery record for any downgrade. Model
-registry activation already selects an exact signed package entry and must not
-fall back to older or unregistered content.
+The release verifier implements a monotonic installed-engine ledger: it stores
+the highest verified generation and exact manifest digest outside the writable
+engine runtime, rejects lower correctly signed generations, and rejects a
+different manifest reusing the same generation. Its create-new lock fails
+closed after concurrent or crash-left ownership. Only the owner may inspect and
+recover such a lock. No emergency downgrade path exists; adding one requires a
+separate owner-authorized recovery-record ADR. Model registry activation still
+selects an exact signed package entry and must not fall back to older or
+unregistered content. Production remains blocked until installer/supervisor
+pre-launch invocation, release-key custody, and operated rollback are proven.
 
 Backend rollback is configuration-only and does not weaken package identity:
 drain and stop Rust, restart it with `--execution-backend cpu-reference`, set

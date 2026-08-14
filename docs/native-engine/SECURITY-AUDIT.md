@@ -14,12 +14,12 @@ process limits, threat coverage, and these evidence records.
 
 | ID | Severity | Status | Finding |
 | --- | --- | --- | --- |
-| R-01 | P0 release | Open | Engine binary/metallib release artifacts are not signed or rollback-protected; production release is prohibited |
+| R-01 | P0 release | Reduced | Release-only signed manifests, exact read-only artifact measurement, and a monotonic external-runtime ledger are source-complete; trusted installer/supervisor integration, key custody, and operated rollback evidence remain production blockers |
 | R-02 | P1 release | Open | Repository-owned Rust crates have no declared owner license, so complete machine license policy cannot pass honestly |
 | R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete Metal prefill/decode/sampling/streaming with scalar parity and persistent weights; owner-selected UDS execution and exact Go descriptor pinning are implemented, while operated canary/rollback and production-size qualification remain |
 | R-04 | P1 operations | Open | Linux confinement and crash-loop telemetry lack operated-host proof; macOS Seatbelt proof is transitional |
 | R-05 | P2 tooling | Open | Miri component is unavailable for the pinned nightly; pure-Rust Miri evidence is absent |
-| R-06 | P2 telemetry | Open | Installed binary/metallib/downgrade/quarantine verifier events cannot be emitted until the release verifier/supervisor exists |
+| R-06 | P2 telemetry | Reduced | The offline verifier detects installed binary/metallib mismatch and downgrade; a qualified supervisor-to-Go event bridge and model-quarantine source remain absent |
 | R-07 | P2 release | Open | Published Go integration and separate local Go security commits are divergent and need deliberate reconciliation |
 | F-01 | P2 tooling | Fixed | Missing explicit fuzz targets for configuration import, authenticated generation requests, and sampling parameters |
 | F-02 | P2 operations | Fixed | Linux service profile lacked explicit core, descriptor, process, task, memory/swap, home, namespace, and common secret-environment limits |
@@ -27,7 +27,8 @@ process limits, threat coverage, and these evidence records.
 No unresolved source-level P0 memory-safety, parser-bypass, authentication-
 bypass, public-listener, outbound-engine-network, arbitrary-code-loading, or
 Go-approval-bypass defect was demonstrated. R-01 is nevertheless a P0 release
-blocker because artifact substitution/rollback is outside current trust checks.
+blocker because source controls have not yet been bound to a trusted installer,
+supervisor identity, release key, and operated target evidence.
 
 ## Boundary conclusions
 
@@ -54,6 +55,11 @@ Nine separate five-second libFuzzer campaigns plus one corrected generation-
 request rerun completed successfully on 2026-08-13 (60 aggregate wall-clock
 seconds as reported by the targets). No crash artifact was produced. This is
 bounded smoke evidence only.
+
+The new engine-release manifest parser additionally completed a bounded
+1,000-run macOS ARM64 libFuzzer smoke campaign on 2026-08-14: 47 coverage
+counters, 55 features, less than 40 MiB RSS, and no crash, timeout, sanitizer,
+or resource-limit artifact. This does not establish parser exhaustion.
 
 The Objective-C++ bridge was compiled and run with Apple clang 21.0.0:
 

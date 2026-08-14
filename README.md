@@ -24,11 +24,12 @@ resumable one-token round-robin coordination, mutually authenticated binary
 protocol, protected Unix-domain socket runtime, a bounded authenticated
 multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
-and an owner CLI. The CLI also exposes an explicit one-shot `generate` command
-that admits a registered signed package by model ID and never accepts a URL or
-arbitrary package path. The CLI exposes the continuous driver only through an explicit
-bounded mode, requires an explicit owner-pinned or Model Foundry V2 registration
-mode, and translates owner-process `SIGINT`/`SIGTERM` into the existing
+an owner CLI, and a separate release-only signer/verifier with a monotonic
+installed-version ledger. The CLI also exposes an explicit one-shot `generate`
+command that admits a registered signed package by model ID and never accepts a
+URL or arbitrary package path. The CLI exposes the continuous driver only
+through an explicit bounded mode, requires an explicit owner-pinned or Model
+Foundry V2 registration mode, and translates owner-process `SIGINT`/`SIGTERM` into the existing
 stop-admit, cancel, and drain path. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
 a pinned weekly/manual workflow is configured to repeat that bounded test eight
@@ -40,11 +41,12 @@ has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed synthetic model. It is not yet a useful production model. A default-off
-ARM64 graph backend now provides bounded Advanced SIMD elementwise and
-matrix-vector kernels with scalar-oracle differential tests, but is not yet a
-complete model-service path. A legally approved real source model/package and
-independent numeric evidence, full ARM64 decoder integration, Metal, CUDA,
-performance qualification, and
+ARM64 graph backend provides bounded Advanced SIMD graph kernels with
+scalar-oracle differential tests. The default-off Metal backend now completes
+the signed synthetic decoder and owner-selected UDS service path, while its
+production-size canary remains gated. A legally approved real source
+model/package and independent numeric evidence, ARM64 service integration,
+CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
 existing production runtimes. Tokenizer support is intentionally limited to
 AIPTok Byte-Level BPE v1; SentencePiece, Unigram, WordPiece, tiktoken, and
@@ -74,6 +76,9 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
 
 - no model training, Python, TypeScript, TCP listener, outbound connection,
   download, updater, dynamic-library discovery, or model-supplied code;
+- release-only signatures bind the exact read-only engine artifact set, and a
+  protected ledger outside engine runtime rejects signed rollback and
+  same-generation substitution without granting the service self-update;
 - clients send a registered `ModelId`, never a path;
 - registry-backed admission verifies the exact owner-selected signed V2 entry
   before package access, derives the approved path from signed identities, and

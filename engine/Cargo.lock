@@ -250,6 +250,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-release"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "personalai-engine-crypto",
+ "personalai-engine-types",
+ "zeroize",
+]
+
+[[package]]
 name = "personalai-engine-sampling"
 version = "0.1.0"
 dependencies = [

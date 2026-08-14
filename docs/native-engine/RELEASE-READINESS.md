@@ -21,9 +21,12 @@ documentation exception.
 
 ## Release blockers
 
-1. Engine binaries and the embedded metallib do not have a first-party signed
-   release manifest, installer verification path, or deployed-version rollback
-   ledger. Package signing does not sign the engine executable.
+1. The source tree now has a first-party release-only signed manifest, exact
+   installed-artifact verifier, and monotonic rollback ledger. Production is
+   still blocked until the verifier itself is OS-authenticated, an installer
+   invokes it atomically before launch, release-key custody is reviewed, and an
+   operated target proves upgrade, same-version restart, tamper rejection, and
+   rollback rejection. Package signing still does not sign the executable.
 2. The repository does not declare an owner-selected license for its own Rust
    workspace crates. `cargo-deny` therefore cannot produce a clean complete
    license verdict without either a real license decision or an unsafe ignore.
@@ -39,9 +42,9 @@ documentation exception.
    macOS host. macOS `sandbox-exec` is deprecated and remains a development
    proof, not a signed production App Sandbox/launcher qualification.
 6. Miri could not run because the pinned nightly lacks the Miri component.
-7. Security-event types/transports do not yet originate engine-binary mismatch,
-   metallib mismatch, downgrade-attempt, or model-quarantine events from an
-   installed-artifact verifier/supervisor because that verifier does not exist.
+7. The release verifier rejects binary/metallib mismatch and downgrade, but a
+   qualified supervisor-to-Go event source for those pre-launch failures and
+   model quarantine is not implemented.
 8. The audited published Go integration baseline and the separate local Go
    security history must be deliberately reconciled and retested as one exact
    release revision; this audit does not silently merge divergent histories.

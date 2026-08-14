@@ -2,6 +2,7 @@
 members = [
     "crates/engine-types",
     "crates/engine-crypto",
+    "crates/engine-release",
     "crates/engine-model-format",
     "crates/engine-quantization",
     "crates/engine-model-importer",
@@ -33,6 +34,7 @@ publish = false
 [workspace.dependencies]
 personalai-engine-types = { path = "crates/engine-types" }
 personalai-engine-crypto = { path = "crates/engine-crypto" }
+personalai-engine-release = { path = "crates/engine-release" }
 personalai-engine-model-format = { path = "crates/engine-model-format" }
 personalai-engine-quantization = { path = "crates/engine-quantization" }
 personalai-engine-model-importer = { path = "crates/engine-model-importer" }

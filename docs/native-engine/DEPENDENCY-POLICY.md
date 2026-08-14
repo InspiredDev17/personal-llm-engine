@@ -41,7 +41,7 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 `zeroize 1.8.2`, and `libc 0.2.189`, all with default features disabled.
-SHA-384 and strict Ed25519 are package/control-message/response integrity
+SHA-384 and strict Ed25519 are package/control-message/response/release integrity
 mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper
 for AIPTok's internal content hash; it adds no external dependency. The
 first-party `engine-quantization` crate uses only workspace model-format,
@@ -53,8 +53,12 @@ feature is enabled. `libc` supplies only `O_CLOEXEC` and `O_NOFOLLOW`
 constants to safe `std::fs::OpenOptions` for package and durable replay state,
 the isolated nonblocking `flock` call recorded in ADR-0004, and the exact
 `mmap`/`munmap` constants and calls used by the read-only, non-executable shard
-mapping wrapper recorded in ADR-0015. The offline importer reuses the same
-reviewed SHA-384, Ed25519, and zeroization dependencies; it adds no dependency.
+mapping wrapper recorded in ADR-0015. The offline importer and isolated
+engine-release signer/verifier reuse the same reviewed SHA-384, Ed25519, and
+zeroization dependencies; they add no dependency. Release signatures have a
+distinct domain and Rust trust type. Release artifact files use the already
+reviewed `O_NOFOLLOW|O_CLOEXEC` constants; the ledger uses only safe
+standard-library create-new, synchronization, and rename operations.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact

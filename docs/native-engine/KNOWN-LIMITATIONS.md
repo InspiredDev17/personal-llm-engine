@@ -2,11 +2,13 @@
 
 ## Release and operations
 
-- This revision is NO-GO for production. It has no signed engine binary or
-  signed release-manifest verification, installed binary/metallib measurement,
-  monotonic version ledger, or rollback enforcement.
-- AIPack signing is implemented; release-artifact signing is a separate missing
-  control. Never treat a signed model as proof that the engine binary is trusted.
+- This revision is NO-GO for production. Source now provides release-only
+  manifest signing, exact installed-artifact measurement, and a monotonic
+  rollback ledger. No target installer/supervisor invocation, OS-authenticated
+  verifier installation, release-key custody, or operated rollback evidence
+  exists yet.
+- Model-package and engine-release signatures are separate roles. Never treat a
+  signed model as proof that the engine binary is trusted, or vice versa.
 - No automatic updater exists. Installation, rollback, and revocation are
   operator actions and must remain fail-closed.
 - The Rust workspace's own license has not been selected by the owner. External
@@ -42,10 +44,10 @@
   slower than CPU on the tiny fixture. Device KV history currently crosses
   bounded host tensors for attention dispatch. Metal driver reset, GPU exhaustion under production-size loads, prolonged
   thermal behavior, and days-long restart/cancellation soak are unqualified.
-- Security telemetry is bounded and content-free. It cannot currently report
-  installed engine binary mismatch, installed metallib mismatch, downgrade
-  attempt, or supervisor model quarantine because the release verifier and
-  supervisor event source do not exist.
+- Security telemetry is bounded and content-free. The offline verifier now
+  rejects binary/metallib mismatch and downgrade, but no qualified supervisor
+  event bridge yet converts those pre-launch failures into Go/Agent Green
+  events. Supervisor model quarantine also remains absent.
 
 ## Tooling gaps
 

@@ -1,7 +1,7 @@
 # Native Engine Roadmap
 
 - Version: 0.2.0
-- Updated: 2026-08-13
+- Updated: 2026-08-14
 - Scope: inference only
 
 ## Delivery rule
@@ -15,7 +15,7 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
-| 0. Boundaries/workspace | COMPLETE | 19-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
+| 0. Boundaries/workspace | COMPLETE | 21-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
 | 1. Package/cryptography | COMPLETE for directory V1 | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, corruption tests |
 | 2. Registry/loader | COMPLETE for directory V1 | ID-only registry, protected directory/direct-child no-follow opens, exact hashes/signature, read-only non-executable mapping, typed failure events |
 | 3. Tokenizer | COMPLETE for AIPTok V1 synthetic profile | First-party `AIPTOK01`, strict metadata conversion, content hash, byte fallback, ranked merges, explicit special policies, exact byte/UTF-8/incremental decode, property/malformed/fuzz tests and dependency-free benchmarks |
@@ -28,11 +28,16 @@ memory, tool, approval, or Agent Green behavior.
 | 9a. Quantized package storage | COMPLETE for AIPQ8/AIPQ4 synthetic evidence | Explicit profiles, canonical fixed-block payloads, signed source/destination/error evidence, secure loading, scalar kernels, and F32/Q8/Q4 transformer divergence regression |
 | 10. ARM64/Metal | METAL SERVICE PATH COMPLETE / OPERATED CANARY PENDING | Metal has signed-directory loading, persistent device weights, complete tiny-model prefill/decode/sampling/streaming, device KV, cancellation/unload, hardware parity and metrics; trusted startup selection now joins it to the protected UDS scheduler and Go pins the signed descriptor; ARM64 decoder integration and operated production-size Metal canary remain |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
-| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
+| 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, release-only signed artifact verification and monotonic rollback state, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; trusted installer/supervisor binding, hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
 
 ## Completed host-independent implementation
 
 - Foundational types and error taxonomy with checked arithmetic and hard bounds.
+- Separate deterministic engine-release manifests use a release-only Ed25519
+  domain and exact read-only direct-child artifacts. The offline pre-launch
+  verifier advances a locked monotonic ledger outside engine runtime state and
+  rejects signed rollback or same-generation substitution without giving the
+  inference service install or self-update authority.
 - Exact, non-recursive, data-only package structures with no arbitrary
   deserialization, compression, plugins, paths, code, or kernel selection.
 - Mature audited cryptographic primitives only; package/control private keys

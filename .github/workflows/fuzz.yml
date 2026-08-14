@@ -144,6 +144,13 @@ jobs:
           --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
           sampling_parameters "$RUNNER_TEMP/personalai-fuzz-corpus/sampling_parameters"
           -- -max_total_time=60 -max_len=4096 -timeout=10 -rss_limit_mb=1024
+      - name: Fuzz engine release manifest parser
+        working-directory: /tmp
+        run: >-
+          cargo +nightly-2026-08-01 fuzz run
+          --fuzz-dir "$GITHUB_WORKSPACE/engine/fuzz"
+          release_manifest "$RUNNER_TEMP/personalai-fuzz-corpus/release_manifest"
+          -- -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=1024
       - name: Preserve crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

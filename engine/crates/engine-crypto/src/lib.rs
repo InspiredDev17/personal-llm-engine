@@ -10,6 +10,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use personalai_engine_types::{EngineError, ModelPackageHash, SignerKeyId};
 use sha2::{Digest, Sha384};
 use std::collections::BTreeMap;
+use std::io::Read;
 use zeroize::Zeroize;
 
 /// Domain separator for version-one model-package content signatures.
@@ -25,6 +26,8 @@ pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.ControlPlane.Request.Signature.v1\0";
 /// Domain separator for version-two engine response signatures.
 pub const ENGINE_RESPONSE_SIGNATURE_DOMAIN_V2: &[u8] = b"PersonalAI.Engine.Response.Signature.v2\0";
+/// Domain separator for version-one installed-engine release manifests.
+pub const ENGINE_RELEASE_SIGNATURE_DOMAIN_V1: &[u8] = b"PersonalAI.Engine.Release.Signature.v1\0";
 /// Ed25519 public-key length.
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 /// Ed25519 signature length.
@@ -38,6 +41,26 @@ pub struct TrustedSigner {
     key_id: SignerKeyId,
     public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
     active: bool,
+}
+
+/// Operator-configured release-signing verification identity.
+///
+/// This deliberately distinct type prevents model-package, request, and
+/// response trust identities from being passed to release verification APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedReleaseSigner {
+    key_id: SignerKeyId,
+    public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    active: bool,
+}
+
+/// Offline Ed25519 identity used only to sign engine release manifests.
+///
+/// The value is neither cloneable nor printable and zeroizes the caller's
+/// seed during construction. Production inference services never construct it.
+pub struct EngineReleaseSigner {
+    key_id: SignerKeyId,
+    signing_key: SigningKey,
 }
 
 /// Operator-configured Go control-plane request-verification key.
@@ -95,6 +118,68 @@ impl EngineResponseSigner {
     ) -> Result<[u8; ED25519_SIGNATURE_BYTES], EngineError> {
         let message = engine_response_signature_message(unsigned_response)?;
         Ok(self.signing_key.sign(&message).to_bytes())
+    }
+}
+
+impl EngineReleaseSigner {
+    /// Constructs a release signer and clears the caller's seed in place.
+    pub fn from_seed(
+        key_id: SignerKeyId,
+        seed: &mut [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        let signing_key = SigningKey::from_bytes(seed);
+        seed.zeroize();
+        validate_public_key(&signing_key.verifying_key().to_bytes())?;
+        Ok(Self { key_id, signing_key })
+    }
+
+    /// Returns the configured release-key identifier.
+    pub const fn key_id(&self) -> SignerKeyId {
+        self.key_id
+    }
+
+    /// Returns the public verification key for owner configuration.
+    pub fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Signs one exact release-manifest digest under the release-only domain.
+    pub fn sign_manifest_digest(
+        &self,
+        manifest_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    ) -> Result<[u8; ED25519_SIGNATURE_BYTES], EngineError> {
+        let message = engine_release_signature_message(manifest_digest)?;
+        Ok(self.signing_key.sign(&message).to_bytes())
+    }
+}
+
+impl TrustedReleaseSigner {
+    /// Creates one active release signer from exact public-key bytes.
+    pub fn active(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: true })
+    }
+
+    /// Creates one explicitly revoked release signer.
+    pub fn revoked(
+        key_id: SignerKeyId,
+        public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    ) -> Result<Self, EngineError> {
+        validate_public_key(&public_key)?;
+        Ok(Self { key_id, public_key, active: false })
+    }
+
+    /// Returns the configured release-key identifier.
+    pub const fn key_id(&self) -> SignerKeyId {
+        self.key_id
+    }
+
+    /// Returns whether this release key accepts signatures.
+    pub const fn is_active(&self) -> bool {
+        self.active
     }
 }
 
@@ -250,6 +335,40 @@ pub fn hash_signed_content(content_bytes: &[u8]) -> [u8; ModelPackageHash::BYTE_
     bytes
 }
 
+/// Computes SHA-384 over a stream while enforcing an exact byte ceiling.
+///
+/// The returned length lets callers bind filesystem metadata without loading
+/// the complete artifact into memory.
+pub fn hash_bounded_reader(
+    reader: &mut impl Read,
+    maximum_bytes: u64,
+) -> Result<([u8; ModelPackageHash::BYTE_LEN], u64), EngineError> {
+    let mut hasher = Sha384::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| EngineError::invalid_input("bounded hash input could not be read"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| {
+                EngineError::internal_invariant("bounded hash read length overflows")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("bounded hash length overflows"))?;
+        if total > maximum_bytes {
+            return Err(EngineError::resource_exhaustion("bounded hash input exceeds limit"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; ModelPackageHash::BYTE_LEN];
+    bytes.copy_from_slice(&digest);
+    Ok((bytes, total))
+}
+
 /// Builds the bounded, domain-separated message signed by package tooling.
 pub fn signature_message(
     content_digest: &[u8; ModelPackageHash::BYTE_LEN],
@@ -281,6 +400,40 @@ pub fn control_plane_signature_message(request_bytes: &[u8]) -> Result<Vec<u8>, 
 pub fn engine_response_signature_message(response_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
     let digest = hash_signed_content(response_bytes);
     domain_separated_message(ENGINE_RESPONSE_SIGNATURE_DOMAIN_V2, &digest)
+}
+
+/// Builds the bounded transcript signed by offline release tooling.
+pub fn engine_release_signature_message(
+    manifest_digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    domain_separated_message(ENGINE_RELEASE_SIGNATURE_DOMAIN_V1, manifest_digest)
+}
+
+/// Strictly verifies one release manifest under a release-only trust identity.
+pub fn verify_engine_release_signature(
+    signer: &TrustedReleaseSigner,
+    envelope_key_id: SignerKeyId,
+    manifest_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("engine release signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "engine release signer does not match owner configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured release key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured release key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = engine_release_signature_message(manifest_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::signature_failure("engine release signature is invalid"))
 }
 
 /// Verifies one strict Ed25519 package signature against operator trust state.
@@ -514,6 +667,47 @@ mod tests {
         let tampered = engine_response_signature_message(b"tampered")
             .expect("tampered transcript must construct");
         assert!(signer.signing_key.verifying_key().verify_strict(&tampered, &signature).is_err());
+    }
+
+    #[test]
+    fn release_signer_is_role_separated_zeroized_and_strict() {
+        let key_id = SignerKeyId::from_bytes([0x71; 16]).expect("key ID must validate");
+        let mut seed = [0x72; 32];
+        let signer =
+            EngineReleaseSigner::from_seed(key_id, &mut seed).expect("release signer validates");
+        assert_eq!(seed, [0_u8; 32]);
+        let trusted = TrustedReleaseSigner::active(key_id, signer.public_key())
+            .expect("release trust validates");
+        let digest = hash_signed_content(b"canonical engine release manifest");
+        let signature = signer.sign_manifest_digest(&digest).expect("release manifest must sign");
+        verify_engine_release_signature(&trusted, key_id, &digest, &signature)
+            .expect("exact release signature must verify");
+        let mut tampered = digest;
+        tampered[0] ^= 1;
+        assert!(verify_engine_release_signature(&trusted, key_id, &tampered, &signature).is_err());
+        let revoked = TrustedReleaseSigner::revoked(key_id, signer.public_key())
+            .expect("revoked release key validates");
+        assert!(verify_engine_release_signature(&revoked, key_id, &digest, &signature).is_err());
+        let package_transcript = signature_message(&digest).expect("package transcript builds");
+        let release_signature = Signature::from_bytes(&signature);
+        assert!(
+            signer
+                .signing_key
+                .verifying_key()
+                .verify_strict(&package_transcript, &release_signature)
+                .is_err(),
+            "release signatures must not verify under the model-package domain"
+        );
+    }
+
+    #[test]
+    fn bounded_stream_hash_matches_slice_hash_and_rejects_excess() {
+        let bytes = vec![0x5a; 40_000];
+        let (digest, length) =
+            hash_bounded_reader(&mut bytes.as_slice(), 40_000).expect("bounded hash succeeds");
+        assert_eq!(digest, hash_signed_content(&bytes));
+        assert_eq!(length, 40_000);
+        assert!(hash_bounded_reader(&mut bytes.as_slice(), 39_999).is_err());
     }
 
     #[test]

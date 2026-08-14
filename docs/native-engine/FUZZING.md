@@ -33,6 +33,7 @@ reproducible.
 | `configuration_importer` | strict offline `AIPTOK-METADATA-V1` conversion | 256 KiB campaign input; parser hard cap 64 MiB |
 | `generation_request` | correctly signed generation envelope and request fields | 256 KiB campaign prompt |
 | `sampling_parameters` | sampler parameter validation and bounded token selection | 4 KiB campaign input; 128-token harness vocabulary |
+| `release_manifest` | canonical signed engine-release manifest parser | 64 KiB parser and campaign ceiling |
 
 The input ceiling is a campaign resource bound, not a reduction of the parser's
 documented format limit. Deterministic unit and mutation tests continue to
@@ -126,6 +127,13 @@ inputs, 845 coverage counters, 923 features, 76 MiB RSS, and no crash or
 resource artifact in six seconds. The resulting 60 seconds of aggregate target
 runtime is smoke evidence, not evidence of parser exhaustion or long-duration
 coverage stability.
+
+The `release_manifest` target received a bounded local 1,000-run macOS ARM64
+campaign on 2026-08-14 from the checked-in truncated-header seed. It completed
+1,000 inputs, reached 47 coverage counters and 55 features, stayed below 40 MiB
+RSS, and produced no crash, timeout, sanitizer, or resource-limit artifact.
+New coverage inputs were moved out of the repository after the run. This is
+smoke evidence only; the weekly 60-second campaign remains the sustained gate.
 
 ## Continuous campaign
 

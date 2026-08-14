@@ -201,6 +201,7 @@ dependencies = [
  "personalai-engine-model-format",
  "personalai-engine-model-importer",
  "personalai-engine-protocol",
+ "personalai-engine-release",
  "personalai-engine-sampling",
  "personalai-engine-tensor",
  "personalai-engine-testkit",
@@ -267,6 +268,16 @@ dependencies = [
  "personalai-engine-model-format",
  "personalai-engine-tensor",
  "personalai-engine-types",
+]
+
+[[package]]
+name = "personalai-engine-release"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "personalai-engine-crypto",
+ "personalai-engine-types",
+ "zeroize",
 ]
 
 [[package]]
