@@ -23,7 +23,7 @@
 | unauthorized/repeated authentication | close peer; rotate control key if compromise is plausible; inspect same-user/service-account isolation |
 | malformed/oversized/version/replay pattern | keep request rejected; rate-limit at Go/supervisor boundary; preserve category/count only |
 | resource exhaustion or GPU/backend failure | cancel affected request; verify cleanup/accounting; unload only after ownership drains; restart under bounded supervisor policy if necessary |
-| engine/metallib mismatch or downgrade | production release must remain stopped; these signals require the missing installed-artifact verifier before GO |
+| engine/metallib mismatch or downgrade | the supervisor verifier keeps the engine stopped and retains a content-free ring event; preserve the release root and ledger, then follow owner-authorized recovery without weakening rollback protection |
 | crash loop | disable restart after the configured threshold; retain supervisor evidence; do not expose prompts in crash reports or enable core dumps |
 | suspected cross-request/KV disclosure | stop service, revoke response/control credentials, preserve only minimal metadata, and treat all requests in the affected process lifetime as potentially exposed |
 | prompt/tool injection | treat output as untrusted; do not execute; preserve Go approval/Action Broker evidence and verify no control-plane bypass occurred |

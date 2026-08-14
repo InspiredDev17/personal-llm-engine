@@ -31,9 +31,10 @@ requires recorded capacity review.
 
 1. Verify the exact source revision, Rust/Go/Apple compiler versions, target,
    release flags, lockfiles, vendor tree, SPDX SBOM, and advisory snapshot.
-2. Invoke `personalai-engine-release verify` with the fixed read-only release
-   root, release-only public key, protected ledger root, and disjoint engine
-   runtime root. The supervisor must stop before launch on every nonzero exit.
+2. Invoke `personalai-engine-release verify-supervised` with the fixed read-only
+   release root, release-only public key, protected ledger root, disjoint event
+   root, and disjoint engine runtime root. The supervisor must stop before
+   launch on every nonzero exit.
    This source-complete verifier is not evidence that an installer or target
    supervisor has been qualified; deployment remains prohibited by
    [RELEASE-READINESS.md](RELEASE-READINESS.md) until that evidence exists.
@@ -82,15 +83,18 @@ production host.
 The trusted pre-launch environment runs:
 
 ```sh
-personalai-engine-release verify \
+personalai-engine-release verify-supervised \
   --release-root RELEASE_ROOT --ledger-root LEDGER_ROOT \
-  --engine-runtime-root RUNTIME_ROOT --signer-key-id KEY_ID \
+  --engine-runtime-root RUNTIME_ROOT --security-event-root EVENT_ROOT \
+  --signer-key-id KEY_ID \
   --signer-public-key PUBLIC_KEY
 ```
 
 The release root is a fixed owner path, not a client input. The ledger root is
 writable only by the trusted verifier/supervisor identity and is disjoint from
-the service-writable runtime. A nonzero exit prohibits launch. The verifier
+the service-writable runtime. The root-owned event directory is not writable
+by Go or the engine; its fixed records are group-readable for Go ingestion. A
+nonzero exit prohibits launch. The verifier
 binary itself must be authenticated by the OS installer/package trust path;
 self-verification would be circular.
 
@@ -127,8 +131,9 @@ closed after concurrent or crash-left ownership. Only the owner may inspect and
 recover such a lock. No emergency downgrade path exists; adding one requires a
 separate owner-authorized recovery-record ADR. Model registry activation still
 selects an exact signed package entry and must not fall back to older or
-unregistered content. Production remains blocked until installer/supervisor
-pre-launch invocation, release-key custody, and operated rollback are proven.
+unregistered content. The checked-in Linux unit binds this verification before
+engine launch. Production remains blocked until OS installer trust,
+release-key custody, and operated upgrade/tamper/rollback behavior are proven.
 
 Backend rollback is configuration-only and does not weaken package identity:
 drain and stop Rust, restart it with `--execution-backend cpu-reference`, set

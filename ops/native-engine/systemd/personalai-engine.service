@@ -2,6 +2,8 @@
 Description=PersonalAI first-party native inference data plane
 Documentation=file:/usr/share/doc/personalai-engine/ADR-0006-always-offline-data-plane.md
 After=local-fs.target
+Requires=personalai-engine-release-verify.service
+After=personalai-engine-release-verify.service
 Before=shutdown.target
 ConditionPathIsDirectory=/var/lib/personalai-engine/models
 
@@ -17,7 +19,7 @@ LoadCredential=response.seed:/etc/personalai-engine/response.seed
 StandardInput=file:/run/credentials/personalai-engine.service/response.seed
 RuntimeDirectory=personalai-engine
 RuntimeDirectoryMode=0700
-ExecStart=/usr/libexec/personalai-engine serve-continuous --model-root /var/lib/personalai-engine/models --runtime-root /run/personalai-engine --socket /run/personalai-engine/engine.sock --model-id ${MODEL_ID} --package ${PACKAGE_NAME} --package-sha384 ${PACKAGE_HASH} --signer-key-id ${SIGNER_KEY_ID} --signer-public-key ${SIGNER_PUBLIC_KEY} --control-key-id ${CONTROL_KEY_ID} --control-public-key ${CONTROL_PUBLIC_KEY} --response-key-id ${RESPONSE_KEY_ID} --max-active-sequences ${MAXIMUM_ACTIVE} --max-connections ${MAXIMUM_CONNECTIONS} --max-memory-bytes ${MAXIMUM_MEMORY_BYTES} --max-kv-cache-bytes ${MAXIMUM_KV_CACHE_BYTES}
+ExecStart=/usr/lib/personalai-engine/release/personalai-engine serve-continuous --model-root /var/lib/personalai-engine/models --runtime-root /run/personalai-engine --socket /run/personalai-engine/engine.sock --model-id ${MODEL_ID} --package ${PACKAGE_NAME} --package-sha384 ${PACKAGE_HASH} --signer-key-id ${SIGNER_KEY_ID} --signer-public-key ${SIGNER_PUBLIC_KEY} --control-key-id ${CONTROL_KEY_ID} --control-public-key ${CONTROL_PUBLIC_KEY} --response-key-id ${RESPONSE_KEY_ID} --max-active-sequences ${MAXIMUM_ACTIVE} --max-connections ${MAXIMUM_CONNECTIONS} --max-memory-bytes ${MAXIMUM_MEMORY_BYTES} --max-kv-cache-bytes ${MAXIMUM_KV_CACHE_BYTES}
 Restart=on-failure
 RestartSec=5s
 StartLimitIntervalSec=60s
@@ -58,6 +60,7 @@ SystemCallFilter=~@mount @privileged @resources @reboot @swap
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 ReadOnlyPaths=/var/lib/personalai-engine/models
+ReadOnlyPaths=/usr/lib/personalai-engine/release
 ReadWritePaths=/run/personalai-engine
 
 [Install]

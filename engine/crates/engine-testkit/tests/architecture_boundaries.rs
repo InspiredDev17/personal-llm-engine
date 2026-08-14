@@ -215,6 +215,8 @@ fn linux_service_profile_denies_ip_network_and_limits_filesystem_authority() {
             .expect("Linux native-engine service unit must exist");
     for required in [
         "User=personalai",
+        "Requires=personalai-engine-release-verify.service",
+        "After=personalai-engine-release-verify.service",
         "UMask=0077",
         "StandardInput=file:/run/credentials/personalai-engine.service/response.seed",
         "RuntimeDirectoryMode=0700",
@@ -226,6 +228,7 @@ fn linux_service_profile_denies_ip_network_and_limits_filesystem_authority() {
         "RestrictAddressFamilies=AF_UNIX",
         "IPAddressDeny=any",
         "ReadOnlyPaths=/var/lib/personalai-engine/models",
+        "ReadOnlyPaths=/usr/lib/personalai-engine/release",
         "ReadWritePaths=/run/personalai-engine",
         "Environment=HOME=/nonexistent",
         "UnsetEnvironment=AWS_ACCESS_KEY_ID",
@@ -243,6 +246,48 @@ fn linux_service_profile_denies_ip_network_and_limits_filesystem_authority() {
         assert!(
             !unit.contains(prohibited),
             "service unit contains prohibited capability {prohibited:?}"
+        );
+    }
+
+    assert!(
+        unit.contains("ExecStart=/usr/lib/personalai-engine/release/personalai-engine "),
+        "service must launch the exact verified release artifact"
+    );
+
+    let verifier = fs::read_to_string(
+        repository.join("ops/native-engine/systemd/personalai-engine-release-verify.service"),
+    )
+    .expect("Linux release-verifier service unit must exist");
+    for required in [
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        "User=root",
+        "Group=personalai",
+        "UMask=0027",
+        "Before=personalai-engine.service",
+        "PartOf=personalai-engine.service",
+        "verify-supervised",
+        "--release-root /usr/lib/personalai-engine/release",
+        "--ledger-root /var/lib/personalai-engine/release-state",
+        "--engine-runtime-root /run/personalai-engine",
+        "--security-event-root /var/lib/personalai-engine/release-events",
+        "StateDirectoryMode=0750",
+        "NoNewPrivileges=yes",
+        "PrivateNetwork=yes",
+        "RestrictAddressFamilies=none",
+        "IPAddressDeny=any",
+        "CapabilityBoundingSet=\n",
+        "ReadOnlyPaths=/usr/lib/personalai-engine/release",
+        "ReadWritePaths=/var/lib/personalai-engine/release-state /var/lib/personalai-engine/release-events",
+        "MemoryDenyWriteExecute=yes",
+        "MemorySwapMax=0",
+    ] {
+        assert!(verifier.contains(required), "release verifier omitted invariant {required:?}");
+    }
+    for prohibited in ["AF_INET", "http://", "https://", "curl ", "wget ", "/bin/sh"] {
+        assert!(
+            !verifier.contains(prohibited),
+            "release verifier contains prohibited capability {prohibited:?}"
         );
     }
 }

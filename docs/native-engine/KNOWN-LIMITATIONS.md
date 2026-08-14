@@ -3,10 +3,10 @@
 ## Release and operations
 
 - This revision is NO-GO for production. Source now provides release-only
-  manifest signing, exact installed-artifact measurement, and a monotonic
-  rollback ledger. No target installer/supervisor invocation, OS-authenticated
-  verifier installation, release-key custody, or operated rollback evidence
-  exists yet.
+  manifest signing, exact installed-artifact measurement, a monotonic rollback
+  ledger, a Linux pre-launch unit binding, and a root-owned event bridge. No
+  OS-authenticated verifier installation, release-key custody, or operated
+  upgrade/tamper/rollback evidence exists yet.
 - Model-package and engine-release signatures are separate roles. Never treat a
   signed model as proof that the engine binary is trusted, or vice versa.
 - No automatic updater exists. Installation, rollback, and revocation are
@@ -44,10 +44,10 @@
   slower than CPU on the tiny fixture. Device KV history currently crosses
   bounded host tensors for attention dispatch. Metal driver reset, GPU exhaustion under production-size loads, prolonged
   thermal behavior, and days-long restart/cancellation soak are unqualified.
-- Security telemetry is bounded and content-free. The offline verifier now
-  rejects binary/metallib mismatch and downgrade, but no qualified supervisor
-  event bridge yet converts those pre-launch failures into Go/Agent Green
-  events. Supervisor model quarantine also remains absent.
+- Security telemetry is bounded and content-free. The verifier rejects
+  binary/metallib mismatch and downgrade and retains bounded pre-launch
+  categories for Go/Agent Green delivery. The source bridge is not yet
+  operated/qualified, and supervisor model quarantine remains absent.
 
 ## Tooling gaps
 

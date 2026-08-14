@@ -23,8 +23,8 @@ documentation exception.
 
 1. The source tree now has a first-party release-only signed manifest, exact
    installed-artifact verifier, and monotonic rollback ledger. Production is
-   still blocked until the verifier itself is OS-authenticated, an installer
-   invokes it atomically before launch, release-key custody is reviewed, and an
+   still blocked until the verifier itself is OS-authenticated, its checked-in
+   Linux pre-launch binding is operated, release-key custody is reviewed, and an
    operated target proves upgrade, same-version restart, tamper rejection, and
    rollback rejection. Package signing still does not sign the executable.
 2. The repository does not declare an owner-selected license for its own Rust
@@ -42,9 +42,9 @@ documentation exception.
    macOS host. macOS `sandbox-exec` is deprecated and remains a development
    proof, not a signed production App Sandbox/launcher qualification.
 6. Miri could not run because the pinned nightly lacks the Miri component.
-7. The release verifier rejects binary/metallib mismatch and downgrade, but a
-   qualified supervisor-to-Go event source for those pre-launch failures and
-   model quarantine is not implemented.
+7. The release verifier rejects binary/metallib mismatch and downgrade and the
+   source-complete root-owned ring feeds Go's existing Agent Green path, but
+   operated event delivery and model quarantine are not qualified.
 8. The audited published Go integration baseline and the separate local Go
    security history must be deliberately reconciled and retested as one exact
    release revision; this audit does not silently merge divergent histories.

@@ -8,14 +8,24 @@ privileges, cannot write the model store, and can write only its protected
 runtime directory.
 
 The operator must create the `personalai` service identity, mode-0755 root-owned
-model directory, root-owned mode-0600
-configuration/signing files, and install the audited release binary at
-`/usr/libexec/personalai-engine`. systemd creates the mode-0700 runtime directory.
+model directory, root-owned mode-0600 configuration/signing files, install the
+OS-authenticated verifier at `/usr/libexec/personalai-engine-release`, and
+install the closed signed release beneath `/usr/lib/personalai-engine/release`.
+The root verifier unit runs before every engine start, advances state under
+`/var/lib/personalai-engine/release-state`, and retains content-free failures
+under `/var/lib/personalai-engine/release-events`. Both state directories are
+root-owned; only event records are group-readable. systemd creates the mode-0700 runtime directory.
+The verifier's active marker is `PartOf` the engine service, so stopping or
+restarting the engine clears prior success and forces a new verification.
 `engine.env` contains public identifiers,
 public verification keys, fixed package registration, and numeric budgets. It
 must never contain the response signing seed. systemd presents the exact
 32-byte seed from its credential directory on standard input; the engine clears
 its copy after signer construction.
+
+`release.env` contains only the release signer key ID and public key. The
+verifier receives no private key and has no network address family. The engine
+unit has no write access to the release, ledger, or event directories.
 
 The template also sets a nonexistent home, removes common cloud/proxy secret
 variables, disables core dumps and swap, restricts namespaces, and caps open

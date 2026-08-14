@@ -56,14 +56,18 @@ metallib/notices. It produces canonical `engine-release.pairm` and
 `engine-release.ed25519` files without overwriting an approval.
 
 Before launch, an owner-controlled supervisor invokes
-`personalai-engine-release verify` against a fixed read-only release root. The
+`personalai-engine-release verify-supervised` against a fixed read-only release root. The
 verifier accepts no URL and no client/model path, requires the exact closed
 direct-child file set, rejects symlinks and writable installed content, verifies
 the release-only Ed25519 identity and every artifact, then advances a locked,
 durable monotonic ledger outside the engine runtime. The release crate has no
 dependency edge into the inference server, so it confers no update, install,
-launch, model, tool, or network authority. ADR-0026 defines the format and
-remaining supervisor/installer assumptions.
+launch, model, tool, or network authority. ADR-0026 defines the signed format;
+ADR-0027 binds the Linux unit to this gate. A failed check retains one
+content-free fixed-width event in a root-owned 64-slot ring. Go validates and
+routes those events through its existing audit/Agent Green boundary without
+write access. OS authentication of the verifier and operated evidence remain
+supervisor/installer assumptions.
 
 ## Package and loading flow
 

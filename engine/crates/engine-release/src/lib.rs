@@ -23,6 +23,8 @@ pub const RELEASE_MANIFEST_MAGIC: [u8; 8] = *b"PAIRLSV1";
 pub const RELEASE_SIGNATURE_MAGIC: [u8; 8] = *b"PAIRSIG1";
 /// Exact rollback-ledger magic.
 pub const ROLLBACK_LEDGER_MAGIC: [u8; 8] = *b"PAIRLDG1";
+/// Exact supervisor security-event magic.
+pub const SUPERVISOR_EVENT_MAGIC: [u8; 8] = *b"PAIRSEV1";
 /// Supported format version.
 pub const RELEASE_FORMAT_VERSION: u16 = 1;
 /// Maximum encoded manifest bytes.
@@ -41,11 +43,232 @@ pub const MAX_TARGET_BYTES: usize = 128;
 pub const MAX_TOOLCHAIN_BYTES: usize = 64;
 /// Maximum direct-child artifact filename length.
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 128;
+/// Fixed number of retained pre-launch security-event slots.
+pub const SUPERVISOR_EVENT_SLOTS: usize = 64;
 
 const SIGNATURE_ENVELOPE_BYTES: usize = 8 + 2 + 2 + 16 + ED25519_SIGNATURE_BYTES;
 const LEDGER_BYTES: usize = 8 + 2 + 2 + 8 + ModelPackageHash::BYTE_LEN;
+const SUPERVISOR_EVENT_BYTES: usize = 8 + 2 + 1 + 1 + 8 + 8 + ModelPackageHash::BYTE_LEN;
 const SIGNATURE_ALGORITHM_ED25519: u16 = 1;
 const MANIFEST_FLAGS: u16 = 0;
+
+/// Content-free category emitted by the trusted pre-launch verifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SupervisorSecurityEventKind {
+    /// A signature or exact release artifact failed integrity verification.
+    ReleaseIntegrityFailure = 1,
+    /// A release manifest, closed file set, or configured path was rejected.
+    ReleaseManifestRejected = 2,
+    /// The configured release signer was inactive, mismatched, or untrusted.
+    ReleaseTrustFailure = 3,
+    /// A finite verifier resource bound was exceeded.
+    ReleaseResourceExhaustion = 4,
+    /// The monotonic ledger rejected a downgrade or generation substitution.
+    ReleaseRollbackAttempt = 5,
+    /// Protected rollback state could not be safely read or advanced.
+    ReleaseLedgerFailure = 6,
+    /// The verifier encountered a fail-closed internal failure.
+    ReleaseVerifierFailure = 7,
+}
+
+impl SupervisorSecurityEventKind {
+    fn parse(value: u8) -> Result<Self, EngineError> {
+        match value {
+            1 => Ok(Self::ReleaseIntegrityFailure),
+            2 => Ok(Self::ReleaseManifestRejected),
+            3 => Ok(Self::ReleaseTrustFailure),
+            4 => Ok(Self::ReleaseResourceExhaustion),
+            5 => Ok(Self::ReleaseRollbackAttempt),
+            6 => Ok(Self::ReleaseLedgerFailure),
+            7 => Ok(Self::ReleaseVerifierFailure),
+            _ => Err(EngineError::invalid_input("supervisor security-event kind is unknown")),
+        }
+    }
+}
+
+/// One fixed-width, content-free pre-launch security event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisorSecurityEvent {
+    kind: SupervisorSecurityEventKind,
+    sequence: u64,
+    release_generation: u64,
+    manifest_digest: [u8; ModelPackageHash::BYTE_LEN],
+}
+
+impl SupervisorSecurityEvent {
+    /// Creates one event. Unknown release identity is represented only by zero
+    /// generation and an all-zero digest.
+    pub fn new(
+        kind: SupervisorSecurityEventKind,
+        sequence: u64,
+        release_generation: u64,
+        manifest_digest: [u8; ModelPackageHash::BYTE_LEN],
+    ) -> Result<Self, EngineError> {
+        if sequence == 0 {
+            return Err(EngineError::invalid_input("supervisor event sequence must be nonzero"));
+        }
+        let zero_digest = manifest_digest.iter().all(|byte| *byte == 0);
+        if (release_generation == 0) != zero_digest {
+            return Err(EngineError::invalid_input(
+                "supervisor event release identity must be entirely present or absent",
+            ));
+        }
+        Ok(Self { kind, sequence, release_generation, manifest_digest })
+    }
+
+    /// Returns the closed event category.
+    pub const fn kind(&self) -> SupervisorSecurityEventKind {
+        self.kind
+    }
+
+    /// Returns the root-owned monotonic event sequence.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the verified release generation, or zero when verification did
+    /// not safely establish an identity.
+    pub const fn release_generation(&self) -> u64 {
+        self.release_generation
+    }
+
+    /// Returns the verified manifest digest, or all zeroes when unavailable.
+    pub const fn manifest_digest(&self) -> &[u8; ModelPackageHash::BYTE_LEN] {
+        &self.manifest_digest
+    }
+
+    /// Encodes the exact fixed-width little-endian V1 record.
+    pub fn encode(&self) -> [u8; SUPERVISOR_EVENT_BYTES] {
+        let mut bytes = [0_u8; SUPERVISOR_EVENT_BYTES];
+        bytes[0..8].copy_from_slice(&SUPERVISOR_EVENT_MAGIC);
+        bytes[8..10].copy_from_slice(&RELEASE_FORMAT_VERSION.to_le_bytes());
+        bytes[10] = self.kind as u8;
+        bytes[11] = 0;
+        bytes[12..20].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.release_generation.to_le_bytes());
+        bytes[28..].copy_from_slice(&self.manifest_digest);
+        bytes
+    }
+
+    /// Parses one exact fixed-width V1 record.
+    pub fn parse(bytes: &[u8]) -> Result<Self, EngineError> {
+        if bytes.len() != SUPERVISOR_EVENT_BYTES {
+            return Err(EngineError::invalid_input(
+                "supervisor security-event record has the wrong length",
+            ));
+        }
+        if bytes[0..8] != SUPERVISOR_EVENT_MAGIC {
+            return Err(EngineError::invalid_input("supervisor security-event magic is invalid"));
+        }
+        if u16::from_le_bytes([bytes[8], bytes[9]]) != RELEASE_FORMAT_VERSION {
+            return Err(EngineError::invalid_input(
+                "supervisor security-event version is unsupported",
+            ));
+        }
+        if bytes[11] != 0 {
+            return Err(EngineError::invalid_input(
+                "supervisor security-event required flags are unknown",
+            ));
+        }
+        let kind = SupervisorSecurityEventKind::parse(bytes[10])?;
+        let sequence = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| EngineError::internal_invariant("event sequence width changed"))?,
+        );
+        let release_generation = u64::from_le_bytes(
+            bytes[20..28]
+                .try_into()
+                .map_err(|_| EngineError::internal_invariant("event generation width changed"))?,
+        );
+        let mut manifest_digest = [0_u8; ModelPackageHash::BYTE_LEN];
+        manifest_digest.copy_from_slice(&bytes[28..]);
+        Self::new(kind, sequence, release_generation, manifest_digest)
+    }
+}
+
+/// Root-owned bounded ring for verifier failures that occur before the engine
+/// process exists. The engine has no dependency on or write access to it.
+pub struct SupervisorSecurityEventJournal {
+    state_root: PathBuf,
+    event_root: PathBuf,
+}
+
+impl SupervisorSecurityEventJournal {
+    /// Opens protected, disjoint state and event directories.
+    pub fn open(
+        state_root: &Path,
+        event_root: &Path,
+        release_root: &Path,
+        engine_runtime_root: &Path,
+    ) -> Result<Self, EngineError> {
+        validate_secure_directory(state_root, true)?;
+        validate_secure_directory(event_root, true)?;
+        validate_secure_directory(release_root, true)?;
+        let state_root = fs::canonicalize(state_root).map_err(|_| {
+            EngineError::invalid_input("release event state root cannot be resolved")
+        })?;
+        let event_root = fs::canonicalize(event_root)
+            .map_err(|_| EngineError::invalid_input("release event root cannot be resolved"))?;
+        let release_root = fs::canonicalize(release_root)
+            .map_err(|_| EngineError::invalid_input("installed release root cannot be resolved"))?;
+        let runtime_root = resolve_secure_runtime_root(engine_runtime_root)?;
+        ensure_disjoint(&state_root, &event_root, "release event roots must be disjoint")?;
+        ensure_disjoint(&state_root, &release_root, "release event state must be outside release")?;
+        ensure_disjoint(&event_root, &release_root, "release events must be outside release")?;
+        ensure_disjoint(&state_root, &runtime_root, "release event state must be outside runtime")?;
+        ensure_disjoint(&event_root, &runtime_root, "release events must be outside runtime")?;
+        Ok(Self { state_root, event_root })
+    }
+
+    /// Appends one event, retaining only the newest fixed ring of 64 records.
+    pub fn append(
+        &self,
+        kind: SupervisorSecurityEventKind,
+        release_generation: u64,
+        manifest_digest: [u8; ModelPackageHash::BYTE_LEN],
+    ) -> Result<SupervisorSecurityEvent, EngineError> {
+        let _lock = LedgerLock::acquire(&self.state_root.join("release-security-event-v1.lock"))?;
+        let mut maximum_sequence = 0_u64;
+        for slot in 0..SUPERVISOR_EVENT_SLOTS {
+            let path = self.event_root.join(supervisor_event_filename(slot));
+            let Some(event) = read_supervisor_event(&path)? else {
+                continue;
+            };
+            maximum_sequence = maximum_sequence.max(event.sequence());
+        }
+        let sequence = maximum_sequence.checked_add(1).ok_or_else(|| {
+            EngineError::resource_exhaustion("supervisor security-event sequence exhausted")
+        })?;
+        let event =
+            SupervisorSecurityEvent::new(kind, sequence, release_generation, manifest_digest)?;
+        let slot = usize::try_from((sequence - 1) % SUPERVISOR_EVENT_SLOTS as u64)
+            .map_err(|_| EngineError::internal_invariant("supervisor event slot overflowed"))?;
+        let target = self.event_root.join(supervisor_event_filename(slot));
+        let temporary = self.event_root.join("release-security-event-v1.new");
+        let mut file = open_new_private(&temporary)?;
+        if let Err(error) = (|| {
+            file.write_all(&event.encode()).map_err(|_| {
+                EngineError::internal_invariant("supervisor security-event write failed")
+            })?;
+            file.sync_all().map_err(|_| {
+                EngineError::internal_invariant("supervisor security-event sync failed")
+            })?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o440)).map_err(|_| {
+                EngineError::internal_invariant("supervisor security-event mode failed")
+            })?;
+            fs::rename(&temporary, &target).map_err(|_| {
+                EngineError::internal_invariant("supervisor security-event activation failed")
+            })?;
+            sync_directory(&self.event_root)
+        })() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(event)
+    }
+}
 
 /// Closed artifact-role vocabulary for an engine release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -444,16 +667,14 @@ impl MonotonicReleaseLedger {
     /// Opens a protected ledger root and proves it is separate from runtime.
     pub fn open(root: &Path, engine_runtime_root: &Path) -> Result<Self, EngineError> {
         validate_secure_directory(root, true)?;
-        validate_secure_directory(engine_runtime_root, true)?;
         let root = fs::canonicalize(root)
             .map_err(|_| EngineError::invalid_input("release ledger root cannot be resolved"))?;
-        let runtime = fs::canonicalize(engine_runtime_root)
-            .map_err(|_| EngineError::invalid_input("engine runtime root cannot be resolved"))?;
-        if root == runtime || root.starts_with(&runtime) || runtime.starts_with(&root) {
-            return Err(EngineError::invalid_input(
-                "release ledger root must be disjoint from engine runtime",
-            ));
-        }
+        let runtime = resolve_secure_runtime_root(engine_runtime_root)?;
+        ensure_disjoint(
+            &root,
+            &runtime,
+            "release ledger root must be disjoint from engine runtime",
+        )?;
         Ok(Self { root })
     }
 
@@ -749,6 +970,84 @@ fn validate_secure_directory(path: &Path, writable: bool) -> Result<(), EngineEr
         return Err(EngineError::invalid_input("installed release directory must be read-only"));
     }
     Ok(())
+}
+
+fn resolve_secure_runtime_root(path: &Path) -> Result<PathBuf, EngineError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(EngineError::invalid_input(
+            "configured engine runtime root must be a normalized absolute path",
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_secure_directory(path, true)?;
+            fs::canonicalize(path)
+                .map_err(|_| EngineError::invalid_input("engine runtime root cannot be resolved"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                EngineError::invalid_input("engine runtime root must have a parent")
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                EngineError::invalid_input("engine runtime root must have a final component")
+            })?;
+            validate_secure_directory(parent, true)?;
+            let parent = fs::canonicalize(parent).map_err(|_| {
+                EngineError::invalid_input("engine runtime parent cannot be resolved")
+            })?;
+            Ok(parent.join(name))
+        }
+        Err(_) => Err(EngineError::invalid_input("engine runtime root metadata is unavailable")),
+    }
+}
+
+fn ensure_disjoint(left: &Path, right: &Path, reason: &'static str) -> Result<(), EngineError> {
+    if left == right || left.starts_with(right) || right.starts_with(left) {
+        return Err(EngineError::invalid_input(reason));
+    }
+    Ok(())
+}
+
+fn supervisor_event_filename(slot: usize) -> String {
+    format!("release-security-event-v1-{slot:02}.event")
+}
+
+fn read_supervisor_event(path: &Path) -> Result<Option<SupervisorSecurityEvent>, EngineError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(EngineError::authentication_failure(
+                "supervisor security-event slot is not a regular non-symlink file",
+            ));
+        }
+        Ok(metadata) if metadata.len() != SUPERVISOR_EVENT_BYTES as u64 => {
+            return Err(EngineError::authentication_failure(
+                "supervisor security-event slot has the wrong length",
+            ));
+        }
+        Ok(metadata) if metadata.permissions().mode() & 0o022 != 0 => {
+            return Err(EngineError::authentication_failure(
+                "supervisor security-event slot is group or world writable",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(EngineError::authentication_failure(
+                "supervisor security-event slot metadata is unavailable",
+            ));
+        }
+    }
+    let mut file = open_readonly_regular_no_follow(path)?;
+    let mut bytes = [0_u8; SUPERVISOR_EVENT_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|_| EngineError::authentication_failure("supervisor event read failed"))?;
+    SupervisorSecurityEvent::parse(&bytes)
+        .map(Some)
+        .map_err(|_| EngineError::authentication_failure("supervisor event is invalid"))
 }
 
 fn write_new_readonly(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
@@ -1125,5 +1424,119 @@ mod tests {
         fs::remove_dir_all(release_root).expect("release root remove");
         fs::remove_dir_all(ledger_root).expect("ledger root remove");
         fs::remove_dir_all(runtime_root).expect("runtime root remove");
+    }
+
+    #[test]
+    fn supervisor_event_records_are_canonical_content_free_and_bounded() {
+        let digest = [0x73; ModelPackageHash::BYTE_LEN];
+        let event = SupervisorSecurityEvent::new(
+            SupervisorSecurityEventKind::ReleaseRollbackAttempt,
+            9,
+            4,
+            digest,
+        )
+        .expect("event must validate");
+        let encoded = event.encode();
+        assert_eq!(encoded.len(), SUPERVISOR_EVENT_BYTES);
+        assert_eq!(SupervisorSecurityEvent::parse(&encoded), Ok(event));
+        assert!(
+            SupervisorSecurityEvent::new(
+                SupervisorSecurityEventKind::ReleaseIntegrityFailure,
+                0,
+                0,
+                [0; ModelPackageHash::BYTE_LEN],
+            )
+            .is_err()
+        );
+        assert!(
+            SupervisorSecurityEvent::new(
+                SupervisorSecurityEventKind::ReleaseIntegrityFailure,
+                1,
+                0,
+                digest,
+            )
+            .is_err()
+        );
+        for index in [0_usize, 8, 10, 11] {
+            let mut corrupt = encoded;
+            corrupt[index] ^= 0xff;
+            assert!(SupervisorSecurityEvent::parse(&corrupt).is_err());
+        }
+        assert!(SupervisorSecurityEvent::parse(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn supervisor_event_journal_is_monotonic_bounded_and_disjoint() {
+        let state_root = temporary_root("event-state");
+        let event_root = temporary_root("event-ring");
+        let release_root = temporary_root("event-release");
+        let runtime_root = temporary_root("event-runtime");
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o500))
+            .expect("release root must be read only");
+        assert!(
+            SupervisorSecurityEventJournal::open(
+                &state_root,
+                &state_root,
+                &release_root,
+                &runtime_root,
+            )
+            .is_err()
+        );
+        assert!(
+            SupervisorSecurityEventJournal::open(
+                &state_root,
+                &runtime_root,
+                &release_root,
+                &runtime_root,
+            )
+            .is_err()
+        );
+        let journal = SupervisorSecurityEventJournal::open(
+            &state_root,
+            &event_root,
+            &release_root,
+            &runtime_root,
+        )
+        .expect("journal must open");
+        for expected in 1..=SUPERVISOR_EVENT_SLOTS as u64 + 3 {
+            let event = journal
+                .append(
+                    SupervisorSecurityEventKind::ReleaseIntegrityFailure,
+                    0,
+                    [0; ModelPackageHash::BYTE_LEN],
+                )
+                .expect("event must append");
+            assert_eq!(event.sequence(), expected);
+        }
+        let events = fs::read_dir(&event_root)
+            .expect("event root must list")
+            .map(|entry| entry.expect("event entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), SUPERVISOR_EVENT_SLOTS);
+        let mut sequences = events
+            .iter()
+            .map(|path| read_supervisor_event(path).expect("event reads").expect("event exists"))
+            .map(|event| event.sequence())
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences.first(), Some(&4));
+        assert_eq!(sequences.last(), Some(&(SUPERVISOR_EVENT_SLOTS as u64 + 3)));
+        fs::remove_dir_all(state_root).expect("state root remove");
+        fs::remove_dir_all(event_root).expect("event root remove");
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))
+            .expect("cleanup mode");
+        fs::remove_dir_all(release_root).expect("release root remove");
+        fs::remove_dir_all(runtime_root).expect("runtime root remove");
+    }
+
+    #[test]
+    fn ledger_accepts_secure_not_yet_created_runtime_leaf() {
+        let ledger_root = temporary_root("ledger-absent-runtime");
+        let runtime_parent = temporary_root("runtime-parent");
+        let runtime_root = runtime_parent.join("personalai-engine");
+        MonotonicReleaseLedger::open(&ledger_root, &runtime_root)
+            .expect("secure absent runtime leaf must be accepted for pre-launch verification");
+        fs::remove_dir_all(ledger_root).expect("ledger root remove");
+        fs::remove_dir_all(runtime_parent).expect("runtime parent remove");
     }
 }

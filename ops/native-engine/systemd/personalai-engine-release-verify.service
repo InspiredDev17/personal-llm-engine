@@ -1,0 +1,55 @@
+[Unit]
+Description=Verify the signed PersonalAI native-engine release before launch
+Documentation=file:/usr/share/doc/personalai-engine/ADR-0026-signed-engine-release-and-rollback-ledger.md
+Before=personalai-engine.service
+PartOf=personalai-engine.service
+ConditionPathIsDirectory=/usr/lib/personalai-engine/release
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=personalai
+UMask=0027
+EnvironmentFile=/etc/personalai-engine/release.env
+Environment=HOME=/nonexistent
+UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN GOOGLE_APPLICATION_CREDENTIALS AZURE_CLIENT_ID AZURE_CLIENT_SECRET OPENAI_API_KEY HTTPS_PROXY HTTP_PROXY ALL_PROXY
+StateDirectory=personalai-engine/release-state personalai-engine/release-events
+StateDirectoryMode=0750
+ExecStart=/usr/libexec/personalai-engine-release verify-supervised --release-root /usr/lib/personalai-engine/release --ledger-root /var/lib/personalai-engine/release-state --engine-runtime-root /run/personalai-engine --security-event-root /var/lib/personalai-engine/release-events --signer-key-id ${RELEASE_SIGNER_KEY_ID} --signer-public-key ${RELEASE_SIGNER_PUBLIC_KEY}
+LimitCORE=0
+LimitNOFILE=128
+LimitNPROC=32
+TasksMax=32
+MemoryMax=1G
+MemorySwapMax=0
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@network-io @mount @privileged @resources @reboot @swap
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ReadOnlyPaths=/usr/lib/personalai-engine/release
+ReadWritePaths=/var/lib/personalai-engine/release-state /var/lib/personalai-engine/release-events

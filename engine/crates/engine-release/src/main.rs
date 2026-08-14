@@ -2,10 +2,11 @@
 
 use personalai_engine_crypto::{EngineReleaseSigner, TrustedReleaseSigner};
 use personalai_engine_release::{
-    MonotonicReleaseLedger, ReleaseArtifactRole, ReleaseManifest, inspect_release_artifact,
-    verify_installed_release, write_signed_manifest,
+    MonotonicReleaseLedger, ReleaseArtifactRole, ReleaseManifest, SupervisorSecurityEventJournal,
+    SupervisorSecurityEventKind, inspect_release_artifact, verify_installed_release,
+    write_signed_manifest,
 };
-use personalai_engine_types::{EngineError, SignerKeyId};
+use personalai_engine_types::{EngineError, EngineErrorKind, SignerKeyId};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Read};
@@ -20,7 +21,10 @@ const USAGE: &str = "usage:\n  personalai-engine-release sign \
 [--metal-library NAME] [--notices NAME]\n  \
 personalai-engine-release verify \
 --release-root PATH --ledger-root PATH --engine-runtime-root PATH \
---signer-key-id HEX32 --signer-public-key HEX64\n\n\
+--signer-key-id HEX32 --signer-public-key HEX64\n  \
+personalai-engine-release verify-supervised \
+--release-root PATH --ledger-root PATH --engine-runtime-root PATH \
+--security-event-root PATH --signer-key-id HEX32 --signer-public-key HEX64\n\n\
 sign reads exactly 32 binary Ed25519 release-signing seed bytes from stdin; \
 verify never reads private key material; all paths are owner configuration";
 
@@ -50,6 +54,7 @@ fn run(
     match command.as_str() {
         "sign" => sign(values, signing_input),
         "verify" => verify(values),
+        "verify-supervised" => verify_supervised(values),
         _ => Err(EngineError::invalid_input("release command is unsupported")),
     }
 }
@@ -101,26 +106,109 @@ fn sign(
 }
 
 fn verify(mut values: BTreeMap<String, OsString>) -> Result<String, EngineError> {
-    let release_root = PathBuf::from(take(&mut values, "--release-root")?);
-    let ledger_root = PathBuf::from(take(&mut values, "--ledger-root")?);
-    let runtime_root = PathBuf::from(take(&mut values, "--engine-runtime-root")?);
-    let key_id =
-        SignerKeyId::from_bytes(parse_hex(&text(take(&mut values, "--signer-key-id")?)?)?)?;
-    let public_key = parse_hex(&text(take(&mut values, "--signer-public-key")?)?)?;
+    let options = verify_options(&mut values)?;
     if !values.is_empty() {
         return Err(EngineError::invalid_input("unknown release verify flag"));
     }
-    let trusted = TrustedReleaseSigner::active(key_id, public_key)?;
-    let release = verify_installed_release(&release_root, &trusted)?;
-    let ledger = MonotonicReleaseLedger::open(&ledger_root, &runtime_root)?;
+    let trusted = TrustedReleaseSigner::active(options.key_id, options.public_key)?;
+    let release = verify_installed_release(&options.release_root, &trusted)?;
+    let ledger = MonotonicReleaseLedger::open(&options.ledger_root, &options.runtime_root)?;
     ledger.checkpoint(&release)?;
-    Ok(format!(
+    Ok(verified_message(&release))
+}
+
+fn verify_supervised(mut values: BTreeMap<String, OsString>) -> Result<String, EngineError> {
+    let event_root = PathBuf::from(take(&mut values, "--security-event-root")?);
+    let options = verify_options(&mut values)?;
+    if !values.is_empty() {
+        return Err(EngineError::invalid_input("unknown supervised release verify flag"));
+    }
+    let events = SupervisorSecurityEventJournal::open(
+        &options.ledger_root,
+        &event_root,
+        &options.release_root,
+        &options.runtime_root,
+    )?;
+    let trusted = match TrustedReleaseSigner::active(options.key_id, options.public_key) {
+        Ok(trusted) => trusted,
+        Err(error) => {
+            events.append(SupervisorSecurityEventKind::ReleaseTrustFailure, 0, [0; 48])?;
+            return Err(error);
+        }
+    };
+    let release = match verify_installed_release(&options.release_root, &trusted) {
+        Ok(release) => release,
+        Err(error) => {
+            events.append(supervisor_verification_kind(error.kind()), 0, [0; 48])?;
+            return Err(error);
+        }
+    };
+    let ledger = match MonotonicReleaseLedger::open(&options.ledger_root, &options.runtime_root) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            events.append(
+                SupervisorSecurityEventKind::ReleaseLedgerFailure,
+                release.manifest().generation(),
+                *release.manifest_digest(),
+            )?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = ledger.checkpoint(&release) {
+        let kind = if error.kind() == EngineErrorKind::AuthenticationFailure {
+            SupervisorSecurityEventKind::ReleaseRollbackAttempt
+        } else {
+            SupervisorSecurityEventKind::ReleaseLedgerFailure
+        };
+        events.append(kind, release.manifest().generation(), *release.manifest_digest())?;
+        return Err(error);
+    }
+    Ok(verified_message(&release))
+}
+
+struct VerifyOptions {
+    release_root: PathBuf,
+    ledger_root: PathBuf,
+    runtime_root: PathBuf,
+    key_id: SignerKeyId,
+    public_key: [u8; 32],
+}
+
+fn verify_options(values: &mut BTreeMap<String, OsString>) -> Result<VerifyOptions, EngineError> {
+    let release_root = PathBuf::from(take(values, "--release-root")?);
+    let ledger_root = PathBuf::from(take(values, "--ledger-root")?);
+    let runtime_root = PathBuf::from(take(values, "--engine-runtime-root")?);
+    let key_id = SignerKeyId::from_bytes(parse_hex(&text(take(values, "--signer-key-id")?)?)?)?;
+    let public_key = parse_hex(&text(take(values, "--signer-public-key")?)?)?;
+    Ok(VerifyOptions { release_root, ledger_root, runtime_root, key_id, public_key })
+}
+
+fn verified_message(release: &personalai_engine_release::VerifiedRelease) -> String {
+    format!(
         "verified_release_generation={} release_id={} target={} manifest_sha384={}",
         release.manifest().generation(),
         release.manifest().release_id(),
         release.manifest().target(),
         encode_hex(release.manifest_digest())
-    ))
+    )
+}
+
+const fn supervisor_verification_kind(kind: EngineErrorKind) -> SupervisorSecurityEventKind {
+    match kind {
+        EngineErrorKind::SignatureFailure => SupervisorSecurityEventKind::ReleaseIntegrityFailure,
+        EngineErrorKind::AuthenticationFailure => SupervisorSecurityEventKind::ReleaseTrustFailure,
+        EngineErrorKind::ResourceExhaustion => {
+            SupervisorSecurityEventKind::ReleaseResourceExhaustion
+        }
+        EngineErrorKind::InvalidInput
+        | EngineErrorKind::UnsupportedArchitecture
+        | EngineErrorKind::UnsupportedTokenizer
+        | EngineErrorKind::CorruptModelPackage
+        | EngineErrorKind::ProtocolViolation => {
+            SupervisorSecurityEventKind::ReleaseManifestRejected
+        }
+        _ => SupervisorSecurityEventKind::ReleaseVerifierFailure,
+    }
 }
 
 fn parse_named_arguments(
@@ -209,6 +297,28 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use personalai_engine_crypto::EngineReleaseSigner;
+    use personalai_engine_release::SupervisorSecurityEvent;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn temporary_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must follow epoch")
+            .as_nanos();
+        let sequence = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir()
+            .join(format!("pair-release-cli-{label}-{}-{nonce}-{sequence}", std::process::id()));
+        fs::create_dir(&root).expect("temporary root must create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("temporary root mode must set");
+        root
+    }
 
     #[test]
     fn parser_rejects_missing_duplicate_unknown_and_bad_hex_arguments() {
@@ -226,5 +336,54 @@ mod tests {
         assert!(read_seed(&mut &[1_u8; 31][..]).is_err());
         assert!(read_seed(&mut &[1_u8; 33][..]).is_err());
         assert_eq!(read_seed(&mut &[1_u8; 32][..]), Ok([1_u8; 32]));
+    }
+
+    #[test]
+    fn supervised_verification_failure_emits_one_content_free_event() {
+        let release_root = temporary_root("release");
+        let ledger_root = temporary_root("ledger");
+        let event_root = temporary_root("events");
+        let runtime_parent = temporary_root("runtime-parent");
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o500))
+            .expect("release root must be read only");
+        let key_id = SignerKeyId::from_bytes([0x31; 16]).expect("key ID must validate");
+        let mut seed = [0x32; 32];
+        let signer = EngineReleaseSigner::from_seed(key_id, &mut seed).expect("signer");
+        let arguments = [
+            "verify-supervised".to_owned(),
+            "--release-root".to_owned(),
+            release_root.to_string_lossy().into_owned(),
+            "--ledger-root".to_owned(),
+            ledger_root.to_string_lossy().into_owned(),
+            "--engine-runtime-root".to_owned(),
+            runtime_parent.join("engine").to_string_lossy().into_owned(),
+            "--security-event-root".to_owned(),
+            event_root.to_string_lossy().into_owned(),
+            "--signer-key-id".to_owned(),
+            encode_hex(key_id.as_bytes()),
+            "--signer-public-key".to_owned(),
+            encode_hex(&signer.public_key()),
+        ]
+        .into_iter()
+        .map(OsString::from);
+        assert!(run(arguments, &mut &[][..]).is_err());
+        let entries = fs::read_dir(&event_root)
+            .expect("event directory must list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("event entries must read");
+        assert_eq!(entries.len(), 1);
+        let event = SupervisorSecurityEvent::parse(
+            &fs::read(entries[0].path()).expect("event bytes must read"),
+        )
+        .expect("event must parse");
+        assert_eq!(event.kind(), SupervisorSecurityEventKind::ReleaseManifestRejected);
+        assert_eq!(event.release_generation(), 0);
+        assert!(event.manifest_digest().iter().all(|byte| *byte == 0));
+
+        fs::set_permissions(&release_root, fs::Permissions::from_mode(0o700))
+            .expect("cleanup mode");
+        for root in [release_root, ledger_root, event_root, runtime_parent] {
+            fs::remove_dir_all(root).expect("temporary root must remove");
+        }
     }
 }

@@ -139,7 +139,7 @@ tested. Remaining release work is selecting and licensing an approved real
 source model, producing/reviewing its production package and independent
 numeric vectors, production-size fuzz/operated-soak/performance evidence, operated
 request/response-key injection, rotation/recovery evidence, repeatable
-vendor/SBOM release renewal, trusted installer/supervisor binding and operated
-release rollback evidence, and hardware-specific
+vendor/SBOM release renewal, trusted OS installation and operated release
+rollback evidence, and hardware-specific
 accelerator implementation/validation. These limits prohibit claiming complete
 production replacement today.
