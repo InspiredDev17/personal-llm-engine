@@ -76,8 +76,12 @@ backend and engine instance identities, reservation count/memory ceilings, and
 an availability TTL. For signed Model Foundry registry admission, the artifact
 correlation must exactly match the signed registry artifact ID. These startup
 fields do not qualify a model; AI-Avenger must still validate the independently
-signed qualification manifest. Execution requests/results are not yet exposed
-through this runtime-v3 service slice.
+signed qualification manifest. Canonical execution requests/results are
+transported only after exact reservation admission and identity revalidation.
+Default builds return a typed not-configured failure. Deterministic fixture
+execution requires the compile-time `development-runtime-v3-simulator` feature
+and the explicit `--runtime-v3-development-fixed-output` flag; it is test
+evidence, not model execution or production qualification.
 
 ## Release signing and pre-launch verification
 

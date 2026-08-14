@@ -38,6 +38,8 @@ pub use runtime_reservations::{
 pub use runtime_v3_adapter::{
     AdmittedRuntimeExecution, RuntimeIdentityAuthority, RuntimeV3ContractAdapter,
 };
+#[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+pub use runtime_v3_service::RuntimeV3DevelopmentBehavior;
 #[cfg(all(unix, feature = "cpu-reference"))]
 pub use runtime_v3_service::RuntimeV3ServiceConfig;
 #[cfg(unix)]
@@ -2286,7 +2288,8 @@ fn handle_service_request_parts(
         ServiceRequestBody::RuntimeV3Availability
         | ServiceRequestBody::RuntimeV3Reserve(_)
         | ServiceRequestBody::RuntimeV3Cancel(_)
-        | ServiceRequestBody::RuntimeV3Release(_) => Err(EngineError::not_implemented(
+        | ServiceRequestBody::RuntimeV3Release(_)
+        | ServiceRequestBody::RuntimeV3Execute(_) => Err(EngineError::not_implemented(
             "runtime v3 authenticated service is not enabled by owner configuration",
         )),
     }
@@ -2392,6 +2395,20 @@ impl CpuEngineRuntime {
             .as_mut()
             .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
             .configure_model(&self.service, &self.backend, identity)
+    }
+
+    /// Enables the compile-time-gated deterministic runtime-v3 simulator.
+    /// Default builds do not expose this method, and it cannot be selected by
+    /// any client message.
+    #[cfg(feature = "development-runtime-v3-simulator")]
+    pub fn enable_runtime_v3_development_simulator(
+        &mut self,
+        behavior: RuntimeV3DevelopmentBehavior,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .enable_development_simulator(behavior)
     }
 
     /// Derives engine-owned package/backend identity from one registered model
@@ -4232,6 +4249,15 @@ mod tests {
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{ContextLimit, ModelHashAlgorithm, ResourceBudget, SignerKeyId};
+    #[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+    use sovereign_ai_contracts::inference::{
+        GenerationParameters as ContractGenerationParameters, InferenceMessage, InferenceRole,
+    };
+    #[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+    use sovereign_ai_contracts::inference_runtime_v3::{
+        ExecutionRequestKindV3, ExecutionStatusV3, InferenceExecutionRequestV3,
+        decode_inference_execution_result_v3, encode_inference_execution_request_v3,
+    };
     #[cfg(all(unix, feature = "cpu-reference"))]
     use sovereign_ai_contracts::inference_runtime_v3::{
         InferenceReservationReleaseV3, InferenceReservationRequestV3,
@@ -6619,6 +6645,10 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated socket transcript proves the complete reservation and execution lifecycle"
+    )]
     fn authenticated_runtime_v3_availability_reservation_and_release_are_exact() {
         let mut fixture = BatchRuntimeFixture::new("runtime-v3-contract", 1);
         let identity = fixture.enable_runtime_v3();
@@ -6678,6 +6708,64 @@ mod tests {
             .expect("reservation decision");
         assert_eq!(decision.decision, ReservationDecisionV3::Accepted);
 
+        #[cfg(feature = "development-runtime-v3-simulator")]
+        {
+            let execution_created = runtime_v3_now_unix_millis().expect("execution service time");
+            fixture
+                .runtime
+                .enable_runtime_v3_development_simulator(
+                    RuntimeV3DevelopmentBehavior::fixed_success(
+                        "development runtime v3 fixture output",
+                    )
+                    .expect("development output"),
+                )
+                .expect("enable explicit development simulator");
+            let execution = InferenceExecutionRequestV3 {
+                contract_version: InferenceRuntimeContractVersionV3,
+                kind: ExecutionRequestKindV3::ExecutionRequest,
+                reservation_id: reservation.reservation_id.clone(),
+                request_id: reservation.request_id.clone(),
+                task_id: reservation.task_id.clone(),
+                identity: reservation.identity.clone(),
+                messages: vec![InferenceMessage {
+                    role: InferenceRole::User,
+                    content: "deterministic fixture input".to_owned(),
+                    name: None,
+                }],
+                parameters: ContractGenerationParameters {
+                    max_output_tokens: 8,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: Some(7),
+                    stop_sequences: None,
+                },
+                idempotency_key: "22".repeat(32),
+                created_at: runtime_v3_timestamp_from_unix_millis(execution_created)
+                    .expect("execution creation"),
+                deadline_at: runtime_v3_timestamp_from_unix_millis(now + 9_000)
+                    .expect("execution deadline"),
+                extensions: None,
+                required_extensions: None,
+            };
+            let execution_body = ServiceRequestBody::RuntimeV3Execute(
+                RuntimeV3Document::new(
+                    encode_inference_execution_request_v3(&execution).expect("execution request"),
+                )
+                .expect("bounded execution request"),
+            );
+            let execute = fixture.authenticated_service_request(43, &execution_body);
+            let ServiceResponseBody::RuntimeV3Execution(document) =
+                fixture.runtime.handle_service_request(&execute).expect("execution response")
+            else {
+                panic!("runtime v3 execution response kind changed");
+            };
+            let result = decode_inference_execution_result_v3(document.as_bytes())
+                .expect("execution result");
+            result.validate_against(&execution).expect("result binding");
+            assert_eq!(result.status, ExecutionStatusV3::Succeeded);
+            assert_eq!(result.output.as_deref(), Some("development runtime v3 fixture output"));
+        }
+
         let release = InferenceReservationReleaseV3 {
             contract_version: InferenceRuntimeContractVersionV3,
             kind: ReservationReleaseKindV3::ReservationRelease,
@@ -6695,7 +6783,7 @@ mod tests {
             )
             .expect("bounded release"),
         );
-        let release = fixture.authenticated_service_request(43, &release_body);
+        let release = fixture.authenticated_service_request(44, &release_body);
         assert_eq!(
             fixture.runtime.handle_service_request(&release),
             Ok(ServiceResponseBody::RuntimeV3Released)

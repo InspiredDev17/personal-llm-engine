@@ -35,7 +35,7 @@ authentication mechanism. They may be dispatched only inside the existing
 signed, replay-journaled, same-user Unix-domain-socket service envelope.
 
 The closed service catalog now carries availability, reservation,
-cancellation, and release documents as bounded opaque payloads. The server
+cancellation, release, and execution documents as bounded opaque payloads. The server
 decodes them only through the pinned Contracts implementation, binds
 owner-configured logical/artifact correlations to live registered package and
 backend state, and revalidates that state before reservation. Availability
@@ -55,9 +55,10 @@ valid Contracts data but unsupported by this native runtime profile.
   memory, approvals, and Agent Green authority.
 - Serde/JSON and the Contracts SHA-256 stack enlarge the reviewed offline graph;
   exact versions, sources, vendor contents, and SPDX entries are enforced.
-- Signed UDS admission is integration-tested with synthetic packages and
-  development keys. Canonical execution request/result dispatch, control-plane
-  transport composition, and durable accepted-reservation recovery remain
-  required before this is an operated inference-runtime-v3 service.
+- Signed UDS admission and canonical execution dispatch are integration-tested
+  with synthetic packages, development keys, and a compile-time-gated fixed
+  output simulator. Production backend dispatch, control-plane operated proof,
+  and durable accepted-reservation recovery remain required before this is an
+  operated inference-runtime-v3 service.
 - Production model, hardware, latency, throughput, resource-pressure, and soak
   evidence remain separate deployment gates.

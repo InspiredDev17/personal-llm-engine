@@ -5,6 +5,8 @@
 //! owner-only; no client message can install an identity or manufacture
 //! qualification authority.
 
+#[cfg(feature = "development-runtime-v3-simulator")]
+use crate::AdmittedRuntimeExecution;
 use crate::{
     ArtifactAuthorityId, EngineService, LoadedRuntimeModel, LogicalModelId,
     MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS, RuntimeBackend, RuntimeIdentityAuthority,
@@ -13,10 +15,19 @@ use crate::{
 use personalai_engine_protocol::{RuntimeV3Document, ServiceRequestBody, ServiceResponseBody};
 use personalai_engine_types::EngineError;
 use personalai_engine_types::ModelId;
+#[cfg(feature = "development-runtime-v3-simulator")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "development-runtime-v3-simulator")]
+use sovereign_ai_contracts::inference::GenerationUsage;
 use sovereign_ai_contracts::inference_runtime_v3::{
     ArtifactDigestAlgorithmV3, InferenceRuntimeContractVersionV3, RuntimeAvailabilityKindV3,
     RuntimeAvailabilityV3, RuntimeIdentityV3, RuntimeModelStateV3, RuntimeModelStatusV3,
     RuntimeStateV3, encode_runtime_availability_v3, runtime_v3_timestamp_from_unix_millis,
+};
+#[cfg(feature = "development-runtime-v3-simulator")]
+use sovereign_ai_contracts::inference_runtime_v3::{
+    ExecutionResultKindV3, ExecutionStatusV3, InferenceExecutionResultV3, RuntimeFailureClassV3,
+    RuntimeFailureV3, RuntimeResourceUnitV3, RuntimeResourceUsageV3, RuntimeResourceV3,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -30,6 +41,33 @@ pub struct RuntimeV3ServiceConfig {
     maximum_active_reservations: usize,
     maximum_inference_memory_bytes: u64,
     availability_ttl_millis: u64,
+}
+
+/// Explicit non-production behavior for deterministic contract integration.
+/// This type is absent from default builds and never represents model quality.
+#[cfg(feature = "development-runtime-v3-simulator")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeV3DevelopmentBehavior {
+    /// Return one fixed bounded output and synthetic resource accounting.
+    FixedSuccess(String),
+    /// Return a retryable structured engine failure.
+    TransientFailure,
+    /// Return a non-retryable structured engine failure.
+    TerminalFailure,
+}
+
+#[cfg(feature = "development-runtime-v3-simulator")]
+impl RuntimeV3DevelopmentBehavior {
+    /// Constructs bounded deterministic success output.
+    pub fn fixed_success(output: impl Into<String>) -> Result<Self, EngineError> {
+        let output = output.into();
+        if output.is_empty() || output.len() > 4_096 || output.contains('\0') {
+            return Err(EngineError::invalid_input(
+                "development runtime v3 output is outside fixture bounds",
+            ));
+        }
+        Ok(Self::FixedSuccess(output))
+    }
 }
 
 impl RuntimeV3ServiceConfig {
@@ -72,6 +110,8 @@ pub(crate) struct RuntimeV3ServiceState {
     adapter: RuntimeV3ContractAdapter,
     bindings: BTreeMap<String, RuntimeIdentityBinding>,
     next_availability_revision: u64,
+    #[cfg(feature = "development-runtime-v3-simulator")]
+    development_behavior: Option<RuntimeV3DevelopmentBehavior>,
 }
 
 impl RuntimeV3ServiceState {
@@ -80,7 +120,28 @@ impl RuntimeV3ServiceState {
             config.maximum_active_reservations,
             config.maximum_inference_memory_bytes,
         )?;
-        Ok(Self { config, adapter, bindings: BTreeMap::new(), next_availability_revision: 0 })
+        Ok(Self {
+            config,
+            adapter,
+            bindings: BTreeMap::new(),
+            next_availability_revision: 0,
+            #[cfg(feature = "development-runtime-v3-simulator")]
+            development_behavior: None,
+        })
+    }
+
+    #[cfg(feature = "development-runtime-v3-simulator")]
+    pub(crate) fn enable_development_simulator(
+        &mut self,
+        behavior: RuntimeV3DevelopmentBehavior,
+    ) -> Result<(), EngineError> {
+        if self.development_behavior.is_some() {
+            return Err(EngineError::invalid_input(
+                "development runtime v3 simulator is already configured",
+            ));
+        }
+        self.development_behavior = Some(behavior);
+        Ok(())
     }
 
     pub(crate) fn configure_model(
@@ -188,9 +249,42 @@ impl RuntimeV3ServiceState {
                     self.adapter.release_document(document.as_bytes(), now_unix_millis)?;
                 ServiceResponseBody::RuntimeV3Released
             }
+            ServiceRequestBody::RuntimeV3Execute(document) => {
+                ServiceResponseBody::RuntimeV3Execution(RuntimeV3Document::new(
+                    self.execute_document(document.as_bytes(), now_unix_millis, &authority)?,
+                )?)
+            }
             _ => return Ok(None),
         };
         Ok(Some(response))
+    }
+
+    fn execute_document(
+        &self,
+        document: &[u8],
+        now_unix_millis: u64,
+        authority: &impl RuntimeIdentityAuthority,
+    ) -> Result<Vec<u8>, EngineError> {
+        #[cfg(not(feature = "development-runtime-v3-simulator"))]
+        {
+            let _ = (document, now_unix_millis, authority);
+            Err(EngineError::not_implemented("runtime v3 execution backend is not configured"))
+        }
+        #[cfg(feature = "development-runtime-v3-simulator")]
+        {
+            let behavior = self.development_behavior.as_ref().ok_or_else(|| {
+                EngineError::not_implemented("runtime v3 execution backend is not configured")
+            })?;
+            let admitted =
+                self.adapter.admit_execution_document(document, now_unix_millis, authority)?;
+            let result = development_result(&admitted, behavior, now_unix_millis)?;
+            self.adapter.finalize_execution_result(
+                &admitted,
+                &result,
+                now_unix_millis.saturating_add(1),
+                authority,
+            )
+        }
     }
 
     fn availability_document(
@@ -280,6 +374,109 @@ impl RuntimeV3ServiceState {
         };
         contract_result(encode_runtime_availability_v3(&availability))
     }
+}
+
+#[cfg(feature = "development-runtime-v3-simulator")]
+fn development_result(
+    admitted: &AdmittedRuntimeExecution,
+    behavior: &RuntimeV3DevelopmentBehavior,
+    now_unix_millis: u64,
+) -> Result<InferenceExecutionResultV3, EngineError> {
+    let request = admitted.request();
+    let nominal_completion = now_unix_millis.checked_add(1).ok_or_else(|| {
+        EngineError::resource_exhaustion("development completion time overflowed")
+    })?;
+    let deadline_unix_millis = contract_result(request.deadline_unix_millis())?;
+    let deadline_exceeded = nominal_completion > deadline_unix_millis;
+    let completed_unix_millis = nominal_completion.min(deadline_unix_millis);
+    let started_at = contract_result(runtime_v3_timestamp_from_unix_millis(now_unix_millis))?;
+    let completed_at =
+        contract_result(runtime_v3_timestamp_from_unix_millis(completed_unix_millis))?;
+    let resources = vec![
+        RuntimeResourceUsageV3 {
+            resource: RuntimeResourceV3::InferenceMemory,
+            units: 1,
+            unit: RuntimeResourceUnitV3::Bytes,
+        },
+        RuntimeResourceUsageV3 {
+            resource: RuntimeResourceV3::WallTime,
+            units: 1,
+            unit: RuntimeResourceUnitV3::Milliseconds,
+        },
+    ];
+    let (status, usage, output, output_digest, failure) = if deadline_exceeded {
+        (
+            ExecutionStatusV3::DeadlineExceeded,
+            GenerationUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            None,
+            None,
+            Some(RuntimeFailureV3 {
+                class: RuntimeFailureClassV3::DeadlineExceeded,
+                code: "development_deadline_exceeded".to_owned(),
+                retryable: false,
+            }),
+        )
+    } else {
+        match behavior {
+            RuntimeV3DevelopmentBehavior::FixedSuccess(output) => {
+                let mut digest = String::with_capacity(64);
+                for byte in Sha256::digest(output.as_bytes()) {
+                    write!(&mut digest, "{byte:02x}").map_err(|_| {
+                        EngineError::internal_invariant(
+                            "development output digest formatting failed",
+                        )
+                    })?;
+                }
+                (
+                    ExecutionStatusV3::Succeeded,
+                    GenerationUsage { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+                    Some(output.clone()),
+                    Some(digest),
+                    None,
+                )
+            }
+            RuntimeV3DevelopmentBehavior::TransientFailure => (
+                ExecutionStatusV3::Failed,
+                GenerationUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+                None,
+                None,
+                Some(RuntimeFailureV3 {
+                    class: RuntimeFailureClassV3::InternalFailure,
+                    code: "development_transient_failure".to_owned(),
+                    retryable: true,
+                }),
+            ),
+            RuntimeV3DevelopmentBehavior::TerminalFailure => (
+                ExecutionStatusV3::Failed,
+                GenerationUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+                None,
+                None,
+                Some(RuntimeFailureV3 {
+                    class: RuntimeFailureClassV3::InternalFailure,
+                    code: "development_terminal_failure".to_owned(),
+                    retryable: false,
+                }),
+            ),
+        }
+    };
+    Ok(InferenceExecutionResultV3 {
+        contract_version: InferenceRuntimeContractVersionV3,
+        kind: ExecutionResultKindV3::ExecutionResult,
+        reservation_id: request.reservation_id.clone(),
+        request_id: request.request_id.clone(),
+        task_id: request.task_id.clone(),
+        identity: request.identity.clone(),
+        status,
+        started_at,
+        completed_at,
+        usage,
+        resource_usage: resources,
+        output,
+        output_digest,
+        failure,
+        extensions: None,
+        required_extensions: None,
+    })
 }
 
 struct LiveRuntimeIdentityAuthority<'a> {

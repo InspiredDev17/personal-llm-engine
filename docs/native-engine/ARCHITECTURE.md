@@ -55,11 +55,13 @@ consumption, and emits canonical decision/result documents. The in-memory state
 machine enforces exact identity/correlation, finite capacity, idempotent replay,
 single consumption, cancellation, release, expiry, terminal identity, and
 resource ceilings. The existing signed, replay-journaled, same-user UDS service
-now carries bounded canonical availability, reservation, cancellation, and
-release documents without assigning them authentication authority. Exact
-execution request/result transport and durable recovery of accepted
-reservations remain incomplete, so this is not yet an operated v3 inference
-service.
+now carries bounded canonical availability, reservation, cancellation, release,
+and execution documents without assigning them authentication authority.
+Execution is fail-closed unless a backend is explicitly composed; the only
+host-independent implementation in this slice is a compile-time-gated
+deterministic development simulator. Production backend dispatch and durable
+recovery of accepted reservations remain incomplete, so this is not yet an
+operated v3 inference service.
 
 ## Engine release trust flow
 

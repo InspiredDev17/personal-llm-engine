@@ -104,6 +104,8 @@ pub enum ServiceRequestBody {
     RuntimeV3Cancel(RuntimeV3Document),
     /// Apply one canonical runtime-v3 reservation release.
     RuntimeV3Release(RuntimeV3Document),
+    /// Execute one previously admitted canonical runtime-v3 request.
+    RuntimeV3Execute(RuntimeV3Document),
 }
 
 impl ServiceRequestBody {
@@ -127,6 +129,7 @@ impl ServiceRequestBody {
             Self::RuntimeV3Reserve(_) => ServiceMessageKind::RuntimeV3Reserve,
             Self::RuntimeV3Cancel(_) => ServiceMessageKind::RuntimeV3Cancel,
             Self::RuntimeV3Release(_) => ServiceMessageKind::RuntimeV3Release,
+            Self::RuntimeV3Execute(_) => ServiceMessageKind::RuntimeV3Execute,
         }
     }
 
@@ -154,7 +157,8 @@ impl ServiceRequestBody {
             }
             Self::RuntimeV3Reserve(document)
             | Self::RuntimeV3Cancel(document)
-            | Self::RuntimeV3Release(document) => Ok(document.as_bytes().to_vec()),
+            | Self::RuntimeV3Release(document)
+            | Self::RuntimeV3Execute(document) => Ok(document.as_bytes().to_vec()),
         }
     }
 
@@ -215,6 +219,9 @@ impl ServiceRequestBody {
             }
             ServiceMessageKind::RuntimeV3Release => {
                 Ok(Self::RuntimeV3Release(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Execute => {
+                Ok(Self::RuntimeV3Execute(decode_runtime_v3_document(payload)?))
             }
             _ => Err(EngineError::protocol_violation("message type has no service request body")),
         }
@@ -864,6 +871,8 @@ pub enum ServiceResponseBody {
     RuntimeV3Cancelled,
     /// Exact reservation release was accepted or was an idempotent replay.
     RuntimeV3Released,
+    /// Canonical identity-bound execution result document.
+    RuntimeV3Execution(RuntimeV3Document),
 }
 
 impl ServiceResponseBody {
@@ -890,6 +899,7 @@ impl ServiceResponseBody {
             Self::RuntimeV3Reservation(_) => ServiceMessageKind::RuntimeV3Reserve,
             Self::RuntimeV3Cancelled => ServiceMessageKind::RuntimeV3Cancel,
             Self::RuntimeV3Released => ServiceMessageKind::RuntimeV3Release,
+            Self::RuntimeV3Execution(_) => ServiceMessageKind::RuntimeV3Execute,
         }
     }
 
@@ -920,9 +930,9 @@ impl ServiceResponseBody {
             Self::ModelDescriptor(descriptor) => descriptor.encode(),
             Self::Error(code) => Ok(vec![*code as u8]),
             Self::ShutdownRejected(reason) => Ok(vec![*reason as u8]),
-            Self::RuntimeV3Availability(document) | Self::RuntimeV3Reservation(document) => {
-                Ok(document.as_bytes().to_vec())
-            }
+            Self::RuntimeV3Availability(document)
+            | Self::RuntimeV3Reservation(document)
+            | Self::RuntimeV3Execution(document) => Ok(document.as_bytes().to_vec()),
         }
     }
 
@@ -1012,6 +1022,9 @@ impl ServiceResponseBody {
             ServiceMessageKind::RuntimeV3Release => {
                 require_empty(payload)?;
                 Ok(Self::RuntimeV3Released)
+            }
+            ServiceMessageKind::RuntimeV3Execute => {
+                Ok(Self::RuntimeV3Execution(decode_runtime_v3_document(payload)?))
             }
             _ => Err(EngineError::protocol_violation("message type has no service response body")),
         }

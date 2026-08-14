@@ -12,6 +12,7 @@ cpu-reference = ["personalai-engine-transformer/cpu-reference"]
 arm64 = ["personalai-engine-transformer/arm64"]
 metal = ["personalai-engine-transformer/metal"]
 cuda = ["personalai-engine-transformer/cuda"]
+development-runtime-v3-simulator = []
 
 [dependencies]
 libc.workspace = true
@@ -26,6 +27,7 @@ personalai-engine-tokenizer.workspace = true
 personalai-engine-transformer = { workspace = true, default-features = false }
 personalai-engine-types.workspace = true
 sovereign-ai-contracts.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

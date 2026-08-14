@@ -74,6 +74,8 @@ pub enum ServiceMessageKind {
     RuntimeV3Cancel = 24,
     /// Apply one canonical inference-runtime-v3 reservation release.
     RuntimeV3Release = 25,
+    /// Execute one admitted canonical inference-runtime-v3 request.
+    RuntimeV3Execute = 26,
 }
 
 impl ServiceMessageKind {
@@ -104,6 +106,7 @@ impl ServiceMessageKind {
             23 => Ok(Self::RuntimeV3Reserve),
             24 => Ok(Self::RuntimeV3Cancel),
             25 => Ok(Self::RuntimeV3Release),
+            26 => Ok(Self::RuntimeV3Execute),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -128,6 +131,7 @@ impl ServiceMessageKind {
                 | Self::RuntimeV3Reserve
                 | Self::RuntimeV3Cancel
                 | Self::RuntimeV3Release
+                | Self::RuntimeV3Execute
         )
     }
 
@@ -154,6 +158,7 @@ impl ServiceMessageKind {
                 | Self::RuntimeV3Reserve
                 | Self::RuntimeV3Cancel
                 | Self::RuntimeV3Release
+                | Self::RuntimeV3Execute
         )
     }
 }

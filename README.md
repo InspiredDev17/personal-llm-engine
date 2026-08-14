@@ -26,7 +26,7 @@ multi-stream reference batch, a bounded per-control-key durable replay journal,
 per-stream bounded output queues, a caller-shutdown continuous reference driver,
 an inference-runtime-v3 semantic reservation state machine pinned to the
 canonical Sovereign AI Contracts commit, canonical availability/reservation/
-cancellation/release documents carried by the existing signed,
+cancellation/release/execution documents carried by the existing signed,
 replay-journaled UDS service,
 an owner CLI, and a separate release-only signer/verifier with a monotonic
 installed-version ledger. The CLI also exposes an explicit one-shot `generate`
@@ -91,8 +91,10 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   escalation fail closed;
 - runtime-v3 service composition is owner-enabled and model identities are
   owner-bound to registered package/backend state before signed availability or
-  reservation is exposed; canonical execution request/result transport and
-  restart recovery of accepted reservations remain disabled release gates;
+  reservation is exposed; canonical execution request/result transport is
+  implemented with an explicitly compiled and configured deterministic
+  development simulator, while production backend execution and restart
+  recovery of accepted reservations remain disabled release gates;
 - registry-backed admission verifies the exact owner-selected signed V2 entry
   before package access, derives the approved path from signed identities, and
   never chooses `latest` or falls back to owner-pinned registration;
