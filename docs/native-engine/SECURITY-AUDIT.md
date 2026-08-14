@@ -16,7 +16,7 @@ process limits, threat coverage, and these evidence records.
 | --- | --- | --- | --- |
 | R-01 | P0 release | Reduced | Release-only signed manifests, exact read-only artifact measurement, monotonic external-runtime ledger, and Linux pre-launch unit binding are source-complete; trusted OS installation, key custody, and operated rollback evidence remain production blockers |
 | R-02 | P1 release | Open | Repository-owned Rust crates have no declared owner license, so complete machine license policy cannot pass honestly |
-| R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete Metal prefill/decode/sampling/streaming with scalar parity and persistent weights; owner-selected UDS execution and exact Go descriptor pinning are implemented, while operated canary/rollback and production-size qualification remain |
+| R-03 | P1 qualification | Reduced | Registered signed synthetic packages now complete ARM64 and Metal prefill/decode/sampling/streaming with scalar parity; owner-selected UDS execution and exact Go descriptor pinning are implemented, while operated canary/rollback and production-size qualification remain |
 | R-04 | P1 operations | Open | Linux confinement and crash-loop telemetry lack operated-host proof; macOS Seatbelt proof is transitional |
 | R-05 | P2 tooling | Open | Miri component is unavailable for the pinned nightly; pure-Rust Miri evidence is absent |
 | R-06 | P2 telemetry | Reduced | The verifier retains bounded content-free installed-artifact/downgrade failures in a root-owned ring with a separate monotonic sequence checkpoint; Go integration `1951a42` persists source-bound provider quarantine and audited owner recovery; operated bridge/quarantine qualification remains |

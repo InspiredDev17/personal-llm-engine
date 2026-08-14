@@ -65,7 +65,7 @@ const USAGE: &str = "usage:
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
-    [--execution-backend cpu-reference]
+    [--execution-backend cpu-reference|arm64]
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
     --registration-mode owner-pinned --model-id ID \
     --package BASENAME.paimodel --package-sha384 HEX96 \
@@ -75,7 +75,8 @@ const USAGE: &str = "usage:
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
     --max-active-sequences U32 --max-connections U32 \
-    [--execution-backend cpu-reference]
+    [--execution-backend cpu-reference|arm64]
+  ARM64 selection requires an aarch64 binary built with --features arm64.
   to select Metal in a macOS binary built with --features metal, replace the backend option with:
     --execution-backend metal --metal-device-index USIZE \
     --max-device-memory-bytes U64 --max-metal-buffers USIZE
@@ -140,6 +141,8 @@ struct ServeConfig {
 #[cfg_attr(not(feature = "cpu-reference"), allow(dead_code))]
 enum ServeBackend {
     CpuReference,
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    Arm64,
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal {
         device_index: usize,
@@ -151,6 +154,7 @@ enum ServeBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeBackendKind {
     CpuReference,
+    Arm64,
     Metal,
 }
 
@@ -631,8 +635,11 @@ fn parse_registration_mode(value: &str) -> Result<RegistrationMode, CliError> {
 fn parse_serve_backend(value: &str) -> Result<ServeBackendKind, CliError> {
     match value {
         "cpu-reference" => Ok(ServeBackendKind::CpuReference),
+        "arm64" => Ok(ServeBackendKind::Arm64),
         "metal" => Ok(ServeBackendKind::Metal),
-        _ => Err(CliError::InvalidArguments("execution backend must be cpu-reference or metal")),
+        _ => Err(CliError::InvalidArguments(
+            "execution backend must be cpu-reference, arm64, or metal",
+        )),
     }
 }
 
@@ -648,6 +655,26 @@ fn finish_serve_backend(config: &RawServeConfig) -> Result<ServeBackend, CliErro
                 ));
             }
             Ok(ServeBackend::CpuReference)
+        }
+        ServeBackendKind::Arm64 => {
+            if config.metal_device_index.is_some()
+                || config.max_device_memory_bytes.is_some()
+                || config.max_metal_buffers.is_some()
+            {
+                return Err(CliError::InvalidArguments(
+                    "Metal limits cannot accompany --execution-backend arm64",
+                ));
+            }
+            #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+            {
+                Ok(ServeBackend::Arm64)
+            }
+            #[cfg(not(all(feature = "arm64", target_arch = "aarch64")))]
+            {
+                Err(CliError::InvalidArguments(
+                    "ARM64 serving requires an aarch64 build with the arm64 feature",
+                ))
+            }
         }
         ServeBackendKind::Metal => {
             #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -916,6 +943,8 @@ fn serve(
     }
     let backend = match config.backend {
         ServeBackend::CpuReference => RuntimeBackend::CpuReference,
+        #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+        ServeBackend::Arm64 => RuntimeBackend::arm64()?,
         #[cfg(all(feature = "metal", target_os = "macos"))]
         ServeBackend::Metal { device_index, memory_bytes, maximum_buffers } => {
             RuntimeBackend::Metal(MetalBackend::new(device_index, memory_bytes, maximum_buffers)?)
@@ -1238,6 +1267,22 @@ mod tests {
     }
 
     #[test]
+    fn arm64_service_selection_is_explicit_and_build_gated() {
+        let mut arguments = complete_serve_arguments();
+        arguments.extend(["--execution-backend", "arm64"].map(OsString::from));
+        let result = parse_command(arguments.into_iter());
+        #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+        {
+            let Command::Serve(config) = result.expect("ARM64 serve must parse") else {
+                panic!("ARM64 serve command changed kind");
+            };
+            assert!(matches!(config.backend, ServeBackend::Arm64));
+        }
+        #[cfg(not(all(feature = "arm64", target_arch = "aarch64")))]
+        assert!(matches!(result, Err(CliError::InvalidArguments(_))));
+    }
+
+    #[test]
     fn generate_requires_registered_package_configuration_and_valid_sampling() {
         let package_hash = "01".repeat(48);
         let signer_key = "03".repeat(32);
@@ -1441,6 +1486,10 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the child is reaped on success and timeout; the flagged return belongs to the independent stdout-reader closure"
+    )]
     fn operating_system_termination_signal_reaches_the_bridge() {
         use std::io::BufRead;
         use std::process::{Command, Stdio};

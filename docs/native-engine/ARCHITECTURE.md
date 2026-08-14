@@ -442,17 +442,20 @@ attention, half-conversion, and AIPQ8/AIPQ4 kernels, plus scalar fallback for
 unsupported shapes, layouts, dtypes, and operations. Its first-party worker
 pool is fixed at one to sixteen threads, requires one thread in deterministic
 mode, bounds ingress to the worker count, isolates panics, and joins cleanly.
-The generic graph executor can select ARM64 through `HostCpuBackend`; the signed
-model decoder/service path is not yet integrated and does not advertise ARM64
-model execution. The Metal feature now exposes a real immutable-graph backend,
+The signed decoder now selects the ARM64 backend only through owner startup
+configuration, executes its complete prefill/decode path through the closed
+backend operation interface, and retains scalar fallback for unsupported
+validated cases. The service advertises ARM64 only on an AArch64 build with the
+feature enabled and returns the exact backend in its authenticated model
+descriptor. The Metal feature exposes a real immutable-graph backend,
 an embedded SHA-384-identified first-party metallib, a closed 19-kernel C ABI,
   bounded pooling and transfer metrics, scalar fallback, and sequence-isolated
   contiguous device KV storage. Its fixed decoder uploads verified weights once
   into model-scoped immutable device buffers and executes the complete reviewed
   architecture through closed kernels. The registered production directory
-  loader can construct it only after signature, hash, tokenizer, and tensor
-  validation. The UDS daemon now selects CPU reference by default or Metal only
-  through complete owner startup configuration. The same fair cursor,
+loader can construct it only after signature, hash, tokenizer, and tensor
+validation. The UDS daemon selects CPU reference by default, or ARM64/Metal only
+through complete owner startup configuration. The same fair cursor,
   cancellation, replay, signed streaming, load/unload and descriptor path is
   used for either backend; requests and packages cannot choose it. Go pins the
   signed descriptor backend and rejects a mismatch. CUDA remains not

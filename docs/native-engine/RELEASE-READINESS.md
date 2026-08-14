@@ -30,11 +30,11 @@ documentation exception.
 2. The repository does not declare an owner-selected license for its own Rust
    workspace crates. `cargo-deny` therefore cannot produce a clean complete
    license verdict without either a real license decision or an unsafe ignore.
-3. A registered signed synthetic package now runs end-to-end through persistent
-   Metal weights, device KV, sampling, and typed streaming with scalar parity.
-   Trusted UDS Metal selection and exact Go descriptor pinning are implemented,
-   but production routing remains blocked pending a reversible operated canary,
-   production-size qualification, and rollback evidence.
+3. Registered signed synthetic packages now run end-to-end through owner-
+   selected ARM64 or persistent Metal execution, sampling, and typed streaming
+   with scalar parity. Trusted UDS selection and exact Go descriptor pinning are
+   implemented, but production routing remains blocked pending reversible
+   operated canaries, production-size qualification, and rollback evidence.
 4. No legally approved production model, production tokenizer vectors,
    production-size context soak, quality evaluation, or thermal/tokens-per-
    second evidence exists.

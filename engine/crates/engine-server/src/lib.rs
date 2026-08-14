@@ -62,6 +62,8 @@ use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{IncrementalDecoder, Tokenizer, build_tokenizer};
+#[cfg(feature = "arm64")]
+use personalai_engine_transformer::Arm64Backend;
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 pub use personalai_engine_transformer::MetalBackend;
 use personalai_engine_transformer::{BackendStatus, backend_status};
@@ -139,6 +141,9 @@ pub enum RuntimeBackend {
     /// Deterministic scalar correctness backend.
     #[default]
     CpuReference,
+    /// Reviewed ARM64 host backend with closed scalar fallback per operation.
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    Arm64(Arm64Backend),
     /// Reviewed Apple Metal backend and its fixed device allocation policy.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal(MetalBackend),
@@ -146,10 +151,18 @@ pub enum RuntimeBackend {
 
 #[cfg(feature = "cpu-reference")]
 impl RuntimeBackend {
+    /// Constructs deterministic owner-selected ARM64 execution on a supported host.
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    pub fn arm64() -> Result<Self, EngineError> {
+        Ok(Self::Arm64(Arm64Backend::new()?))
+    }
+
     /// Returns the protocol identity pinned by the Go control plane.
     pub fn backend_id(&self) -> Result<BackendId, EngineError> {
         match self {
             Self::CpuReference => BackendId::new("cpu-reference"),
+            #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+            Self::Arm64(_) => BackendId::new("arm64"),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(_) => BackendId::new("metal"),
         }
@@ -161,6 +174,10 @@ impl RuntimeBackend {
             EngineCapability::StreamingGeneration,
             EngineCapability::UnixDomainSocket,
         ];
+        #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+        if matches!(self, Self::Arm64(_)) {
+            capabilities.push(EngineCapability::Arm64);
+        }
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if matches!(self, Self::Metal(_)) {
             capabilities.push(EngineCapability::Metal);
@@ -171,6 +188,8 @@ impl RuntimeBackend {
     fn device_memory_bytes(&self) -> Result<u64, EngineError> {
         match self {
             Self::CpuReference => Ok(0),
+            #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+            Self::Arm64(_) => Ok(0),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(backend) => Ok(backend.statistics()?.current_allocated_bytes),
         }
@@ -466,7 +485,7 @@ impl LoadedRuntimeModel {
 
     fn backend_id(&self) -> Result<BackendId, EngineError> {
         match self {
-            Self::Cpu(_) => BackendId::new("cpu-reference"),
+            Self::Cpu(loaded) => loaded.model().backend_id(),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(_) => BackendId::new("metal"),
         }
@@ -2051,6 +2070,10 @@ fn load_runtime_model(
         RuntimeBackend::CpuReference => {
             service.load_registered_cpu_model(model_id, budget, events).map(LoadedRuntimeModel::Cpu)
         }
+        #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+        RuntimeBackend::Arm64(arm64) => service
+            .load_registered_arm64_model(model_id, budget, arm64.clone(), events)
+            .map(LoadedRuntimeModel::Cpu),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         RuntimeBackend::Metal(metal) => service
             .load_registered_metal_model(model_id, budget, metal.clone(), events)
@@ -2370,6 +2393,32 @@ impl CpuEngineRuntime {
         }
         let loaded =
             self.service.load_registered_cpu_model_bytes(model_id, package_bytes, budget)?;
+        self.models.insert(model_id.as_str().to_owned(), LoadedRuntimeModel::Cpu(loaded));
+        Ok(())
+    }
+
+    /// Verifies and installs one legacy ARM64 fixture for service-integration tests.
+    #[cfg(all(test, feature = "arm64", target_arch = "aarch64"))]
+    pub fn load_registered_arm64_model_bytes(
+        &mut self,
+        model_id: &ModelId,
+        package_bytes: &[u8],
+        budget: &ResourceBudget,
+    ) -> Result<(), EngineError> {
+        if self.models.contains_key(model_id.as_str()) {
+            return Err(EngineError::invalid_input("model is already loaded"));
+        }
+        let RuntimeBackend::Arm64(backend) = &self.backend else {
+            return Err(EngineError::invalid_input(
+                "ARM64 fixture requires an ARM64-selected runtime",
+            ));
+        };
+        let loaded = self.service.load_registered_arm64_model_bytes(
+            model_id,
+            package_bytes,
+            budget,
+            backend.clone(),
+        )?;
         self.models.insert(model_id.as_str().to_owned(), LoadedRuntimeModel::Cpu(loaded));
         Ok(())
     }
@@ -3679,6 +3728,68 @@ impl EngineService {
         Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
     }
 
+    /// Verifies a signed legacy test fixture before constructing the ARM64 decoder.
+    #[cfg(all(feature = "cpu-reference", feature = "arm64", target_arch = "aarch64", test))]
+    pub fn load_registered_arm64_model_bytes(
+        &self,
+        model_id: &ModelId,
+        package_bytes: &[u8],
+        budget: &personalai_engine_types::ResourceBudget,
+        backend: Arm64Backend,
+    ) -> Result<LoadedCpuModel, EngineError> {
+        let registration = self.registry.resolve(model_id)?;
+        let package_length = u64::try_from(package_bytes.len()).map_err(|_| {
+            EngineError::resource_exhaustion("legacy ARM64 fixture length is not representable")
+        })?;
+        if package_length == 0 || package_length > budget.max_memory_bytes() {
+            return Err(EngineError::resource_exhaustion(
+                "legacy ARM64 fixture exceeds its test memory budget",
+            ));
+        }
+        if hash_package(package_bytes) != *registration.expected_hash() {
+            return Err(EngineError::signature_failure(
+                "legacy ARM64 fixture digest differs from test registration",
+            ));
+        }
+        let parsed = ParsedModelPackage::parse(package_bytes)?;
+        let signed_range = parsed.header().signed_content_range()?;
+        let content_digest = hash_signed_content(&package_bytes[signed_range]);
+        verify_package_signature(
+            registration.trusted_signer(),
+            parsed.signature().key_id(),
+            &content_digest,
+            parsed.signature().signature(),
+        )?;
+        let pool = MemoryPool::from_budget(budget)?;
+        let config = TransformerConfig::from_manifest(parsed.manifest())?;
+        let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
+        let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
+        if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+            return Err(EngineError::corrupt_model_package(
+                "manifest and tokenizer vocabulary sizes differ",
+            ));
+        }
+        let mut weights = BTreeMap::new();
+        for record in parsed.tensors() {
+            let bytes = parsed.tensor_data(package_bytes, record)?;
+            let tensor =
+                Tensor::copy_from_bytes(record.dtype(), record.shape().clone(), bytes, &pool)?;
+            if weights.insert(record.name().as_str().to_owned(), tensor).is_some() {
+                return Err(EngineError::internal_invariant(
+                    "legacy ARM64 fixture contains duplicate tensor names",
+                ));
+            }
+        }
+        let model = CpuDecoderModel::new_registered_arm64(
+            model_id.clone(),
+            config,
+            weights,
+            &pool,
+            backend,
+        )?;
+        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+    }
+
     /// Opens, verifies, and materializes a signed directory-backed package.
     ///
     /// The mandatory sink receives one typed rejection event for every failed
@@ -3703,6 +3814,55 @@ impl EngineService {
             }
             let weights = verified.materialize_tensors(&pool)?.into_tensors();
             let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
+            Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+        })();
+        if let Err(error) = &result {
+            let reason = match error {
+                EngineError::UnsupportedArchitecture(_) | EngineError::NotImplemented(_) => {
+                    ModelPackageRejection::UnsupportedArchitecture
+                }
+                EngineError::UnsupportedTokenizer(_) => ModelPackageRejection::UnsupportedTokenizer,
+                EngineError::ResourceExhaustion(_) => ModelPackageRejection::SizeLimit,
+                _ => ModelPackageRejection::Corrupt,
+            };
+            events.emit(SecurityEvent::ModelPackageRejected { model_id: model_id.clone(), reason });
+        }
+        result
+    }
+
+    /// Opens one registered signed directory package for complete ARM64 host execution.
+    ///
+    /// The backend is created only from owner-selected startup configuration.
+    /// Package metadata and clients cannot select intrinsics, worker counts, or
+    /// operation implementations; unsupported validated operations retain the
+    /// scalar correctness fallback inside the reviewed backend.
+    #[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    pub fn load_registered_arm64_model(
+        &self,
+        model_id: &ModelId,
+        budget: &personalai_engine_types::ResourceBudget,
+        backend: Arm64Backend,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<LoadedCpuModel, EngineError> {
+        let verified = self.registry.load_registered_directory(model_id, budget, events)?;
+        let result: Result<LoadedCpuModel, EngineError> = (|| {
+            let pool = MemoryPool::from_budget(budget)?;
+            let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
+            let tokenizer =
+                Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
+            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+                return Err(EngineError::corrupt_model_package(
+                    "manifest and tokenizer vocabulary sizes differ",
+                ));
+            }
+            let weights = verified.materialize_tensors(&pool)?.into_tensors();
+            let model = CpuDecoderModel::new_registered_arm64(
+                model_id.clone(),
+                config,
+                weights,
+                &pool,
+                backend,
+            )?;
             Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
         })();
         if let Err(error) = &result {
@@ -5316,6 +5476,65 @@ mod tests {
         fixture.cleanup();
     }
 
+    #[cfg(all(unix, feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn authenticated_service_streams_through_owner_selected_arm64_backend() {
+        let mut fixture = BatchRuntimeFixture::new_with_backend(
+            "arm64-service",
+            1,
+            RuntimeBackend::arm64().expect("ARM64 backend must construct"),
+        );
+        let capabilities = service_capabilities(&fixture.runtime.backend)
+            .expect("selected capabilities must encode");
+        assert!(
+            capabilities
+                .contains(EngineCapability::CpuReference)
+                .expect("CPU fallback capability must decode")
+        );
+        assert!(
+            capabilities.contains(EngineCapability::Arm64).expect("ARM64 capability must decode")
+        );
+        let descriptor = model_descriptor_parts(
+            &fixture.runtime.service,
+            &fixture.runtime.models,
+            &fixture.model_id,
+        )
+        .expect("descriptor must construct");
+        let ServiceResponseBody::ModelDescriptor(descriptor) = descriptor else {
+            panic!("descriptor response kind changed");
+        };
+        assert_eq!(descriptor.backend_id().as_str(), "arm64");
+        assert_eq!(
+            fixture.runtime.metrics().expect("ARM64 metrics must read").device_memory_bytes,
+            0
+        );
+
+        let request = fixture.request(608, "A", 2);
+        let signed = signed_generation_frame(
+            &request,
+            1,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let client = spawn_ordered_runtime_test_client(
+            fixture.socket_path(),
+            signed,
+            fixture.response_public_key,
+            1,
+            3,
+        );
+        let result = fixture
+            .runtime
+            .serve_batch(&fixture.listener, 1)
+            .expect("ARM64 service batch must run");
+        assert!(matches!(
+            result.as_slice(),
+            [Ok(ServeOutcome::Generated { request_id, .. })] if request_id.get() == 608
+        ));
+        assert_eq!(client.join().expect("ARM64 client must finish").last(), Some(&3));
+        fixture.cleanup();
+    }
+
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn authenticated_batch_isolates_cancellation_and_completes_neighbor() {
@@ -6121,8 +6340,8 @@ mod tests {
             let response_public_key = response_signer.public_key();
             let trusted_keys = TrustedControlPlaneKeys::single(trusted_key)
                 .expect("control key ring must validate");
-            let metal_selected =
-                backend.backend_id().expect("backend identity must validate").as_str() == "metal";
+            let backend_id =
+                backend.backend_id().expect("backend identity must validate").as_str().to_owned();
             let mut runtime = CpuEngineRuntime::new_with_control_keys_and_backend(
                 service,
                 trusted_keys,
@@ -6130,11 +6349,16 @@ mod tests {
                 backend,
             )
             .expect("runtime must construct");
-            if metal_selected {
+            if backend_id == "metal" {
                 #[cfg(all(feature = "metal", target_os = "macos"))]
                 runtime
                     .load_registered_metal_model_bytes(&model_id, fixture.bytes(), &budget)
                     .expect("Metal model must load");
+            } else if backend_id == "arm64" {
+                #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+                runtime
+                    .load_registered_arm64_model_bytes(&model_id, fixture.bytes(), &budget)
+                    .expect("ARM64 model must load");
             } else {
                 runtime
                     .load_registered_model_bytes(&model_id, fixture.bytes(), &budget)

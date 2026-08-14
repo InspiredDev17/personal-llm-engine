@@ -9,6 +9,7 @@ description = "Owner-facing diagnostic CLI for the PersonalAI native engine foun
 [features]
 default = ["cpu-reference"]
 cpu-reference = ["personalai-engine-server/cpu-reference"]
+arm64 = ["cpu-reference", "personalai-engine-server/arm64"]
 metal = ["cpu-reference", "personalai-engine-server/metal"]
 
 [[bin]]

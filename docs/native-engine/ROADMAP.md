@@ -144,8 +144,11 @@ currently included in this repository.
 
 ARM64, Metal, and CUDA remain default-off. ARM64 now has a complete optimized
 graph backend with isolated documented intrinsics, runtime dispatch, bounded
-workers, scalar differential tests, and Apple M1 release measurements; the
-signed decoder/service does not yet advertise ARM64 model execution. Metal now
+workers, scalar differential tests, and Apple M1 release measurements. Its
+owner-selected signed decoder/service path now performs authenticated package
+loading, prefill, cached decode, sampling, streaming, and exact descriptor
+reporting, with scalar operation fallback when required. Production-size ARM64
+model qualification and sustained operated evidence remain open. Metal now
 has a build-time first-party metallib, closed C ABI, all baseline correctness
 kernels, bounded reuse, explicit transfer/dispatch metrics, and contiguous
   sequence-isolated device KV storage with Apple M1 differential evidence. A

@@ -1,7 +1,7 @@
 # ADR-0023: Isolated ARM64 graph kernels
 
-Status: accepted as the optimized host-graph backend; transformer-service
-activation remains a separate integration gate.
+Status: accepted and integrated as an owner-selected transformer-service
+backend; production model qualification remains external.
 
 ## Decision
 
@@ -113,10 +113,14 @@ scalar, 125.7 ms ARM64); it is not a signed full-model throughput claim.
 Staging, scalar exponentials/trigonometry, and tensor materialization remain
 optimization targets.
 
-The generic immutable graph executor can now choose scalar or ARM64 safely, but
-this does not yet make `arm64` a transformer-service backend. The current signed
-model decoder orchestration is still scalar and the service must continue
-reporting ARM64 model execution as not implemented. Direct immutable weight
-views (without staging), decoder/session integration, full signed-model
-differential generation, longer cancellation/soak evidence, and real-model
-quality/performance evaluation remain before service activation.
+The signed decoder now routes linear projections, RMSNorm, RoPE, residual add,
+SwiGLU, and grouped-query attention through the closed ARM64 backend interface.
+It materializes bounded cache tensors for attention and retains the scalar
+fallback already enforced by that interface. A full transformer differential
+test covers cached prefill/decode with an explicit `2e-4` absolute plus `2e-4`
+relative acceptance bound, while the authenticated UDS service test
+loads a signed package, advertises ARM64, streams generation, and reports an
+ARM64 descriptor. Selection is owner-only; neither package nor request can
+choose the backend. Direct immutable weight views without staging, production-
+size differential generation, longer cancellation/soak evidence, and real-
+model quality/performance evaluation remain external acceptance work.

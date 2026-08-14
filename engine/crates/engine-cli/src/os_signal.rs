@@ -39,11 +39,8 @@ impl ProcessSignalGuard {
             } else {
                 let mut previous_interrupt = MaybeUninit::<libc::sigaction>::uninit();
                 let mut previous_terminate = MaybeUninit::<libc::sigaction>::uninit();
-                if libc::sigaction(
-                    libc::SIGINT,
-                    &raw const action,
-                    previous_interrupt.as_mut_ptr(),
-                ) != 0
+                if libc::sigaction(libc::SIGINT, &raw const action, previous_interrupt.as_mut_ptr())
+                    != 0
                 {
                     None
                 } else if libc::sigaction(
@@ -92,18 +89,16 @@ impl ProcessSignalGuard {
         // calls and remain owned by this non-cloneable guard. Null output
         // pointers request restoration without exposing kernel-written data.
         let restored = unsafe {
-            let interrupt =
-                libc::sigaction(
-                    libc::SIGINT,
-                    &raw const self.previous_interrupt,
-                    std::ptr::null_mut(),
-                );
-            let terminate =
-                libc::sigaction(
-                    libc::SIGTERM,
-                    &raw const self.previous_terminate,
-                    std::ptr::null_mut(),
-                );
+            let interrupt = libc::sigaction(
+                libc::SIGINT,
+                &raw const self.previous_interrupt,
+                std::ptr::null_mut(),
+            );
+            let terminate = libc::sigaction(
+                libc::SIGTERM,
+                &raw const self.previous_terminate,
+                std::ptr::null_mut(),
+            );
             interrupt == 0 && terminate == 0
         };
         self.active = false;

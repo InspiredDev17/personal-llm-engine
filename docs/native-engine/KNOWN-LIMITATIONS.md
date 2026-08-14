@@ -24,11 +24,11 @@
   license/provenance review, tokenizer conformance corpus, long-context quality,
   or generated-output acceptance evidence exists.
 - Scalar CPU is the correctness oracle. ARM64 and Metal operation tests pass
-  documented synthetic tolerances. Metal now has persistent device-resident
-  weights and complete signed synthetic-model generation. The UDS daemon now
-  has explicit owner-selected Metal execution and Go already pins the signed
-  descriptor, but production-size canary and operated CPU rollback evidence do
-  not exist.
+  documented synthetic tolerances. Both now run complete signed synthetic-model
+  generation through explicit owner-selected UDS execution, and Go pins the
+  signed descriptor. ARM64 currently materializes bounded intermediates and KV
+  history around the kernel interface. Production-size canaries and operated
+  CPU rollback evidence do not exist for either accelerated path.
 - The measured 128x128 Metal matvec is a microbenchmark, not production token
   throughput. Prior recorded methodology and numbers remain in [METAL.md](METAL.md).
 - AIPQ8/AIPQ4 synthetic error evidence does not establish real-model quality.

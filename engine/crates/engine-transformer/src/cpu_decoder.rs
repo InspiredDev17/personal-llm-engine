@@ -1,7 +1,11 @@
 //! Safe scalar implementation of the exact first-party decoder architecture.
 
 use crate::{FIRST_PARTY_DECODER_ARCHITECTURE_ID, TransformerConfig, TransformerPlan};
+#[cfg(feature = "arm64")]
+use personalai_engine_arm64::Arm64Backend;
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
+#[cfg(feature = "arm64")]
+use personalai_engine_cpu_reference::{Backend, Operation};
 use personalai_engine_kv_cache::{
     ContiguousKvCache, KvCacheMetrics, KvTokenWriter, SequenceHandle,
 };
@@ -33,6 +37,14 @@ struct CpuDecoderModelInner {
     weights: BTreeMap<String, Tensor>,
     pool: MemoryPool,
     cache: ContiguousKvCache,
+    backend: DecoderCpuBackend,
+}
+
+#[derive(Clone, Debug)]
+enum DecoderCpuBackend {
+    Scalar,
+    #[cfg(feature = "arm64")]
+    Arm64(Arm64Backend),
 }
 
 impl CpuDecoderModel {
@@ -51,6 +63,40 @@ impl CpuDecoderModel {
         config: TransformerConfig,
         weights: BTreeMap<String, Tensor>,
         pool: &MemoryPool,
+    ) -> Result<Self, EngineError> {
+        Self::new_registered_with_backend(
+            model_id,
+            config,
+            weights,
+            pool,
+            DecoderCpuBackend::Scalar,
+        )
+    }
+
+    /// Validates a production model for owner-selected ARM64 execution.
+    #[cfg(feature = "arm64")]
+    pub fn new_registered_arm64(
+        model_id: ModelId,
+        config: TransformerConfig,
+        weights: BTreeMap<String, Tensor>,
+        pool: &MemoryPool,
+        backend: Arm64Backend,
+    ) -> Result<Self, EngineError> {
+        Self::new_registered_with_backend(
+            model_id,
+            config,
+            weights,
+            pool,
+            DecoderCpuBackend::Arm64(backend),
+        )
+    }
+
+    fn new_registered_with_backend(
+        model_id: ModelId,
+        config: TransformerConfig,
+        weights: BTreeMap<String, Tensor>,
+        pool: &MemoryPool,
+        backend: DecoderCpuBackend,
     ) -> Result<Self, EngineError> {
         if config.architecture_id().as_str() != FIRST_PARTY_DECODER_ARCHITECTURE_ID {
             return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
@@ -86,8 +132,23 @@ impl CpuDecoderModel {
         let cache =
             ContiguousKvCache::new(model_id, cache_plan, MAX_CONCURRENT_SEQUENCES, pool.clone())?;
         Ok(Self {
-            inner: Arc::new(CpuDecoderModelInner { config, weights, pool: pool.clone(), cache }),
+            inner: Arc::new(CpuDecoderModelInner {
+                config,
+                weights,
+                pool: pool.clone(),
+                cache,
+                backend,
+            }),
         })
+    }
+
+    /// Returns the exact trusted execution backend selected for this model.
+    pub fn backend_id(&self) -> Result<personalai_engine_types::BackendId, EngineError> {
+        match &self.inner.backend {
+            DecoderCpuBackend::Scalar => personalai_engine_types::BackendId::new("cpu-reference"),
+            #[cfg(feature = "arm64")]
+            DecoderCpuBackend::Arm64(backend) => Ok(backend.id().clone()),
+        }
     }
 
     /// Returns the validated architecture configuration.
@@ -210,12 +271,12 @@ impl CpuDecoderSession {
         for layer in 0..self.model.inner.config.layer_count() {
             self.forward_layer(layer, &mut writer, &mut state)?;
         }
-        let normalized = rms_norm(
+        let normalized = self.rms_norm(
             &state,
             self.model.weight("final_norm.weight")?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
-        let logits = linear(
+        let logits = self.linear(
             self.model.weight("output.weight")?,
             &normalized,
             usize_from_u32(self.model.inner.config.vocabulary_size())?,
@@ -250,37 +311,37 @@ impl CpuDecoderSession {
                 .ok_or_else(|| EngineError::internal_invariant("KV dimension overflows"))?,
         )?;
         let prefix = format!("layers.{layer:03}");
-        let attention_input = rms_norm(
+        let attention_input = self.rms_norm(
             state,
             self.model.weight(&format!("{prefix}.attn_norm.weight"))?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
-        let mut query = linear(
+        let mut query = self.linear(
             self.model.weight(&format!("{prefix}.q_proj.weight"))?,
             &attention_input,
             hidden,
             hidden,
         )?;
-        let mut key = linear(
+        let mut key = self.linear(
             self.model.weight(&format!("{prefix}.k_proj.weight"))?,
             &attention_input,
             kv_dimension,
             hidden,
         )?;
-        let value = linear(
+        let value = self.linear(
             self.model.weight(&format!("{prefix}.v_proj.weight"))?,
             &attention_input,
             kv_dimension,
             hidden,
         )?;
-        apply_rope(
+        self.apply_rope(
             &mut query,
             self.model.inner.config.attention_head_count(),
             self.model.inner.config.head_dimension(),
             self.token_count,
             self.model.inner.config.rope_theta(),
         )?;
-        apply_rope(
+        self.apply_rope(
             &mut key,
             self.model.inner.config.kv_head_count(),
             self.model.inner.config.head_dimension(),
@@ -289,40 +350,40 @@ impl CpuDecoderSession {
         )?;
         writer.write_layer(layer, &key, &value)?;
         let attention = self.attention(layer, writer, &query)?;
-        let projected = linear(
+        let projected = self.linear(
             self.model.weight(&format!("{prefix}.o_proj.weight"))?,
             &attention,
             hidden,
             hidden,
         )?;
-        add_in_place(state, &projected)?;
+        self.add_in_place(state, &projected)?;
 
-        let ffn_input = rms_norm(
+        let ffn_input = self.rms_norm(
             state,
             self.model.weight(&format!("{prefix}.ffn_norm.weight"))?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
         let intermediate = usize_from_u32(self.model.inner.config.intermediate_dimension())?;
-        let gate = linear(
+        let gate = self.linear(
             self.model.weight(&format!("{prefix}.gate_proj.weight"))?,
             &ffn_input,
             intermediate,
             hidden,
         )?;
-        let up = linear(
+        let up = self.linear(
             self.model.weight(&format!("{prefix}.up_proj.weight"))?,
             &ffn_input,
             intermediate,
             hidden,
         )?;
-        let activated = swiglu(&gate, &up)?;
-        let down = linear(
+        let activated = self.swiglu(&gate, &up)?;
+        let down = self.linear(
             self.model.weight(&format!("{prefix}.down_proj.weight"))?,
             &activated,
             hidden,
             intermediate,
         )?;
-        add_in_place(state, &down)
+        self.add_in_place(state, &down)
     }
 
     fn attention(
@@ -331,6 +392,10 @@ impl CpuDecoderSession {
         writer: &KvTokenWriter<'_>,
         query: &[f32],
     ) -> Result<Vec<f32>, EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            return self.arm64_attention(layer, writer, query, backend);
+        }
         let attention_heads = usize_from_u32(self.model.inner.config.attention_head_count())?;
         let kv_heads = usize_from_u32(self.model.inner.config.kv_head_count())?;
         let head_dimension = usize_from_u32(self.model.inner.config.head_dimension())?;
@@ -387,6 +452,186 @@ impl CpuDecoderSession {
             }
         }
         Ok(output)
+    }
+
+    #[cfg(feature = "arm64")]
+    fn arm64_attention(
+        &self,
+        layer: u32,
+        writer: &KvTokenWriter<'_>,
+        query: &[f32],
+        backend: &Arm64Backend,
+    ) -> Result<Vec<f32>, EngineError> {
+        let attention_heads = usize_from_u32(self.model.inner.config.attention_head_count())?;
+        let kv_heads = usize_from_u32(self.model.inner.config.kv_head_count())?;
+        let head_dimension = usize_from_u32(self.model.inner.config.head_dimension())?;
+        let sequence_length = usize_from_u32(
+            self.token_count
+                .checked_add(1)
+                .ok_or_else(|| EngineError::internal_invariant("sequence length overflows"))?,
+        )?;
+        let kv_values = sequence_length
+            .checked_mul(kv_heads)
+            .and_then(|count| count.checked_mul(head_dimension))
+            .ok_or_else(|| EngineError::resource_exhaustion("attention cache tensor overflows"))?;
+        let mut keys = zero_f32(kv_values)?;
+        let mut values = zero_f32(kv_values)?;
+        for position in 0..sequence_length {
+            for head in 0..kv_heads {
+                for dimension in 0..head_dimension {
+                    let index = position
+                        .checked_mul(kv_heads)
+                        .and_then(|offset| offset.checked_add(head))
+                        .and_then(|offset| offset.checked_mul(head_dimension))
+                        .and_then(|offset| offset.checked_add(dimension))
+                        .ok_or_else(|| {
+                            EngineError::internal_invariant("attention cache index overflows")
+                        })?;
+                    keys[index] = writer.read_key_value(
+                        layer,
+                        u32_from_usize(position)?,
+                        u32_from_usize(head)?,
+                        u32_from_usize(dimension)?,
+                    )?;
+                    values[index] = writer.read_cached_value(
+                        layer,
+                        u32_from_usize(position)?,
+                        u32_from_usize(head)?,
+                        u32_from_usize(dimension)?,
+                    )?;
+                }
+            }
+        }
+        let query_tensor = Tensor::from_f32_values(
+            TensorShape::new([attention_heads as u64, head_dimension as u64])?,
+            query,
+            &self.scratch_pool,
+        )?;
+        let key_tensor = Tensor::from_f32_values(
+            TensorShape::new([sequence_length as u64, kv_heads as u64, head_dimension as u64])?,
+            &keys,
+            &self.scratch_pool,
+        )?;
+        let value_tensor =
+            Tensor::from_f32_values(key_tensor.shape().clone(), &values, &self.scratch_pool)?;
+        let output = backend.execute_operation(
+            &Operation::GroupedQueryAttention { causal_position: self.token_count },
+            &[&query_tensor, &key_tensor, &value_tensor],
+            &self.scratch_pool,
+        )?;
+        tensor_f32_values(&output)
+    }
+
+    fn linear(
+        &self,
+        weight: &Tensor,
+        input: &[f32],
+        output_dimension: usize,
+        input_dimension: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            if input.len() != input_dimension {
+                return Err(EngineError::internal_invariant("linear input dimension differs"));
+            }
+            let input_tensor = Tensor::from_f32_values(
+                TensorShape::new([input_dimension as u64])?,
+                input,
+                &self.scratch_pool,
+            )?;
+            let output = backend.execute_operation(
+                &Operation::MatrixVector,
+                &[weight, &input_tensor],
+                &self.scratch_pool,
+            )?;
+            if output.shape().dimensions() != [output_dimension as u64] {
+                return Err(EngineError::internal_invariant("ARM64 linear output shape differs"));
+            }
+            return tensor_f32_values(&output);
+        }
+        linear(weight, input, output_dimension, input_dimension)
+    }
+
+    fn rms_norm(
+        &self,
+        input: &[f32],
+        weight: &Tensor,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            let input_tensor = Tensor::from_f32_values(
+                TensorShape::new([input.len() as u64])?,
+                input,
+                &self.scratch_pool,
+            )?;
+            let output = backend.execute_operation(
+                &Operation::RmsNorm { epsilon },
+                &[&input_tensor, weight],
+                &self.scratch_pool,
+            )?;
+            return tensor_f32_values(&output);
+        }
+        rms_norm(input, weight, epsilon)
+    }
+
+    fn apply_rope(
+        &self,
+        values: &mut [f32],
+        head_count: u32,
+        head_dimension: u32,
+        position: u32,
+        theta: f32,
+    ) -> Result<(), EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            let input = Tensor::from_f32_values(
+                TensorShape::new([u64::from(head_count), u64::from(head_dimension)])?,
+                values,
+                &self.scratch_pool,
+            )?;
+            let output = backend.execute_operation(
+                &Operation::Rope { position, theta },
+                &[&input],
+                &self.scratch_pool,
+            )?;
+            values.copy_from_slice(&tensor_f32_values(&output)?);
+            return Ok(());
+        }
+        apply_rope(values, head_count, head_dimension, position, theta)
+    }
+
+    fn swiglu(&self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            let shape = TensorShape::new([gate.len() as u64])?;
+            let gate_tensor = Tensor::from_f32_values(shape.clone(), gate, &self.scratch_pool)?;
+            let up_tensor = Tensor::from_f32_values(shape, up, &self.scratch_pool)?;
+            let output = backend.execute_operation(
+                &Operation::SwiGlu,
+                &[&gate_tensor, &up_tensor],
+                &self.scratch_pool,
+            )?;
+            return tensor_f32_values(&output);
+        }
+        swiglu(gate, up)
+    }
+
+    fn add_in_place(&self, left: &mut [f32], right: &[f32]) -> Result<(), EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            let shape = TensorShape::new([left.len() as u64])?;
+            let left_tensor = Tensor::from_f32_values(shape.clone(), left, &self.scratch_pool)?;
+            let right_tensor = Tensor::from_f32_values(shape, right, &self.scratch_pool)?;
+            let output = backend.execute_operation(
+                &Operation::Add,
+                &[&left_tensor, &right_tensor],
+                &self.scratch_pool,
+            )?;
+            left.copy_from_slice(&tensor_f32_values(&output)?);
+            return Ok(());
+        }
+        add_in_place(left, right)
     }
 }
 
@@ -627,6 +872,18 @@ fn zero_f32(length: usize) -> Result<Vec<f32>, EngineError> {
     Ok(values)
 }
 
+#[cfg(feature = "arm64")]
+fn tensor_f32_values(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
+    let count = usize::try_from(tensor.shape().element_count()).map_err(|_| {
+        EngineError::resource_exhaustion("decoder tensor length is not addressable")
+    })?;
+    let mut values = zero_f32(count)?;
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = finite(tensor.f32_value(index)?)?;
+    }
+    Ok(values)
+}
+
 fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<(), EngineError> {
     let hidden = u64::from(config.hidden_dimension());
     let intermediate = u64::from(config.intermediate_dimension());
@@ -795,6 +1052,44 @@ mod tests {
         ));
     }
 
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn complete_arm64_decoder_matches_scalar_and_cached_execution() {
+        let scalar_pool = MemoryPool::new(16 << 20).expect("scalar pool must validate");
+        let arm64_pool = MemoryPool::new(16 << 20).expect("ARM64 pool must validate");
+        let config = arm64_config();
+        let scalar = CpuDecoderModel::new_registered(
+            ModelId::new("scalar-model").unwrap(),
+            config.clone(),
+            arm64_weights(&scalar_pool),
+            &scalar_pool,
+        )
+        .expect("scalar model must construct");
+        let arm64 = CpuDecoderModel::new_registered_arm64(
+            ModelId::new("arm64-model").unwrap(),
+            config,
+            arm64_weights(&arm64_pool),
+            &arm64_pool,
+            Arm64Backend::new().expect("ARM64 backend must construct"),
+        )
+        .expect("ARM64 model must construct");
+        assert_eq!(arm64.backend_id().unwrap().as_str(), "arm64");
+        let budget = ResourceBudget::new(16 << 20, 2 << 20, 2).unwrap();
+        let mut scalar_session = scalar
+            .start_session(&budget, RequestId::new(11).unwrap(), SequenceId::new(11).unwrap())
+            .unwrap();
+        let mut arm64_session = arm64
+            .start_session(&budget, RequestId::new(12).unwrap(), SequenceId::new(12).unwrap())
+            .unwrap();
+        let scalar_logits = scalar_session.prefill(&[1, 2, 3]).unwrap();
+        let arm64_logits = arm64_session.prefill(&[1, 2, 3]).unwrap();
+        assert_tensors_close(&scalar_logits, &arm64_logits, 2.0e-4, 2.0e-4);
+
+        let scalar_next = scalar_session.decode(4).unwrap();
+        let arm64_next = arm64_session.decode(4).unwrap();
+        assert_tensors_close(&scalar_next, &arm64_next, 2.0e-4, 2.0e-4);
+    }
+
     fn tiny_config() -> TransformerConfig {
         TransformerConfig::new_decoder(
             ArchitectureId::new(FIRST_PARTY_DECODER_ARCHITECTURE_ID)
@@ -811,6 +1106,69 @@ mod tests {
             10_000.0,
         )
         .expect("tiny config must validate")
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    fn arm64_config() -> TransformerConfig {
+        TransformerConfig::new_decoder(
+            ArchitectureId::new(FIRST_PARTY_DECODER_ARCHITECTURE_ID).unwrap(),
+            1,
+            32,
+            4,
+            2,
+            32,
+            ContextLimit::new(4).unwrap(),
+            DType::F32,
+            64,
+            1.0e-5,
+            10_000.0,
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    fn arm64_weights(pool: &MemoryPool) -> BTreeMap<String, Tensor> {
+        let mut weights = BTreeMap::new();
+        insert(&mut weights, "token_embedding.weight", [32, 32], &repeated(1024, 0.0005), pool);
+        insert(&mut weights, "final_norm.weight", [32], &[1.0; 32], pool);
+        insert(&mut weights, "output.weight", [32, 32], &repeated(1024, 0.0003), pool);
+        insert(&mut weights, "layers.000.attn_norm.weight", [32], &[1.0; 32], pool);
+        insert(&mut weights, "layers.000.q_proj.weight", [32, 32], &identity(32), pool);
+        insert(&mut weights, "layers.000.k_proj.weight", [16, 32], &repeated(512, 0.0004), pool);
+        insert(&mut weights, "layers.000.v_proj.weight", [16, 32], &repeated(512, 0.0002), pool);
+        insert(&mut weights, "layers.000.o_proj.weight", [32, 32], &identity(32), pool);
+        insert(&mut weights, "layers.000.ffn_norm.weight", [32], &[1.0; 32], pool);
+        insert(
+            &mut weights,
+            "layers.000.gate_proj.weight",
+            [64, 32],
+            &repeated(2048, 0.0001),
+            pool,
+        );
+        insert(&mut weights, "layers.000.up_proj.weight", [64, 32], &repeated(2048, 0.00015), pool);
+        insert(
+            &mut weights,
+            "layers.000.down_proj.weight",
+            [32, 64],
+            &repeated(2048, 0.0001),
+            pool,
+        );
+        weights
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    fn assert_tensors_close(left: &Tensor, right: &Tensor, absolute: f32, relative: f32) {
+        assert_eq!(left.shape(), right.shape());
+        for index in 0..usize::try_from(left.shape().element_count()).unwrap() {
+            let left = left.f32_value(index).unwrap();
+            let right = right.f32_value(index).unwrap();
+            let difference = (left - right).abs();
+            let scale = left.abs().max(right.abs());
+            assert!(
+                difference <= absolute + relative * scale,
+                "index {index}: scalar={left} arm64={right} difference={difference}"
+            );
+        }
     }
 
     fn tiny_weights(pool: &MemoryPool) -> BTreeMap<String, Tensor> {

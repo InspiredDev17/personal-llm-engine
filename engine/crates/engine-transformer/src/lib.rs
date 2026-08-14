@@ -102,8 +102,9 @@ pub fn backend_status(backend_id: &BackendId) -> Result<BackendStatus, EngineErr
     Ok(BackendStatus {
         backend_id: backend_id.clone(),
         compiled,
-        model_execution_implemented: id == METAL_BACKEND_ID
-            && cfg!(all(feature = "metal", target_os = "macos")),
+        model_execution_implemented: (id == ARM64_BACKEND_ID
+            && cfg!(all(feature = "arm64", target_arch = "aarch64")))
+            || (id == METAL_BACKEND_ID && cfg!(all(feature = "metal", target_os = "macos"))),
         default_backend: false,
     })
 }
@@ -546,7 +547,9 @@ mod tests {
             let status = backend_status(&backend_id).expect("known backend must resolve");
             assert_eq!(
                 status.model_execution_implemented(),
-                id == METAL_BACKEND_ID && cfg!(all(feature = "metal", target_os = "macos"))
+                (id == ARM64_BACKEND_ID && cfg!(all(feature = "arm64", target_arch = "aarch64")))
+                    || (id == METAL_BACKEND_ID
+                        && cfg!(all(feature = "metal", target_os = "macos")))
             );
             assert!(!status.default_backend());
         }
