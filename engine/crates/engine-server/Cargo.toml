@@ -25,11 +25,13 @@ personalai-engine-tensor.workspace = true
 personalai-engine-tokenizer.workspace = true
 personalai-engine-transformer = { workspace = true, default-features = false }
 personalai-engine-types.workspace = true
+sovereign-ai-contracts.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
 personalai-engine-model-format.workspace = true
 personalai-engine-testkit.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

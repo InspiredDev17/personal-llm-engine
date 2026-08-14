@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// Exact Sovereign AI Contracts commit defining inference runtime v3.
-pub const INFERENCE_RUNTIME_V3_CONTRACT_COMMIT: &str = "77f987c3c1c61153fc17698336d25b95edaf2304";
+pub const INFERENCE_RUNTIME_V3_CONTRACT_COMMIT: &str = "138128520dea7a602c0cf2ea905fa32396917db8";
 /// Exact canonical contract version implemented by this lifecycle.
 pub const INFERENCE_RUNTIME_V3_CONTRACT_VERSION: &str = "3.0.0";
 /// Maximum active and historical reservation records retained in memory.

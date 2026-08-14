@@ -47,12 +47,15 @@ call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no thi
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
-commit `77f987c3c1c61153fc17698336d25b95edaf2304`. It does not define or parse a
-second wire format. It consumes values only after a future authenticated
-adapter validates canonical v3 documents. The in-memory state machine enforces
-exact identity/correlation, finite capacity, idempotent replay, single
-consumption, cancellation, release, and expiry. Authenticated transport mapping
-and durable reservation recovery remain incomplete and therefore cannot be
+commit `138128520dea7a602c0cf2ea905fa32396917db8`. It does not define or parse a
+second wire format. A strict bounded adapter consumes only canonical v3
+documents decoded by the pinned Contracts implementation, maps them into the
+engine state machine, revalidates engine-owned identity before reservation and
+consumption, and emits canonical decision/result documents. The in-memory state
+machine enforces exact identity/correlation, finite capacity, idempotent replay,
+single consumption, cancellation, release, expiry, terminal identity, and
+resource ceilings. Mapping those documents into the authenticated service and
+durable reservation recovery remain incomplete and therefore cannot be
 reported as an operated v3 service.
 
 ## Engine release trust flow

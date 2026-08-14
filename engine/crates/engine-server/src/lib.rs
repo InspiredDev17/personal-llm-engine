@@ -16,6 +16,7 @@ mod peer_credential;
 #[cfg(unix)]
 mod replay;
 mod runtime_reservations;
+mod runtime_v3_adapter;
 #[cfg(unix)]
 mod transport;
 
@@ -31,6 +32,9 @@ pub use runtime_reservations::{
     ReservationDecision, ReservationDenial, ReservationId, ReservationStatistics,
     ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId, RuntimeReservationManager,
     RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
+};
+pub use runtime_v3_adapter::{
+    AdmittedRuntimeExecution, RuntimeIdentityAuthority, RuntimeV3ContractAdapter,
 };
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
@@ -177,19 +181,27 @@ impl RuntimeBackend {
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilitySet, EngineError> {
-        let mut capabilities = vec![
+        let capabilities = vec![
             EngineCapability::CpuReference,
             EngineCapability::StreamingGeneration,
             EngineCapability::UnixDomainSocket,
         ];
         #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
-        if matches!(self, Self::Arm64(_)) {
-            capabilities.push(EngineCapability::Arm64);
-        }
+        let capabilities = {
+            let mut capabilities = capabilities;
+            if matches!(self, Self::Arm64(_)) {
+                capabilities.push(EngineCapability::Arm64);
+            }
+            capabilities
+        };
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if matches!(self, Self::Metal(_)) {
-            capabilities.push(EngineCapability::Metal);
-        }
+        let capabilities = {
+            let mut capabilities = capabilities;
+            if matches!(self, Self::Metal(_)) {
+                capabilities.push(EngineCapability::Metal);
+            }
+            capabilities
+        };
         ServiceCapabilitySet::from_capabilities(capabilities)
     }
 

@@ -522,6 +522,10 @@ impl CpuDecoderSession {
         tensor_f32_values(&output)
     }
 
+    #[cfg_attr(
+        not(feature = "arm64"),
+        allow(clippy::unused_self, reason = "ARM64 dispatch is compiled only with its feature")
+    )]
     fn linear(
         &self,
         weight: &Tensor,
@@ -552,6 +556,10 @@ impl CpuDecoderSession {
         linear(weight, input, output_dimension, input_dimension)
     }
 
+    #[cfg_attr(
+        not(feature = "arm64"),
+        allow(clippy::unused_self, reason = "ARM64 dispatch is compiled only with its feature")
+    )]
     fn rms_norm(
         &self,
         input: &[f32],
@@ -575,6 +583,10 @@ impl CpuDecoderSession {
         rms_norm(input, weight, epsilon)
     }
 
+    #[cfg_attr(
+        not(feature = "arm64"),
+        allow(clippy::unused_self, reason = "ARM64 dispatch is compiled only with its feature")
+    )]
     fn apply_rope(
         &self,
         values: &mut [f32],
@@ -601,6 +613,10 @@ impl CpuDecoderSession {
         apply_rope(values, head_count, head_dimension, position, theta)
     }
 
+    #[cfg_attr(
+        not(feature = "arm64"),
+        allow(clippy::unused_self, reason = "ARM64 dispatch is compiled only with its feature")
+    )]
     fn swiglu(&self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, EngineError> {
         #[cfg(feature = "arm64")]
         if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
@@ -617,6 +633,10 @@ impl CpuDecoderSession {
         swiglu(gate, up)
     }
 
+    #[cfg_attr(
+        not(feature = "arm64"),
+        allow(clippy::unused_self, reason = "ARM64 dispatch is compiled only with its feature")
+    )]
     fn add_in_place(&self, left: &mut [f32], right: &[f32]) -> Result<(), EngineError> {
         #[cfg(feature = "arm64")]
         if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {

@@ -5,33 +5,53 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn workspace_external_dependencies_match_the_cryptography_allowlist() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete exact external dependency and source allowlist is intentionally visible"
+)]
+fn workspace_external_dependencies_match_the_reviewed_allowlist() {
     let root = engine_root();
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock must exist");
     let expected = [
         "block-buffer@0.12.1",
+        "block-buffer@0.10.4",
         "cfg-if@1.0.4",
+        "cpufeatures@0.2.17",
         "cpufeatures@0.3.0",
+        "crypto-common@0.1.7",
         "crypto-common@0.2.2",
         "curve25519-dalek-derive@0.1.1",
         "curve25519-dalek@5.0.0",
+        "digest@0.10.7",
         "digest@0.11.3",
         "ed25519-dalek@3.0.0",
         "ed25519@3.0.0",
         "fiat-crypto@0.3.0",
+        "generic-array@0.14.7",
         "hybrid-array@0.4.14",
+        "itoa@1.0.18",
         "libc@0.2.189",
+        "memchr@2.8.3",
         "proc-macro2@1.0.107",
         "quote@1.0.47",
         "rustc_version@0.4.1",
         "semver@1.0.28",
+        "serde@1.0.229",
+        "serde_core@1.0.229",
+        "serde_derive@1.0.229",
+        "serde_json@1.0.151",
+        "sha2@0.10.9",
         "sha2@0.11.0",
         "signature@3.0.0",
+        "sovereign-ai-contracts@3.0.0",
         "subtle@2.6.1",
         "syn@2.0.119",
+        "syn@3.0.3",
         "typenum@1.20.1",
         "unicode-ident@1.0.24",
+        "version_check@0.9.5",
         "zeroize@1.8.2",
+        "zmij@1.0.23",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -41,18 +61,39 @@ fn workspace_external_dependencies_match_the_cryptography_allowlist() {
         let name = lock_value(package, "name").expect("locked package must have a name");
         let version = lock_value(package, "version").expect("locked package must have a version");
         if let Some(source) = lock_value(package, "source") {
-            assert_eq!(
-                source, "registry+https://github.com/rust-lang/crates.io-index",
-                "external dependency must use the approved registry"
-            );
-            assert!(
-                lock_value(package, "checksum").is_some(),
-                "external dependency must have a locked checksum: {name}"
-            );
+            if name == "sovereign-ai-contracts" {
+                assert_eq!(
+                    source,
+                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=138128520dea7a602c0cf2ea905fa32396917db8#138128520dea7a602c0cf2ea905fa32396917db8",
+                    "canonical runtime contract dependency must use its exact reviewed commit"
+                );
+                assert!(
+                    lock_value(package, "checksum").is_none(),
+                    "git contract source is content-pinned by commit, not a registry checksum"
+                );
+            } else {
+                assert_eq!(
+                    source, "registry+https://github.com/rust-lang/crates.io-index",
+                    "external dependency must use the approved registry"
+                );
+                assert!(
+                    lock_value(package, "checksum").is_some(),
+                    "external dependency must have a locked checksum: {name}"
+                );
+            }
             observed.insert(format!("{name}@{version}"));
         }
     }
     assert_eq!(observed, expected, "resolved external dependency allowlist changed");
+
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
+    assert!(
+        workspace_manifest.contains(
+            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"138128520dea7a602c0cf2ea905fa32396917db8\", default-features = false, features = [\"runtime-v3\"] }"
+        ),
+        "canonical contracts must remain exact-commit pinned with only runtime-v3 enabled"
+    );
 
     let prohibited = [
         "ollama",
@@ -384,15 +425,25 @@ fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
             continue;
         }
         let name = lock_value(package, "name").expect("locked package must have a name");
-        let checksum = lock_value(package, "checksum").expect("external package needs checksum");
-        expected.insert(name.to_owned());
-        let vendored_checksum = fs::read_to_string(vendor.join(name).join(".cargo-checksum.json"))
-            .expect("vendored package checksum metadata must exist");
-        assert!(
-            vendored_checksum.contains(&format!("\"package\": \"{checksum}\""))
-                || vendored_checksum.contains(&format!("\"package\":\"{checksum}\"")),
-            "vendored archive checksum differs for {name}"
-        );
+        let version = lock_value(package, "version").expect("locked package must have a version");
+        let directory = format!("{name}-{version}");
+        expected.insert(directory.clone());
+        let vendored_checksum =
+            fs::read_to_string(vendor.join(&directory).join(".cargo-checksum.json"))
+                .expect("vendored package checksum metadata must exist");
+        if let Some(checksum) = lock_value(package, "checksum") {
+            assert!(
+                vendored_checksum.contains(&format!("\"package\": \"{checksum}\""))
+                    || vendored_checksum.contains(&format!("\"package\":\"{checksum}\"")),
+                "vendored archive checksum differs for {directory}"
+            );
+        } else {
+            assert!(
+                vendored_checksum.contains("\"package\":null")
+                    || vendored_checksum.contains("\"package\": null"),
+                "vendored git dependency has unexpected package checksum for {directory}"
+            );
+        }
     }
     let observed = fs::read_dir(&vendor)
         .expect("vendor directory must exist")
@@ -424,10 +475,15 @@ fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
     .expect("release SPDX document must exist");
     assert!(sbom.starts_with("SPDXVersion: SPDX-2.3\n"));
     let observed_names = sbom
-        .lines()
-        .filter_map(|line| line.strip_prefix("PackageName: "))
-        .filter(|name| *name != "personalai-native-engine")
-        .map(str::to_owned)
+        .split("\n\n")
+        .filter_map(|block| {
+            let name = block.lines().find_map(|line| line.strip_prefix("PackageName: "))?;
+            if name == "personalai-native-engine" {
+                return None;
+            }
+            let version = block.lines().find_map(|line| line.strip_prefix("PackageVersion: "))?;
+            Some(format!("{name}@{version}"))
+        })
         .collect::<BTreeSet<_>>();
     let mut expected_names = BTreeSet::new();
     for package in lock.split("[[package]]").skip(1) {
@@ -435,12 +491,19 @@ fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
             continue;
         }
         let name = lock_value(package, "name").expect("locked package must have a name");
-        let checksum = lock_value(package, "checksum").expect("external package needs checksum");
-        expected_names.insert(name.to_owned());
-        assert!(
-            sbom.contains(&format!("PackageChecksum: SHA256: {checksum}")),
-            "SPDX document omits checksum for {name}"
-        );
+        let version = lock_value(package, "version").expect("locked package must have a version");
+        expected_names.insert(format!("{name}@{version}"));
+        if let Some(checksum) = lock_value(package, "checksum") {
+            assert!(
+                sbom.contains(&format!("PackageChecksum: SHA256: {checksum}")),
+                "SPDX document omits checksum for {name}@{version}"
+            );
+        } else {
+            assert!(
+                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@138128520dea7a602c0cf2ea905fa32396917db8"),
+                "SPDX document omits the exact canonical contract commit"
+            );
+        }
     }
     assert_eq!(observed_names, expected_names, "SPDX package set differs from Cargo.lock");
 }
@@ -907,9 +970,13 @@ fn locked_external_packages(lock: &str) -> BTreeSet<String> {
             let name = lock_value(package, "name").expect("locked package must have a name");
             let version =
                 lock_value(package, "version").expect("locked package must have a version");
+            let source = lock_value(package, "source").expect("external package source");
             assert!(
-                lock_value(package, "checksum").is_some(),
-                "external dependency must have a locked checksum: {name}"
+                lock_value(package, "checksum").is_some()
+                    || (name == "sovereign-ai-contracts"
+                        && source
+                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=138128520dea7a602c0cf2ea905fa32396917db8#138128520dea7a602c0cf2ea905fa32396917db8"),
+                "external dependency must have a locked checksum or exact reviewed commit: {name}"
             );
             format!("{name}@{version}")
         })
