@@ -231,6 +231,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-placement"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-crypto",
+ "personalai-engine-loader",
+ "personalai-engine-memory",
+ "personalai-engine-model-format",
+ "personalai-engine-model-importer",
+ "personalai-engine-quantization",
+ "personalai-engine-testkit",
+ "personalai-engine-types",
+]
+
+[[package]]
 name = "personalai-engine-protocol"
 version = "0.1.0"
 dependencies = [
@@ -285,6 +299,7 @@ dependencies = [
  "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-placement",
  "personalai-engine-protocol",
  "personalai-engine-sampling",
  "personalai-engine-scheduler",

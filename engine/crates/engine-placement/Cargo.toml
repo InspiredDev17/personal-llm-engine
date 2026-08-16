@@ -1,0 +1,22 @@
+[package]
+name = "personalai-engine-placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Trusted bounded execution-placement plans for the PersonalAI native engine"
+
+[dependencies]
+personalai-engine-loader.workspace = true
+personalai-engine-memory.workspace = true
+personalai-engine-model-format.workspace = true
+personalai-engine-types.workspace = true
+
+[dev-dependencies]
+personalai-engine-crypto.workspace = true
+personalai-engine-model-importer.workspace = true
+personalai-engine-quantization.workspace = true
+personalai-engine-testkit.workspace = true
+
+[lints]
+workspace = true

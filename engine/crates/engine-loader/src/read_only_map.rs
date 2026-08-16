@@ -45,6 +45,16 @@ pub(crate) struct ReadOnlyFileMap {
     file: File,
 }
 
+// SAFETY: the mapping is created `PROT_READ|MAP_PRIVATE`, the descriptor and
+// mapping remain owned until drop, and the safe wrapper exposes immutable
+// slices only. Moving ownership or sharing immutable reads across a bounded
+// prefetch worker therefore cannot create mutation or outlive the mapping.
+unsafe impl Send for ReadOnlyFileMap {}
+// SAFETY: the same immutable-mapping invariant permits concurrent reads. Drop
+// requires unique ownership and can run only after every shared package owner
+// has been released.
+unsafe impl Sync for ReadOnlyFileMap {}
+
 impl ReadOnlyFileMap {
     /// Maps the complete nonempty file without executable permission.
     pub(crate) fn new(file: File, length: usize) -> Result<Self, EngineError> {

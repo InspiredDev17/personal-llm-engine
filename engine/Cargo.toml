@@ -7,6 +7,7 @@ members = [
     "crates/engine-quantization",
     "crates/engine-model-importer",
     "crates/engine-loader",
+    "crates/engine-placement",
     "crates/engine-tokenizer",
     "crates/engine-tensor",
     "crates/engine-cpu-reference",
@@ -39,6 +40,7 @@ personalai-engine-model-format = { path = "crates/engine-model-format" }
 personalai-engine-quantization = { path = "crates/engine-quantization" }
 personalai-engine-model-importer = { path = "crates/engine-model-importer" }
 personalai-engine-loader = { path = "crates/engine-loader" }
+personalai-engine-placement = { path = "crates/engine-placement" }
 personalai-engine-tokenizer = { path = "crates/engine-tokenizer" }
 personalai-engine-tensor = { path = "crates/engine-tensor" }
 personalai-engine-cpu-reference = { path = "crates/engine-cpu-reference" }

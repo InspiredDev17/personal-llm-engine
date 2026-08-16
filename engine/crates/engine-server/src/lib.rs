@@ -32,14 +32,19 @@ use personalai_engine_crypto::EngineResponseSigner;
 use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
-#[cfg(all(unix, feature = "cpu-reference"))]
-use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
 pub use personalai_engine_loader::RegistrySelectionV2;
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_model_format::ParsedModelPackage;
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_placement::{
+    BackendPlacementCapabilities, ExecutionPlacementPlan, MemoryTopology, PlacementPolicy,
+    PlacementResourceEnvelope,
+};
 use personalai_engine_protocol::{
     AuthenticatedServiceRequest, CancellationEnvelope, Frame, FrameKind, GenerationRequestEnvelope,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -169,11 +174,16 @@ impl RuntimeBackend {
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilitySet, EngineError> {
-        let mut capabilities = vec![
+        let capabilities = vec![
             EngineCapability::CpuReference,
             EngineCapability::StreamingGeneration,
             EngineCapability::UnixDomainSocket,
         ];
+        #[cfg(any(
+            all(feature = "arm64", target_arch = "aarch64"),
+            all(feature = "metal", target_os = "macos")
+        ))]
+        let mut capabilities = capabilities;
         #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
         if matches!(self, Self::Arm64(_)) {
             capabilities.push(EngineCapability::Arm64);
@@ -410,6 +420,7 @@ pub struct LoadedCpuModel {
     model_id: ModelId,
     model: CpuDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+    placement: Option<Arc<ExecutionPlacementPlan>>,
 }
 
 /// Fully loaded, signed model whose complete decoder executes through Metal.
@@ -419,6 +430,7 @@ pub struct LoadedMetalModel {
     model_id: ModelId,
     model: MetalDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+    placement: Option<Arc<ExecutionPlacementPlan>>,
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -588,6 +600,12 @@ impl LoadedMetalModel {
     /// Returns the package tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// Returns the immutable verified-package placement plan, when this is not
+    /// a legacy test fixture.
+    pub fn placement(&self) -> Option<&ExecutionPlacementPlan> {
+        self.placement.as_deref()
     }
 
     /// Creates one validated, resumable greedy Metal sequence for fair service scheduling.
@@ -785,6 +803,12 @@ impl LoadedCpuModel {
     /// Returns the package tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// Returns the immutable verified-package placement plan, when this is not
+    /// a legacy test fixture.
+    pub fn placement(&self) -> Option<&ExecutionPlacementPlan> {
+        self.placement.as_deref()
     }
 
     /// Creates one validated, resumable greedy-generation sequence.
@@ -3725,7 +3749,7 @@ impl EngineService {
             }
         }
         let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
-        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer, placement: None })
     }
 
     /// Verifies a signed legacy test fixture before constructing the ARM64 decoder.
@@ -3787,7 +3811,33 @@ impl EngineService {
             &pool,
             backend,
         )?;
-        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer, placement: None })
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    fn fully_resident_placement(
+        verified: &VerifiedDirectoryPackage,
+        budget: &ResourceBudget,
+        backend_id: BackendId,
+        topology: MemoryTopology,
+    ) -> Result<Arc<ExecutionPlacementPlan>, EngineError> {
+        let maximum = budget.max_memory_bytes();
+        let envelope =
+            PlacementResourceEnvelope::new(maximum, maximum, maximum, budget.max_kv_cache_bytes())
+                .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+        let capabilities =
+            BackendPlacementCapabilities::new(backend_id, topology, maximum, maximum, false)
+                .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+        let plan = ExecutionPlacementPlan::derive(
+            verified,
+            &capabilities,
+            envelope,
+            PlacementPolicy::fully_resident(),
+            0,
+            verified.registration().registry_sequence().unwrap_or(1),
+        )
+        .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+        Ok(Arc::new(plan))
     }
 
     /// Opens, verifies, and materializes a signed directory-backed package.
@@ -3803,6 +3853,12 @@ impl EngineService {
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
+            let placement = Self::fully_resident_placement(
+                &verified,
+                budget,
+                BackendId::new("cpu-reference")?,
+                MemoryTopology::HostOnly,
+            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3814,7 +3870,12 @@ impl EngineService {
             }
             let weights = verified.materialize_tensors(&pool)?.into_tensors();
             let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
-            Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+            Ok(LoadedCpuModel {
+                model_id: model_id.clone(),
+                model,
+                tokenizer,
+                placement: Some(placement),
+            })
         })();
         if let Err(error) = &result {
             let reason = match error {
@@ -3846,6 +3907,12 @@ impl EngineService {
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
+            let placement = Self::fully_resident_placement(
+                &verified,
+                budget,
+                BackendId::new("arm64")?,
+                MemoryTopology::HostOnly,
+            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3863,7 +3930,12 @@ impl EngineService {
                 &pool,
                 backend,
             )?;
-            Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer })
+            Ok(LoadedCpuModel {
+                model_id: model_id.clone(),
+                model,
+                tokenizer,
+                placement: Some(placement),
+            })
         })();
         if let Err(error) = &result {
             let reason = match error {
@@ -3894,6 +3966,12 @@ impl EngineService {
     ) -> Result<LoadedMetalModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result = (|| {
+            let placement = Self::fully_resident_placement(
+                &verified,
+                budget,
+                BackendId::new("metal")?,
+                MemoryTopology::Unified,
+            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3911,7 +3989,12 @@ impl EngineService {
                 &pool,
                 backend,
             )?;
-            Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer })
+            Ok(LoadedMetalModel {
+                model_id: model_id.clone(),
+                model,
+                tokenizer,
+                placement: Some(placement),
+            })
         })();
         if let Err(error) = &result {
             let reason = match error {
@@ -3986,7 +4069,7 @@ impl EngineService {
         }
         let model =
             MetalDecoderModel::new_registered(model_id.clone(), config, weights, &pool, backend)?;
-        Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer })
+        Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer, placement: None })
     }
 
     /// Activates and runs the next queued request on an already loaded model.

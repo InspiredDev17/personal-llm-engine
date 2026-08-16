@@ -201,6 +201,58 @@ impl VerifiedDirectoryPackage {
         Ok(LoadedDirectoryTensors { tensors, _metadata_reservation: metadata_reservation })
     }
 
+    /// Materializes one trusted architecture-selected tensor subset.
+    ///
+    /// Names must originate from a validated placement plan. Protocol and
+    /// request schemas do not expose this API, offsets, or package paths.
+    pub fn materialize_named_tensors(
+        &self,
+        names: &[String],
+        pool: &MemoryPool,
+    ) -> Result<LoadedDirectoryTensors, EngineError> {
+        self.validate_mapping_hashes()?;
+        if names.is_empty() || names.len() > self.manifest.tensors().len() {
+            return Err(EngineError::invalid_input(
+                "placement tensor selection is empty or exceeds the manifest",
+            ));
+        }
+        let mut selected = BTreeSet::new();
+        for name in names {
+            if !selected.insert(name.as_str()) {
+                return Err(EngineError::invalid_input(
+                    "placement tensor selection contains a duplicate",
+                ));
+            }
+        }
+        let metadata_bytes =
+            u64::try_from(names.len()).ok().and_then(|count| count.checked_mul(192)).ok_or_else(
+                || EngineError::resource_exhaustion("placement metadata bound overflows"),
+            )?;
+        let metadata_pool =
+            pool.scoped(MemoryOwner::ModelMetadata(self.registration.model_id().clone()));
+        let tensor_pool =
+            pool.scoped(MemoryOwner::PlacementStaging(self.registration.model_id().clone()));
+        let metadata_reservation = metadata_pool.reserve(metadata_bytes)?;
+        let mut tensors = BTreeMap::new();
+        for name in names {
+            let record =
+                self.manifest.tensors().iter().find(|record| record.name() == name).ok_or_else(
+                    || {
+                        EngineError::internal_invariant(
+                            "placement plan names a tensor absent from the verified manifest",
+                        )
+                    },
+                )?;
+            let tensor = self.materialize_tensor(record, &tensor_pool)?;
+            if tensors.insert(name.clone(), tensor).is_some() {
+                return Err(EngineError::internal_invariant(
+                    "placement materialization produced a duplicate tensor",
+                ));
+            }
+        }
+        Ok(LoadedDirectoryTensors { tensors, _metadata_reservation: metadata_reservation })
+    }
+
     fn materialize_tensor(
         &self,
         record: &DirectoryTensorRecord,
@@ -227,6 +279,11 @@ pub struct LoadedDirectoryTensors {
 }
 
 impl LoadedDirectoryTensors {
+    /// Borrows the immutable architecture-selected tensor map.
+    pub const fn tensors(&self) -> &BTreeMap<String, Tensor> {
+        &self.tensors
+    }
+
     /// Transfers the complete tensor map to the architecture implementation.
     pub fn into_tensors(self) -> BTreeMap<String, Tensor> {
         self.tensors

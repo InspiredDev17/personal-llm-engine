@@ -460,9 +460,9 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 21-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 22-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 21] = [
+    let allowed: [(&str, &[&str]); 22] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-release", &["personalai-engine-crypto", "personalai-engine-types"]),
@@ -484,6 +484,15 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-model-format",
                 "personalai-engine-quantization",
                 "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
+        ),
+        (
+            "engine-placement",
+            &[
+                "personalai-engine-loader",
+                "personalai-engine-memory",
+                "personalai-engine-model-format",
                 "personalai-engine-types",
             ],
         ),
@@ -560,6 +569,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-crypto",
                 "personalai-engine-loader",
                 "personalai-engine-memory",
+                "personalai-engine-placement",
                 "personalai-engine-protocol",
                 "personalai-engine-sampling",
                 "personalai-engine-scheduler",
@@ -607,6 +617,28 @@ fn internal_crate_dependencies_match_the_approved_dag() {
 }
 
 #[test]
+fn placement_authority_remains_internal_to_the_trusted_runtime() {
+    let root = engine_root();
+    let protocol_manifest = fs::read_to_string(root.join("crates/engine-protocol/Cargo.toml"))
+        .expect("protocol manifest");
+    let protocol_source = fs::read_to_string(root.join("crates/engine-protocol/src/lib.rs"))
+        .expect("protocol source");
+
+    assert!(
+        !protocol_manifest.contains("personalai-engine-placement"),
+        "the wire protocol must not depend on internal physical placement mechanics"
+    );
+    for prohibited in
+        ["ExecutionPlacementPlan", "WeightResidencyMode", "byte_offset", "package_path"]
+    {
+        assert!(
+            !protocol_source.contains(prohibited),
+            "the client protocol must not accept internal placement authority {prohibited:?}"
+        );
+    }
+}
+
+#[test]
 fn crate_manifests_cannot_add_native_links_or_weaken_workspace_lints() {
     let crates = engine_root().join("crates");
     for manifest_path in collect_files(&crates, "Cargo.toml") {
@@ -638,6 +670,7 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
     let unix_datagram_marker = ["Unix", "Datagram"].concat();
     let network_module_marker = ["std::", "net"].concat();
     let unsafe_block_marker = ["unsafe", " {"].concat();
+    let unsafe_impl_marker = ["unsafe", " impl"].concat();
     let unsafe_allow_marker = ["allow", "(unsafe_code)"].concat();
     let dynamic_open_marker = ["dl", "open"].concat();
     let source_path = PathBuf::from(file!());
@@ -721,6 +754,13 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             3,
             "read-only model mapping FFI",
         );
+        if canonical == approved_read_only_mapping {
+            assert_eq!(
+                source.matches(&unsafe_impl_marker).count(),
+                2,
+                "read-only mapping must have exactly the reviewed Send and Sync implementations"
+            );
+        }
         assert_exact_unsafe_boundary(
             &canonical,
             &approved_arm64_intrinsics,
@@ -745,6 +785,7 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             unix_datagram_marker.as_str(),
             network_module_marker.as_str(),
             unsafe_block_marker.as_str(),
+            unsafe_impl_marker.as_str(),
             unsafe_allow_marker.as_str(),
             dynamic_open_marker.as_str(),
         ] {
@@ -769,7 +810,9 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
                 continue;
             }
             if canonical == approved_read_only_mapping
-                && (marker == unsafe_block_marker || marker == unsafe_allow_marker)
+                && (marker == unsafe_block_marker
+                    || marker == unsafe_impl_marker
+                    || marker == unsafe_allow_marker)
             {
                 continue;
             }

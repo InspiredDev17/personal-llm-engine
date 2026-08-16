@@ -35,6 +35,18 @@
 
 ## Resource and service behavior
 
+- Signed CPU, ARM64, and Metal loads now derive exact fully resident placement
+  plans. A bounded CPU layer-staging and depth-one prefetch substrate exists,
+  but streamed transformer generation is not wired into the service and is not
+  advertised. Hybrid CPU/GPU placement is explicitly unsupported. There is no
+  evidence that streaming is faster than residency.
+- Placement accounting uses conservative logical bytes for mapped content,
+  immutable metadata, execution tensors, staged metadata, existing reservations,
+  and safety reserve. General allocator/page-table overhead remains part of the
+  operated memory-pressure qualification gate.
+- Automatic pressure eviction remains absent. The Go control plane may request
+  exact idle unload; without that authorization the engine rejects pressure
+  rather than selecting a cognitively different model.
 - Contiguous KV cache reserves maximum context and is memory-inefficient; paged
   KV is not implemented.
 - Continuous batching, distributed execution, speculative decoding, beam

@@ -18,6 +18,7 @@ libc.workspace = true
 personalai-engine-crypto.workspace = true
 personalai-engine-loader.workspace = true
 personalai-engine-memory.workspace = true
+personalai-engine-placement.workspace = true
 personalai-engine-protocol.workspace = true
 personalai-engine-sampling.workspace = true
 personalai-engine-scheduler.workspace = true

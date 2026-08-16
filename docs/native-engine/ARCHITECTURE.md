@@ -26,6 +26,7 @@ Green authority.
 | `engine-quantization` | fixed AIPQ8/AIPQ4 validation, deterministic conversion, error measurement and safe scalar reference kernels |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
+| `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
 | `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
@@ -114,6 +115,35 @@ with architecture-owned RMSNorm, Q/K/V projections, RoPE, grouped attention,
 output projection, residual paths, SwiGLU MLP, final norm, and logits. Model
 metadata cannot define operations, plugins, paths, executable code, or kernels.
 
+## Trusted execution placement
+
+Physical placement is an internal runtime decision, not protocol authority.
+Sovereign-AI-Contracts does not yet define a canonical placement policy, so the
+local wire protocol intentionally accepts neither physical plans nor tensor
+offsets. `engine-placement` derives an immutable plan only from a verified
+package, trusted backend capabilities, engine memory state, an owner-selected
+closed policy, and the configured resource envelope. It binds the exact model,
+artifact and package identities, package/model generations, architecture,
+backend, quantization, topology, stage/range inventory, and checked byte totals.
+
+`FullyResident` is the only mode composed into the signed CPU, ARM64, and Metal
+service paths. It preserves complete materialization while requiring mapped,
+metadata, execution, existing-reservation, and safety-reserve bytes to fit
+before model exposure. `LayerStreamed` currently provides a real CPU staging
+substrate over immutable unequal-sized architecture stages with at most one
+prefetch worker. Every live mapped hash is revalidated before a trusted subset
+is materialized; cancellation or failure joins the worker and releases staged
+reservations. A mapping-identity failure uses the existing typed, content-free
+package-rejection event. It is not yet wired into transformer generation or advertised as
+a service capability. `HybridResident` returns an explicit unsupported error.
+
+Quantization is orthogonal and stays bound to the signed artifact. Apple CPU
+and Metal placement use unified-memory topology rather than fabricated
+host-versus-VRAM capacity. Backend ownership remains logically explicit. A
+future discrete CUDA implementation may use distinct host, staging, and device
+ceilings, but CUDA has no runtime success path today. ADR-0029 records the
+decision and acceptance boundary.
+
 ## Tensor, graph, and numerical policy
 
 Owned tensors use canonical dense row-major order with the final dimension
@@ -164,7 +194,7 @@ before output allocation. ADR-0017 records these invariants.
 Every accounted allocation has one engine-owned category: model weights,
 model metadata, tokenizer tables, immutable model state, request prompt,
 sequence KV, request scratch, output logits, sampling state, streaming decoder,
-or backend resources. Pools expose current, peak, category and allocation-count
+placement staging, or backend resources. Pools expose current, peak, category and allocation-count
 metrics. A scoped pool changes only the owner label; it shares the exact same
 hard ceiling and counters, so a subcomponent cannot create capacity by nesting
 pools. Loader tensor materialization labels immutable metadata and weights by
@@ -442,7 +472,9 @@ cancellation-watcher, and output-writer stacks (256 KiB each), pending output
 events per active stream (8), aggregate queued bytes (64 MiB), active coordinator/request/output
 retention (64 MiB or a lower configured limit), CPU work (100 million
 operations per bounded operation), durable nonces per control key (1,048,576),
-and portable socket path (100 bytes).
+portable socket path (100 bytes), placement layers (4,096), and placement
+prefetch depth (1). Placement/backend memory ceilings cannot exceed the existing
+1 TiB resource hard limit.
 
 ## Backend features
 
@@ -494,7 +526,9 @@ no pointer and performs only an atomic store; peer outputs use exact initialized
 ABI storage and borrowed live descriptors. `engine-loader/src/read_only_map.rs`
 owns exactly one nonempty mapping, exposes only an immutable slice, requests
 `PROT_READ|MAP_PRIVATE` without execution, and unmaps the exact pointer/length
-once while its file remains live. Architecture tests enforce the exact
+once while its file remains live. Its reviewed `Send`/`Sync` implementations
+are valid only because shared access exposes immutable bytes and the mapping
+cannot be unmapped until the last owning package is dropped. Architecture tests enforce the exact
 block and allowance counts and reject an unsafe block or unsafe-lint allowance
 in every other first-party Rust source. ADR-0004 records the lock invariants;
 ADR-0011 records signal invariants; ADR-0013 records peer-credential invariants
