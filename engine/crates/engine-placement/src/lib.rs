@@ -305,7 +305,7 @@ impl PlacementStage {
         self.metadata_bytes
     }
 
-    /// Returns F32 tensor bytes plus materialized-map metadata.
+    /// Returns source snapshots, F32 tensor bytes, and materialized-map metadata.
     pub const fn accounted_bytes(&self) -> u64 {
         self.accounted_bytes
     }
@@ -501,7 +501,10 @@ impl ExecutionPlacementPlan {
         self.complete_execution_bytes
     }
 
-    /// Returns complete F32 weights plus materialized tensor-map metadata.
+    /// Returns the peak complete-residency commitment.
+    ///
+    /// This includes every F32 execution tensor, the complete materialized
+    /// tensor map, and one largest source snapshot used for checked conversion.
     pub const fn complete_materialized_bytes(&self) -> u64 {
         self.complete_materialized_bytes
     }
@@ -521,7 +524,9 @@ impl ExecutionPlacementPlan {
         self.prefetch_depth
     }
 
-    fn verify_package_binding(
+    /// Revalidates that a live verified package still has this plan's exact
+    /// registry, digest, architecture, quantization, and generation identity.
+    pub fn verify_package_binding(
         &self,
         package: &VerifiedDirectoryPackage,
     ) -> Result<(), PlacementError> {
@@ -561,9 +566,21 @@ fn measure_verified_package(
     let complete_execution_bytes = stages.iter().try_fold(0_u64, |total, stage| {
         checked_add(total, stage.execution_bytes, "complete execution weights")
     })?;
-    let complete_materialized_bytes = stages.iter().try_fold(0_u64, |total, stage| {
-        checked_add(total, stage.accounted_bytes, "complete materialized weights")
-    })?;
+    let largest_source_snapshot = manifest
+        .tensors()
+        .iter()
+        .map(DirectoryTensorRecord::byte_length)
+        .max()
+        .ok_or_else(|| resource("placement manifest contains no tensors"))?;
+    let complete_materialized_bytes = checked_add(
+        checked_add(
+            complete_execution_bytes,
+            manifest_metadata_bytes,
+            "complete materialized weights",
+        )?,
+        largest_source_snapshot,
+        "complete materialized weights",
+    )?;
     Ok(PlacementMeasurements {
         stages,
         mapped_bytes,
@@ -677,7 +694,6 @@ pub fn run_layer_streamed(
         )));
     }
     plan.verify_package_binding(package)?;
-    package.revalidate_mappings(events).map_err(classify_engine_error)?;
     let materialize =
         |stage: &PlacementStage| materialize_stage(package, pool, cancellation, faults, stage);
     let mut trusted_execute = |stage: &PlacementStage, tensors: &LoadedDirectoryTensors| {
@@ -811,8 +827,11 @@ fn derive_stages(
             .ok()
             .and_then(|count| count.checked_mul(192))
             .ok_or_else(|| resource("stage metadata bytes overflow"))?;
-        let accounted_bytes =
-            checked_add(execution_bytes, metadata_bytes, "stage accounted bytes")?;
+        let accounted_bytes = checked_add(
+            checked_add(execution_bytes, storage_bytes, "stage accounted bytes")?,
+            metadata_bytes,
+            "stage accounted bytes",
+        )?;
         stages.push(PlacementStage {
             ordinal: u32::try_from(ordinal).map_err(|_| resource("stage ordinal overflows"))?,
             kind,
@@ -1086,8 +1105,8 @@ mod tests {
         assert_eq!(stages[3].execution_bytes(), 28);
         assert_eq!(stages[3].tensors()[1].logical_name(), "output.weight");
         assert_eq!(stages[3].tensors()[1].source_name(), "token_embedding.weight");
-        assert_eq!(required_streaming_staging(&stages, 1).unwrap(), 656);
-        assert_eq!(required_streaming_staging(&stages, 0).unwrap(), 412);
+        assert_eq!(required_streaming_staging(&stages, 1).unwrap(), 736);
+        assert_eq!(required_streaming_staging(&stages, 0).unwrap(), 440);
     }
 
     #[test]

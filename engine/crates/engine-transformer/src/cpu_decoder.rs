@@ -9,7 +9,12 @@ use personalai_engine_cpu_reference::{Backend, Operation};
 use personalai_engine_kv_cache::{
     ContiguousKvCache, KvCacheMetrics, KvTokenWriter, SequenceHandle,
 };
+use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
+use personalai_engine_placement::{
+    ExecutionPlacementPlan, PlacementCancellation, PlacementFaultInjector, PlacementStage,
+    PlacementStageKind, PlacementTensorRange, WeightResidencyMode, run_layer_streamed,
+};
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
     DType, EngineError, MAX_CONCURRENT_SEQUENCES, ModelId, RequestId, ResourceBudget, SequenceId,
@@ -34,10 +39,16 @@ pub struct CpuDecoderModel {
 #[derive(Debug)]
 struct CpuDecoderModelInner {
     config: TransformerConfig,
-    weights: BTreeMap<String, Tensor>,
+    weights: DecoderWeights,
     pool: MemoryPool,
     cache: ContiguousKvCache,
     backend: DecoderCpuBackend,
+}
+
+#[derive(Debug)]
+enum DecoderWeights {
+    Resident(BTreeMap<String, Tensor>),
+    Streamed { package: Arc<VerifiedDirectoryPackage>, plan: Arc<ExecutionPlacementPlan> },
 }
 
 #[derive(Clone, Debug)]
@@ -98,14 +109,7 @@ impl CpuDecoderModel {
         pool: &MemoryPool,
         backend: DecoderCpuBackend,
     ) -> Result<Self, EngineError> {
-        if config.architecture_id().as_str() != FIRST_PARTY_DECODER_ARCHITECTURE_ID {
-            return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
-        }
-        if config.cache_dtype() != DType::F32 {
-            return Err(EngineError::not_implemented(
-                "CPU decoder currently supports only f32 model and cache tensors",
-            ));
-        }
+        validate_model_configuration(&config)?;
         let layer_count = usize::try_from(config.layer_count()).map_err(|_| {
             EngineError::corrupt_model_package("decoder layer count is not addressable")
         })?;
@@ -119,6 +123,57 @@ impl CpuDecoderModel {
             ));
         }
         validate_weights(&config, &weights, pool)?;
+        Self::finish_new(model_id, config, DecoderWeights::Resident(weights), pool, backend)
+    }
+
+    /// Constructs a scalar decoder whose weights are materialized one trusted
+    /// architecture stage at a time from one exact verified package.
+    pub fn new_registered_streamed(
+        model_id: ModelId,
+        config: TransformerConfig,
+        package: Arc<VerifiedDirectoryPackage>,
+        plan: Arc<ExecutionPlacementPlan>,
+        pool: &MemoryPool,
+    ) -> Result<Self, EngineError> {
+        validate_model_configuration(&config)?;
+        plan.verify_package_binding(&package)
+            .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+        if plan.mode() != WeightResidencyMode::LayerStreamed
+            || plan.model_id() != &model_id
+            || plan.architecture_id() != config.architecture_id()
+            || plan.backend_id().as_str() != "cpu-reference"
+        {
+            return Err(EngineError::invalid_input(
+                "streamed decoder plan does not match the exact model and scalar backend",
+            ));
+        }
+        if plan.required_envelope_bytes() > pool.limit_bytes() {
+            return Err(EngineError::resource_exhaustion(
+                "streamed decoder pool is below the guaranteed placement envelope",
+            ));
+        }
+        let package_config = TransformerConfig::from_directory_manifest(package.manifest())?;
+        if package_config != config {
+            return Err(EngineError::corrupt_model_package(
+                "streamed decoder configuration differs from the verified package",
+            ));
+        }
+        Self::finish_new(
+            model_id,
+            config,
+            DecoderWeights::Streamed { package, plan },
+            pool,
+            DecoderCpuBackend::Scalar,
+        )
+    }
+
+    fn finish_new(
+        model_id: ModelId,
+        config: TransformerConfig,
+        weights: DecoderWeights,
+        pool: &MemoryPool,
+        backend: DecoderCpuBackend,
+    ) -> Result<Self, EngineError> {
         let cache_budget =
             ResourceBudget::new(pool.limit_bytes(), pool.limit_bytes(), MAX_CONCURRENT_SEQUENCES)?;
         let cache_plan = personalai_engine_kv_cache::KvCachePlan::new(
@@ -140,6 +195,28 @@ impl CpuDecoderModel {
                 backend,
             }),
         })
+    }
+
+    fn resident_weights(&self) -> Result<&BTreeMap<String, Tensor>, EngineError> {
+        match &self.inner.weights {
+            DecoderWeights::Resident(weights) => Ok(weights),
+            DecoderWeights::Streamed { .. } => Err(EngineError::not_implemented(
+                "streamed decoder requires the cancellation-aware staged execution API",
+            )),
+        }
+    }
+
+    fn streamed_weights(
+        &self,
+    ) -> Result<(Arc<VerifiedDirectoryPackage>, Arc<ExecutionPlacementPlan>), EngineError> {
+        match &self.inner.weights {
+            DecoderWeights::Streamed { package, plan } => {
+                Ok((Arc::clone(package), Arc::clone(plan)))
+            }
+            DecoderWeights::Resident(_) => Err(EngineError::invalid_input(
+                "resident decoder cannot use the streamed execution API",
+            )),
+        }
     }
 
     /// Returns the exact trusted execution backend selected for this model.
@@ -194,13 +271,6 @@ impl CpuDecoderModel {
             token_count: 0,
         })
     }
-
-    fn weight(&self, name: &str) -> Result<&Tensor, EngineError> {
-        self.inner
-            .weights
-            .get(name)
-            .ok_or_else(|| EngineError::internal_invariant("validated decoder weight is missing"))
-    }
 }
 
 /// Mutable per-sequence CPU decoder state and materialized KV cache.
@@ -250,6 +320,7 @@ impl CpuDecoderSession {
 
     /// Executes one token and returns finite next-token logits.
     pub fn forward_token(&mut self, token: u32) -> Result<Tensor, EngineError> {
+        let weights = self.model.resident_weights()?;
         if token >= self.model.inner.config.vocabulary_size() {
             return Err(EngineError::invalid_input("input token is outside the model vocabulary"));
         }
@@ -261,7 +332,7 @@ impl CpuDecoderSession {
         let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
         let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
         let mut state = embedding_row(
-            self.model.weight("token_embedding.weight")?,
+            required_weight(weights, "token_embedding.weight")?,
             usize::try_from(token)
                 .map_err(|_| EngineError::invalid_input("token identifier is not addressable"))?,
             hidden,
@@ -269,19 +340,144 @@ impl CpuDecoderSession {
 
         let mut writer = self.model.inner.cache.begin_token(self.handle)?;
         for layer in 0..self.model.inner.config.layer_count() {
-            self.forward_layer(layer, &mut writer, &mut state)?;
+            self.forward_layer(layer, &mut writer, &mut state, weights)?;
         }
         let normalized = self.rms_norm(
             &state,
-            self.model.weight("final_norm.weight")?,
+            required_weight(weights, "final_norm.weight")?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
         let logits = self.linear(
-            self.model.weight("output.weight")?,
+            required_weight(weights, "output.weight")?,
             &normalized,
             usize_from_u32(self.model.inner.config.vocabulary_size())?,
             hidden,
         )?;
+        let output = Tensor::from_f32_values(
+            TensorShape::new([u64::from(self.model.inner.config.vocabulary_size())])?,
+            &logits,
+            &self.output_pool,
+        )?;
+        writer.commit()?;
+        self.token_count = self
+            .token_count
+            .checked_add(1)
+            .ok_or_else(|| EngineError::internal_invariant("decoder token count overflows"))?;
+        Ok(output)
+    }
+
+    /// Processes a prompt through the cancellation-aware streamed-weight path.
+    pub fn prefill_streamed(
+        &mut self,
+        tokens: &[u32],
+        cancellation: &PlacementCancellation,
+        faults: &dyn PlacementFaultInjector,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<Tensor, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::invalid_input(
+                "streamed decoder prefill requires at least one token",
+            ));
+        }
+        let additional = u32::try_from(tokens.len())
+            .map_err(|_| EngineError::resource_exhaustion("prefill token count exceeds u32"))?;
+        if self
+            .token_count
+            .checked_add(additional)
+            .is_none_or(|total| total > self.model.inner.config.context_limit().get())
+        {
+            return Err(EngineError::resource_exhaustion("decoder prefill exceeds context"));
+        }
+        let mut final_logits = None;
+        for token in tokens {
+            final_logits =
+                Some(self.forward_token_streamed(*token, cancellation, faults, events)?);
+        }
+        final_logits.ok_or_else(|| EngineError::internal_invariant("prefill produced no logits"))
+    }
+
+    /// Executes one token while materializing only the current and optionally
+    /// next trusted architecture stages.
+    pub fn forward_token_streamed(
+        &mut self,
+        token: u32,
+        cancellation: &PlacementCancellation,
+        faults: &dyn PlacementFaultInjector,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<Tensor, EngineError> {
+        if cancellation.is_cancelled() {
+            return Err(EngineError::cancellation(None));
+        }
+        if token >= self.model.inner.config.vocabulary_size() {
+            return Err(EngineError::invalid_input("input token is outside the model vocabulary"));
+        }
+        if self.token_count >= self.model.inner.config.context_limit().get() {
+            return Err(EngineError::resource_exhaustion("decoder context capacity is exhausted"));
+        }
+        let (package, plan) = self.model.streamed_weights()?;
+        check_operation_count(&self.model.inner.config, self.token_count)?;
+        let workspace_bytes = workspace_bytes(&self.model.inner.config, self.token_count)?;
+        let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
+        let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
+        let token_index = usize::try_from(token)
+            .map_err(|_| EngineError::invalid_input("token identifier is not addressable"))?;
+        let mut writer = self.model.inner.cache.begin_token(self.handle)?;
+        let mut state = None;
+        let mut logits = None;
+        run_layer_streamed(
+            &plan,
+            &package,
+            &self.model.inner.pool,
+            cancellation,
+            faults,
+            events,
+            |stage, loaded| match stage.kind() {
+                PlacementStageKind::Embedding => {
+                    if state.is_some() {
+                        return Err(EngineError::internal_invariant(
+                            "streamed embedding stage executed more than once",
+                        ));
+                    }
+                    state = Some(embedding_row(
+                        stage_weight(stage, loaded.tensors(), "token_embedding.weight")?,
+                        token_index,
+                        hidden,
+                    )?);
+                    Ok(())
+                }
+                PlacementStageKind::DecoderLayer(layer) => {
+                    let current = state.as_mut().ok_or_else(|| {
+                        EngineError::internal_invariant(
+                            "streamed decoder layer preceded the embedding stage",
+                        )
+                    })?;
+                    self.forward_layer(layer, &mut writer, current, loaded.tensors())
+                }
+                PlacementStageKind::Output => {
+                    let current = state.as_ref().ok_or_else(|| {
+                        EngineError::internal_invariant(
+                            "streamed output stage preceded decoder state",
+                        )
+                    })?;
+                    let normalized = self.rms_norm(
+                        current,
+                        stage_weight(stage, loaded.tensors(), "final_norm.weight")?,
+                        self.model.inner.config.rms_norm_epsilon(),
+                    )?;
+                    logits = Some(self.linear(
+                        stage_weight(stage, loaded.tensors(), "output.weight")?,
+                        &normalized,
+                        usize_from_u32(self.model.inner.config.vocabulary_size())?,
+                        hidden,
+                    )?);
+                    Ok(())
+                }
+            },
+        )
+        .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+        let logits = logits.ok_or_else(|| {
+            EngineError::internal_invariant("streamed decoder produced no output stage")
+        })?;
         let output = Tensor::from_f32_values(
             TensorShape::new([u64::from(self.model.inner.config.vocabulary_size())])?,
             &logits,
@@ -300,6 +496,7 @@ impl CpuDecoderSession {
         layer: u32,
         writer: &mut KvTokenWriter<'_>,
         state: &mut [f32],
+        weights: &BTreeMap<String, Tensor>,
     ) -> Result<(), EngineError> {
         let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
         let kv_dimension = usize_from_u32(
@@ -313,23 +510,23 @@ impl CpuDecoderSession {
         let prefix = format!("layers.{layer:03}");
         let attention_input = self.rms_norm(
             state,
-            self.model.weight(&format!("{prefix}.attn_norm.weight"))?,
+            required_weight(weights, &format!("{prefix}.attn_norm.weight"))?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
         let mut query = self.linear(
-            self.model.weight(&format!("{prefix}.q_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.q_proj.weight"))?,
             &attention_input,
             hidden,
             hidden,
         )?;
         let mut key = self.linear(
-            self.model.weight(&format!("{prefix}.k_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.k_proj.weight"))?,
             &attention_input,
             kv_dimension,
             hidden,
         )?;
         let value = self.linear(
-            self.model.weight(&format!("{prefix}.v_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.v_proj.weight"))?,
             &attention_input,
             kv_dimension,
             hidden,
@@ -351,7 +548,7 @@ impl CpuDecoderSession {
         writer.write_layer(layer, &key, &value)?;
         let attention = self.attention(layer, writer, &query)?;
         let projected = self.linear(
-            self.model.weight(&format!("{prefix}.o_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.o_proj.weight"))?,
             &attention,
             hidden,
             hidden,
@@ -360,25 +557,25 @@ impl CpuDecoderSession {
 
         let ffn_input = self.rms_norm(
             state,
-            self.model.weight(&format!("{prefix}.ffn_norm.weight"))?,
+            required_weight(weights, &format!("{prefix}.ffn_norm.weight"))?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
         let intermediate = usize_from_u32(self.model.inner.config.intermediate_dimension())?;
         let gate = self.linear(
-            self.model.weight(&format!("{prefix}.gate_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.gate_proj.weight"))?,
             &ffn_input,
             intermediate,
             hidden,
         )?;
         let up = self.linear(
-            self.model.weight(&format!("{prefix}.up_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.up_proj.weight"))?,
             &ffn_input,
             intermediate,
             hidden,
         )?;
         let activated = self.swiglu(&gate, &up)?;
         let down = self.linear(
-            self.model.weight(&format!("{prefix}.down_proj.weight"))?,
+            required_weight(weights, &format!("{prefix}.down_proj.weight"))?,
             &activated,
             hidden,
             intermediate,
@@ -639,6 +836,43 @@ impl Drop for CpuDecoderSession {
     fn drop(&mut self) {
         let _ = self.model.inner.cache.destroy_sequence(self.handle);
     }
+}
+
+fn validate_model_configuration(config: &TransformerConfig) -> Result<(), EngineError> {
+    if config.architecture_id().as_str() != FIRST_PARTY_DECODER_ARCHITECTURE_ID {
+        return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
+    }
+    if config.cache_dtype() != DType::F32 {
+        return Err(EngineError::not_implemented(
+            "CPU decoder currently supports only f32 model and cache tensors",
+        ));
+    }
+    Ok(())
+}
+
+fn required_weight<'a>(
+    weights: &'a BTreeMap<String, Tensor>,
+    name: &str,
+) -> Result<&'a Tensor, EngineError> {
+    weights
+        .get(name)
+        .ok_or_else(|| EngineError::internal_invariant("validated decoder weight is missing"))
+}
+
+fn stage_weight<'a>(
+    stage: &PlacementStage,
+    weights: &'a BTreeMap<String, Tensor>,
+    logical_name: &str,
+) -> Result<&'a Tensor, EngineError> {
+    let source_name = stage
+        .tensors()
+        .iter()
+        .find(|tensor| tensor.logical_name() == logical_name)
+        .map(PlacementTensorRange::source_name)
+        .ok_or_else(|| {
+            EngineError::internal_invariant("streamed stage lacks a required logical tensor")
+        })?;
+    required_weight(weights, source_name)
 }
 
 fn validate_weights(

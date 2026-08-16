@@ -1,8 +1,8 @@
 # ADR-0029: Trusted execution placement and bounded layer staging
 
-Status: accepted for portable planning, fully resident composition, and CPU
-staging; streamed decoder, hybrid execution, and operated qualification remain
-open
+Status: accepted for portable planning, fully resident composition, and scalar
+CPU streamed decoding; service activation, hybrid execution, and operated
+qualification remain open
 
 Date: 2026-08-16
 
@@ -39,19 +39,24 @@ Three modes are named so unsupported behavior is explicit:
   worker. The worker is joined before ownership can end; cancellation, read,
   verification, or callback failure drops all request-owned staging state.
   Mapping-identity failures emit the existing bounded package-rejection event.
+  The scalar decoder consumes these stages directly for prefill and decode,
+  uses its existing contiguous KV ownership, and invalidates a partially
+  written sequence on cancellation or stage failure.
 - `HybridResident` remains a typed unsupported placement. No backend currently
   implements a reviewed cross-device execution path.
 
 Quantization remains an artifact property, not a residency mode. A plan never
 silently changes package, backend, model revision, or quantization. The loader
 can materialize a unique trusted subset of manifest tensor names and revalidates
-all live mapped hashes before exposure. The read-only mapping is explicitly
+the selected mapping identity and signed per-tensor content hash before each
+exposure. This avoids repeatedly hashing unrelated layers while retaining
+artifact binding. The read-only mapping is explicitly
 `Send` and `Sync`: it owns one nonempty `MAP_PRIVATE|PROT_READ` region and live
 descriptor, exposes only immutable byte slices, and unmaps only after all
 shared owners are gone.
 
-Memory accounting includes mapped package bytes, immutable metadata,
-materialized execution bytes, per-staged-tensor metadata reservations, staging,
+Memory accounting includes mapped package bytes, immutable metadata, an owned
+hash-checked source snapshot, materialized execution bytes, per-staged-tensor metadata reservations, staging,
 existing engine reservations, and a safety reserve. Arithmetic and configured
 limits are bounded by the existing 1 TiB hard ceiling. Streamed staging uses the
 dedicated `PlacementStaging(ModelId)` owner. The initial prefetch depth is zero
@@ -67,9 +72,9 @@ future discrete-device topology are distinct. CUDA remains unimplemented.
   without changing client authority or degrading its execution path.
 - Layer ranges may be unequal and are derived from signed tensor records rather
   than caller offsets.
-- The staged loader/prefetch substrate is real and fault-tested, but the
-  transformer service does not yet advertise or execute streamed generation.
-  No performance claim is made.
+- Scalar streamed prefill/decode is real and differential-tested against fully
+  resident scalar execution. The authenticated service does not yet advertise
+  or select it. No performance claim is made.
 - Automatic eviction remains absent. Go may request exact idle unload under
   ADR-0028; pressure otherwise fails explicitly.
 - A future canonical placement policy requires a reviewed Sovereign Contracts
@@ -80,7 +85,8 @@ future discrete-device topology are distinct. CUDA remains unimplemented.
 Portable tests cover real signed package conversion and verification, exact
 resident/streamed plans, unequal stages, tied weights, checked ceilings,
 bounded prefetch order, cancellation and injected failure cleanup, mapped-file
-mutation after verification, hybrid rejection, and protocol/DAG authority
+mutation after verification, bit-exact resident-versus-streamed multi-token
+decode, partial-KV cancellation invalidation, hybrid rejection, and protocol/DAG authority
 boundaries. These tests establish planning and staging correctness only.
 
 Production acceptance still requires a licensed qualified model, owner-held

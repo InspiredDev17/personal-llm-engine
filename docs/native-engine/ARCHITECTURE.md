@@ -33,7 +33,7 @@ Green authority.
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
-| `engine-transformer` | fixed decoder configuration, tensor inventory and CPU forward path |
+| `engine-transformer` | fixed decoder configuration, tensor inventory, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
@@ -131,11 +131,16 @@ service paths. It preserves complete materialization while requiring mapped,
 metadata, execution, existing-reservation, and safety-reserve bytes to fit
 before model exposure. `LayerStreamed` currently provides a real CPU staging
 substrate over immutable unequal-sized architecture stages with at most one
-prefetch worker. Every live mapped hash is revalidated before a trusted subset
-is materialized; cancellation or failure joins the worker and releases staged
+prefetch worker. Each selected mapping identity and signed per-tensor content
+hash is revalidated before materialization; the exact bytes used for conversion
+are copied into an accounted snapshot and hashed again, closing the
+check-versus-copy race. Unrelated layers are not repeatedly hashed. Cancellation or failure joins the worker and releases staged
 reservations. A mapping-identity failure uses the existing typed, content-free
-package-rejection event. It is not yet wired into transformer generation or advertised as
-a service capability. `HybridResident` returns an explicit unsupported error.
+package-rejection event. The scalar decoder now performs prefill and one-token
+decode directly over these stages and preserves its existing atomic contiguous
+KV-cache commit. Cancellation during a layer invalidates partial KV state. The
+authenticated service does not yet expose a placement selection or advertise
+streamed residency. `HybridResident` returns an explicit unsupported error.
 
 Quantization is orthogonal and stays bound to the signed artifact. Apple CPU
 and Metal placement use unified-memory topology rather than fabricated

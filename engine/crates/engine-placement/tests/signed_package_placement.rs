@@ -109,8 +109,17 @@ fn source_and_tokenizer() -> (Vec<u8>, Vec<u8>) {
 
 fn verified_package()
 -> (FixtureRoot, Arc<personalai_engine_loader::VerifiedDirectoryPackage>, ResourceBudget) {
+    verified_package_named("placement-fixture", "placement-fixture.paimodel", 0x61, 0x62)
+}
+
+fn verified_package_named(
+    model_name: &str,
+    package_name: &str,
+    key_byte: u8,
+    seed_byte: u8,
+) -> (FixtureRoot, Arc<personalai_engine_loader::VerifiedDirectoryPackage>, ResourceBudget) {
     let root = FixtureRoot::new();
-    let model_id = ModelId::new("placement-fixture").unwrap();
+    let model_id = ModelId::new(model_name).unwrap();
     let spec = ImportSpec::new(
         model_id.clone(),
         SourceMapping::LlamaSafetensorsV1,
@@ -130,11 +139,10 @@ fn verified_package()
     )
     .unwrap();
     let (source, tokenizer) = source_and_tokenizer();
-    let key_id = SignerKeyId::from_bytes([0x61; 16]).unwrap();
-    let mut seed = [0x62; 32];
+    let key_id = SignerKeyId::from_bytes([key_byte; 16]).unwrap();
+    let mut seed = [seed_byte; 32];
     let imported =
         build_package(&spec, "model.safetensors", &source, &tokenizer, key_id, &mut seed).unwrap();
-    let package_name = "placement-fixture.paimodel";
     let package_path = root.0.join(package_name);
     fs::create_dir(&package_path).unwrap();
     for (name, bytes) in imported.files() {
@@ -151,6 +159,42 @@ fn verified_package()
     let budget = ResourceBudget::new(1 << 24, 1 << 20, 1).unwrap();
     let package = registry.load_registered_directory(&model_id, &budget, &mut |_event| {}).unwrap();
     (root, Arc::new(package), budget)
+}
+
+#[test]
+fn one_model_plan_cannot_stage_another_verified_model() {
+    let (_root_a, package_a, budget) =
+        verified_package_named("placement-model-a", "placement-model-a.paimodel", 0x63, 0x64);
+    let (_root_b, package_b, _budget_b) =
+        verified_package_named("placement-model-b", "placement-model-b.paimodel", 0x65, 0x66);
+    let capabilities =
+        BackendPlacementCapabilities::cpu_reference(budget.max_memory_bytes()).unwrap();
+    let plan = ExecutionPlacementPlan::derive(
+        &package_a,
+        &capabilities,
+        envelope(budget),
+        PlacementPolicy::layer_streamed(),
+        0,
+        1,
+    )
+    .unwrap();
+    let pool = MemoryPool::new(plan.guaranteed_staging_bytes()).unwrap();
+    let mut exposed = false;
+    let result = run_layer_streamed(
+        &plan,
+        &package_b,
+        &pool,
+        &PlacementCancellation::new(),
+        &NoPlacementFaults,
+        &mut |_event| {},
+        |_stage, _tensors| {
+            exposed = true;
+            Ok(())
+        },
+    );
+    assert_eq!(result, Err(PlacementError::ArtifactIdentityMismatch));
+    assert!(!exposed);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 
 fn envelope(budget: ResourceBudget) -> PlacementResourceEnvelope {
@@ -198,7 +242,7 @@ fn signed_package_derives_exact_resident_and_streamed_plans() {
     .unwrap();
     assert_eq!(streamed.mode(), WeightResidencyMode::LayerStreamed);
     assert_eq!(streamed.prefetch_depth(), 1);
-    assert!(streamed.guaranteed_staging_bytes() < streamed.complete_execution_bytes());
+    assert!(streamed.guaranteed_staging_bytes() < streamed.complete_materialized_bytes());
 }
 
 #[test]

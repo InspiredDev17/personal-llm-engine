@@ -348,11 +348,17 @@ version = "0.1.0"
 dependencies = [
  "personalai-engine-arm64",
  "personalai-engine-cpu-reference",
+ "personalai-engine-crypto",
  "personalai-engine-kv-cache",
+ "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-metal",
  "personalai-engine-model-format",
+ "personalai-engine-model-importer",
+ "personalai-engine-placement",
+ "personalai-engine-quantization",
  "personalai-engine-tensor",
+ "personalai-engine-testkit",
  "personalai-engine-types",
 ]
 

@@ -97,20 +97,7 @@ impl VerifiedDirectoryPackage {
 
     /// Returns one immutable verified mapped tensor range.
     pub fn tensor_bytes(&self, tensor: &DirectoryTensorRecord) -> Result<&[u8], EngineError> {
-        let shard = self
-            .shards
-            .get(usize::try_from(tensor.shard_index()).map_err(|_| {
-                EngineError::resource_exhaustion("tensor shard index is not addressable")
-            })?)
-            .ok_or_else(|| EngineError::internal_invariant("validated tensor shard is missing"))?;
-        if !shard.map.identity_is_unchanged()?
-            || hash_package(shard.map.bytes()) != shard.expected_hash
-        {
-            return Err(EngineError::signature_failure(
-                "mapped tensor shard changed after package admission",
-            ));
-        }
-        Self::tensor_bytes_from_verified_shard(shard, tensor)
+        self.tensor_bytes_revalidated(tensor)
     }
 
     /// Consumes package ownership, immediately dropping every live mapping.
@@ -132,14 +119,28 @@ impl VerifiedDirectoryPackage {
         })
     }
 
-    fn tensor_bytes_verified(&self, tensor: &DirectoryTensorRecord) -> Result<&[u8], EngineError> {
+    fn tensor_bytes_revalidated(
+        &self,
+        tensor: &DirectoryTensorRecord,
+    ) -> Result<&[u8], EngineError> {
         let shard = self
             .shards
             .get(usize::try_from(tensor.shard_index()).map_err(|_| {
                 EngineError::resource_exhaustion("tensor shard index is not addressable")
             })?)
             .ok_or_else(|| EngineError::internal_invariant("validated tensor shard is missing"))?;
-        Self::tensor_bytes_from_verified_shard(shard, tensor)
+        if !shard.map.identity_is_unchanged()? {
+            return Err(EngineError::signature_failure(
+                "mapped tensor shard identity changed after package admission",
+            ));
+        }
+        let bytes = Self::tensor_bytes_from_verified_shard(shard, tensor)?;
+        if hash_package(bytes) != tensor.content_hash() {
+            return Err(EngineError::signature_failure(
+                "mapped tensor content changed after package admission",
+            ));
+        }
+        Ok(bytes)
     }
 
     fn tensor_bytes_from_verified_shard<'a>(
@@ -210,7 +211,6 @@ impl VerifiedDirectoryPackage {
         names: &[String],
         pool: &MemoryPool,
     ) -> Result<LoadedDirectoryTensors, EngineError> {
-        self.validate_mapping_hashes()?;
         if names.is_empty() || names.len() > self.manifest.tensors().len() {
             return Err(EngineError::invalid_input(
                 "placement tensor selection is empty or exceeds the manifest",
@@ -258,13 +258,36 @@ impl VerifiedDirectoryPackage {
         record: &DirectoryTensorRecord,
         pool: &MemoryPool,
     ) -> Result<Tensor, EngineError> {
-        let bytes = self.tensor_bytes_verified(record)?;
+        let live_bytes = self.tensor_bytes_revalidated(record)?;
+        let mut snapshot_reservation = pool.reserve(record.byte_length())?;
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(live_bytes.len())
+            .map_err(|_| EngineError::resource_exhaustion("tensor snapshot allocation failed"))?;
+        let allocated_bytes = u64::try_from(snapshot.capacity()).map_err(|_| {
+            EngineError::resource_exhaustion("tensor snapshot capacity is not representable")
+        })?;
+        if allocated_bytes > record.byte_length() {
+            pool.grow_reservation(
+                &mut snapshot_reservation,
+                allocated_bytes - record.byte_length(),
+            )?;
+        }
+        snapshot.extend_from_slice(live_bytes);
+        if hash_package(&snapshot) != record.content_hash() {
+            return Err(EngineError::signature_failure(
+                "snapshotted tensor content differs from the signed manifest",
+            ));
+        }
         match record.quantization() {
-            Quantization::None => {
-                Tensor::convert_storage_to_f32(record.dtype(), record.shape().clone(), bytes, pool)
-            }
+            Quantization::None => Tensor::convert_storage_to_f32(
+                record.dtype(),
+                record.shape().clone(),
+                &snapshot,
+                pool,
+            ),
             Quantization::AipQ8V1 | Quantization::AipQ4V1 => {
-                QuantizedTensor::parse(record.quantization(), record.shape(), bytes)?
+                QuantizedTensor::parse(record.quantization(), record.shape(), &snapshot)?
                     .dequantize(pool)
             }
         }
