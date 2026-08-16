@@ -585,6 +585,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             "engine-cli",
             &[
                 "personalai-engine-crypto",
+                "personalai-engine-placement",
                 "personalai-engine-sampling",
                 "personalai-engine-scheduler",
                 "personalai-engine-server",

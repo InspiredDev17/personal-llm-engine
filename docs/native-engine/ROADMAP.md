@@ -26,7 +26,7 @@ memory, tool, approval, or Agent Green behavior.
 | 8. UDS/Go adapter | COMPLETE for local reference path | Same-service-user kernel peer admission, separate Ed25519 request/response identities, bounded two-key verification overlap, signed ordered events, cancellation/disconnect watchers, durable replay rejection, single-stream CLI plus bounded batch/continuous reference drivers, Go `NATIVE_ENGINE` adapter and real socket tests |
 | 9. Production package operations | COMPLETE for synthetic inputs; real-model approval pending | Rust-only quarantine safetensors importer, deterministic one-or-more-shard directory package, provenance, offline signing, loader round trip and rejection/fuzz coverage |
 | 9a. Quantized package storage | COMPLETE for AIPQ8/AIPQ4 synthetic evidence | Explicit profiles, canonical fixed-block payloads, signed source/destination/error evidence, secure loading, scalar kernels, and F32/Q8/Q4 transformer divergence regression |
-| 9b. Execution placement | PARTIAL | Exact verified-artifact fully resident plans are composed into signed service loads; bounded scalar CPU stage materialization, depth-one prefetch, prefill/decode parity and cancellation-safe KV invalidation pass signed-package/fault tests. Authenticated service selection and hybrid placement remain unsupported, with no performance claim. |
+| 9b. Execution placement | PARTIAL | Exact verified-artifact plans are composed into signed service loads; owner startup may select fully resident or bounded scalar streamed CPU execution, with depth-one prefetch, generation parity and cancellation-safe KV invalidation. Hybrid placement, per-model policy and operated performance remain open, with no performance claim. |
 | 10. ARM64/Metal | SOURCE PATHS COMPLETE / OPERATED QUALIFICATION PENDING | ARM64 and Metal have owner-selected signed-directory loading, complete tiny-model prefill/decode/sampling/streaming, cancellation/unload, scalar parity and authenticated backend identity; target-specific production model, pressure, thermal, soak and performance qualification remain |
 | 11. CUDA | HARDWARE GATED | Fixed kernels, differential and device tests required |
 | 12. Production cutover | PARTIAL | Mutual response trust, bounded rotation mechanics, exclusively owned durable request replay, release-only signed artifact verification, monotonic rollback state, Linux pre-launch binding, root-owned verifier event routing, deterministic mutation/transport faults, scheduled fuzzing, signal-drained continuous CLI serving, bounded delayed-reader/restart soak, and pinned offline Linux/macOS verification are complete in source; trusted OS installation, hosted evidence, production-size operated soak/performance, key/journal recovery and reversible live canary remain |
@@ -207,8 +207,9 @@ and all-models-hot control-plane gaps through ADR-0028. ADR-0029 adds the
 verified-artifact placement abstraction, exact fully resident admission, and a
 bounded cancellation-safe CPU staging/prefetch substrate. Scalar streamed
 prefill/decode is bit-exact with the resident oracle on signed fixtures. The
-authenticated service still selects only fully resident models; streamed
-service activation and true hybrid execution are not represented as complete.
+authenticated service defaults to fully resident and may select scalar streamed
+execution only through owner startup configuration. True hybrid execution is
+not represented as complete.
 Automatic eviction, a multi-entry signed Foundry registry,
 and new modalities/architectures remain deliberately gated on measured or
 model-specific requirements rather than represented as working features. Further

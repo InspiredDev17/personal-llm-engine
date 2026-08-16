@@ -139,8 +139,11 @@ reservations. A mapping-identity failure uses the existing typed, content-free
 package-rejection event. The scalar decoder now performs prefill and one-token
 decode directly over these stages and preserves its existing atomic contiguous
 KV-cache commit. Cancellation during a layer invalidates partial KV state. The
-authenticated service does not yet expose a placement selection or advertise
-streamed residency. `HybridResident` returns an explicit unsupported error.
+local service accepts an owner-only startup selection for fully resident or
+scalar layer-streamed weights. It defaults to fully resident and rejects
+streaming with ARM64 or Metal. Authenticated clients still provide only a
+registered `ModelId`; the wire exposes no physical plan or placement override.
+`HybridResident` returns an explicit unsupported error.
 
 Quantization is orthogonal and stays bound to the signed artifact. Apple CPU
 and Metal placement use unified-memory topology rather than fabricated

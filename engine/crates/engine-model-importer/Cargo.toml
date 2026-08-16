@@ -22,6 +22,7 @@ libc.workspace = true
 
 [dev-dependencies]
 personalai-engine-loader.workspace = true
+personalai-engine-placement.workspace = true
 personalai-engine-scheduler.workspace = true
 personalai-engine-server = { workspace = true, features = ["cpu-reference", "metal"] }
 personalai-engine-testkit.workspace = true

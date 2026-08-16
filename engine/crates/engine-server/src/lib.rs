@@ -32,18 +32,36 @@ use personalai_engine_crypto::EngineResponseSigner;
 use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
 pub use personalai_engine_loader::RegistrySelectionV2;
-#[cfg(all(unix, feature = "cpu-reference"))]
-use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
+#[cfg(all(
+    unix,
+    feature = "cpu-reference",
+    any(
+        all(feature = "arm64", target_arch = "aarch64"),
+        all(feature = "metal", target_os = "macos")
+    )
+))]
+use personalai_engine_loader::VerifiedDirectoryPackage;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_model_format::ParsedModelPackage;
+#[cfg(all(
+    unix,
+    feature = "cpu-reference",
+    any(
+        all(feature = "arm64", target_arch = "aarch64"),
+        all(feature = "metal", target_os = "macos")
+    )
+))]
+use personalai_engine_placement::MemoryTopology;
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_placement::{
-    BackendPlacementCapabilities, ExecutionPlacementPlan, MemoryTopology, PlacementPolicy,
-    PlacementResourceEnvelope,
+    BackendPlacementCapabilities, ExecutionPlacementPlan, PlacementPolicy,
+    PlacementResourceEnvelope, WeightResidencyMode,
 };
 use personalai_engine_protocol::{
     AuthenticatedServiceRequest, CancellationEnvelope, Frame, FrameKind, GenerationRequestEnvelope,
@@ -479,6 +497,24 @@ impl LoadedRuntimeModel {
         }
     }
 
+    fn pinned_package_bytes(&self) -> Result<u64, EngineError> {
+        let placement = match self {
+            Self::Cpu(loaded) => loaded.placement(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(loaded) => loaded.placement(),
+        };
+        let Some(placement) = placement else {
+            return Ok(0);
+        };
+        if placement.mode() != WeightResidencyMode::LayerStreamed {
+            return Ok(0);
+        }
+        placement
+            .mapped_bytes()
+            .checked_add(placement.immutable_overhead_bytes())
+            .ok_or_else(|| EngineError::resource_exhaustion("pinned package metric overflows"))
+    }
+
     fn architecture_id(&self) -> &personalai_engine_types::ArchitectureId {
         match self {
             Self::Cpu(loaded) => loaded.model().config().architecture_id(),
@@ -568,9 +604,25 @@ impl RuntimeDecoderSession {
     fn forward_token(
         &mut self,
         token: u32,
+        cancelled: &AtomicBool,
+        security_event: &mut Option<SecurityEvent>,
     ) -> Result<personalai_engine_tensor::Tensor, EngineError> {
         match self {
-            Self::Cpu(session) => session.forward_token(token),
+            Self::Cpu(session) => {
+                let mut duplicate = false;
+                let mut sink = |event| {
+                    if security_event.replace(event).is_some() {
+                        duplicate = true;
+                    }
+                };
+                let result = session.forward_token_selected(token, cancelled, &mut sink);
+                if duplicate {
+                    return Err(EngineError::internal_invariant(
+                        "one streamed token emitted multiple package security events",
+                    ));
+                }
+                result
+            }
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(session) => session.decode(token),
         }
@@ -1205,6 +1257,7 @@ pub struct GreedyGeneration {
     started: bool,
     terminal: Option<TerminalState>,
     usage: Option<GenerationUsage>,
+    pending_security_event: Option<SecurityEvent>,
     prefill_nanoseconds: u64,
     decode_nanoseconds: u64,
 }
@@ -1251,6 +1304,7 @@ fn start_generation_cursor(
         started: false,
         terminal: None,
         usage: None,
+        pending_security_event: None,
         prefill_nanoseconds: 0,
         decode_nanoseconds: 0,
     })
@@ -1309,7 +1363,8 @@ impl GreedyGeneration {
         })?;
         let logits = if let Some(token) = self.input_tokens.get(self.next_input).copied() {
             let started = Instant::now();
-            let logits = session.forward_token(token)?;
+            let logits =
+                session.forward_token(token, cancelled, &mut self.pending_security_event)?;
             add_timing(&mut self.prefill_nanoseconds, started.elapsed())?;
             self.next_input = self.next_input.checked_add(1).ok_or_else(|| {
                 EngineError::internal_invariant("generation input position overflows")
@@ -1320,7 +1375,8 @@ impl GreedyGeneration {
             logits
         } else if let Some(token) = self.next_generated_token.take() {
             let started = Instant::now();
-            let logits = session.forward_token(token)?;
+            let logits =
+                session.forward_token(token, cancelled, &mut self.pending_security_event)?;
             add_timing(&mut self.decode_nanoseconds, started.elapsed())?;
             logits
         } else {
@@ -1364,6 +1420,12 @@ impl GreedyGeneration {
     /// Returns final usage after completion.
     pub const fn usage(&self) -> Option<GenerationUsage> {
         self.usage
+    }
+
+    /// Removes one content-free package validation event produced during the
+    /// most recent streamed execution turn.
+    pub fn take_security_event(&mut self) -> Option<SecurityEvent> {
+        self.pending_security_event.take()
     }
 
     /// Returns the request correlation identifier.
@@ -1467,6 +1529,7 @@ pub struct ScheduledGenerationAdvance {
     decoder_tokens_advanced: u32,
     timing: GenerationTiming,
     event: Option<GenerationEvent>,
+    security_event: Option<SecurityEvent>,
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -1499,6 +1562,11 @@ impl ScheduledGenerationAdvance {
     /// Consumes the turn and returns its optional event.
     pub fn into_event(self) -> Option<GenerationEvent> {
         self.event
+    }
+
+    /// Returns one content-free package validation event from this turn.
+    pub const fn security_event(&self) -> Option<&SecurityEvent> {
+        self.security_event.as_ref()
     }
 }
 
@@ -1682,6 +1750,7 @@ impl GenerationRoundRobin {
         let before = scheduled.generation.processed_tokens();
         let timing_before = scheduled.generation.timing();
         let advance = scheduled.generation.advance(&scheduled.cancelled);
+        let security_event = scheduled.generation.take_security_event();
         let after = scheduled.generation.processed_tokens();
         let timing_after = scheduled.generation.timing();
         let decoder_tokens_advanced = after.checked_sub(before).ok_or_else(|| {
@@ -1729,6 +1798,7 @@ impl GenerationRoundRobin {
                     })?,
             },
             event,
+            security_event,
         }))
     }
 
@@ -1900,6 +1970,7 @@ struct GenerationConnection {
 struct ConnectionBatchState<'a> {
     service: &'a mut EngineService,
     metrics: &'a mut RuntimeMetrics,
+    security_events: &'a mut VecDeque<SecurityEvent>,
     models: &'a BTreeMap<String, LoadedRuntimeModel>,
     response_signer: &'a EngineResponseSigner,
     next_sequence: &'a mut u64,
@@ -1922,6 +1993,7 @@ pub struct CpuEngineRuntime {
         BTreeMap<personalai_engine_types::SignerKeyId, Arc<Mutex<DurableReplayJournal>>>,
     models: BTreeMap<String, LoadedRuntimeModel>,
     backend: RuntimeBackend,
+    placement_policy: PlacementPolicy,
     model_load_budgets: BTreeMap<String, ResourceBudget>,
     security_events: VecDeque<SecurityEvent>,
     metrics: RuntimeMetrics,
@@ -1943,7 +2015,12 @@ fn runtime_metrics(
     metrics.queued_requests = u64::try_from(service.scheduler.queued_len())
         .map_err(|_| EngineError::internal_invariant("queued request count exceeds u64"))?;
     metrics.host_memory_bytes = models.values().try_fold(0_u64, |total, loaded| {
-        let used = loaded.memory_pool().used_bytes()?;
+        let used =
+            loaded
+                .memory_pool()
+                .used_bytes()?
+                .checked_add(loaded.pinned_package_bytes()?)
+                .ok_or_else(|| EngineError::resource_exhaustion("model memory metric overflows"))?;
         total
             .checked_add(used)
             .ok_or_else(|| EngineError::resource_exhaustion("loaded model memory metric overflows"))
@@ -2056,10 +2133,15 @@ fn unload_model_parts(
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "load composition borrows disjoint trusted runtime state and keeps client input limited to ModelId"
+)]
 fn load_registered_model_parts(
     service: &EngineService,
     models: &mut BTreeMap<String, LoadedRuntimeModel>,
     backend: &RuntimeBackend,
+    placement_policy: PlacementPolicy,
     metrics: &mut RuntimeMetrics,
     model_id: &ModelId,
     budget: &ResourceBudget,
@@ -2068,16 +2150,19 @@ fn load_registered_model_parts(
     if models.contains_key(model_id.as_str()) {
         return Err(EngineError::invalid_input("model is already loaded"));
     }
-    let loaded = match load_runtime_model(service, model_id, budget, backend, events) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            metrics.package_validation_failures =
-                metrics.package_validation_failures.checked_add(1).ok_or_else(|| {
-                    EngineError::resource_exhaustion("package validation failure counter exhausted")
-                })?;
-            return Err(error);
-        }
-    };
+    let loaded =
+        match load_runtime_model(service, model_id, budget, backend, placement_policy, events) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                metrics.package_validation_failures =
+                    metrics.package_validation_failures.checked_add(1).ok_or_else(|| {
+                        EngineError::resource_exhaustion(
+                            "package validation failure counter exhausted",
+                        )
+                    })?;
+                return Err(error);
+            }
+        };
     models.insert(model_id.as_str().to_owned(), loaded);
     Ok(())
 }
@@ -2088,12 +2173,13 @@ fn load_runtime_model(
     model_id: &ModelId,
     budget: &ResourceBudget,
     backend: &RuntimeBackend,
+    placement_policy: PlacementPolicy,
     events: &mut impl DirectorySecurityEventSink,
 ) -> Result<LoadedRuntimeModel, EngineError> {
     match backend {
-        RuntimeBackend::CpuReference => {
-            service.load_registered_cpu_model(model_id, budget, events).map(LoadedRuntimeModel::Cpu)
-        }
+        RuntimeBackend::CpuReference => service
+            .load_registered_cpu_model_with_placement(model_id, budget, placement_policy, events)
+            .map(LoadedRuntimeModel::Cpu),
         #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
         RuntimeBackend::Arm64(arm64) => service
             .load_registered_arm64_model(model_id, budget, arm64.clone(), events)
@@ -2162,6 +2248,7 @@ fn handle_service_request_parts(
     service: &mut EngineService,
     models: &mut BTreeMap<String, LoadedRuntimeModel>,
     backend: &RuntimeBackend,
+    placement_policy: PlacementPolicy,
     model_load_budgets: &BTreeMap<String, ResourceBudget>,
     security_events: &mut VecDeque<SecurityEvent>,
     metrics: &mut RuntimeMetrics,
@@ -2208,6 +2295,7 @@ fn handle_service_request_parts(
                 service,
                 models,
                 backend,
+                placement_policy,
                 metrics,
                 model_id,
                 &budget,
@@ -2305,6 +2393,36 @@ impl CpuEngineRuntime {
         response_signer: EngineResponseSigner,
         backend: RuntimeBackend,
     ) -> Result<Self, EngineError> {
+        Self::new_with_control_keys_backend_and_placement(
+            service,
+            trusted_control_keys,
+            response_signer,
+            backend,
+            PlacementPolicy::fully_resident(),
+        )
+    }
+
+    /// Creates an unloaded runtime with owner-selected backend and residency.
+    ///
+    /// This policy is local startup configuration. It is never decoded from a
+    /// client frame and cannot contain package paths or tensor offsets.
+    pub fn new_with_control_keys_backend_and_placement(
+        service: EngineService,
+        trusted_control_keys: TrustedControlPlaneKeys,
+        response_signer: EngineResponseSigner,
+        backend: RuntimeBackend,
+        placement_policy: PlacementPolicy,
+    ) -> Result<Self, EngineError> {
+        match placement_policy.mode() {
+            WeightResidencyMode::FullyResident => {}
+            WeightResidencyMode::LayerStreamed
+                if matches!(&backend, RuntimeBackend::CpuReference) => {}
+            WeightResidencyMode::LayerStreamed | WeightResidencyMode::HybridResident => {
+                return Err(EngineError::not_implemented(
+                    "selected backend does not support the owner-configured residency mode",
+                ));
+            }
+        }
         for trusted_control_key in trusted_control_keys.configured_keys() {
             if trusted_control_key.key_id() == response_signer.key_id()
                 || trusted_control_key.public_key() == response_signer.public_key()
@@ -2329,6 +2447,7 @@ impl CpuEngineRuntime {
             replay_journals,
             models: BTreeMap::new(),
             backend,
+            placement_policy,
             model_load_budgets: BTreeMap::new(),
             security_events: VecDeque::new(),
             metrics: RuntimeMetrics::default(),
@@ -2359,6 +2478,11 @@ impl CpuEngineRuntime {
     /// Returns the current local health classification.
     pub fn health(&self) -> ServiceHealth {
         runtime_health(self.draining, &self.models)
+    }
+
+    /// Returns the owner-selected, content-free residency policy.
+    pub const fn placement_policy(&self) -> PlacementPolicy {
+        self.placement_policy
     }
 
     /// Drains sanitized typed telemetry for Go-owned delivery and audit.
@@ -2393,6 +2517,7 @@ impl CpuEngineRuntime {
             &mut self.service,
             &mut self.models,
             &self.backend,
+            self.placement_policy,
             &self.model_load_budgets,
             &mut self.security_events,
             &mut self.metrics,
@@ -2485,6 +2610,7 @@ impl CpuEngineRuntime {
             &self.service,
             &mut self.models,
             &self.backend,
+            self.placement_policy,
             &mut self.metrics,
             model_id,
             budget,
@@ -2636,6 +2762,7 @@ impl CpuEngineRuntime {
                         model,
                         sequence_id,
                         &cancelled,
+                        &mut self.security_events,
                         |event| {
                             let ordinal = event_ordinal;
                             event_ordinal = event_ordinal.checked_add(1).ok_or_else(|| {
@@ -2707,6 +2834,7 @@ impl CpuEngineRuntime {
         let mut batch = ConnectionBatchState {
             service: &mut self.service,
             metrics: &mut self.metrics,
+            security_events: &mut self.security_events,
             models: &self.models,
             response_signer: &self.response_signer,
             next_sequence: &mut self.next_sequence,
@@ -2726,6 +2854,7 @@ impl CpuEngineRuntime {
         Self::run_connection_coordinator(
             batch.service,
             batch.metrics,
+            batch.security_events,
             batch.response_signer,
             &mut coordinator,
             batch.active,
@@ -2816,6 +2945,7 @@ impl CpuEngineRuntime {
     fn run_connection_coordinator(
         service: &mut EngineService,
         metrics: &mut RuntimeMetrics,
+        security_events: &mut VecDeque<SecurityEvent>,
         response_signer: &EngineResponseSigner,
         coordinator: &mut GenerationRoundRobin,
         active: &mut Vec<ActiveGenerationConnection>,
@@ -2908,6 +3038,7 @@ impl CpuEngineRuntime {
             let run_result = drive_generation_connections(
                 service,
                 metrics,
+                security_events,
                 response_signer,
                 coordinator,
                 active,
@@ -3137,6 +3268,7 @@ fn prepare_output_writers(
 fn drive_generation_connections(
     service: &mut EngineService,
     metrics: &mut RuntimeMetrics,
+    security_events: &mut VecDeque<SecurityEvent>,
     response_signer: &EngineResponseSigner,
     coordinator: &mut GenerationRoundRobin,
     active: &mut Vec<ActiveGenerationConnection>,
@@ -3144,6 +3276,9 @@ fn drive_generation_connections(
 ) -> Result<(), EngineError> {
     while let Some(turn) = coordinator.advance_next()? {
         record_generation_timing(metrics, turn.timing())?;
+        if let Some(event) = turn.security_event().cloned() {
+            retain_security_event(security_events, event);
+        }
         let request_id = turn.request_id();
         let position = active
             .iter()
@@ -3814,12 +3949,20 @@ impl EngineService {
         Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer, placement: None })
     }
 
-    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[cfg(all(
+        unix,
+        feature = "cpu-reference",
+        any(
+            all(feature = "arm64", target_arch = "aarch64"),
+            all(feature = "metal", target_os = "macos")
+        )
+    ))]
     fn fully_resident_placement(
         verified: &VerifiedDirectoryPackage,
         budget: &ResourceBudget,
         backend_id: BackendId,
         topology: MemoryTopology,
+        currently_reserved_bytes: u64,
     ) -> Result<Arc<ExecutionPlacementPlan>, EngineError> {
         let maximum = budget.max_memory_bytes();
         let envelope =
@@ -3833,7 +3976,7 @@ impl EngineService {
             &capabilities,
             envelope,
             PlacementPolicy::fully_resident(),
-            0,
+            currently_reserved_bytes,
             verified.registration().registry_sequence().unwrap_or(1),
         )
         .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
@@ -3851,14 +3994,26 @@ impl EngineService {
         budget: &personalai_engine_types::ResourceBudget,
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<LoadedCpuModel, EngineError> {
+        self.load_registered_cpu_model_with_placement(
+            model_id,
+            budget,
+            PlacementPolicy::fully_resident(),
+            events,
+        )
+    }
+
+    /// Opens one registered package under an owner-selected CPU residency
+    /// policy. The policy is trusted startup state and never client input.
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    pub fn load_registered_cpu_model_with_placement(
+        &self,
+        model_id: &ModelId,
+        budget: &personalai_engine_types::ResourceBudget,
+        placement_policy: PlacementPolicy,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
-            let placement = Self::fully_resident_placement(
-                &verified,
-                budget,
-                BackendId::new("cpu-reference")?,
-                MemoryTopology::HostOnly,
-            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3868,8 +4023,52 @@ impl EngineService {
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
             }
-            let weights = verified.materialize_tensors(&pool)?.into_tensors();
-            let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
+            let maximum = budget.max_memory_bytes();
+            let envelope = PlacementResourceEnvelope::new(
+                maximum,
+                maximum,
+                maximum,
+                budget.max_kv_cache_bytes(),
+            )
+            .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+            let capabilities = BackendPlacementCapabilities::cpu_reference(maximum)
+                .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
+            let placement = Arc::new(
+                ExecutionPlacementPlan::derive(
+                    &verified,
+                    &capabilities,
+                    envelope,
+                    placement_policy,
+                    pool.used_bytes()?,
+                    verified.registration().registry_sequence().unwrap_or(1),
+                )
+                .map_err(personalai_engine_placement::PlacementError::into_engine_error)?,
+            );
+            if placement.backend_id() != &BackendId::new("cpu-reference")?
+                || placement.mode() != placement_policy.mode()
+            {
+                return Err(EngineError::internal_invariant(
+                    "derived CPU placement identity changed",
+                ));
+            }
+            let model = match placement.mode() {
+                WeightResidencyMode::FullyResident => {
+                    let weights = verified.materialize_tensors(&pool)?.into_tensors();
+                    CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?
+                }
+                WeightResidencyMode::LayerStreamed => CpuDecoderModel::new_registered_streamed(
+                    model_id.clone(),
+                    config,
+                    Arc::new(verified),
+                    Arc::clone(&placement),
+                    &pool,
+                )?,
+                WeightResidencyMode::HybridResident => {
+                    return Err(EngineError::not_implemented(
+                        "hybrid CPU placement is not implemented",
+                    ));
+                }
+            };
             Ok(LoadedCpuModel {
                 model_id: model_id.clone(),
                 model,
@@ -3907,12 +4106,6 @@ impl EngineService {
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
-            let placement = Self::fully_resident_placement(
-                &verified,
-                budget,
-                BackendId::new("arm64")?,
-                MemoryTopology::HostOnly,
-            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3922,6 +4115,13 @@ impl EngineService {
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
             }
+            let placement = Self::fully_resident_placement(
+                &verified,
+                budget,
+                BackendId::new("arm64")?,
+                MemoryTopology::HostOnly,
+                pool.used_bytes()?,
+            )?;
             let weights = verified.materialize_tensors(&pool)?.into_tensors();
             let model = CpuDecoderModel::new_registered_arm64(
                 model_id.clone(),
@@ -3966,12 +4166,6 @@ impl EngineService {
     ) -> Result<LoadedMetalModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result = (|| {
-            let placement = Self::fully_resident_placement(
-                &verified,
-                budget,
-                BackendId::new("metal")?,
-                MemoryTopology::Unified,
-            )?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -3981,6 +4175,13 @@ impl EngineService {
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
             }
+            let placement = Self::fully_resident_placement(
+                &verified,
+                budget,
+                BackendId::new("metal")?,
+                MemoryTopology::Unified,
+                pool.used_bytes()?,
+            )?;
             let weights = verified.materialize_tensors(&pool)?.into_tensors();
             let model = MetalDecoderModel::new_registered(
                 model_id.clone(),
@@ -4093,7 +4294,7 @@ impl EngineService {
         cancelled: &AtomicBool,
         emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
     ) -> Result<Option<GenerationMeasurement>, EngineError> {
-        self.run_next_greedy_cursor(sequence_id, cancelled, emit, |request| {
+        self.run_next_greedy_cursor(sequence_id, cancelled, emit, &mut |_event| {}, |request| {
             loaded.start_greedy(request, sequence_id)
         })
     }
@@ -4104,11 +4305,16 @@ impl EngineService {
         loaded: &LoadedRuntimeModel,
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
+        security_events: &mut VecDeque<SecurityEvent>,
         emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
     ) -> Result<Option<GenerationMeasurement>, EngineError> {
-        self.run_next_greedy_cursor(sequence_id, cancelled, emit, |request| {
-            loaded.start_greedy(request, sequence_id)
-        })
+        self.run_next_greedy_cursor(
+            sequence_id,
+            cancelled,
+            emit,
+            &mut |event| retain_security_event(security_events, event),
+            |request| loaded.start_greedy(request, sequence_id),
+        )
     }
 
     #[cfg(feature = "cpu-reference")]
@@ -4117,6 +4323,7 @@ impl EngineService {
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
         mut emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
+        security_events: &mut impl FnMut(SecurityEvent),
         start: impl FnOnce(&GenerationRequest) -> Result<GreedyGeneration, EngineError>,
     ) -> Result<Option<GenerationMeasurement>, EngineError> {
         let Some(active) = self.scheduler.start_next(sequence_id)?.cloned() else {
@@ -4126,7 +4333,11 @@ impl EngineService {
         let result: Result<GenerationMeasurement, EngineError> = (|| {
             let mut generation = start(active.request())?;
             loop {
-                match generation.advance(cancelled)? {
+                let advance = generation.advance(cancelled);
+                if let Some(event) = generation.take_security_event() {
+                    security_events(event);
+                }
+                match advance? {
                     GreedyAdvance::Progressed => {}
                     GreedyAdvance::Event(event) => {
                         let completed = match &event {

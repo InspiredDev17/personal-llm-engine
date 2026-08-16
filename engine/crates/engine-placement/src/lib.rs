@@ -35,6 +35,17 @@ pub enum WeightResidencyMode {
     LayerStreamed,
 }
 
+impl WeightResidencyMode {
+    /// Returns the stable content-free diagnostic name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullyResident => "fully-resident",
+            Self::HybridResident => "hybrid-resident",
+            Self::LayerStreamed => "layer-streamed",
+        }
+    }
+}
+
 /// Physical memory topology relevant to trusted placement decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryTopology {
@@ -181,6 +192,11 @@ impl PlacementPolicy {
     /// Selects bounded layer streaming with depth-one prefetch.
     pub const fn layer_streamed() -> Self {
         Self { mode: WeightResidencyMode::LayerStreamed, prefetch_depth: 1 }
+    }
+
+    /// Returns the exact owner-selected residency mode.
+    pub const fn mode(self) -> WeightResidencyMode {
+        self.mode
     }
 }
 
@@ -627,6 +643,16 @@ fn select_staging_requirement(
 #[derive(Clone, Debug, Default)]
 pub struct PlacementCancellation(Arc<AtomicBool>);
 
+/// Read-only cancellation probe shared by trusted placement execution.
+///
+/// The local service implements this through its existing request cancellation
+/// flag, so a cancellation watcher can stop an in-flight prefetch without a
+/// second polling thread or client-visible placement state.
+pub trait PlacementCancellationProbe: Sync {
+    /// Returns whether placement work must stop.
+    fn is_cancelled(&self) -> bool;
+}
+
 impl PlacementCancellation {
     /// Creates a live cancellation state.
     pub fn new() -> Self {
@@ -641,6 +667,18 @@ impl PlacementCancellation {
     /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+impl PlacementCancellationProbe for PlacementCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+impl PlacementCancellationProbe for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::Acquire)
     }
 }
 
@@ -683,7 +721,7 @@ pub fn run_layer_streamed(
     plan: &ExecutionPlacementPlan,
     package: &VerifiedDirectoryPackage,
     pool: &MemoryPool,
-    cancellation: &PlacementCancellation,
+    cancellation: &dyn PlacementCancellationProbe,
     faults: &dyn PlacementFaultInjector,
     events: &mut impl DirectorySecurityEventSink,
     mut execute: impl FnMut(&PlacementStage, &LoadedDirectoryTensors) -> Result<(), EngineError>,
@@ -921,7 +959,7 @@ fn required_streaming_staging(
 fn materialize_stage(
     package: &VerifiedDirectoryPackage,
     pool: &MemoryPool,
-    cancellation: &PlacementCancellation,
+    cancellation: &dyn PlacementCancellationProbe,
     faults: &dyn PlacementFaultInjector,
     stage: &PlacementStage,
 ) -> Result<LoadedDirectoryTensors, PlacementError> {
@@ -936,7 +974,7 @@ fn materialize_stage(
 fn run_bounded_pipeline<T, M, E>(
     stages: &[PlacementStage],
     peak_staging_bytes: u64,
-    cancellation: &PlacementCancellation,
+    cancellation: &dyn PlacementCancellationProbe,
     materialize: &M,
     execute: &mut E,
 ) -> Result<StreamedPlacementMetrics, PlacementError>
@@ -1019,7 +1057,7 @@ fn classify_engine_error(error: EngineError) -> PlacementError {
     }
 }
 
-fn check_cancelled(cancellation: &PlacementCancellation) -> Result<(), PlacementError> {
+fn check_cancelled(cancellation: &dyn PlacementCancellationProbe) -> Result<(), PlacementError> {
     if cancellation.is_cancelled() { Err(PlacementError::Cancelled) } else { Ok(()) }
 }
 

@@ -12,8 +12,9 @@ use personalai_engine_kv_cache::{
 use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 use personalai_engine_placement::{
-    ExecutionPlacementPlan, PlacementCancellation, PlacementFaultInjector, PlacementStage,
-    PlacementStageKind, PlacementTensorRange, WeightResidencyMode, run_layer_streamed,
+    ExecutionPlacementPlan, NoPlacementFaults, PlacementCancellationProbe, PlacementFaultInjector,
+    PlacementStage, PlacementStageKind, PlacementTensorRange, WeightResidencyMode,
+    run_layer_streamed,
 };
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
@@ -370,7 +371,7 @@ impl CpuDecoderSession {
     pub fn prefill_streamed(
         &mut self,
         tokens: &[u32],
-        cancellation: &PlacementCancellation,
+        cancellation: &dyn PlacementCancellationProbe,
         faults: &dyn PlacementFaultInjector,
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<Tensor, EngineError> {
@@ -401,7 +402,7 @@ impl CpuDecoderSession {
     pub fn forward_token_streamed(
         &mut self,
         token: u32,
-        cancellation: &PlacementCancellation,
+        cancellation: &dyn PlacementCancellationProbe,
         faults: &dyn PlacementFaultInjector,
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<Tensor, EngineError> {
@@ -489,6 +490,26 @@ impl CpuDecoderSession {
             .checked_add(1)
             .ok_or_else(|| EngineError::internal_invariant("decoder token count overflows"))?;
         Ok(output)
+    }
+
+    /// Executes through the model's owner-selected residency mode while
+    /// observing the service request's existing cancellation flag.
+    ///
+    /// Fully resident models retain the original fast path. Streamed models
+    /// use the bounded, fault-free production staging path and report any
+    /// content-free package validation event through the mandatory sink.
+    pub fn forward_token_selected(
+        &mut self,
+        token: u32,
+        cancellation: &dyn PlacementCancellationProbe,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<Tensor, EngineError> {
+        let streamed = matches!(self.model.inner.weights, DecoderWeights::Streamed { .. });
+        if streamed {
+            self.forward_token_streamed(token, cancellation, &NoPlacementFaults, events)
+        } else {
+            self.forward_token(token)
+        }
     }
 
     fn forward_layer(

@@ -1,8 +1,8 @@
 # ADR-0029: Trusted execution placement and bounded layer staging
 
-Status: accepted for portable planning, fully resident composition, and scalar
-CPU streamed decoding; service activation, hybrid execution, and operated
-qualification remain open
+Status: accepted for portable planning, fully resident composition, scalar CPU
+streamed decoding, and owner-selected local service activation; hybrid
+execution and operated qualification remain open
 
 Date: 2026-08-16
 
@@ -73,8 +73,10 @@ future discrete-device topology are distinct. CUDA remains unimplemented.
 - Layer ranges may be unequal and are derived from signed tensor records rather
   than caller offsets.
 - Scalar streamed prefill/decode is real and differential-tested against fully
-  resident scalar execution. The authenticated service does not yet advertise
-  or select it. No performance claim is made.
+  resident scalar execution. Owner startup may select it only with the
+  `cpu-reference` backend; the default remains fully resident. Clients still
+  submit only `ModelId`, and the wire contains no plan, path, offset, or
+  residency override. No performance claim is made.
 - Automatic eviction remains absent. Go may request exact idle unload under
   ADR-0028; pressure otherwise fails explicitly.
 - A future canonical placement policy requires a reviewed Sovereign Contracts
@@ -86,8 +88,9 @@ Portable tests cover real signed package conversion and verification, exact
 resident/streamed plans, unequal stages, tied weights, checked ceilings,
 bounded prefetch order, cancellation and injected failure cleanup, mapped-file
 mutation after verification, bit-exact resident-versus-streamed multi-token
-decode, partial-KV cancellation invalidation, hybrid rejection, and protocol/DAG authority
-boundaries. These tests establish planning and staging correctness only.
+decode, service-composed generation, partial-KV cancellation invalidation,
+hybrid rejection, and protocol/DAG authority boundaries. These tests establish
+portable correctness only.
 
 Production acceptance still requires a licensed qualified model, owner-held
 signing keys, actual Apple Silicon/Metal pressure and throughput measurements,

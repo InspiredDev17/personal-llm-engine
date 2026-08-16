@@ -37,10 +37,11 @@
 
 - Signed CPU, ARM64, and Metal loads now derive exact fully resident placement
   plans. Scalar CPU streamed prefill/decode runs through bounded layer staging
-  and depth-one prefetch with signed-fixture parity, but it is not selectable
-  through the authenticated service and is not advertised. Hybrid CPU/GPU
-  placement is explicitly unsupported. There is no evidence that streaming is
-  faster than residency.
+  and depth-one prefetch with signed-fixture parity. Owner startup may select it
+  only for the scalar CPU service; fully resident remains the default and
+  clients cannot override it. The V1 descriptor does not report residency mode.
+  Hybrid CPU/GPU placement is explicitly unsupported. There is no evidence that
+  streaming is faster than residency.
 - Placement accounting uses conservative logical bytes for mapped content,
   immutable metadata, execution tensors, staged metadata, existing reservations,
   and safety reserve. General allocator/page-table overhead remains part of the

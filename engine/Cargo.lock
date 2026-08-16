@@ -133,6 +133,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "personalai-engine-crypto",
+ "personalai-engine-placement",
  "personalai-engine-sampling",
  "personalai-engine-scheduler",
  "personalai-engine-server",
@@ -220,6 +221,7 @@ dependencies = [
  "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",
+ "personalai-engine-placement",
  "personalai-engine-quantization",
  "personalai-engine-scheduler",
  "personalai-engine-server",

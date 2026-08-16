@@ -48,6 +48,11 @@ requires recorded capacity review.
    device-memory ceiling and buffer-count ceiling. Omission selects CPU
    reference. Confirm Go pins `PERSONALAI_NATIVE_ENGINE_BACKEND_ID=metal` and
    rejects any signed descriptor mismatch before registering the provider.
+   Fully resident weights remain the default. The owner may set
+   `--weight-residency layer-streamed` only with `--execution-backend
+   cpu-reference`; confirm the content-free startup record reports the selected
+   residency. Clients cannot override this value, and V1 authenticated status
+   does not yet carry a canonical residency field.
 6. On Linux, run `systemd-analyze security` and an operated UDS-success plus
    IPv4/IPv6-denial test. On macOS, run `verify-sandbox.sh`; treat it only as a
    transitional development proof.

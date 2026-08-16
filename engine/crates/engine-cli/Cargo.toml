@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 libc.workspace = true
 personalai-engine-crypto.workspace = true
+personalai-engine-placement.workspace = true
 personalai-engine-scheduler.workspace = true
 personalai-engine-sampling.workspace = true
 personalai-engine-server = { workspace = true, default-features = false }

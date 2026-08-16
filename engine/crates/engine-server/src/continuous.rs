@@ -166,6 +166,7 @@ struct ContinuousState<'a> {
     replay_journals: Arc<BTreeMap<SignerKeyId, Arc<Mutex<DurableReplayJournal>>>>,
     models: &'a mut BTreeMap<String, LoadedRuntimeModel>,
     backend: &'a super::RuntimeBackend,
+    placement_policy: super::PlacementPolicy,
     model_load_budgets: &'a BTreeMap<String, ResourceBudget>,
     security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
@@ -227,6 +228,7 @@ impl CpuEngineRuntime {
             replay_journals: Arc::new(self.replay_journals.clone()),
             models: &mut self.models,
             backend: &self.backend,
+            placement_policy: self.placement_policy,
             model_load_budgets: &self.model_load_budgets,
             security_events: &mut self.security_events,
             metrics: &mut self.metrics,
@@ -495,6 +497,7 @@ impl ContinuousState<'_> {
             self.service,
             self.models,
             self.backend,
+            self.placement_policy,
             self.model_load_budgets,
             self.security_events,
             self.metrics,
@@ -574,6 +577,9 @@ impl ContinuousState<'_> {
             return Ok(false);
         };
         record_generation_timing(self.metrics, turn.timing())?;
+        if let Some(event) = turn.security_event().cloned() {
+            retain_security_event(self.security_events, event);
+        }
         let request_id = turn.request_id();
         let position = self
             .active

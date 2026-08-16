@@ -8,6 +8,7 @@ use personalai_engine_crypto::TrustedSigner;
 use personalai_engine_crypto::{
     EngineResponseSigner, TrustedControlPlaneKey, TrustedControlPlaneKeys,
 };
+use personalai_engine_placement::{PlacementPolicy, WeightResidencyMode};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_sampling::SamplingConfig;
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -65,7 +66,8 @@ const USAGE: &str = "usage:
     [--previous-control-key-id HEX32 --previous-control-public-key HEX64] \
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
-    [--execution-backend cpu-reference|arm64]
+    [--execution-backend cpu-reference|arm64] \
+    [--weight-residency fully-resident|layer-streamed]
   owner-pinned serving may repeat this option up to 127 times to register cold models:
     --additional-owner-model 'ID|BASENAME.paimodel|SHA384_HEX96|SIGNER_KEY_ID_HEX32|SIGNER_PUBLIC_KEY_HEX64|MAX_MEMORY|MAX_KV|MAX_SEQUENCES'
   personalai-engine serve-continuous --model-root PATH --runtime-root PATH --socket PATH \
@@ -77,7 +79,8 @@ const USAGE: &str = "usage:
     --response-key-id HEX32 \
     --max-memory-bytes U64 --max-kv-cache-bytes U64 \
     --max-active-sequences U32 --max-connections U32 \
-    [--execution-backend cpu-reference|arm64]
+    [--execution-backend cpu-reference|arm64] \
+    [--weight-residency fully-resident|layer-streamed]
   ARM64 selection requires an aarch64 binary built with --features arm64.
   to select Metal in a macOS binary built with --features metal, replace the backend option with:
     --execution-backend metal --metal-device-index USIZE \
@@ -137,6 +140,7 @@ struct ServeConfig {
     budget: ResourceBudget,
     additional_models: Vec<AdditionalOwnerModel>,
     backend: ServeBackend,
+    placement_policy: PlacementPolicy,
     mode: ServeMode,
 }
 
@@ -219,6 +223,7 @@ struct RawServeConfig {
     max_active_sequences: Option<u32>,
     max_connections: Option<u32>,
     execution_backend: Option<ServeBackendKind>,
+    weight_residency: Option<WeightResidencyMode>,
     metal_device_index: Option<usize>,
     max_device_memory_bytes: Option<u64>,
     max_metal_buffers: Option<usize>,
@@ -489,6 +494,9 @@ fn parse_serve(
             "--execution-backend" if config.execution_backend.is_none() => {
                 config.execution_backend = Some(parse_serve_backend(text)?);
             }
+            "--weight-residency" if config.weight_residency.is_none() => {
+                config.weight_residency = Some(parse_weight_residency(text)?);
+            }
             "--metal-device-index" if config.metal_device_index.is_none() => {
                 config.metal_device_index = Some(parse_usize(text)?);
             }
@@ -530,6 +538,7 @@ fn parse_serve(
             | "--max-active-sequences"
             | "--max-connections"
             | "--execution-backend"
+            | "--weight-residency"
             | "--metal-device-index"
             | "--max-device-memory-bytes"
             | "--max-metal-buffers" => {
@@ -551,6 +560,20 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
     let registration = finish_registration(&config, &model_id)?;
     validate_additional_models(&config, &model_id)?;
     let backend = finish_serve_backend(&config)?;
+    let placement_policy = match config.weight_residency {
+        None | Some(WeightResidencyMode::FullyResident) => PlacementPolicy::fully_resident(),
+        Some(WeightResidencyMode::LayerStreamed) => {
+            if !matches!(&backend, ServeBackend::CpuReference) {
+                return Err(CliError::InvalidArguments(
+                    "layer-streamed residency requires the cpu-reference backend",
+                ));
+            }
+            PlacementPolicy::layer_streamed()
+        }
+        Some(WeightResidencyMode::HybridResident) => {
+            return Err(CliError::InvalidArguments("hybrid residency is not implemented"));
+        }
+    };
     let service = ServiceConfig::new(
         required(config.model_root, "--model-root is required")?,
         required(config.runtime_root, "--runtime-root is required")?,
@@ -576,6 +599,7 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         budget,
         additional_models: config.additional_models,
         backend,
+        placement_policy,
         mode,
     })
 }
@@ -735,6 +759,16 @@ fn parse_serve_backend(value: &str) -> Result<ServeBackendKind, CliError> {
         "metal" => Ok(ServeBackendKind::Metal),
         _ => Err(CliError::InvalidArguments(
             "execution backend must be cpu-reference, arm64, or metal",
+        )),
+    }
+}
+
+fn parse_weight_residency(value: &str) -> Result<WeightResidencyMode, CliError> {
+    match value {
+        "fully-resident" => Ok(WeightResidencyMode::FullyResident),
+        "layer-streamed" => Ok(WeightResidencyMode::LayerStreamed),
+        _ => Err(CliError::InvalidArguments(
+            "weight residency must be fully-resident or layer-streamed",
         )),
     }
 }
@@ -1060,11 +1094,12 @@ fn serve(
             RuntimeBackend::Metal(MetalBackend::new(device_index, memory_bytes, maximum_buffers)?)
         }
     };
-    let mut runtime = CpuEngineRuntime::new_with_control_keys_and_backend(
+    let mut runtime = CpuEngineRuntime::new_with_control_keys_backend_and_placement(
         service,
         control_keys,
         response_signer,
         backend,
+        config.placement_policy,
     )?;
     runtime.configure_model_load_budget(&config.model_id, config.budget)?;
     for model in &config.additional_models {
@@ -1080,6 +1115,12 @@ fn serve(
     if event_write_failed {
         return Err(CliError::Io);
     }
+    writeln!(
+        errors,
+        "native-engine weight_residency={}",
+        runtime.placement_policy().mode().as_str(),
+    )
+    .map_err(|_| CliError::Io)?;
     let listener = UnixFrameListener::bind(runtime.service().config())?;
     match config.mode {
         ServeMode::Single => serve_single(&mut runtime, &listener, errors),
@@ -1398,6 +1439,16 @@ mod tests {
             panic!("serve command changed kind");
         };
         assert!(matches!(config.backend, ServeBackend::CpuReference));
+        assert_eq!(config.placement_policy.mode(), WeightResidencyMode::FullyResident);
+
+        let mut streamed = complete_serve_arguments();
+        streamed.extend(["--weight-residency", "layer-streamed"].map(OsString::from));
+        let Command::Serve(streamed) =
+            parse_command(streamed.into_iter()).expect("streamed CPU serve must parse")
+        else {
+            panic!("streamed serve command changed kind");
+        };
+        assert_eq!(streamed.placement_policy.mode(), WeightResidencyMode::LayerStreamed);
 
         let mut invalid = complete_serve_arguments();
         invalid.extend(["--max-device-memory-bytes", "1048576"].map(OsString::from));

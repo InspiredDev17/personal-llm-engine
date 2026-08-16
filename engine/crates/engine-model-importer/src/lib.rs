@@ -1451,6 +1451,7 @@ mod tests {
     use personalai_engine_model_format::{
         DIRECTORY_MANIFEST_HEADER_BYTES, DirectoryManifest, ParsedModelPackage,
     };
+    use personalai_engine_placement::{PlacementPolicy, WeightResidencyMode};
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
@@ -1738,6 +1739,17 @@ mod tests {
 
     #[cfg(unix)]
     fn load_cpu_profile(profile: QuantizationProfile) -> personalai_engine_server::LoadedCpuModel {
+        let (model, root, store, package_path) =
+            load_cpu_profile_fixture(profile, PlacementPolicy::fully_resident());
+        remove_sealed_store(&root, &store, &package_path);
+        model
+    }
+
+    #[cfg(unix)]
+    fn load_cpu_profile_fixture(
+        profile: QuantizationProfile,
+        placement_policy: PlacementPolicy,
+    ) -> (personalai_engine_server::LoadedCpuModel, PathBuf, PathBuf, PathBuf) {
         let root = temporary_root(&format!("cpu-{}", profile.as_str()));
         let store = root.join("models");
         let runtime = root.join("runtime");
@@ -1779,10 +1791,14 @@ mod tests {
             .expect("profile package must register");
         let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
         let model = service
-            .load_registered_cpu_model(spec.model_id(), &budget, &mut |_| {})
+            .load_registered_cpu_model_with_placement(
+                spec.model_id(),
+                &budget,
+                placement_policy,
+                &mut |_| {},
+            )
             .expect("profile CPU model must load");
-        remove_sealed_store(&root, &store, &package_path);
-        model
+        (model, root, store, package_path)
     }
 
     #[cfg(unix)]
@@ -1837,6 +1853,27 @@ mod tests {
             )
             .expect("profile generation must complete");
         tokens
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_selected_streamed_service_generation_matches_resident_scalar_tokens() {
+        let resident = load_cpu_profile(QuantizationProfile::ReferenceF32);
+        let (streamed, root, store, package_path) = load_cpu_profile_fixture(
+            QuantizationProfile::ReferenceF32,
+            PlacementPolicy::layer_streamed(),
+        );
+        assert_eq!(
+            resident.placement().expect("resident plan").mode(),
+            WeightResidencyMode::FullyResident,
+        );
+        assert_eq!(
+            streamed.placement().expect("streamed plan").mode(),
+            WeightResidencyMode::LayerStreamed,
+        );
+        assert_eq!(profile_tokens(&resident, 701, 701), profile_tokens(&streamed, 702, 702));
+        drop(streamed);
+        remove_sealed_store(&root, &store, &package_path);
     }
 
     const REGISTRY_V2: &[u8] = include_bytes!(concat!(
