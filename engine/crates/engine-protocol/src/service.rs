@@ -66,6 +66,20 @@ pub enum ServiceMessageKind {
     ModelDescriptor = 20,
     /// Acknowledge delivery of a previously polled security-event prefix.
     AcknowledgeSecurityEvents = 21,
+    /// Create one sealed reusable prefix cache from a loaded registered model.
+    CreateReusableCache = 22,
+    /// Describe one scope-authorized reusable cache.
+    DescribeCache = 23,
+    /// List bounded scope-authorized reusable caches.
+    ListCaches = 24,
+    /// Stage one cache attachment for the correlated generation request.
+    AttachCache = 25,
+    /// Release a staged cache attachment.
+    ReleaseCache = 26,
+    /// Invalidate reusable cache state through a closed selector.
+    InvalidateCache = 27,
+    /// Query content-free reusable-cache metrics for one loaded model.
+    CacheMetrics = 28,
 }
 
 impl ServiceMessageKind {
@@ -92,6 +106,13 @@ impl ServiceMessageKind {
             19 => Ok(Self::SecurityEvents),
             20 => Ok(Self::ModelDescriptor),
             21 => Ok(Self::AcknowledgeSecurityEvents),
+            22 => Ok(Self::CreateReusableCache),
+            23 => Ok(Self::DescribeCache),
+            24 => Ok(Self::ListCaches),
+            25 => Ok(Self::AttachCache),
+            26 => Ok(Self::ReleaseCache),
+            27 => Ok(Self::InvalidateCache),
+            28 => Ok(Self::CacheMetrics),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -112,6 +133,13 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::CreateReusableCache
+                | Self::DescribeCache
+                | Self::ListCaches
+                | Self::AttachCache
+                | Self::ReleaseCache
+                | Self::InvalidateCache
+                | Self::CacheMetrics
         )
     }
 
@@ -134,6 +162,13 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::CreateReusableCache
+                | Self::DescribeCache
+                | Self::ListCaches
+                | Self::AttachCache
+                | Self::ReleaseCache
+                | Self::InvalidateCache
+                | Self::CacheMetrics
         )
     }
 }

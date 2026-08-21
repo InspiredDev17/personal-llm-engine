@@ -327,6 +327,120 @@ impl ContiguousKvCache {
         Ok(entry.token_count)
     }
 
+    /// Copies the committed prefix into a compact immutable byte sequence.
+    ///
+    /// The compact representation is ordered by key/value side, layer, then
+    /// committed token. Spare sequence capacity is never copied.
+    pub fn copy_committed_prefix(
+        &self,
+        handle: SequenceHandle,
+        token_count: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        let state = self.lock_state()?;
+        ensure_loaded(&state)?;
+        let entry = sequence(&state, handle)?;
+        ensure_active(entry)?;
+        if token_count == 0 || token_count > entry.token_count {
+            return Err(EngineError::invalid_input("reusable KV prefix token count is invalid"));
+        }
+        let compact_length = self.prefix_storage_bytes(token_count)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(compact_length)
+            .map_err(|_| EngineError::resource_exhaustion("KV prefix copy allocation failed"))?;
+        let layer_bytes = self.layer_token_bytes()?;
+        let copied_layer_bytes = usize::try_from(token_count)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(layer_bytes))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV prefix layer bytes overflow"))?;
+        let capacity_layer_bytes = usize::try_from(self.plan.token_capacity())
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(layer_bytes))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV capacity layer bytes overflow"))?;
+        let layers = usize::try_from(self.plan.layer_count())
+            .map_err(|_| EngineError::resource_exhaustion("KV layer count exceeds usize"))?;
+        for side in 0..2_usize {
+            for layer in 0..layers {
+                let segment = side
+                    .checked_mul(layers)
+                    .and_then(|value| value.checked_add(layer))
+                    .and_then(|value| value.checked_mul(capacity_layer_bytes))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("KV prefix offset overflows")
+                    })?;
+                let end = segment
+                    .checked_add(copied_layer_bytes)
+                    .ok_or_else(|| EngineError::resource_exhaustion("KV prefix range overflows"))?;
+                let bytes = entry.storage.as_bytes().get(segment..end).ok_or_else(|| {
+                    EngineError::internal_invariant("KV prefix range exceeds sequence storage")
+                })?;
+                output.extend_from_slice(bytes);
+            }
+        }
+        debug_assert_eq!(output.len(), compact_length);
+        Ok(output)
+    }
+
+    /// Restores a compact immutable prefix into a newly allocated empty sequence.
+    pub fn restore_committed_prefix(
+        &self,
+        handle: SequenceHandle,
+        token_count: u32,
+        source: &[u8],
+    ) -> Result<(), EngineError> {
+        let expected = self.prefix_storage_bytes(token_count)?;
+        if source.len() != expected {
+            return Err(EngineError::invalid_input("reusable KV prefix length is invalid"));
+        }
+        let layer_bytes = self.layer_token_bytes()?;
+        let copied_layer_bytes = usize::try_from(token_count)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(layer_bytes))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV prefix layer bytes overflow"))?;
+        let capacity_layer_bytes = usize::try_from(self.plan.token_capacity())
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(layer_bytes))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV capacity layer bytes overflow"))?;
+        let layers = usize::try_from(self.plan.layer_count())
+            .map_err(|_| EngineError::resource_exhaustion("KV layer count exceeds usize"))?;
+        let mut state = self.lock_state()?;
+        ensure_loaded(&state)?;
+        let entry = sequence_mut(&mut state, handle)?;
+        ensure_active(entry)?;
+        if entry.token_count != 0 {
+            return Err(EngineError::protocol_violation(
+                "reusable KV state requires an empty destination sequence",
+            ));
+        }
+        for side in 0..2_usize {
+            for layer in 0..layers {
+                let compact_segment = side
+                    .checked_mul(layers)
+                    .and_then(|value| value.checked_add(layer))
+                    .and_then(|value| value.checked_mul(copied_layer_bytes))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("KV source offset overflows")
+                    })?;
+                let compact_end = compact_segment
+                    .checked_add(copied_layer_bytes)
+                    .ok_or_else(|| EngineError::resource_exhaustion("KV source range overflows"))?;
+                let destination = side
+                    .checked_mul(layers)
+                    .and_then(|value| value.checked_add(layer))
+                    .and_then(|value| value.checked_mul(capacity_layer_bytes))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion("KV destination offset overflows")
+                    })?;
+                let bytes = source.get(compact_segment..compact_end).ok_or_else(|| {
+                    EngineError::internal_invariant("validated KV source range disappeared")
+                })?;
+                entry.storage.copy_storage_range_from(destination, bytes)?;
+            }
+        }
+        entry.token_count = token_count;
+        Ok(())
+    }
+
     /// Clears committed and spare storage while retaining sequence ownership.
     pub fn reset_sequence(&self, handle: SequenceHandle) -> Result<(), EngineError> {
         let mut state = self.lock_state()?;
@@ -420,6 +534,29 @@ impl ContiguousKvCache {
             .ok()
             .and_then(|heads| heads.checked_mul(usize::try_from(self.plan.head_dimension()).ok()?))
             .ok_or_else(|| EngineError::resource_exhaustion("KV layer width overflows"))
+    }
+
+    fn layer_token_bytes(&self) -> Result<usize, EngineError> {
+        self.layer_width()?
+            .checked_mul(usize::try_from(self.plan.dtype().byte_width()).map_err(|_| {
+                EngineError::resource_exhaustion("KV data type width exceeds usize")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("KV layer byte count overflows"))
+    }
+
+    pub(crate) fn prefix_storage_bytes(&self, token_count: u32) -> Result<usize, EngineError> {
+        if token_count == 0 || token_count > self.plan.token_capacity() {
+            return Err(EngineError::invalid_input("KV prefix token count is outside bounds"));
+        }
+        2_usize
+            .checked_mul(
+                usize::try_from(self.plan.layer_count()).map_err(|_| {
+                    EngineError::resource_exhaustion("KV layer count exceeds usize")
+                })?,
+            )
+            .and_then(|value| value.checked_mul(usize::try_from(token_count).ok()?))
+            .and_then(|value| value.checked_mul(self.layer_token_bytes().ok()?))
+            .ok_or_else(|| EngineError::resource_exhaustion("KV prefix byte count overflows"))
     }
 
     fn read_into(

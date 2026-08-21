@@ -32,6 +32,12 @@ use personalai_engine_crypto::EngineResponseSigner;
 use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_kv_cache::{
+    AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheScope,
+    CacheSourceIdentity, KvCacheAttachment, KvCacheCompatibility, KvCacheDescriptor, KvCacheId,
+    ReusableKvCacheLimits, ReusableKvCacheMetrics, ReusableKvCacheStore,
+};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
@@ -69,10 +75,12 @@ use personalai_engine_protocol::{
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_protocol::{
-    FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES, ServiceCapabilitySet, ServiceErrorCode,
-    ServiceHealthStatus, ServiceMessageKind, ServiceMetrics, ServiceModelDescriptor,
-    ServiceModelStatus, ServiceRequestBody, ServiceResponseBody, ServiceSecurityEvent,
-    ShutdownRejectionReason, encode_signed_service_response,
+    FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES, ServiceCacheDescriptor, ServiceCacheId,
+    ServiceCacheInvalidation, ServiceCacheMetrics, ServiceCacheNamespace, ServiceCacheRequest,
+    ServiceCacheResponse, ServiceCacheScope, ServiceCacheSource, ServiceCapabilitySet,
+    ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind, ServiceMetrics,
+    ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody, ServiceResponseBody,
+    ServiceSecurityEvent, ShutdownRejectionReason, encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -84,7 +92,9 @@ use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_tokenizer::{IncrementalDecoder, Tokenizer, build_tokenizer};
+use personalai_engine_tokenizer::{
+    EncodeOptions, IncrementalDecoder, SpecialTokenPolicy, Tokenizer, build_tokenizer,
+};
 #[cfg(feature = "arm64")]
 use personalai_engine_transformer::Arm64Backend;
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
@@ -121,6 +131,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
 #[cfg(feature = "cpu-reference")]
 use std::time::Instant;
+#[cfg(all(unix, feature = "cpu-reference"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum configured Unix socket path bytes for conservative portability.
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -439,6 +451,8 @@ pub struct LoadedCpuModel {
     model: CpuDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
     placement: Option<Arc<ExecutionPlacementPlan>>,
+    reusable_cache: Option<Arc<ReusableKvCacheStore>>,
+    cache_compatibility: KvCacheCompatibility,
 }
 
 /// Fully loaded, signed model whose complete decoder executes through Metal.
@@ -459,8 +473,27 @@ enum LoadedRuntimeModel {
     Metal(LoadedMetalModel),
 }
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[derive(Clone)]
+struct PendingCacheAttachment {
+    model_id: ModelId,
+    cache_id: KvCacheId,
+    scope: CacheScope,
+    expected_token_count: u32,
+}
+
 #[cfg(feature = "cpu-reference")]
 impl LoadedRuntimeModel {
+    fn cpu(&self) -> Result<&LoadedCpuModel, EngineError> {
+        match self {
+            Self::Cpu(loaded) => Ok(loaded),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => Err(EngineError::not_implemented(
+                "reusable cache operations are not implemented for Metal",
+            )),
+        }
+    }
+
     fn tokenizer(&self) -> &dyn Tokenizer {
         match self {
             Self::Cpu(loaded) => loaded.tokenizer(),
@@ -479,6 +512,31 @@ impl LoadedRuntimeModel {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(loaded) => loaded.start_greedy(request, sequence_id),
         }
+    }
+
+    #[cfg(unix)]
+    fn start_greedy_with_cache(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        pending: Option<PendingCacheAttachment>,
+    ) -> Result<GreedyGeneration, EngineError> {
+        let Some(pending) = pending else {
+            return self.start_greedy(request, sequence_id);
+        };
+        if pending.model_id != *request.model_id() {
+            return Err(EngineError::authentication_failure(
+                "staged cache model differs from generation model",
+            ));
+        }
+        self.cpu()?.start_greedy_with_cache(
+            request,
+            sequence_id,
+            pending.cache_id,
+            pending.scope,
+            pending.expected_token_count,
+            unix_seconds()?,
+        )
     }
 
     fn memory_pool(&self) -> &MemoryPool {
@@ -546,6 +604,19 @@ impl LoadedRuntimeModel {
             Self::Metal(loaded) => loaded.model().unload_if_idle().map(|_| ()),
         }
     }
+
+    fn invalidate_reusable_model(&self) -> Result<(), EngineError> {
+        match self {
+            Self::Cpu(loaded) => {
+                if let Some(store) = &loaded.reusable_cache {
+                    store.invalidate_model()?;
+                }
+                Ok(())
+            }
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => Ok(()),
+        }
+    }
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -601,6 +672,26 @@ impl RuntimeDecoderModel {
 
 #[cfg(feature = "cpu-reference")]
 impl RuntimeDecoderSession {
+    fn attach_reusable_cache(
+        &mut self,
+        start: &CacheGenerationStart,
+    ) -> Result<(KvCacheAttachment, personalai_engine_tensor::Tensor), EngineError> {
+        match self {
+            Self::Cpu(session) => session.attach_reusable_cache(
+                &start.store,
+                start.cache_id,
+                &start.scope,
+                &start.compatibility,
+                start.expected_token_count,
+                start.now_unix_seconds,
+            ),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => Err(EngineError::not_implemented(
+                "reusable cache attachment is not implemented for Metal",
+            )),
+        }
+    }
+
     fn forward_token(
         &mut self,
         token: u32,
@@ -673,6 +764,7 @@ impl LoadedMetalModel {
             request,
             sequence_id,
             SamplingConfig::greedy(),
+            None,
         )
     }
 
@@ -863,6 +955,83 @@ impl LoadedCpuModel {
         self.placement.as_deref()
     }
 
+    /// Returns the bounded reusable-prefix store when the load budget preserved headroom.
+    pub fn reusable_cache_store(&self) -> Result<&ReusableKvCacheStore, EngineError> {
+        self.reusable_cache.as_deref().ok_or_else(|| {
+            EngineError::resource_exhaustion(
+                "loaded model budget leaves no reusable-cache memory headroom",
+            )
+        })
+    }
+
+    /// Returns exact package, tokenizer, architecture, backend, RoPE, and K/V compatibility.
+    pub const fn reusable_cache_compatibility(&self) -> &KvCacheCompatibility {
+        &self.cache_compatibility
+    }
+
+    /// Prefills and seals one exact static prefix in request-independent state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_reusable_cache(
+        &self,
+        budget: &ResourceBudget,
+        request_id: RequestId,
+        sequence_id: SequenceId,
+        text: &str,
+        scope: CacheScope,
+        source: Option<CacheSourceIdentity>,
+        retention: CacheRetentionPolicy,
+        now_unix_seconds: u64,
+    ) -> Result<KvCacheDescriptor, EngineError> {
+        let tokens = self.tokenizer.encode(text)?;
+        let token_count = u32::try_from(tokens.len())
+            .map_err(|_| EngineError::resource_exhaustion("cache token count exceeds u32"))?;
+        if token_count == 0 || token_count > self.model.config().context_limit().get() {
+            return Err(EngineError::invalid_input("cache prefix token count is invalid"));
+        }
+        let mut session = self.model.start_session(budget, request_id, sequence_id)?;
+        let logits = session.prefill(&tokens)?;
+        session.seal_reusable_cache(
+            self.reusable_cache_store()?,
+            self.cache_compatibility.clone(),
+            scope,
+            source,
+            &tokens,
+            &logits,
+            now_unix_seconds,
+            retention,
+        )
+    }
+
+    /// Creates one resumable greedy cursor from a scope-authorized sealed prefix.
+    pub fn start_greedy_with_cache(
+        &self,
+        request: &GenerationRequest,
+        sequence_id: SequenceId,
+        cache_id: KvCacheId,
+        scope: CacheScope,
+        expected_token_count: u32,
+        now_unix_seconds: u64,
+    ) -> Result<GreedyGeneration, EngineError> {
+        start_generation_cursor(
+            &self.model_id,
+            RuntimeDecoderModel::Cpu(self.model.clone()),
+            Arc::clone(&self.tokenizer),
+            request,
+            sequence_id,
+            SamplingConfig::greedy(),
+            Some(CacheGenerationStart {
+                store: Arc::clone(self.reusable_cache.as_ref().ok_or_else(|| {
+                    EngineError::resource_exhaustion("reusable cache is unavailable")
+                })?),
+                compatibility: self.cache_compatibility.clone(),
+                cache_id,
+                scope,
+                expected_token_count,
+                now_unix_seconds,
+            }),
+        )
+    }
+
     /// Creates one validated, resumable greedy-generation sequence.
     ///
     /// Each call to [`GreedyGeneration::advance`] performs at most one decoder
@@ -890,6 +1059,7 @@ impl LoadedCpuModel {
             request,
             sequence_id,
             sampling,
+            None,
         )
     }
 
@@ -1099,6 +1269,53 @@ impl LoadedCpuModel {
     }
 }
 
+#[cfg(feature = "cpu-reference")]
+fn build_loaded_cpu_model(
+    model_id: ModelId,
+    model: CpuDecoderModel,
+    tokenizer: Arc<dyn Tokenizer>,
+    placement: Option<Arc<ExecutionPlacementPlan>>,
+    package_hash: ModelPackageHash,
+    tokenizer_hash: ModelPackageHash,
+    budget: &ResourceBudget,
+) -> Result<LoadedCpuModel, EngineError> {
+    let compatibility = KvCacheCompatibility::new(
+        model_id.clone(),
+        package_hash,
+        tokenizer_hash,
+        model.config().architecture_id().clone(),
+        model.backend_id()?,
+        AttentionPositionSemantics::CausalZeroBasedV1,
+        model.config().rope_theta(),
+        1.0,
+        model.config().cache_dtype(),
+    )?;
+    let headroom = model.kv_sequence_allocation_bytes();
+    let maximum_bytes = budget
+        .max_kv_cache_bytes()
+        .saturating_sub(headroom)
+        .min(model.memory_pool().limit_bytes().saturating_sub(headroom));
+    let reusable_cache = if maximum_bytes == 0 || headroom == 0 {
+        None
+    } else {
+        let limits = ReusableKvCacheLimits::new(
+            u32::from(personalai_engine_protocol::MAX_SERVICE_CACHE_RESULTS),
+            maximum_bytes,
+            headroom,
+            model.memory_pool().limit_bytes(),
+        )?;
+        Some(Arc::new(model.create_reusable_cache_store(limits)?))
+    };
+    Ok(LoadedCpuModel {
+        model_id,
+        model,
+        tokenizer,
+        placement,
+        reusable_cache,
+        cache_compatibility: compatibility,
+    })
+}
+
 /// First-party generation stop classification.
 #[cfg(feature = "cpu-reference")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1246,8 +1463,13 @@ pub struct GreedyGeneration {
     model: RuntimeDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
     session: Option<RuntimeDecoderSession>,
+    cache_start: Option<CacheGenerationStart>,
+    cache_attachment: Option<KvCacheAttachment>,
+    cached_final_logits: Option<personalai_engine_tensor::Tensor>,
+    cache_metric_store: Option<Arc<ReusableKvCacheStore>>,
     input_tokens: Vec<u32>,
     input_count: u32,
+    uncached_input_count: u32,
     history: Vec<u32>,
     sampler: Sampler,
     next_input: usize,
@@ -1260,6 +1482,19 @@ pub struct GreedyGeneration {
     pending_security_event: Option<SecurityEvent>,
     prefill_nanoseconds: u64,
     decode_nanoseconds: u64,
+    request_started: Option<Instant>,
+    time_to_first_token_nanoseconds: Option<u64>,
+}
+
+#[cfg(feature = "cpu-reference")]
+#[derive(Clone)]
+struct CacheGenerationStart {
+    store: Arc<ReusableKvCacheStore>,
+    compatibility: KvCacheCompatibility,
+    cache_id: KvCacheId,
+    scope: CacheScope,
+    expected_token_count: u32,
+    now_unix_seconds: u64,
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -1270,6 +1505,7 @@ fn start_generation_cursor(
     request: &GenerationRequest,
     sequence_id: SequenceId,
     sampling: SamplingConfig,
+    cache_start: Option<CacheGenerationStart>,
 ) -> Result<GreedyGeneration, EngineError> {
     if request.model_id() != model_id {
         return Err(EngineError::invalid_input(
@@ -1281,9 +1517,20 @@ fn start_generation_cursor(
             "request context exceeds the loaded model context",
         ));
     }
-    let input_tokens = tokenizer.encode(request.input_text())?;
-    let input_count = u32::try_from(input_tokens.len())
+    let input_tokens = if cache_start.is_some() {
+        tokenizer.encode_with_options(
+            request.input_text(),
+            EncodeOptions::new(false, false, SpecialTokenPolicy::Reject),
+        )?
+    } else {
+        tokenizer.encode(request.input_text())?
+    };
+    let uncached_input_count = u32::try_from(input_tokens.len())
         .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
+    let cached_input_count = cache_start.as_ref().map_or(0, |cache| cache.expected_token_count);
+    let input_count = cached_input_count
+        .checked_add(uncached_input_count)
+        .ok_or_else(|| EngineError::resource_exhaustion("cached input token count overflows"))?;
     request.validate_tokenized_input(input_count)?;
     let sampler = Sampler::new(sampling, request.request_id(), model.memory_pool());
     let history = input_tokens.clone();
@@ -1293,8 +1540,13 @@ fn start_generation_cursor(
         model,
         tokenizer: Arc::clone(&tokenizer),
         session: None,
+        cache_start,
+        cache_attachment: None,
+        cached_final_logits: None,
+        cache_metric_store: None,
         input_tokens,
         input_count,
+        uncached_input_count,
         history,
         sampler,
         next_input: 0,
@@ -1307,12 +1559,18 @@ fn start_generation_cursor(
         pending_security_event: None,
         prefill_nanoseconds: 0,
         decode_nanoseconds: 0,
+        request_started: None,
+        time_to_first_token_nanoseconds: None,
     })
 }
 
 #[cfg(feature = "cpu-reference")]
 impl GreedyGeneration {
     /// Advances this sequence by at most one decoder token step.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one explicit state transition keeps cache attachment, prefill, decode, and terminal cleanup auditable"
+    )]
     pub fn advance(&mut self, cancelled: &AtomicBool) -> Result<GreedyAdvance, EngineError> {
         if self.usage.is_some() {
             return Err(EngineError::protocol_violation(
@@ -1335,6 +1593,13 @@ impl GreedyGeneration {
             }
             let usage =
                 GenerationUsage::for_request(&self.request, self.input_count, self.generated)?;
+            if let Some(store) = self.cache_metric_store.take() {
+                store.record_execution_measurement(
+                    self.uncached_input_count,
+                    self.prefill_nanoseconds,
+                    self.time_to_first_token_nanoseconds.unwrap_or(0),
+                )?;
+            }
             self.usage = Some(usage);
             return Ok(GreedyAdvance::Event(GenerationEvent::Completed {
                 request_id: self.request.request_id(),
@@ -1344,6 +1609,7 @@ impl GreedyGeneration {
         }
         if !self.started {
             self.started = true;
+            self.request_started = Some(Instant::now());
             return Ok(GreedyAdvance::Event(GenerationEvent::Started {
                 request_id: self.request.request_id(),
                 sequence_id: self.sequence_id,
@@ -1351,11 +1617,29 @@ impl GreedyGeneration {
         }
         check_cancelled(cancelled, self.request.request_id())?;
         if self.session.is_none() {
-            self.session = Some(self.model.start_session(
+            let mut session = self.model.start_session(
                 &self.request.resource_budget(),
                 self.request.request_id(),
                 self.sequence_id,
-            )?);
+            )?;
+            if let Some(start) = self.cache_start.take() {
+                self.cache_metric_store = Some(Arc::clone(&start.store));
+                let (attachment, logits) = session.attach_reusable_cache(&start)?;
+                let combined_capacity =
+                    attachment.tokens().len().checked_add(self.history.len()).ok_or_else(|| {
+                        EngineError::resource_exhaustion("cache history overflows")
+                    })?;
+                let mut combined = Vec::new();
+                combined.try_reserve_exact(combined_capacity).map_err(|_| {
+                    EngineError::resource_exhaustion("cache history allocation failed")
+                })?;
+                combined.extend_from_slice(attachment.tokens());
+                combined.extend_from_slice(&self.history);
+                self.history = combined;
+                self.cache_attachment = Some(attachment);
+                self.cached_final_logits = Some(logits);
+            }
+            self.session = Some(session);
             return Ok(GreedyAdvance::Progressed);
         }
         let session = self.session.as_mut().ok_or_else(|| {
@@ -1379,8 +1663,12 @@ impl GreedyGeneration {
                 session.forward_token(token, cancelled, &mut self.pending_security_event)?;
             add_timing(&mut self.decode_nanoseconds, started.elapsed())?;
             logits
+        } else if let Some(logits) = self.cached_final_logits.take() {
+            logits
         } else {
-            return Err(EngineError::internal_invariant("tokenizer produced no prompt tokens"));
+            return Err(EngineError::internal_invariant(
+                "tokenizer and reusable cache produced no prompt tokens",
+            ));
         };
         let token = self.sampler.sample(&logits, &self.history)?;
         self.generated = self
@@ -1388,6 +1676,15 @@ impl GreedyGeneration {
             .checked_add(1)
             .ok_or_else(|| EngineError::internal_invariant("generated token count overflows"))?;
         let text = self.stream_decoder.push(token)?;
+        if self.time_to_first_token_nanoseconds.is_none() {
+            self.time_to_first_token_nanoseconds = Some(duration_nanoseconds(
+                self.request_started
+                    .ok_or_else(|| {
+                        EngineError::internal_invariant("generation start time disappeared")
+                    })?
+                    .elapsed(),
+            )?);
+        }
         self.history.push(token);
         let end_of_sequence = token == self.tokenizer.spec().end_of_sequence_token()
             || self.sampler.config().is_stop_token(token);
@@ -1654,6 +1951,7 @@ impl GenerationRoundRobin {
         )
     }
 
+    #[cfg(unix)]
     fn submit_runtime(
         &mut self,
         model: &LoadedRuntimeModel,
@@ -1661,9 +1959,10 @@ impl GenerationRoundRobin {
         sequence_id: SequenceId,
         cancelled: Arc<AtomicBool>,
         additional_retained_bytes: usize,
+        pending_cache: Option<PendingCacheAttachment>,
     ) -> Result<(), EngineError> {
         self.submit_generation(
-            || model.start_greedy(request, sequence_id),
+            || model.start_greedy_with_cache(request, sequence_id, pending_cache),
             request,
             sequence_id,
             cancelled,
@@ -1974,6 +2273,7 @@ struct ConnectionBatchState<'a> {
     models: &'a BTreeMap<String, LoadedRuntimeModel>,
     response_signer: &'a EngineResponseSigner,
     next_sequence: &'a mut u64,
+    pending_cache_attachments: &'a mut BTreeMap<RequestId, PendingCacheAttachment>,
     active: &'a mut Vec<ActiveGenerationConnection>,
     results: &'a mut [Option<ConnectionServeResult>],
 }
@@ -1999,6 +2299,7 @@ pub struct CpuEngineRuntime {
     metrics: RuntimeMetrics,
     draining: bool,
     next_sequence: u64,
+    pending_cache_attachments: BTreeMap<RequestId, PendingCacheAttachment>,
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2242,6 +2543,7 @@ fn model_descriptor_parts(
 #[cfg(all(unix, feature = "cpu-reference"))]
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "one internal service dispatcher borrows disjoint bounded runtime state without granting a combined authority object"
 )]
 fn handle_service_request_parts(
@@ -2253,6 +2555,8 @@ fn handle_service_request_parts(
     security_events: &mut VecDeque<SecurityEvent>,
     metrics: &mut RuntimeMetrics,
     draining: bool,
+    next_sequence: &mut u64,
+    pending_cache_attachments: &mut BTreeMap<RequestId, PendingCacheAttachment>,
     request: &AuthenticatedServiceRequest,
 ) -> Result<ServiceResponseBody, EngineError> {
     match request.body() {
@@ -2308,6 +2612,14 @@ fn handle_service_request_parts(
             Ok(ServiceResponseBody::ModelLoaded)
         }
         ServiceRequestBody::UnloadModel(model_id) => {
+            if pending_cache_attachments.values().any(|pending| &pending.model_id == model_id) {
+                return Err(EngineError::resource_exhaustion(
+                    "model has a staged reusable-cache attachment",
+                ));
+            }
+            if let Some(loaded) = models.get(model_id.as_str()) {
+                loaded.invalidate_reusable_model()?;
+            }
             unload_model_parts(service, models, model_id)?;
             Ok(ServiceResponseBody::ModelUnloaded)
         }
@@ -2354,7 +2666,236 @@ fn handle_service_request_parts(
             security_events.drain(..count);
             Ok(ServiceResponseBody::SecurityEventsAcknowledged)
         }
+        ServiceRequestBody::Cache(cache_request) => handle_cache_service_request(
+            models,
+            model_load_budgets,
+            next_sequence,
+            pending_cache_attachments,
+            request.request_id(),
+            cache_request,
+        ),
     }
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed cache command catalog keeps authorization and lifecycle effects visible in one dispatcher"
+)]
+fn handle_cache_service_request(
+    models: &BTreeMap<String, LoadedRuntimeModel>,
+    model_load_budgets: &BTreeMap<String, ResourceBudget>,
+    next_sequence: &mut u64,
+    pending: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    request_id: RequestId,
+    request: &ServiceCacheRequest,
+) -> Result<ServiceResponseBody, EngineError> {
+    let response = match request {
+        ServiceCacheRequest::Create { model_id, scope, text, source, retention } => {
+            let loaded = loaded_cpu(models, model_id)?;
+            let budget = model_load_budgets.get(model_id.as_str()).ok_or_else(|| {
+                EngineError::authentication_failure("model budget is unavailable")
+            })?;
+            let sequence_id = SequenceId::new(*next_sequence)?;
+            *next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| EngineError::resource_exhaustion("sequence ID counter wraps"))?;
+            let descriptor = loaded.create_reusable_cache(
+                budget,
+                request_id,
+                sequence_id,
+                text,
+                cache_scope_from_service(scope)?,
+                source.map(cache_source_from_service).transpose()?,
+                CacheRetentionPolicy::new(
+                    retention.ttl_seconds(),
+                    retention.priority(),
+                    retention.pinned(),
+                )?,
+                unix_seconds()?,
+            )?;
+            ServiceCacheResponse::Created(service_cache_descriptor(&descriptor)?)
+        }
+        ServiceCacheRequest::Describe { model_id, cache_id, scope } => {
+            let loaded = loaded_cpu(models, model_id)?;
+            let descriptor = loaded.reusable_cache_store()?.describe(
+                KvCacheId::from_hash(cache_id.hash()),
+                &cache_scope_from_service(scope)?,
+                unix_seconds()?,
+            )?;
+            ServiceCacheResponse::Described(service_cache_descriptor(&descriptor)?)
+        }
+        ServiceCacheRequest::List { model_id, scope, maximum } => {
+            let loaded = loaded_cpu(models, model_id)?;
+            let descriptors = loaded.reusable_cache_store()?.list(
+                &cache_scope_from_service(scope)?,
+                *maximum,
+                unix_seconds()?,
+            )?;
+            ServiceCacheResponse::Listed(
+                descriptors.iter().map(service_cache_descriptor).collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+        ServiceCacheRequest::Attach { model_id, cache_id, scope, expected_token_count } => {
+            if pending.len()
+                >= usize::try_from(MAX_CONCURRENT_SEQUENCES)
+                    .map_err(|_| EngineError::internal_invariant("sequence bound exceeds usize"))?
+            {
+                return Err(EngineError::resource_exhaustion(
+                    "pending cache attachment limit is reached",
+                ));
+            }
+            let loaded = loaded_cpu(models, model_id)?;
+            let scope = cache_scope_from_service(scope)?;
+            let id = KvCacheId::from_hash(cache_id.hash());
+            let descriptor =
+                loaded.reusable_cache_store()?.describe(id, &scope, unix_seconds()?)?;
+            if descriptor.key().token_count() != *expected_token_count {
+                return Err(EngineError::invalid_input(
+                    "cache token count differs from attachment expectation",
+                ));
+            }
+            if pending
+                .insert(
+                    request_id,
+                    PendingCacheAttachment {
+                        model_id: model_id.clone(),
+                        cache_id: id,
+                        scope,
+                        expected_token_count: *expected_token_count,
+                    },
+                )
+                .is_some()
+            {
+                return Err(EngineError::protocol_violation(
+                    "request already has a staged cache attachment",
+                ));
+            }
+            ServiceCacheResponse::Attached {
+                cache_id: *cache_id,
+                token_count: *expected_token_count,
+            }
+        }
+        ServiceCacheRequest::Release { target_request_id } => {
+            pending.remove(target_request_id).ok_or_else(|| {
+                EngineError::invalid_input("staged cache attachment is unavailable")
+            })?;
+            ServiceCacheResponse::Released
+        }
+        ServiceCacheRequest::Invalidate { model_id, scope, selector } => {
+            let loaded = loaded_cpu(models, model_id)?;
+            let store = loaded.reusable_cache_store()?;
+            let scope = cache_scope_from_service(scope)?;
+            let count = match selector {
+                ServiceCacheInvalidation::Exact(id) => {
+                    store.invalidate_cache(KvCacheId::from_hash(id.hash()), &scope)?;
+                    1
+                }
+                ServiceCacheInvalidation::Scope => store.invalidate_namespace(&scope)?,
+                ServiceCacheInvalidation::Model => store.invalidate_model()?,
+                ServiceCacheInvalidation::Source(source) => store
+                    .invalidate_source_identity_in_scope(
+                        &scope,
+                        cache_source_from_service(*source)?,
+                    )?,
+                ServiceCacheInvalidation::Revision(revision) => {
+                    store.invalidate_revision_in_scope(&scope, *revision)?
+                }
+            };
+            ServiceCacheResponse::Invalidated(count)
+        }
+        ServiceCacheRequest::Metrics { model_id } => {
+            let metrics = loaded_cpu(models, model_id)?.reusable_cache_store()?.metrics()?;
+            ServiceCacheResponse::Metrics(service_cache_metrics(metrics))
+        }
+    };
+    Ok(ServiceResponseBody::Cache(response))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn loaded_cpu<'a>(
+    models: &'a BTreeMap<String, LoadedRuntimeModel>,
+    model_id: &ModelId,
+) -> Result<&'a LoadedCpuModel, EngineError> {
+    models
+        .get(model_id.as_str())
+        .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?
+        .cpu()
+}
+
+#[cfg(feature = "cpu-reference")]
+fn cache_scope_from_service(scope: &ServiceCacheScope) -> Result<CacheScope, EngineError> {
+    let namespace = match scope.namespace() {
+        ServiceCacheNamespace::GlobalSafeStatic => CacheNamespace::GlobalSafeStatic,
+        ServiceCacheNamespace::User => CacheNamespace::User,
+        ServiceCacheNamespace::Project => CacheNamespace::Project,
+        ServiceCacheNamespace::Task => CacheNamespace::Task,
+        ServiceCacheNamespace::Agent => CacheNamespace::Agent,
+    };
+    CacheScope::new(namespace, scope.owner())
+}
+
+#[cfg(feature = "cpu-reference")]
+fn cache_source_from_service(
+    source: ServiceCacheSource,
+) -> Result<CacheSourceIdentity, EngineError> {
+    CacheSourceIdentity::new(source.hash(), source.revision())
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn service_cache_descriptor(
+    descriptor: &KvCacheDescriptor,
+) -> Result<ServiceCacheDescriptor, EngineError> {
+    let scope = descriptor.key().scope();
+    let namespace = match scope.namespace() {
+        CacheNamespace::GlobalSafeStatic => ServiceCacheNamespace::GlobalSafeStatic,
+        CacheNamespace::User => ServiceCacheNamespace::User,
+        CacheNamespace::Project => ServiceCacheNamespace::Project,
+        CacheNamespace::Task => ServiceCacheNamespace::Task,
+        CacheNamespace::Agent => ServiceCacheNamespace::Agent,
+    };
+    ServiceCacheDescriptor::new(
+        ServiceCacheId::new(descriptor.cache_id().as_hash()),
+        descriptor.key().compatibility().model_id().clone(),
+        ServiceCacheScope::new(namespace, scope.owner())?,
+        descriptor.key().token_count(),
+        descriptor.byte_size(),
+        descriptor.created_at_unix_seconds(),
+        descriptor.last_access_unix_seconds(),
+        descriptor.hit_count(),
+        descriptor.retention().pinned(),
+    )
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+const fn service_cache_metrics(metrics: ReusableKvCacheMetrics) -> ServiceCacheMetrics {
+    ServiceCacheMetrics([
+        metrics.lookup_count,
+        metrics.hit_count,
+        metrics.miss_count,
+        metrics.exact_prefix_hits,
+        metrics.partial_prefix_hits,
+        metrics.tokens_reused,
+        metrics.tokens_recomputed,
+        metrics.bytes_reused,
+        metrics.cpu_cache_bytes,
+        metrics.gpu_cache_bytes,
+        metrics.evictions,
+        metrics.invalidations,
+        metrics.transfer_nanoseconds,
+        metrics.measured_time_saved_nanoseconds,
+        metrics.time_to_first_token_nanoseconds,
+        metrics.prefill_nanoseconds,
+        0,
+    ])
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn unix_seconds() -> Result<u64, EngineError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EngineError::internal_invariant("system time precedes Unix epoch"))?
+        .as_secs())
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2453,6 +2994,7 @@ impl CpuEngineRuntime {
             metrics: RuntimeMetrics::default(),
             draining: false,
             next_sequence: 1,
+            pending_cache_attachments: BTreeMap::new(),
         })
     }
 
@@ -2522,6 +3064,8 @@ impl CpuEngineRuntime {
             &mut self.security_events,
             &mut self.metrics,
             self.draining,
+            &mut self.next_sequence,
+            &mut self.pending_cache_attachments,
             request,
         )
     }
@@ -2695,6 +3239,7 @@ impl CpuEngineRuntime {
                 Ok(ServeOutcome::ServiceResponded { request_id, kind })
             }
             InboundCommand::Cancel(request_id) => {
+                self.pending_cache_attachments.remove(&request_id);
                 let outcome = self.service.scheduler.cancel(&request_id)?;
                 Ok(match outcome {
                     CancellationOutcome::Queued => {
@@ -2738,6 +3283,7 @@ impl CpuEngineRuntime {
                 })?;
                 self.service.admit(request)?;
                 self.next_sequence = next_sequence;
+                let pending_cache = self.pending_cache_attachments.remove(&request_id);
                 let model = self.models.get(&model_key).ok_or_else(|| {
                     EngineError::internal_invariant("loaded model disappeared during admission")
                 })?;
@@ -2763,6 +3309,7 @@ impl CpuEngineRuntime {
                         sequence_id,
                         &cancelled,
                         &mut self.security_events,
+                        pending_cache,
                         |event| {
                             let ordinal = event_ordinal;
                             event_ordinal = event_ordinal.checked_add(1).ok_or_else(|| {
@@ -2838,6 +3385,7 @@ impl CpuEngineRuntime {
             models: &self.models,
             response_signer: &self.response_signer,
             next_sequence: &mut self.next_sequence,
+            pending_cache_attachments: &mut self.pending_cache_attachments,
             active: &mut active,
             results: &mut results,
         };
@@ -3113,6 +3661,7 @@ fn prepare_generation_connection(
         sequence_id,
         Arc::clone(&cancelled),
         OUTBOUND_PIPELINE_RESERVED_BYTES,
+        batch.pending_cache_attachments.remove(&request_id),
     ) {
         batch.service.scheduler.finish(&request_id)?;
         return reject_generation_connection(
@@ -3884,7 +4433,15 @@ impl EngineService {
             }
         }
         let model = CpuDecoderModel::new_registered(model_id.clone(), config, weights, &pool)?;
-        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer, placement: None })
+        build_loaded_cpu_model(
+            model_id.clone(),
+            model,
+            tokenizer,
+            None,
+            *registration.expected_hash(),
+            hash_package(tokenizer_data),
+            budget,
+        )
     }
 
     /// Verifies a signed legacy test fixture before constructing the ARM64 decoder.
@@ -3946,7 +4503,15 @@ impl EngineService {
             &pool,
             backend,
         )?;
-        Ok(LoadedCpuModel { model_id: model_id.clone(), model, tokenizer, placement: None })
+        build_loaded_cpu_model(
+            model_id.clone(),
+            model,
+            tokenizer,
+            None,
+            *registration.expected_hash(),
+            hash_package(tokenizer_data),
+            budget,
+        )
     }
 
     #[cfg(all(
@@ -4051,6 +4616,8 @@ impl EngineService {
                     "derived CPU placement identity changed",
                 ));
             }
+            let package_hash = *verified.registration().expected_hash();
+            let tokenizer_hash = verified.manifest().tokenizer_hash();
             let model = match placement.mode() {
                 WeightResidencyMode::FullyResident => {
                     let weights = verified.materialize_tensors(&pool)?.into_tensors();
@@ -4069,12 +4636,15 @@ impl EngineService {
                     ));
                 }
             };
-            Ok(LoadedCpuModel {
-                model_id: model_id.clone(),
+            build_loaded_cpu_model(
+                model_id.clone(),
                 model,
                 tokenizer,
-                placement: Some(placement),
-            })
+                Some(placement),
+                package_hash,
+                tokenizer_hash,
+                budget,
+            )
         })();
         if let Err(error) = &result {
             let reason = match error {
@@ -4130,12 +4700,15 @@ impl EngineService {
                 &pool,
                 backend,
             )?;
-            Ok(LoadedCpuModel {
-                model_id: model_id.clone(),
+            build_loaded_cpu_model(
+                model_id.clone(),
                 model,
                 tokenizer,
-                placement: Some(placement),
-            })
+                Some(placement),
+                *verified.registration().expected_hash(),
+                verified.manifest().tokenizer_hash(),
+                budget,
+            )
         })();
         if let Err(error) = &result {
             let reason = match error {
@@ -4299,13 +4872,14 @@ impl EngineService {
         })
     }
 
-    #[cfg(feature = "cpu-reference")]
+    #[cfg(all(feature = "cpu-reference", unix))]
     fn run_next_greedy_runtime(
         &mut self,
         loaded: &LoadedRuntimeModel,
         sequence_id: SequenceId,
         cancelled: &AtomicBool,
         security_events: &mut VecDeque<SecurityEvent>,
+        pending_cache: Option<PendingCacheAttachment>,
         emit: impl FnMut(GenerationEvent) -> Result<(), EngineError>,
     ) -> Result<Option<GenerationMeasurement>, EngineError> {
         self.run_next_greedy_cursor(
@@ -4313,7 +4887,7 @@ impl EngineService {
             cancelled,
             emit,
             &mut |event| retain_security_event(security_events, event),
-            |request| loaded.start_greedy(request, sequence_id),
+            |request| loaded.start_greedy_with_cache(request, sequence_id, pending_cache),
         )
     }
 
@@ -5714,6 +6288,12 @@ mod tests {
     #[cfg(all(unix, feature = "metal", target_os = "macos"))]
     #[test]
     fn authenticated_service_streams_through_owner_selected_metal_backend() {
+        let Ok(devices) = MetalBackend::devices() else {
+            return;
+        };
+        if devices.is_empty() {
+            return;
+        }
         let backend = MetalBackend::new(0, 1 << 24, 16).expect("Metal backend must construct");
         let mut fixture = BatchRuntimeFixture::new_with_backend(
             "metal-service",
@@ -6065,6 +6645,12 @@ mod tests {
     fn continuous_service_streams_owner_selected_metal_and_drains() {
         use std::thread;
 
+        let Ok(devices) = MetalBackend::devices() else {
+            return;
+        };
+        if devices.is_empty() {
+            return;
+        }
         let backend = MetalBackend::new(0, 1 << 24, 16).expect("Metal backend must construct");
         let mut fixture = BatchRuntimeFixture::new_with_backend(
             "continuous-metal",
@@ -6678,6 +7264,9 @@ mod tests {
                 backend,
             )
             .expect("runtime must construct");
+            runtime
+                .configure_model_load_budget(&model_id, budget)
+                .expect("model load budget must configure");
             if backend_id == "metal" {
                 #[cfg(all(feature = "metal", target_os = "macos"))]
                 runtime
@@ -6927,6 +7516,168 @@ mod tests {
         assert_eq!(
             fixture.runtime.handle_service_request(&idempotent_load),
             Ok(ServiceResponseBody::ModelLoaded)
+        );
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end protocol fixture intentionally keeps the signed cache lifecycle and parity assertion together"
+    )]
+    fn authenticated_cag_cache_lifecycle_and_generation_match_full_prefill() {
+        let mut fixture = BatchRuntimeFixture::new("service-cag", 2);
+        let decode = |fixture: &BatchRuntimeFixture,
+                      request_id: RequestId,
+                      nonce: u64,
+                      body: ServiceRequestBody| {
+            let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+                request_id,
+                nonce,
+                fixture.control_key_id,
+                &body,
+            )
+            .unwrap();
+            let transcript = control_plane_signature_message(&unsigned).unwrap();
+            let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+            let payload = attach_service_signature(&unsigned, &signature).unwrap();
+            let trusted = TrustedControlPlaneKeys::single(
+                TrustedControlPlaneKey::active(
+                    fixture.control_key_id,
+                    fixture.control_signing_key.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            AuthenticatedServiceRequest::decode(&payload, &trusted).unwrap()
+        };
+        let scope = ServiceCacheScope::new(ServiceCacheNamespace::Project, "project:cag").unwrap();
+        let create = decode(
+            &fixture,
+            RequestId::new(9_001).unwrap(),
+            101,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Create {
+                model_id: fixture.model_id.clone(),
+                scope: scope.clone(),
+                text: "A".to_owned(),
+                source: Some(
+                    ServiceCacheSource::new(ModelPackageHash::from_sha384_bytes([0x31; 48]), 1)
+                        .unwrap(),
+                ),
+                retention: personalai_engine_protocol::ServiceCacheRetention::new(
+                    Some(60),
+                    10,
+                    false,
+                )
+                .unwrap(),
+            }),
+        );
+        let descriptor = match fixture.runtime.handle_service_request(&create).unwrap() {
+            ServiceResponseBody::Cache(ServiceCacheResponse::Created(descriptor)) => descriptor,
+            other => panic!("unexpected cache response: {other:?}"),
+        };
+        assert!(descriptor.token_count() > 0);
+
+        let cached_request_id = RequestId::new(9_002).unwrap();
+        let attach = decode(
+            &fixture,
+            cached_request_id,
+            102,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Attach {
+                model_id: fixture.model_id.clone(),
+                cache_id: descriptor.cache_id(),
+                scope: scope.clone(),
+                expected_token_count: descriptor.token_count(),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&attach).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Attached { .. })
+        ));
+        let pending = fixture
+            .runtime
+            .pending_cache_attachments
+            .remove(&cached_request_id)
+            .expect("attachment must stage");
+        let loaded = fixture.runtime.models.get(fixture.model_id.as_str()).unwrap();
+        let cached_request = fixture.request(9_002, "B", 2);
+        let full_request = fixture.request(9_003, "AB", 2);
+        let mut cached = loaded
+            .start_greedy_with_cache(&cached_request, SequenceId::new(40).unwrap(), Some(pending))
+            .unwrap();
+        let mut full = loaded.start_greedy(&full_request, SequenceId::new(41).unwrap()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let collect = |generation: &mut GreedyGeneration| {
+            let mut tokens = Vec::new();
+            loop {
+                match generation.advance(&cancelled).unwrap() {
+                    GreedyAdvance::Progressed
+                    | GreedyAdvance::Event(GenerationEvent::Started { .. }) => {}
+                    GreedyAdvance::Event(GenerationEvent::Token { token_id, .. }) => {
+                        tokens.push(token_id.get());
+                    }
+                    GreedyAdvance::Event(GenerationEvent::Completed { usage, .. }) => {
+                        break (tokens, usage);
+                    }
+                    GreedyAdvance::Event(GenerationEvent::Failed { error, .. }) => {
+                        panic!("generation failed: {error}")
+                    }
+                    GreedyAdvance::Event(_) => panic!("unexpected generation event"),
+                }
+            }
+        };
+        let (cached_tokens, cached_usage) = collect(&mut cached);
+        let (full_tokens, full_usage) = collect(&mut full);
+        assert_eq!(cached_tokens, full_tokens);
+        assert_eq!(cached_usage.input_tokens(), full_usage.input_tokens());
+        drop(cached);
+        drop(full);
+
+        let metrics = decode(
+            &fixture,
+            RequestId::new(9_004).unwrap(),
+            103,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Metrics {
+                model_id: fixture.model_id.clone(),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&metrics).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Metrics(values))
+                if values.0[1] >= 1 && values.0[5] >= u64::from(descriptor.token_count())
+        ));
+
+        let wrong_scope =
+            ServiceCacheScope::new(ServiceCacheNamespace::User, "user:other").unwrap();
+        let unauthorized = decode(
+            &fixture,
+            RequestId::new(9_005).unwrap(),
+            104,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Describe {
+                model_id: fixture.model_id.clone(),
+                cache_id: descriptor.cache_id(),
+                scope: wrong_scope,
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&unauthorized),
+            Err(EngineError::AuthenticationFailure(_))
+        ));
+
+        let invalidate = decode(
+            &fixture,
+            RequestId::new(9_006).unwrap(),
+            105,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Invalidate {
+                model_id: fixture.model_id.clone(),
+                scope,
+                selector: ServiceCacheInvalidation::Exact(descriptor.cache_id()),
+            }),
+        );
+        assert_eq!(
+            fixture.runtime.handle_service_request(&invalidate).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Invalidated(1))
         );
         fixture.cleanup();
     }

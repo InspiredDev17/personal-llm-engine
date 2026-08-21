@@ -4,7 +4,7 @@
 //! the PAISVC01/PAISVR01 wire representation while preventing callers from
 //! attaching arbitrary bytes to a recognized service message kind.
 
-use crate::ServiceMessageKind;
+use crate::{ServiceCacheRequest, ServiceCacheResponse, ServiceMessageKind};
 use personalai_engine_types::{
     ArchitectureId, BackendId, ContextLimit, EngineCapability, EngineError, ForbiddenOperation,
     MAX_REQUEST_BYTES, MAX_TOKEN_COUNT, ModelHashAlgorithm, ModelId, ModelPackageHash,
@@ -67,6 +67,8 @@ pub enum ServiceRequestBody {
         /// Positive prefix length no greater than [`MAX_SERVICE_SECURITY_EVENTS`].
         count: u16,
     },
+    /// Reusable prefix-cache operation.
+    Cache(ServiceCacheRequest),
 }
 
 impl ServiceRequestBody {
@@ -86,6 +88,7 @@ impl ServiceRequestBody {
             Self::SecurityEvents { .. } => ServiceMessageKind::SecurityEvents,
             Self::ModelDescriptor(_) => ServiceMessageKind::ModelDescriptor,
             Self::AcknowledgeSecurityEvents { .. } => ServiceMessageKind::AcknowledgeSecurityEvents,
+            Self::Cache(request) => request.kind(),
         }
     }
 
@@ -110,6 +113,7 @@ impl ServiceRequestBody {
                 validate_security_event_maximum(*count)?;
                 Ok(count.to_le_bytes().to_vec())
             }
+            Self::Cache(request) => request.encode(),
         }
     }
 
@@ -157,6 +161,15 @@ impl ServiceRequestBody {
                 let count = read_u16(payload, 0)?;
                 validate_security_event_maximum(count)?;
                 Ok(Self::AcknowledgeSecurityEvents { count })
+            }
+            ServiceMessageKind::CreateReusableCache
+            | ServiceMessageKind::DescribeCache
+            | ServiceMessageKind::ListCaches
+            | ServiceMessageKind::AttachCache
+            | ServiceMessageKind::ReleaseCache
+            | ServiceMessageKind::InvalidateCache
+            | ServiceMessageKind::CacheMetrics => {
+                Ok(Self::Cache(ServiceCacheRequest::decode(kind, payload)?))
             }
             _ => Err(EngineError::protocol_violation("message type has no service request body")),
         }
@@ -792,6 +805,8 @@ pub enum ServiceResponseBody {
     ModelDescriptor(ServiceModelDescriptor),
     /// One delivered event prefix was removed.
     SecurityEventsAcknowledged,
+    /// Reusable prefix-cache response.
+    Cache(ServiceCacheResponse),
     /// Stable failure category without sensitive diagnostics.
     Error(ServiceErrorCode),
     /// Shutdown lacks separate administrative authorization.
@@ -817,6 +832,7 @@ impl ServiceResponseBody {
             Self::SecurityEvents(_) => ServiceMessageKind::SecurityEvents,
             Self::ModelDescriptor(_) => ServiceMessageKind::ModelDescriptor,
             Self::SecurityEventsAcknowledged => ServiceMessageKind::AcknowledgeSecurityEvents,
+            Self::Cache(response) => response.kind(),
             Self::Error(_) => ServiceMessageKind::Error,
             Self::ShutdownRejected(_) => ServiceMessageKind::ShutdownRejected,
             Self::ShutdownAccepted => ServiceMessageKind::ShutdownAccepted,
@@ -846,6 +862,7 @@ impl ServiceResponseBody {
             Self::ModelStatus(status) => Ok(status.encode().to_vec()),
             Self::SecurityEvents(events) => encode_security_events(events),
             Self::ModelDescriptor(descriptor) => descriptor.encode(),
+            Self::Cache(response) => response.encode(),
             Self::Error(code) => Ok(vec![*code as u8]),
             Self::ShutdownRejected(reason) => Ok(vec![*reason as u8]),
         }
@@ -903,6 +920,15 @@ impl ServiceResponseBody {
             ServiceMessageKind::AcknowledgeSecurityEvents => {
                 require_empty(payload)?;
                 Ok(Self::SecurityEventsAcknowledged)
+            }
+            ServiceMessageKind::CreateReusableCache
+            | ServiceMessageKind::DescribeCache
+            | ServiceMessageKind::ListCaches
+            | ServiceMessageKind::AttachCache
+            | ServiceMessageKind::ReleaseCache
+            | ServiceMessageKind::InvalidateCache
+            | ServiceMessageKind::CacheMetrics => {
+                Ok(Self::Cache(ServiceCacheResponse::decode(kind, payload)?))
             }
             ServiceMessageKind::Error => {
                 require_length(payload, 1)?;

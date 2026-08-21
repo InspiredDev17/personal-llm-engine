@@ -163,6 +163,7 @@ dependencies = [
 name = "personalai-engine-kv-cache"
 version = "0.1.0"
 dependencies = [
+ "personalai-engine-crypto",
  "personalai-engine-memory",
  "personalai-engine-tensor",
  "personalai-engine-types",
@@ -298,6 +299,7 @@ dependencies = [
  "ed25519-dalek",
  "libc",
  "personalai-engine-crypto",
+ "personalai-engine-kv-cache",
  "personalai-engine-loader",
  "personalai-engine-memory",
  "personalai-engine-model-format",

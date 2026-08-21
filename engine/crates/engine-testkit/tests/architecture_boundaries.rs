@@ -542,7 +542,12 @@ fn internal_crate_dependencies_match_the_approved_dag() {
         ("engine-memory", &["personalai-engine-types"]),
         (
             "engine-kv-cache",
-            &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-memory",
+                "personalai-engine-tensor",
+                "personalai-engine-types",
+            ],
         ),
         (
             "engine-transformer",
@@ -569,6 +574,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             "engine-server",
             &[
                 "personalai-engine-crypto",
+                "personalai-engine-kv-cache",
                 "personalai-engine-loader",
                 "personalai-engine-memory",
                 "personalai-engine-placement",

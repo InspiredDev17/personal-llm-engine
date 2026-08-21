@@ -17,7 +17,7 @@ pub use runtime::{
     ScratchMetrics,
 };
 
-const OWNER_CATEGORY_COUNT: usize = 13;
+const OWNER_CATEGORY_COUNT: usize = 14;
 
 /// Explicit owner for one engine inference allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,8 @@ pub enum MemoryOwner {
     ModelState(ModelId),
     /// Bounded layer-streaming and backend-prefetch staging owned by one model.
     PlacementStaging(ModelId),
+    /// Immutable reusable prefix K/V state owned by one verified model.
+    ReusableKvCache(ModelId),
     /// Request prompt/token state.
     RequestPrompt(RequestId),
     /// Sequence-owned key/value state.
@@ -59,13 +61,14 @@ impl MemoryOwner {
             Self::Tokenizer(_) => 3,
             Self::ModelState(_) => 4,
             Self::PlacementStaging(_) => 5,
-            Self::RequestPrompt(_) => 6,
-            Self::SequenceKv(_) => 7,
-            Self::RequestScratch(_) => 8,
-            Self::OutputLogits(_) => 9,
-            Self::Sampling(_) => 10,
-            Self::StreamingDecoder(_) => 11,
-            Self::Backend(_) => 12,
+            Self::ReusableKvCache(_) => 6,
+            Self::RequestPrompt(_) => 7,
+            Self::SequenceKv(_) => 8,
+            Self::RequestScratch(_) => 9,
+            Self::OutputLogits(_) => 10,
+            Self::Sampling(_) => 11,
+            Self::StreamingDecoder(_) => 12,
+            Self::Backend(_) => 13,
         }
     }
 }

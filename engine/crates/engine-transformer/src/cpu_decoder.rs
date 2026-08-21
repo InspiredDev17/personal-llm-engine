@@ -7,7 +7,9 @@ use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
 #[cfg(feature = "arm64")]
 use personalai_engine_cpu_reference::{Backend, Operation};
 use personalai_engine_kv_cache::{
-    ContiguousKvCache, KvCacheMetrics, KvTokenWriter, SequenceHandle,
+    CacheRetentionPolicy, CacheScope, CacheSourceIdentity, ContiguousKvCache, KvCacheAttachment,
+    KvCacheCompatibility, KvCacheDescriptor, KvCacheId, KvCacheMetrics, KvTokenWriter,
+    ReusableKvCacheLimits, ReusableKvCacheStore, SequenceHandle,
 };
 use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
@@ -244,6 +246,23 @@ impl CpuDecoderModel {
         self.inner.cache.metrics()
     }
 
+    /// Creates a bounded reusable-prefix store charged to this model's pool.
+    pub fn create_reusable_cache_store(
+        &self,
+        limits: ReusableKvCacheLimits,
+    ) -> Result<ReusableKvCacheStore, EngineError> {
+        ReusableKvCacheStore::new(
+            self.inner.cache.model_id().clone(),
+            self.inner.pool.clone(),
+            limits,
+        )
+    }
+
+    /// Returns the full per-sequence reservation needed to preserve headroom.
+    pub fn kv_sequence_allocation_bytes(&self) -> u64 {
+        self.inner.cache.sequence_allocation_bytes()
+    }
+
     /// Allocates one bounded sequence cache under the model's aggregate pool.
     pub fn start_session(
         &self,
@@ -291,6 +310,70 @@ impl CpuDecoderSession {
     /// Returns the number of tokens already committed to this sequence.
     pub const fn token_count(&self) -> u32 {
         self.token_count
+    }
+
+    /// Seals the current committed prefix as immutable reusable state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_reusable_cache(
+        &self,
+        store: &ReusableKvCacheStore,
+        compatibility: KvCacheCompatibility,
+        scope: CacheScope,
+        source: Option<CacheSourceIdentity>,
+        tokens: &[u32],
+        final_logits: &Tensor,
+        created_at_unix_seconds: u64,
+        retention: CacheRetentionPolicy,
+    ) -> Result<KvCacheDescriptor, EngineError> {
+        if self.token_count == 0 || usize::try_from(self.token_count).ok() != Some(tokens.len()) {
+            return Err(EngineError::invalid_input(
+                "reusable cache tokens differ from committed decoder state",
+            ));
+        }
+        store.create_from_sequence(
+            &self.model.inner.cache,
+            self.handle,
+            compatibility,
+            scope,
+            source,
+            tokens,
+            &tensor_f32_values(final_logits)?,
+            created_at_unix_seconds,
+            retention,
+        )
+    }
+
+    /// Forks one immutable reusable prefix into this empty request-local session.
+    pub fn attach_reusable_cache(
+        &mut self,
+        store: &ReusableKvCacheStore,
+        cache_id: KvCacheId,
+        authorized_scope: &CacheScope,
+        compatibility: &KvCacheCompatibility,
+        expected_token_count: u32,
+        now_unix_seconds: u64,
+    ) -> Result<(KvCacheAttachment, Tensor), EngineError> {
+        if self.token_count != 0 {
+            return Err(EngineError::protocol_violation(
+                "reusable cache attachment requires a fresh decoder session",
+            ));
+        }
+        let attachment = store.attach_to_sequence(
+            cache_id,
+            authorized_scope,
+            compatibility,
+            expected_token_count,
+            &self.model.inner.cache,
+            self.handle,
+            now_unix_seconds,
+        )?;
+        let logits = Tensor::from_f32_values(
+            TensorShape::new([u64::from(self.model.inner.config.vocabulary_size())])?,
+            attachment.final_logits(),
+            &self.output_pool,
+        )?;
+        self.token_count = expected_token_count;
+        Ok((attachment, logits))
     }
 
     /// Processes a non-empty prompt and returns logits for its final position.
@@ -1127,7 +1210,6 @@ fn zero_f32(length: usize) -> Result<Vec<f32>, EngineError> {
     Ok(values)
 }
 
-#[cfg(feature = "arm64")]
 fn tensor_f32_values(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
     let count = usize::try_from(tensor.shape().element_count()).map_err(|_| {
         EngineError::resource_exhaustion("decoder tensor length is not addressable")
@@ -1226,7 +1308,11 @@ fn u32_from_usize(value: usize) -> Result<u32, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personalai_engine_types::{ArchitectureId, ContextLimit};
+    use personalai_engine_kv_cache::{
+        AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheScope,
+        ReusableKvCacheLimits,
+    };
+    use personalai_engine_types::{ArchitectureId, ContextLimit, ModelPackageHash};
 
     #[test]
     fn tiny_decoder_executes_deterministically_and_advances_cache() {
@@ -1294,6 +1380,82 @@ mod tests {
             .expect("maximum session must construct");
         maximum.prefill(&[1; 8]).expect("exact context must execute");
         assert!(maximum.decode(1).is_err());
+    }
+
+    #[test]
+    fn sealed_prefix_fork_matches_full_prefill_and_is_request_local() {
+        let pool = MemoryPool::new(1 << 20).expect("pool must validate");
+        let model = CpuDecoderModel::new(tiny_config(), tiny_weights(&pool), &pool)
+            .expect("tiny exact architecture must construct");
+        let limits = ReusableKvCacheLimits::new(
+            8,
+            1 << 16,
+            model.kv_sequence_allocation_bytes(),
+            pool.limit_bytes(),
+        )
+        .unwrap();
+        let store = model.create_reusable_cache_store(limits).unwrap();
+        let budget = ResourceBudget::new(1 << 20, 1 << 18, 3).unwrap();
+        let mut source = model
+            .start_session(&budget, RequestId::new(10).unwrap(), SequenceId::new(10).unwrap())
+            .unwrap();
+        let prefix_logits = source.prefill(&[1, 2, 3]).unwrap();
+        let compatibility = KvCacheCompatibility::new(
+            ModelId::new("unregistered-test-model").unwrap(),
+            ModelPackageHash::from_sha384_bytes([1; ModelPackageHash::BYTE_LEN]),
+            ModelPackageHash::from_sha384_bytes([2; ModelPackageHash::BYTE_LEN]),
+            model.config().architecture_id().clone(),
+            model.backend_id().unwrap(),
+            AttentionPositionSemantics::CausalZeroBasedV1,
+            model.config().rope_theta(),
+            1.0,
+            model.config().cache_dtype(),
+        )
+        .unwrap();
+        let scope = CacheScope::new(CacheNamespace::Project, "project:test").unwrap();
+        let descriptor = source
+            .seal_reusable_cache(
+                &store,
+                compatibility.clone(),
+                scope.clone(),
+                None,
+                &[1, 2, 3],
+                &prefix_logits,
+                100,
+                CacheRetentionPolicy::explicit(),
+            )
+            .unwrap();
+
+        let mut cached = model
+            .start_session(&budget, RequestId::new(11).unwrap(), SequenceId::new(11).unwrap())
+            .unwrap();
+        let (_lease, restored_logits) = cached
+            .attach_reusable_cache(&store, descriptor.cache_id(), &scope, &compatibility, 3, 101)
+            .unwrap();
+        for index in 0..8 {
+            assert!(
+                (restored_logits.f32_value(index).unwrap()
+                    - prefix_logits.f32_value(index).unwrap())
+                .abs()
+                    <= 1.0e-6
+            );
+        }
+        let cached_logits = cached.decode(4).unwrap();
+
+        let mut uncached = model
+            .start_session(&budget, RequestId::new(12).unwrap(), SequenceId::new(12).unwrap())
+            .unwrap();
+        let uncached_logits = uncached.prefill(&[1, 2, 3, 4]).unwrap();
+        for index in 0..8 {
+            assert!(
+                (cached_logits.f32_value(index).unwrap()
+                    - uncached_logits.f32_value(index).unwrap())
+                .abs()
+                    <= 1.0e-6
+            );
+        }
+        assert_eq!(source.token_count(), 3);
+        assert_eq!(cached.token_count(), 4);
     }
 
     #[test]

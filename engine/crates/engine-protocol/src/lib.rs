@@ -4,10 +4,17 @@
 //! fixed header and carries one bounded payload for strict message-specific
 //! decoders. No general-purpose deserializer is used.
 
+mod cache_payload;
 mod messages;
 mod service;
 mod service_payload;
 
+pub use cache_payload::{
+    MAX_SERVICE_CACHE_OWNER_BYTES, MAX_SERVICE_CACHE_RESULTS, ServiceCacheDescriptor,
+    ServiceCacheId, ServiceCacheInvalidation, ServiceCacheMetrics, ServiceCacheNamespace,
+    ServiceCacheRequest, ServiceCacheResponse, ServiceCacheRetention, ServiceCacheScope,
+    ServiceCacheSource,
+};
 pub use messages::{
     CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_EVENT_AUTH_BYTES,
     GENERATION_REQUEST_FIXED_BYTES, GenerationRequestEnvelope, attach_cancellation_signature,

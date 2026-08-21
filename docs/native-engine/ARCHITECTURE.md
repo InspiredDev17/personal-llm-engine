@@ -551,3 +551,15 @@ capability or dependency authority.
 to Go; Go validates, audits, and sends only allowlisted events through its own
 authenticated Agent Green liaison. The engine has no Agent Green client or key,
 and the model cannot create, route, suppress, or act on Agent Green decisions.
+
+## Reusable prefix K/V state
+
+First-party CAG is implemented as a model-local `ReusableKvCacheStore` above the contiguous
+request K/V cache. It accepts only exact, compatibility-bound token prefixes and copies sealed CPU
+state into a fresh sequence before decode. Retrieval, ranking, document ordering, durable knowledge,
+and CAG routing remain Go/Memory-Vault responsibilities. See [CAG.md](CAG.md),
+[KV-CACHE-LIFECYCLE.md](KV-CACHE-LIFECYCLE.md), and [CACHE-SECURITY.md](CACHE-SECURITY.md).
+
+CPU RAM is the only implemented reusable tier. Metal/CUDA migration and SSD persistence are
+explicitly unsupported. `selective_cache_recomposition` is reserved and disabled pending
+mathematical correctness and model-quality qualification.

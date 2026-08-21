@@ -103,3 +103,13 @@ implemented; a client path, TCP/outbound network, dynamic loading, Python,
 TypeScript, model code, tool, memory, approval, or Agent Green authority appears;
 the target service lacks independent OS egress confinement; an operated
 no-egress test fails; or rollback through Go cannot be demonstrated.
+
+## Reusable K/V cache threats
+
+Reusable cache state adds stale-state, cross-scope disclosure, cross-model substitution, mutable
+shared-state, guessed-ID, memory-exhaustion, and positional-mismatch risks. V1 mitigates these with
+exact compatibility keys, namespace-plus-owner authorization, immutable sealed storage,
+request-local copies, content revalidation, deterministic bounded eviction, active-sequence
+headroom, one-shot staged attachments, and path-free authenticated protocol operations. A cache ID
+is never treated as authorization. Residual risks and unsupported persistence/device tiers are
+tracked in [CACHE-SECURITY.md](CACHE-SECURITY.md).

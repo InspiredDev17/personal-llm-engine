@@ -574,6 +574,27 @@ impl MutableTensor {
         self.storage.as_bytes()
     }
 
+    /// Copies bytes into one engine-selected contiguous storage range.
+    ///
+    /// This is intended for trusted runtime state restoration. Callers still
+    /// receive checked bounds and cannot change tensor metadata or capacity.
+    pub fn copy_storage_range_from(
+        &mut self,
+        offset: usize,
+        source: &[u8],
+    ) -> Result<(), TensorError> {
+        let end = offset
+            .checked_add(source.len())
+            .ok_or_else(|| EngineError::resource_exhaustion("tensor byte range overflows"))?;
+        let destination = self
+            .storage
+            .as_bytes_mut()
+            .get_mut(offset..end)
+            .ok_or_else(|| EngineError::invalid_input("tensor byte range exceeds storage"))?;
+        destination.copy_from_slice(source);
+        Ok(())
+    }
+
     /// Returns whether storage is charged to the supplied pool.
     pub fn accounted_by(&self, pool: &MemoryPool) -> bool {
         self.storage.accounted_by(pool)

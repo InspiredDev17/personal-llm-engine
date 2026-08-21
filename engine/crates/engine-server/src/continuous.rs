@@ -171,6 +171,7 @@ struct ContinuousState<'a> {
     security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
     next_sequence: &'a mut u64,
+    pending_cache_attachments: &'a mut BTreeMap<RequestId, super::PendingCacheAttachment>,
     coordinator: GenerationRoundRobin,
     ingress: Vec<IngressWorker>,
     pending: Vec<PendingGenerationConnection>,
@@ -233,6 +234,7 @@ impl CpuEngineRuntime {
             security_events: &mut self.security_events,
             metrics: &mut self.metrics,
             next_sequence: &mut self.next_sequence,
+            pending_cache_attachments: &mut self.pending_cache_attachments,
             coordinator,
             ingress: bounded_vec(maximum_connections, "continuous ingress")?,
             pending: bounded_vec(maximum_connections, "continuous pending")?,
@@ -502,6 +504,8 @@ impl ContinuousState<'_> {
             self.security_events,
             self.metrics,
             false,
+            self.next_sequence,
+            self.pending_cache_attachments,
             request,
         ) {
             Ok(response) => response,
@@ -544,6 +548,7 @@ impl ContinuousState<'_> {
                 sequence_id,
                 Arc::clone(&self.pending[0].workers.cancelled),
                 OUTBOUND_PIPELINE_RESERVED_BYTES,
+                self.pending_cache_attachments.remove(&request_id),
             );
             if let Err(error) = submission {
                 self.service.scheduler.finish(&request_id)?;
@@ -623,6 +628,7 @@ impl ContinuousState<'_> {
             }
             progressed = true;
             let request_id = self.pending[index].request.request_id();
+            self.pending_cache_attachments.remove(&request_id);
             match self.service.scheduler.cancel(&request_id)? {
                 CancellationOutcome::Queued => {
                     increment(&mut self.metrics.cancelled_requests, "cancelled request counter")?;
@@ -646,6 +652,7 @@ impl ContinuousState<'_> {
     }
 
     fn apply_cancellation(&mut self, request_id: RequestId) -> Result<(), EngineError> {
+        self.pending_cache_attachments.remove(&request_id);
         if let Some(active) =
             self.active.iter().find(|connection| connection.request_id == request_id)
         {
@@ -791,6 +798,7 @@ impl ContinuousState<'_> {
             let _shutdown_result = worker.control.shutdown_inbound();
         }
         while let Some(pending) = self.pending.pop() {
+            self.pending_cache_attachments.remove(&pending.request.request_id());
             let cancellation = self.service.scheduler.cancel(&pending.request.request_id());
             match cancellation {
                 Ok(CancellationOutcome::Queued) => {
