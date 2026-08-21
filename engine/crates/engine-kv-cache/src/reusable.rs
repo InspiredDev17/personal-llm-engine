@@ -7,8 +7,8 @@ use crate::{ContiguousKvCache, SequenceHandle};
 use personalai_engine_crypto::hash_package;
 use personalai_engine_memory::{MemoryOwner, MemoryPool, MemoryReservation};
 use personalai_engine_types::{
-    ArchitectureId, BackendId, DType, EngineError, MAX_CONTEXT_TOKENS, ModelHashAlgorithm, ModelId,
-    ModelPackageHash,
+    ArchitectureId, BackendId, DType, EngineError, MAX_CONTEXT_TOKENS,
+    MAX_REUSABLE_CACHE_TTL_SECONDS, ModelHashAlgorithm, ModelId, ModelPackageHash,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,8 +20,6 @@ pub const REUSABLE_KV_CACHE_FORMAT_VERSION: u16 = 1;
 pub const MAX_REUSABLE_KV_CACHES: u32 = 1_024;
 /// Maximum bounded cache owner identifier bytes.
 pub const MAX_CACHE_OWNER_BYTES: usize = 96;
-/// Maximum control-plane TTL for one reusable cache: 365 days.
-pub const MAX_REUSABLE_CACHE_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Conservative accounted metadata bytes per reusable cache entry.
 const CACHE_METADATA_BYTES: u64 = 768;
 

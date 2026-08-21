@@ -2,7 +2,8 @@
 
 use crate::ServiceMessageKind;
 use personalai_engine_types::{
-    EngineError, MAX_REQUEST_BYTES, ModelId, ModelPackageHash, RequestId,
+    EngineError, MAX_REQUEST_BYTES, MAX_REUSABLE_CACHE_TTL_SECONDS, ModelId, ModelPackageHash,
+    RequestId,
 };
 
 /// Maximum cache descriptors returned by one list request.
@@ -130,10 +131,10 @@ pub struct ServiceCacheRetention {
 }
 
 impl ServiceCacheRetention {
-    /// Constructs retention settings; zero TTL is rejected.
+    /// Constructs retention settings with the shared 365-day maximum.
     pub fn new(ttl_seconds: Option<u64>, priority: u8, pinned: bool) -> Result<Self, EngineError> {
-        if ttl_seconds == Some(0) {
-            return Err(EngineError::invalid_input("cache TTL must be nonzero"));
+        if ttl_seconds.is_some_and(|ttl| ttl == 0 || ttl > MAX_REUSABLE_CACHE_TTL_SECONDS) {
+            return Err(EngineError::invalid_input("cache TTL is outside its bounded range"));
         }
         Ok(Self { ttl_seconds, priority, pinned })
     }
@@ -811,6 +812,11 @@ mod tests {
     #[test]
     fn every_cache_request_round_trips_and_trailing_data_fails() {
         assert!(ServiceCacheScope::new(ServiceCacheNamespace::Project, "../project/a").is_err());
+        assert!(ServiceCacheRetention::new(Some(0), 1, false).is_err());
+        assert!(ServiceCacheRetention::new(Some(MAX_REUSABLE_CACHE_TTL_SECONDS), 1, false).is_ok());
+        assert!(
+            ServiceCacheRetention::new(Some(MAX_REUSABLE_CACHE_TTL_SECONDS + 1), 1, false).is_err()
+        );
         let model_id = ModelId::new("tiny").unwrap();
         let id = ServiceCacheId::new(hash(1));
         let requests = vec![

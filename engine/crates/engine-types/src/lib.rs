@@ -34,6 +34,8 @@ pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Largest number of sequences permitted by one resource budget.
 pub const MAX_CONCURRENT_SEQUENCES: u32 = 4_096;
+/// Longest reusable-cache TTL accepted from control-plane policy: 365 days.
+pub const MAX_REUSABLE_CACHE_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Largest resident-memory budget accepted by the engine: 1 TiB.
 pub const MAX_RESOURCE_MEMORY_BYTES: u64 = 1_u64 << 40;
 /// Largest diagnostic retained in an engine error.
