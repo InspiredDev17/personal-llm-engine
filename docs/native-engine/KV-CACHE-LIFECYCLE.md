@@ -23,8 +23,11 @@ drop lease -> invalidate/evict`.
 
 A generation cursor consumes a staged attachment once. Cancellation, client disconnect, cursor
 drop, backend failure, or normal completion drops the request-local sequence and lease. Queued and
-disconnected cancellation removes the staged binding. Model unload is rejected while scheduler or
-staged attachment ownership exists, then invalidates idle reusable objects before removal.
+disconnected cancellation removes the staged binding. A service-stage that is never followed by
+generation expires after 30 seconds, preventing an abandoned client from pinning model lifecycle
+indefinitely. Duplicate staging never replaces the original binding. Model unload is rejected while
+scheduler or a non-expired staged attachment owns the model, then invalidates idle reusable objects
+before removal.
 
 ## Memory and eviction
 

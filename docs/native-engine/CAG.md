@@ -36,6 +36,9 @@ never a compatibility signal.
 5. The engine copies the sealed prefix into a new sequence and continues prefill/decode at the
    cached token position. The sealed object is held through an immutable lease and is not mutated.
 
+The one-shot staged binding expires after 30 seconds if generation never consumes it. This bounds
+crash/disconnect residue without mutating or evicting the shared sealed cache object.
+
 The Go prompt assembler must preserve the declared static/dynamic token boundary. A BPE merge that
 would cross that boundary can make separately tokenized pieces differ from tokenizing concatenated
 text; Go must qualify and use boundaries whose exact token sequence is intended. Direct internal

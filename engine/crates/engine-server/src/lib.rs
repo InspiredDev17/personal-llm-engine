@@ -480,6 +480,17 @@ struct PendingCacheAttachment {
     cache_id: KvCacheId,
     scope: CacheScope,
     expected_token_count: u32,
+    expires_at: Instant,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+const PENDING_CACHE_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+impl PendingCacheAttachment {
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
 }
 
 #[cfg(feature = "cpu-reference")]
@@ -524,6 +535,9 @@ impl LoadedRuntimeModel {
         let Some(pending) = pending else {
             return self.start_greedy(request, sequence_id);
         };
+        if pending.is_expired(Instant::now()) {
+            return Err(EngineError::cancellation(Some(request.request_id())));
+        }
         if pending.model_id != *request.model_id() {
             return Err(EngineError::authentication_failure(
                 "staged cache model differs from generation model",
@@ -2612,6 +2626,7 @@ fn handle_service_request_parts(
             Ok(ServiceResponseBody::ModelLoaded)
         }
         ServiceRequestBody::UnloadModel(model_id) => {
+            expire_pending_cache_attachments(pending_cache_attachments, Instant::now());
             if pending_cache_attachments.values().any(|pending| &pending.model_id == model_id) {
                 return Err(EngineError::resource_exhaustion(
                     "model has a staged reusable-cache attachment",
@@ -2690,6 +2705,9 @@ fn handle_cache_service_request(
     request_id: RequestId,
     request: &ServiceCacheRequest,
 ) -> Result<ServiceResponseBody, EngineError> {
+    let now = Instant::now();
+    let now_unix_seconds = unix_seconds()?;
+    expire_pending_cache_attachments(pending, now);
     let response = match request {
         ServiceCacheRequest::Create { model_id, scope, text, source, retention } => {
             let loaded = loaded_cpu(models, model_id)?;
@@ -2712,7 +2730,7 @@ fn handle_cache_service_request(
                     retention.priority(),
                     retention.pinned(),
                 )?,
-                unix_seconds()?,
+                now_unix_seconds,
             )?;
             ServiceCacheResponse::Created(service_cache_descriptor(&descriptor)?)
         }
@@ -2721,7 +2739,7 @@ fn handle_cache_service_request(
             let descriptor = loaded.reusable_cache_store()?.describe(
                 KvCacheId::from_hash(cache_id.hash()),
                 &cache_scope_from_service(scope)?,
-                unix_seconds()?,
+                now_unix_seconds,
             )?;
             ServiceCacheResponse::Described(service_cache_descriptor(&descriptor)?)
         }
@@ -2730,47 +2748,38 @@ fn handle_cache_service_request(
             let descriptors = loaded.reusable_cache_store()?.list(
                 &cache_scope_from_service(scope)?,
                 *maximum,
-                unix_seconds()?,
+                now_unix_seconds,
             )?;
             ServiceCacheResponse::Listed(
                 descriptors.iter().map(service_cache_descriptor).collect::<Result<Vec<_>, _>>()?,
             )
         }
         ServiceCacheRequest::Attach { model_id, cache_id, scope, expected_token_count } => {
-            if pending.len()
-                >= usize::try_from(MAX_CONCURRENT_SEQUENCES)
-                    .map_err(|_| EngineError::internal_invariant("sequence bound exceeds usize"))?
-            {
-                return Err(EngineError::resource_exhaustion(
-                    "pending cache attachment limit is reached",
-                ));
-            }
             let loaded = loaded_cpu(models, model_id)?;
             let scope = cache_scope_from_service(scope)?;
             let id = KvCacheId::from_hash(cache_id.hash());
             let descriptor =
-                loaded.reusable_cache_store()?.describe(id, &scope, unix_seconds()?)?;
+                loaded.reusable_cache_store()?.describe(id, &scope, now_unix_seconds)?;
             if descriptor.key().token_count() != *expected_token_count {
                 return Err(EngineError::invalid_input(
                     "cache token count differs from attachment expectation",
                 ));
             }
-            if pending
-                .insert(
-                    request_id,
-                    PendingCacheAttachment {
-                        model_id: model_id.clone(),
-                        cache_id: id,
-                        scope,
-                        expected_token_count: *expected_token_count,
-                    },
-                )
-                .is_some()
-            {
-                return Err(EngineError::protocol_violation(
-                    "request already has a staged cache attachment",
-                ));
-            }
+            let expires_at = now
+                .checked_add(PENDING_CACHE_ATTACHMENT_TTL)
+                .ok_or_else(|| EngineError::resource_exhaustion("cache attachment expiry wraps"))?;
+            stage_pending_cache_attachment(
+                pending,
+                request_id,
+                PendingCacheAttachment {
+                    model_id: model_id.clone(),
+                    cache_id: id,
+                    scope,
+                    expected_token_count: *expected_token_count,
+                    expires_at,
+                },
+                now,
+            )?;
             ServiceCacheResponse::Attached {
                 cache_id: *cache_id,
                 token_count: *expected_token_count,
@@ -2810,6 +2819,40 @@ fn handle_cache_service_request(
         }
     };
     Ok(ServiceResponseBody::Cache(response))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn expire_pending_cache_attachments(
+    pending: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    now: Instant,
+) {
+    pending.retain(|_request_id, attachment| !attachment.is_expired(now));
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn stage_pending_cache_attachment(
+    pending: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    request_id: RequestId,
+    attachment: PendingCacheAttachment,
+    now: Instant,
+) -> Result<(), EngineError> {
+    expire_pending_cache_attachments(pending, now);
+    if attachment.is_expired(now) {
+        return Err(EngineError::cancellation(Some(request_id)));
+    }
+    if pending.contains_key(&request_id) {
+        return Err(EngineError::protocol_violation(
+            "request already has a staged cache attachment",
+        ));
+    }
+    if pending.len()
+        >= usize::try_from(MAX_CONCURRENT_SEQUENCES)
+            .map_err(|_| EngineError::internal_invariant("sequence bound exceeds usize"))?
+    {
+        return Err(EngineError::resource_exhaustion("pending cache attachment limit is reached"));
+    }
+    pending.insert(request_id, attachment);
+    Ok(())
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -4997,6 +5040,41 @@ mod tests {
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{ContextLimit, ModelHashAlgorithm, ResourceBudget, SignerKeyId};
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn staged_cache_attachments_expire_and_duplicate_staging_is_non_destructive() {
+        let request_id = RequestId::new(91).unwrap();
+        let now = Instant::now();
+        let original = PendingCacheAttachment {
+            model_id: ModelId::new("model-a").unwrap(),
+            cache_id: KvCacheId::from_hash(test_hash()),
+            scope: CacheScope::new(CacheNamespace::Project, "project:a").unwrap(),
+            expected_token_count: 3,
+            expires_at: now + std::time::Duration::from_secs(30),
+        };
+        let mut pending = BTreeMap::new();
+        stage_pending_cache_attachment(&mut pending, request_id, original.clone(), now).unwrap();
+
+        let replacement = PendingCacheAttachment {
+            model_id: ModelId::new("model-b").unwrap(),
+            expires_at: now + std::time::Duration::from_secs(40),
+            ..original.clone()
+        };
+        assert!(
+            stage_pending_cache_attachment(&mut pending, request_id, replacement, now).is_err()
+        );
+        assert_eq!(pending.get(&request_id).unwrap().model_id, original.model_id);
+
+        let expired_at = now + std::time::Duration::from_secs(30);
+        expire_pending_cache_attachments(&mut pending, expired_at);
+        assert!(pending.is_empty());
+        let expired = PendingCacheAttachment { expires_at: expired_at, ..original };
+        assert!(
+            stage_pending_cache_attachment(&mut pending, request_id, expired, expired_at).is_err()
+        );
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn config_requires_distinct_normal_local_paths() {
