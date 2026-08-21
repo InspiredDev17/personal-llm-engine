@@ -32,9 +32,10 @@ The store shares the loaded model's checked `MemoryPool`. Each object charges co
 bytes, token IDs, final logits, and conservative metadata. Store limits require nonzero
 full-sequence headroom, so reusable state cannot consume the entire configured inference pool.
 
-TTL expiry and memory pressure use deterministic eviction. Entries are ordered by pin state,
-priority, last access, creation time, then cache ID. Pinned entries and entries with live attachment
-leases cannot be evicted. If sufficient headroom cannot be reclaimed, admission fails explicitly.
+TTL expiry and memory pressure use deterministic eviction. Optional TTL is bounded to one second
+through 365 days. Entries are ordered by pin state, priority, last access, creation time, then cache
+ID. Pinned entries and entries with live attachment leases cannot be evicted. If sufficient
+headroom cannot be reclaimed, admission fails explicitly.
 
 V1 physically copies a compact sealed prefix into a full-capacity contiguous sequence. This favors
 correctness and isolation over memory efficiency. Paged K/V storage and device-resident cache

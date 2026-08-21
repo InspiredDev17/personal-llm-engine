@@ -41,6 +41,9 @@ would cross that boundary can make separately tokenized pieces differ from token
 text; Go must qualify and use boundaries whose exact token sequence is intended. Direct internal
 lookup accepts full token sequences and supports longest exact-prefix selection.
 
+Optional cache TTL is explicitly bounded to 365 days. A longer-lived cache must be renewed through
+fresh authenticated policy rather than encoded as an effectively unbounded expiration.
+
 ## Protocol operations
 
 PAISVC01/PAISVR01 kinds 27 through 33 are: create, describe, list, attach, release, invalidate, and

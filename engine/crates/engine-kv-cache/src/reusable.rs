@@ -20,6 +20,8 @@ pub const REUSABLE_KV_CACHE_FORMAT_VERSION: u16 = 1;
 pub const MAX_REUSABLE_KV_CACHES: u32 = 1_024;
 /// Maximum bounded cache owner identifier bytes.
 pub const MAX_CACHE_OWNER_BYTES: usize = 96;
+/// Maximum control-plane TTL for one reusable cache: 365 days.
+pub const MAX_REUSABLE_CACHE_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Conservative accounted metadata bytes per reusable cache entry.
 const CACHE_METADATA_BYTES: u64 = 768;
 
@@ -344,14 +346,14 @@ pub struct CacheRetentionPolicy {
 }
 
 impl CacheRetentionPolicy {
-    /// Constructs a retention policy. TTL zero is rejected.
+    /// Constructs a retention policy. TTL must be between one second and 365 days.
     pub fn new(
         ttl_seconds: Option<u64>,
         eviction_priority: u8,
         pinned: bool,
     ) -> Result<Self, EngineError> {
-        if ttl_seconds == Some(0) {
-            return Err(EngineError::invalid_input("cache TTL must be positive when present"));
+        if ttl_seconds.is_some_and(|ttl| ttl == 0 || ttl > MAX_REUSABLE_CACHE_TTL_SECONDS) {
+            return Err(EngineError::invalid_input("cache TTL is outside its bounded range"));
         }
         Ok(Self { ttl_seconds, eviction_priority, pinned })
     }
@@ -1610,6 +1612,15 @@ mod tests {
             .unwrap();
         assert!(store.evict_for_memory_pressure(store.pool.limit_bytes(), 103).is_err());
         assert!(store.describe(pinned.cache_id(), &scope, 103).is_ok());
+    }
+
+    #[test]
+    fn retention_ttl_is_strictly_bounded() {
+        assert!(CacheRetentionPolicy::new(Some(0), 1, false).is_err());
+        assert!(CacheRetentionPolicy::new(Some(MAX_REUSABLE_CACHE_TTL_SECONDS), 1, false).is_ok());
+        assert!(
+            CacheRetentionPolicy::new(Some(MAX_REUSABLE_CACHE_TTL_SECONDS + 1), 1, false).is_err()
+        );
     }
 
     #[test]
