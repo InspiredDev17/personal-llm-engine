@@ -43,9 +43,12 @@ lookup accepts full token sequences and supports longest exact-prefix selection.
 
 ## Protocol operations
 
-PAISVC01/PAISVR01 kinds 22 through 28 are: create, describe, list, attach, release, invalidate, and
+PAISVC01/PAISVR01 kinds 27 through 33 are: create, describe, list, attach, release, invalidate, and
 metrics. Payloads are fixed-order, bounded binary fields. Clients use `ModelId`, `KvCacheId`, and
 closed selectors only; no path, tensor offset, raw K/V bytes, backend plugin, or code is accepted.
+
+Kinds 22 through 26 remain reserved for the canonical inference-runtime-v3 service bridge. Cache
+operations must never reuse or reinterpret those message numbers.
 
 The protocol extension is repository-local until the corresponding canonical
 Sovereign-AI-Contracts revision is published. It must not be treated as a competing source of

@@ -67,19 +67,19 @@ pub enum ServiceMessageKind {
     /// Acknowledge delivery of a previously polled security-event prefix.
     AcknowledgeSecurityEvents = 21,
     /// Create one sealed reusable prefix cache from a loaded registered model.
-    CreateReusableCache = 22,
+    CreateReusableCache = 27,
     /// Describe one scope-authorized reusable cache.
-    DescribeCache = 23,
+    DescribeCache = 28,
     /// List bounded scope-authorized reusable caches.
-    ListCaches = 24,
+    ListCaches = 29,
     /// Stage one cache attachment for the correlated generation request.
-    AttachCache = 25,
+    AttachCache = 30,
     /// Release a staged cache attachment.
-    ReleaseCache = 26,
+    ReleaseCache = 31,
     /// Invalidate reusable cache state through a closed selector.
-    InvalidateCache = 27,
+    InvalidateCache = 32,
     /// Query content-free reusable-cache metrics for one loaded model.
-    CacheMetrics = 28,
+    CacheMetrics = 33,
 }
 
 impl ServiceMessageKind {
@@ -106,13 +106,13 @@ impl ServiceMessageKind {
             19 => Ok(Self::SecurityEvents),
             20 => Ok(Self::ModelDescriptor),
             21 => Ok(Self::AcknowledgeSecurityEvents),
-            22 => Ok(Self::CreateReusableCache),
-            23 => Ok(Self::DescribeCache),
-            24 => Ok(Self::ListCaches),
-            25 => Ok(Self::AttachCache),
-            26 => Ok(Self::ReleaseCache),
-            27 => Ok(Self::InvalidateCache),
-            28 => Ok(Self::CacheMetrics),
+            27 => Ok(Self::CreateReusableCache),
+            28 => Ok(Self::DescribeCache),
+            29 => Ok(Self::ListCaches),
+            30 => Ok(Self::AttachCache),
+            31 => Ok(Self::ReleaseCache),
+            32 => Ok(Self::InvalidateCache),
+            33 => Ok(Self::CacheMetrics),
             _ => Err(EngineError::protocol_violation("service message type is unsupported")),
         }
     }
@@ -600,6 +600,20 @@ mod tests {
                 &ServiceRequestBody::Health,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cache_message_numbers_do_not_collide_with_runtime_v3_reservations() {
+        assert_eq!(ServiceMessageKind::CreateReusableCache as u8, 27);
+        assert_eq!(ServiceMessageKind::CacheMetrics as u8, 33);
+        assert_eq!(
+            ServiceMessageKind::from_byte(27).expect("CAG create kind"),
+            ServiceMessageKind::CreateReusableCache
+        );
+        assert_eq!(
+            ServiceMessageKind::from_byte(33).expect("CAG metrics kind"),
+            ServiceMessageKind::CacheMetrics
         );
     }
 
