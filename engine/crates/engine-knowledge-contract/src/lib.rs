@@ -11,12 +11,17 @@ use personalai_engine_types::{
 };
 
 /// Exact Contracts source revision audited by this adapter.
-pub const SOVEREIGN_CONTRACT_COMMIT: &str = "f3f6881d1661a088eef5dfbf7b51be4c747f1093";
+pub const SOVEREIGN_CONTRACT_COMMIT: &str = "2eaa6c23e6334df9b1309dcb28a0a8d15ebb5356";
 /// Canonical Knowledge cache lifecycle contract version.
 pub const KNOWLEDGE_CACHE_LIFECYCLE_VERSION: &str = "1.1.0";
 /// Canonical Knowledge 1.1 schema digest from the component support profile.
 pub const KNOWLEDGE_CACHE_SCHEMA_SHA256: &str =
     "4976b42a04c35efbbf9f00be71d2e26343399d1c8528811eecf6fa4aa07451f9";
+/// Canonical Knowledge exact-prefix acquisition contract version.
+pub const KNOWLEDGE_STATIC_PREFIX_CONTRACT_VERSION: &str = "1.2.0";
+/// Canonical Knowledge 1.2 exact-prefix schema digest.
+pub const KNOWLEDGE_STATIC_PREFIX_SCHEMA_SHA256: &str =
+    "0f711d87f54c22992887e21a3ef4b2a4c7814f5ff3c47bb95f8d29fbd2ed68b9";
 /// Pinned canonical accepted lifecycle fixture digests in operation/request-result order:
 /// attach, create, describe, invalidate, list, metrics, and release.
 pub const KNOWLEDGE_ACCEPTED_FIXTURE_SHA256: [&str; 14] = [
@@ -45,12 +50,45 @@ pub const KNOWLEDGE_REJECTED_FIXTURE_SHA256: [&str; 6] = [
     "97e074116930e11ab448e120fe4602c576aef71f897582beb034113fd4d123a0",
     "3dda876c5aa389f989f68926a7e461faa125bfa72f956148527e7f648d944de0",
 ];
+/// Pinned canonical accepted Knowledge 1.2 request/result fixture digests.
+pub const KNOWLEDGE_STATIC_PREFIX_ACCEPTED_FIXTURE_SHA256: [&str; 5] = [
+    "efa60e9dd9073d0797d4a4e8814eec7249bb914bd1908666ef6319f507323432",
+    "8f109b58b658c046161fa947aa8d360bbc0158f942ce9061958a76b08de7c82a",
+    "daabb9dab31e0d302a34e5460d39b01547a2d714f216163575996517a2a40e3a",
+    "6f3b67b11f348afd8be7fb0de57b993020efb7096efac308fc13afdd5faab3c4",
+    "16b0c404ad6d64e39edb465feaf3f7d44df083fb7aa7fa80ae186b800980841e",
+];
+/// Pinned canonical rejected Knowledge 1.2 exact-prefix fixture digests.
+pub const KNOWLEDGE_STATIC_PREFIX_REJECTED_FIXTURE_SHA256: [&str; 18] = [
+    "15dcaa018ecb951ad0fdd0e94cab30e93418ebc42410a2a970c8687f77244b28",
+    "37f1fffb3adb84fae5847850c917f93d0b7edb05a7afea4c29a83eb65282f3fa",
+    "a41be899eaa84137d5b831291407c552e0867d0f7f298060e19c8563649762b8",
+    "2309e42095fd119a08f60880c34897fc5c202484f5ab4be9b5be14602139b128",
+    "2767ccc74968e0c45edc31f6dd3e6ee51e0af5c3f5c08210ab8f9fff04848ea6",
+    "161997c312eaae5ba8d4d3992f8220ca3b408b7ecb5b494d175e4790ca996548",
+    "c85371481fbbcad13a2dd965f14df2d829c218961ce17238c89fb3ecad4cb23f",
+    "fa1fec3ec75b2aef6f09128c19c84a88ebed1bf78b14e3407d2f36de3c7884dd",
+    "41e320fbe6141218fdf98d513bd07cbde09d4a46ec05f630de0ceac251ed6b3c",
+    "6e45277b9167a00c808266497b6c70756cc1a71edc6549364508d223c488dc03",
+    "ac29add4c904709fa48bbe03b5eaa4371182669c2e584293e0ba8ce830a8eae7",
+    "e7872e705896e1915d40adbfe9e2d17aee437ad0d088bee49476b7bb2ab05379",
+    "45122d519463d46d52f906d3cddb2fb3a97f6adbe65fae0724d5055a0d812e6b",
+    "fb1c880f6399b6b5519f5a14467ec1f29f2786439090df74cb35c1221d4b4c2c",
+    "e81feb670fde986abf3de6bc09c8ff95c8fd964f6176acac557264c877e8ed24",
+    "874d4994a003c1ef59485c8eac67c63fb468fd95e288bb8cbe78bb53c34f7eee",
+    "54584cc2eb619fd8417daabb73ce6d8c86565abf1e32fdd1c474c335fe5ab7bd",
+    "5d83a89000e79b0eba2854e982334f6699ea158487e54ab7e9e7872fcffbfad2",
+];
 /// First engine cache representation projected into the canonical contract.
 pub const CACHE_FORMAT_VERSION: &str = "1.0.0";
 /// Exact prefix-material domain emitted by Memory Vault.
 pub const STATIC_PREFIX_DOMAIN: &[u8] = b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n";
+/// Canonical Knowledge 1.2 decoded prefix-material ceiling.
+pub const MAX_STATIC_PREFIX_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum exact ordered source members accepted in one prefix.
 pub const MAX_STATIC_PREFIX_MEMBERS: usize = 256;
+/// Maximum canonical decimal digits in one member byte length.
+pub const MAX_STATIC_PREFIX_LENGTH_DIGITS: usize = 10;
 /// Maximum bytes in one canonical identity.
 pub const MAX_KNOWLEDGE_IDENTITY_BYTES: usize = 128;
 
@@ -754,6 +792,7 @@ impl StaticKnowledgePrefix {
         maximum_bytes: usize,
     ) -> Result<Self, EngineError> {
         if maximum_bytes < STATIC_PREFIX_DOMAIN.len()
+            || maximum_bytes > MAX_STATIC_PREFIX_BYTES
             || bytes.len() > maximum_bytes
             || !bytes.starts_with(STATIC_PREFIX_DOMAIN)
             || bytes.contains(&0)
@@ -774,6 +813,7 @@ impl StaticKnowledgePrefix {
             if offset == length_start
                 || offset >= bytes.len()
                 || bytes[offset] != b':'
+                || offset - length_start > MAX_STATIC_PREFIX_LENGTH_DIGITS
                 || (bytes[length_start] == b'0' && offset - length_start != 1)
             {
                 return Err(EngineError::invalid_input("static prefix length frame is malformed"));
@@ -891,6 +931,18 @@ mod tests {
     }
 
     #[test]
+    fn canonical_knowledge_1_2_available_fixture_bytes_are_accepted_exactly() {
+        let bytes = b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n5:hello5:world";
+        let digest = Sha256Digest::from_hex(
+            "b6d8d9788107e9b6d0a32665b2045af4f4d60558af65f2e679fc092c97864484",
+        )
+        .unwrap();
+        let parsed = StaticKnowledgePrefix::parse(bytes, digest, bytes.len()).unwrap();
+        assert_eq!(parsed.as_bytes(), bytes);
+        assert_eq!(parsed.member_count(), 2);
+    }
+
+    #[test]
     fn prefix_transport_rejects_malformed_truncated_nul_and_bounds() {
         for bytes in [
             &b"5:alpha"[..],
@@ -898,11 +950,27 @@ mod tests {
             &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n6:alpha"[..],
             &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n1:\0"[..],
             &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n0:"[..],
+            &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n12345678901:x"[..],
+            &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n1:aX"[..],
+            &b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n1:\xff"[..],
         ] {
             assert!(StaticKnowledgePrefix::parse(bytes, hash_sha256(bytes), 1024).is_err());
         }
         let bytes = b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n5:alpha";
         assert!(StaticKnowledgePrefix::parse(bytes, hash_sha256(bytes), bytes.len() - 1).is_err());
+        assert!(
+            StaticKnowledgePrefix::parse(bytes, hash_sha256(bytes), MAX_STATIC_PREFIX_BYTES + 1)
+                .is_err()
+        );
+
+        let mut too_many = STATIC_PREFIX_DOMAIN.to_vec();
+        for _ in 0..=MAX_STATIC_PREFIX_MEMBERS {
+            too_many.extend_from_slice(b"1:a");
+        }
+        assert!(
+            StaticKnowledgePrefix::parse(&too_many, hash_sha256(&too_many), too_many.len())
+                .is_err()
+        );
     }
 
     #[test]
@@ -950,9 +1018,19 @@ mod tests {
         assert_eq!(SOVEREIGN_CONTRACT_COMMIT.len(), 40);
         assert_eq!(KNOWLEDGE_CACHE_LIFECYCLE_VERSION, "1.1.0");
         assert_eq!(KNOWLEDGE_CACHE_SCHEMA_SHA256.len(), 64);
+        assert_eq!(KNOWLEDGE_STATIC_PREFIX_CONTRACT_VERSION, "1.2.0");
+        assert_eq!(KNOWLEDGE_STATIC_PREFIX_SCHEMA_SHA256.len(), 64);
         assert_eq!(KNOWLEDGE_ACCEPTED_FIXTURE_SHA256.len(), 14);
         assert!(KNOWLEDGE_ACCEPTED_FIXTURE_SHA256.iter().all(|digest| digest.len() == 64));
         assert_eq!(KNOWLEDGE_REJECTED_FIXTURE_SHA256.len(), 6);
         assert!(KNOWLEDGE_REJECTED_FIXTURE_SHA256.iter().all(|digest| digest.len() == 64));
+        assert_eq!(KNOWLEDGE_STATIC_PREFIX_ACCEPTED_FIXTURE_SHA256.len(), 5);
+        assert!(
+            KNOWLEDGE_STATIC_PREFIX_ACCEPTED_FIXTURE_SHA256.iter().all(|digest| digest.len() == 64)
+        );
+        assert_eq!(KNOWLEDGE_STATIC_PREFIX_REJECTED_FIXTURE_SHA256.len(), 18);
+        assert!(
+            KNOWLEDGE_STATIC_PREFIX_REJECTED_FIXTURE_SHA256.iter().all(|digest| digest.len() == 64)
+        );
     }
 }

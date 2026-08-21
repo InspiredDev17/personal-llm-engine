@@ -26,6 +26,12 @@ owner/project/task/agent identities are shape-validated exactly. The engine does
 relationships among identities and does not perform semantic access control. Go must authenticate
 the caller and authorize the complete scope and sensitivity before signing the request.
 
+Knowledge 1.2 acquisition remains outside the engine. Memory Vault authenticates and produces the
+canonical envelope; Go validates its producer, bundle, scope, sensitivity, freshness, canonical
+base64, length, and digest. Rust receives no Memory Vault identity or endpoint and independently
+validates only the exact decoded bytes before tokenization. Prefix content never enters metrics,
+audit metadata, security events, paths, or errors.
+
 ## Failure behavior
 
 Unknown IDs, wrong scope or sensitivity, compatibility mismatch, stale attachment, malformed or

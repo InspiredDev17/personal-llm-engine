@@ -737,14 +737,6 @@ impl RuntimeDecoderSession {
             Self::Metal(session) => session.decode(token),
         }
     }
-
-    fn token_count(&self) -> u32 {
-        match self {
-            Self::Cpu(session) => session.token_count(),
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            Self::Metal(session) => session.token_count(),
-        }
-    }
 }
 
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
@@ -1330,7 +1322,7 @@ fn build_loaded_cpu_model(
 ) -> Result<LoadedCpuModel, EngineError> {
     let artifact_id = match placement.as_ref().and_then(|plan| plan.artifact_id()) {
         Some(value) => KnowledgeIdentity::new(value)?,
-        None => KnowledgeIdentity::new(format!("aipack.{package_hash}"))?,
+        None => owner_pinned_artifact_id(package_hash)?,
     };
     let compatibility = KvCacheCompatibility::new(
         model_id.clone(),
@@ -1370,6 +1362,27 @@ fn build_loaded_cpu_model(
         tokenizer_digest,
         artifact_id,
     })
+}
+
+#[cfg(feature = "cpu-reference")]
+fn owner_pinned_artifact_id(
+    package_hash: ModelPackageHash,
+) -> Result<KnowledgeIdentity, EngineError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const CANONICAL_SUFFIX_BYTES: usize = 63;
+    let mut identifier = String::with_capacity(4 + CANONICAL_SUFFIX_BYTES);
+    identifier.push_str("art_");
+    for byte in package_hash.as_bytes() {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            if identifier.len() == 4 + CANONICAL_SUFFIX_BYTES {
+                return KnowledgeIdentity::new(identifier);
+            }
+            identifier.push(char::from(HEX[usize::from(nibble)]));
+        }
+    }
+    Err(EngineError::internal_invariant(
+        "owner-pinned artifact digest is shorter than the canonical identifier suffix",
+    ))
 }
 
 /// First-party generation stop classification.
@@ -1530,6 +1543,7 @@ pub struct GreedyGeneration {
     sampler: Sampler,
     next_input: usize,
     next_generated_token: Option<u32>,
+    decoder_tokens_processed: u32,
     generated: u32,
     stream_decoder: IncrementalDecoder<'static>,
     started: bool,
@@ -1606,6 +1620,7 @@ fn start_generation_cursor(
         sampler,
         next_input: 0,
         next_generated_token: None,
+        decoder_tokens_processed: 0,
         generated: 0,
         stream_decoder: IncrementalDecoder::new_shared(tokenizer),
         started: false,
@@ -1704,6 +1719,10 @@ impl GreedyGeneration {
             let started = Instant::now();
             let logits =
                 session.forward_token(token, cancelled, &mut self.pending_security_event)?;
+            self.decoder_tokens_processed =
+                self.decoder_tokens_processed.checked_add(1).ok_or_else(|| {
+                    EngineError::internal_invariant("generation decoder token count overflows")
+                })?;
             add_timing(&mut self.prefill_nanoseconds, started.elapsed())?;
             self.next_input = self.next_input.checked_add(1).ok_or_else(|| {
                 EngineError::internal_invariant("generation input position overflows")
@@ -1716,6 +1735,10 @@ impl GreedyGeneration {
             let started = Instant::now();
             let logits =
                 session.forward_token(token, cancelled, &mut self.pending_security_event)?;
+            self.decoder_tokens_processed =
+                self.decoder_tokens_processed.checked_add(1).ok_or_else(|| {
+                    EngineError::internal_invariant("generation decoder token count overflows")
+                })?;
             add_timing(&mut self.decode_nanoseconds, started.elapsed())?;
             logits
         } else if let Some(logits) = self.cached_final_logits.take() {
@@ -1790,9 +1813,12 @@ impl GreedyGeneration {
         self.sequence_id
     }
 
-    /// Returns decoder tokens committed to this request-local KV cache.
-    pub fn processed_tokens(&self) -> u32 {
-        self.session.as_ref().map_or(0, RuntimeDecoderSession::token_count)
+    /// Returns tokens advanced through decoder computation by this request.
+    ///
+    /// Attaching already-computed reusable state does not count as a decoder
+    /// step and therefore cannot violate the round-robin one-step bound.
+    pub const fn processed_tokens(&self) -> u32 {
+        self.decoder_tokens_processed
     }
 
     /// Returns monotonic CPU forward time split between prompt and decode work.
@@ -7961,6 +7987,17 @@ mod tests {
             .unwrap();
         let mut full = loaded.start_greedy(&full_request, SequenceId::new(41).unwrap()).unwrap();
         let cancelled = AtomicBool::new(false);
+        assert!(matches!(
+            cached.advance(&cancelled).unwrap(),
+            GreedyAdvance::Event(GenerationEvent::Started { .. })
+        ));
+        assert_eq!(cached.processed_tokens(), 0);
+        assert_eq!(cached.advance(&cancelled).unwrap(), GreedyAdvance::Progressed);
+        assert_eq!(
+            cached.processed_tokens(),
+            0,
+            "attaching sealed prefix state must not masquerade as decoder work"
+        );
         let collect = |generation: &mut GreedyGeneration| {
             let mut tokens = Vec::new();
             loop {
@@ -8360,6 +8397,14 @@ mod tests {
             ResourceBudget::new(1 << 20, 1 << 19, 1).expect("budget must validate"),
         )
         .expect("request must validate")
+    }
+
+    #[test]
+    fn owner_pinned_artifact_identity_is_canonical_and_digest_derived() {
+        let identity = owner_pinned_artifact_id(test_hash()).expect("artifact ID must derive");
+        let expected = format!("art_{}0", "03".repeat(31));
+        assert_eq!(identity.as_str(), expected);
+        assert_eq!(identity.as_str().len(), 67);
     }
 
     fn test_hash() -> ModelPackageHash {

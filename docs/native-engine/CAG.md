@@ -22,6 +22,12 @@ source/revision identity, authorization scope, sensitivity, ordered-token SHA-38
 entire immutable binding, so changing any execution, bundle, scope, sensitivity, or runtime fact
 fails closed rather than downgrading compatibility.
 
+For owner-pinned packages, which do not carry a Model Foundry artifact ID, Rust derives the
+canonical execution identifier as `art_` plus the first 63 lowercase hexadecimal digits of the
+verified package SHA-384. The complete SHA-384 remains a separate mandatory binding, so this
+bounded identifier is never treated as the artifact's cryptographic identity. Registry-backed
+packages retain their exact registered `art_` identifier.
+
 Lookup is byte-for-byte token-prefix matching. It chooses the longest compatible cached token
 sequence. Whitespace, tokenization, document order, model revision, tokenizer, RoPE, backend, K/V
 dtype, namespace, or owner changes produce a miss or authorization failure. Semantic similarity is
@@ -68,15 +74,33 @@ Kinds 22 through 26 remain reserved for the canonical inference-runtime-v3 servi
 operations must never reuse or reinterpret those message numbers.
 
 The authenticated binary payload is an internal transport adapter behind Sovereign Knowledge
-1.1.0 at Contracts commit `f3f6881d1661a088eef5dfbf7b51be4c747f1093`; its canonical schema
-SHA-256 is `4976b42a04c35efbbf9f00be71d2e26343399d1c8528811eecf6fa4aa07451f9`.
+1.1.0 and the exact-byte handoff defined by Knowledge 1.2.0 at Contracts commit
+`2eaa6c23e6334df9b1309dcb28a0a8d15ebb5356`. The 1.1 schema SHA-256 is
+`4976b42a04c35efbbf9f00be71d2e26343399d1c8528811eecf6fa4aa07451f9`; the 1.2 schema
+SHA-256 is `0f711d87f54c22992887e21a3ef4b2a4c7814f5ff3c47bb95f8d29fbd2ed68b9`.
 `engine-knowledge-contract` contains only the execution-safe closed projection and pinned fixture
-digests. It is not a competing public contract. The current Contracts Rust crate cannot compile
-Knowledge 1.1 under `runtime-v3` alone because its lifecycle module imports the `full`-gated
-knowledge module. Pulling `full` would import control-plane domains and JSON dependencies that are
-prohibited here, so the engine does not depend directly on that broad feature. AI-Avenger must
-perform canonical JSON validation and translate only validated fields into this adapter; activating
-the experimental contract remains an explicit downstream decision.
+digests. It is not a competing public contract. The engine does not parse the Knowledge 1.2 JSON
+envelope or base64 and has no Memory Vault client: AI-Avenger validates and authorizes the exact
+Memory Vault result, then passes only decoded bytes through the authenticated internal adapter.
+The engine independently rechecks UTF-8, NUL absence, the 8 MiB canonical ceiling, one through 256
+positive canonical decimal frames with at most ten length digits, its stricter request-size bound,
+and the ordered-prefix digest before tokenization.
+
+The current Contracts Rust crate still cannot compile Knowledge 1.1 under `runtime-v3` alone
+because its lifecycle module imports the `full`-gated knowledge module. Pulling `full` would import
+control-plane domains and JSON dependencies prohibited here, so the engine does not depend directly
+on that broad feature. Activating either experimental contract remains an explicit downstream
+decision.
+
+Portable interoperability was exercised against Memory-Vault commit
+`a25f76ac6ac932ff4dfa7a1ec51441c8020a4a98` and the real AI-Avenger native client at commit
+`002366ab6567c3e71752107e693fb095b3a9e91f`. A local test-only signed directory AIPack was loaded
+by the CPU reference daemon; the published Go client completed authenticated health, exact model
+identity, Knowledge 1.2 prefix tokenization, cache create/describe/list, attached streaming
+generation, release, metrics, idempotent exact invalidation, miss confirmation, and unload over a
+protected Unix socket. The harness and synthetic model remain outside the repository. This is
+portable conformance evidence only: it is not activation, production-model qualification,
+signing-key custody, accelerator qualification, soak evidence, or canary authorization.
 
 ## Unsupported selective recomposition
 
