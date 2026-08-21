@@ -22,10 +22,10 @@ measured prefill and time-to-first-token nanoseconds for cached requests, plus t
 and recomputed. The time-saved field remains zero because no paired measured baseline is available.
 GPU cache benchmarking is unsupported because GPU reusable-cache migration is not implemented.
 
-One synthetic planner/store smoke run on the development host (`arm64`, macOS 26.6.2, Rust
-1.85.0, optimized bench profile) performed 10,000 exact-prefix lookups over a 256-token synthetic
-entry in 1,916,417 ns total. This is a single non-statistical run, measures lookup machinery only,
-and is not model latency, throughput, or production performance evidence.
+The repository includes a bounded synthetic 10,000-lookup smoke benchmark over one 256-token
+entry. Timing is deliberately reported only by the current invocation and must not be copied into
+this document as durable performance evidence: it is a non-statistical lookup-mechanism run, not
+model latency, throughput, or production evidence.
 
 ## External qualification command shape
 

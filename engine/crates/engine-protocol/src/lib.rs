@@ -10,10 +10,10 @@ mod service;
 mod service_payload;
 
 pub use cache_payload::{
-    MAX_SERVICE_CACHE_OWNER_BYTES, MAX_SERVICE_CACHE_RESULTS, ServiceCacheDescriptor,
-    ServiceCacheId, ServiceCacheInvalidation, ServiceCacheMetrics, ServiceCacheNamespace,
-    ServiceCacheRequest, ServiceCacheResponse, ServiceCacheRetention, ServiceCacheScope,
-    ServiceCacheSource,
+    MAX_SERVICE_CACHE_COUNTER, MAX_SERVICE_CACHE_RESULTS, SERVICE_CACHE_METRIC_COUNT,
+    ServiceCacheDescriptor, ServiceCacheId, ServiceCacheInvalidation, ServiceCacheMetrics,
+    ServiceCacheNamespace, ServiceCacheRequest, ServiceCacheResponse, ServiceCacheRetention,
+    ServiceCacheScope, ServiceCacheSource,
 };
 pub use messages::{
     CANCELLATION_UNSIGNED_BYTES, CancellationEnvelope, GENERATION_EVENT_AUTH_BYTES,

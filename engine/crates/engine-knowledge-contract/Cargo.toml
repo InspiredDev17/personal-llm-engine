@@ -1,0 +1,14 @@
+[package]
+name = "personalai-engine-knowledge-contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Narrow first-party adapter for canonical Sovereign Knowledge cache lifecycle semantics"
+
+[dependencies]
+personalai-engine-crypto.workspace = true
+personalai-engine-types.workspace = true
+
+[lints]
+workspace = true

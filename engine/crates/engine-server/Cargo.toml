@@ -16,6 +16,7 @@ cuda = ["personalai-engine-transformer/cuda"]
 [dependencies]
 libc.workspace = true
 personalai-engine-crypto.workspace = true
+personalai-engine-knowledge-contract.workspace = true
 personalai-engine-loader.workspace = true
 personalai-engine-kv-cache.workspace = true
 personalai-engine-memory.workspace = true

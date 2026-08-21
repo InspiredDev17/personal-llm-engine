@@ -460,9 +460,9 @@ fn workspace_contains_no_python_or_typescript() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // The explicit 22-crate DAG is intentionally visible in one test.
+#[allow(clippy::too_many_lines)] // The explicit 23-crate DAG is intentionally visible in one test.
 fn internal_crate_dependencies_match_the_approved_dag() {
-    let allowed: [(&str, &[&str]); 22] = [
+    let allowed: [(&str, &[&str]); 23] = [
         ("engine-types", &[]),
         ("engine-crypto", &["personalai-engine-types"]),
         ("engine-release", &["personalai-engine-crypto", "personalai-engine-types"]),
@@ -540,10 +540,12 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             ],
         ),
         ("engine-memory", &["personalai-engine-types"]),
+        ("engine-knowledge-contract", &["personalai-engine-crypto", "personalai-engine-types"]),
         (
             "engine-kv-cache",
             &[
                 "personalai-engine-crypto",
+                "personalai-engine-knowledge-contract",
                 "personalai-engine-memory",
                 "personalai-engine-tensor",
                 "personalai-engine-types",
@@ -555,6 +557,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
                 "personalai-engine-arm64",
                 "personalai-engine-cpu-reference",
                 "personalai-engine-kv-cache",
+                "personalai-engine-knowledge-contract",
                 "personalai-engine-loader",
                 "personalai-engine-metal",
                 "personalai-engine-memory",
@@ -569,12 +572,20 @@ fn internal_crate_dependencies_match_the_approved_dag() {
             &["personalai-engine-memory", "personalai-engine-tensor", "personalai-engine-types"],
         ),
         ("engine-scheduler", &["personalai-engine-types"]),
-        ("engine-protocol", &["personalai-engine-crypto", "personalai-engine-types"]),
+        (
+            "engine-protocol",
+            &[
+                "personalai-engine-crypto",
+                "personalai-engine-knowledge-contract",
+                "personalai-engine-types",
+            ],
+        ),
         (
             "engine-server",
             &[
                 "personalai-engine-crypto",
                 "personalai-engine-kv-cache",
+                "personalai-engine-knowledge-contract",
                 "personalai-engine-loader",
                 "personalai-engine-memory",
                 "personalai-engine-placement",

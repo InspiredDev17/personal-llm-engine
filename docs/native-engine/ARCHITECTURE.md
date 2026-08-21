@@ -29,6 +29,7 @@ Green authority.
 | `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
 | `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
+| `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 CAG lifecycle semantics and exact prefix framing |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
@@ -36,7 +37,7 @@ Green authority.
 | `engine-transformer` | fixed decoder configuration, tensor inventory, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
-| `engine-protocol` | directional frames, signed request/cancel envelopes and signed event encoding |
+| `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding and the fixed-binary internal Knowledge 1.1 cache adapter |
 | `engine-server` | service composition, protected UDS and owner-selected CPU/Metal runtime |
 | `engine-cli` | owner configuration, explicit backend policy and daemon entrypoint |
 | `engine-testkit` | deterministic non-production signed fixtures and boundary tests |

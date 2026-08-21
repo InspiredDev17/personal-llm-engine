@@ -160,10 +160,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-knowledge-contract"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-crypto",
+ "personalai-engine-types",
+]
+
+[[package]]
 name = "personalai-engine-kv-cache"
 version = "0.1.0"
 dependencies = [
  "personalai-engine-crypto",
+ "personalai-engine-knowledge-contract",
  "personalai-engine-memory",
  "personalai-engine-tensor",
  "personalai-engine-types",
@@ -253,6 +262,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "personalai-engine-crypto",
+ "personalai-engine-knowledge-contract",
  "personalai-engine-types",
 ]
 
@@ -299,6 +309,7 @@ dependencies = [
  "ed25519-dalek",
  "libc",
  "personalai-engine-crypto",
+ "personalai-engine-knowledge-contract",
  "personalai-engine-kv-cache",
  "personalai-engine-loader",
  "personalai-engine-memory",
@@ -353,6 +364,7 @@ dependencies = [
  "personalai-engine-arm64",
  "personalai-engine-cpu-reference",
  "personalai-engine-crypto",
+ "personalai-engine-knowledge-contract",
  "personalai-engine-kv-cache",
  "personalai-engine-loader",
  "personalai-engine-memory",

@@ -294,18 +294,35 @@ impl PackageFixtureBuilder {
 }
 
 /// Builder for a tiny package implementing the exact first-party decoder schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DecoderPackageFixtureBuilder;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderPackageFixtureBuilder {
+    context_limit: u32,
+}
 
 impl DecoderPackageFixtureBuilder {
     /// Creates the deterministic tiny decoder fixture builder.
     pub const fn new() -> Self {
-        Self
+        Self { context_limit: 8 }
+    }
+
+    /// Sets the synthetic decoder context limit without changing its weights.
+    pub fn with_context_limit(mut self, context_limit: u32) -> Result<Self, EngineError> {
+        if context_limit == 0 || context_limit > personalai_engine_types::MAX_CONTEXT_TOKENS {
+            return Err(EngineError::invalid_input("fixture context limit is outside hard bounds"));
+        }
+        self.context_limit = context_limit;
+        Ok(self)
     }
 
     /// Builds a signed two-layer GQA f32 decoder package with byte tokenizer data.
     pub fn build(self) -> Result<SignedPackageFixture, EngineError> {
-        build_signed_package(decoder_manifest(), decoder_tensors()?)
+        build_signed_package(decoder_manifest(self.context_limit), decoder_tensors()?)
+    }
+}
+
+impl Default for DecoderPackageFixtureBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -387,14 +404,14 @@ impl Default for PackageFixtureBuilder {
     }
 }
 
-fn decoder_manifest() -> ManifestFixture {
+fn decoder_manifest(context_limit: u32) -> ManifestFixture {
     ManifestFixture {
         architecture: DECODER_ARCHITECTURE,
         layer_count: 2,
         hidden_dimension: 4,
         attention_head_count: 2,
         kv_head_count: 1,
-        context_limit: 8,
+        context_limit,
         intermediate_dimension: 8,
     }
 }

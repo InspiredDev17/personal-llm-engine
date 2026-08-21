@@ -210,6 +210,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "personalai-engine-knowledge-contract"
+version = "0.1.0"
+dependencies = [
+ "personalai-engine-crypto",
+ "personalai-engine-types",
+]
+
+[[package]]
 name = "personalai-engine-loader"
 version = "0.1.0"
 dependencies = [
@@ -257,6 +265,7 @@ name = "personalai-engine-protocol"
 version = "0.1.0"
 dependencies = [
  "personalai-engine-crypto",
+ "personalai-engine-knowledge-contract",
  "personalai-engine-types",
 ]
 

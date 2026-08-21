@@ -21,7 +21,9 @@ The lifecycle is:
 `request-local prefill -> seal -> lookup/describe -> attach lease -> forked sequence -> decode ->
 drop lease -> invalidate/evict`.
 
-A generation cursor consumes a staged attachment once. Cancellation, client disconnect, cursor
+A generation cursor consumes a staged attachment once. Attach is explicitly target-request-bound;
+release verifies target request, cache ID, engine instance, and full authorization scope. Repeated
+exact release reports `already_released`. Cancellation, client disconnect, cursor
 drop, backend failure, or normal completion drops the request-local sequence and lease. Queued and
 disconnected cancellation removes the staged binding. A service-stage that is never followed by
 generation expires after 30 seconds, preventing an abandoned client from pinning model lifecycle
@@ -46,7 +48,9 @@ migration remain future work.
 
 ## Invalidation
 
-Supported selectors are exact cache ID, exact scope, loaded model, exact source identity, and
-source revision within an authorized scope. Active leases fail invalidation rather than becoming
-stale. Package/model revision changes naturally produce incompatible keys; model unload removes
-all idle objects.
+Supported canonical selectors are exact cache ID, exact scope, exact logical model, and exact
+source/revision identity within an authorized scope. Exact-cache invalidation can remove at most
+one object and is idempotent. Active leases fail invalidation rather than becoming stale.
+Package/model revision changes naturally produce incompatible keys; model unload removes all idle
+objects. Reusable caches are intentionally memory-only in V1, so a process restart starts with an
+empty reusable store and cannot accidentally resurrect stale state.

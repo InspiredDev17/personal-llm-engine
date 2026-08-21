@@ -1,20 +1,27 @@
 //! Dependency-free synthetic reusable-prefix lookup benchmark.
 
+use personalai_engine_knowledge_contract::{
+    ArtifactDigest, CacheAuthorizationScope, CacheBinding, CacheNamespace, CacheRuntimeIdentity,
+    CacheSensitivity, KnowledgeIdentity, StaticBundleBinding,
+};
 use personalai_engine_kv_cache::{
-    AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheScope,
-    ContiguousKvCache, KvCacheCompatibility, KvCacheLookup, KvCachePlan, ReusableKvCacheLimits,
-    ReusableKvCacheStore,
+    AttentionPositionSemantics, CacheRetentionPolicy, ContiguousKvCache, KvCacheCompatibility,
+    KvCacheLookup, KvCachePlan, ReusableKvCacheLimits, ReusableKvCacheStore,
 };
 use personalai_engine_memory::MemoryPool;
 use personalai_engine_types::{
     ArchitectureId, BackendId, DType, ModelId, ModelPackageHash, RequestId, ResourceBudget,
-    SequenceId,
+    SequenceId, Sha256Digest,
 };
 use std::hint::black_box;
 use std::time::Instant;
 
 const ITERATIONS: u32 = 10_000;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the standalone benchmark keeps its complete synthetic identity and accounting fixture visible"
+)]
 fn main() {
     let budget = ResourceBudget::new(16 << 20, 8 << 20, 4).expect("benchmark budget");
     let pool = MemoryPool::from_budget(&budget).expect("benchmark pool");
@@ -40,6 +47,7 @@ fn main() {
         model_id,
         ModelPackageHash::from_sha384_bytes([1; 48]),
         ModelPackageHash::from_sha384_bytes([2; 48]),
+        Sha256Digest::from_bytes([2; 32]),
         ArchitectureId::new("decoder-rms-rope-swiglu-gqa-v1").expect("architecture"),
         BackendId::new("cpu-reference").expect("backend"),
         AttentionPositionSemantics::CausalZeroBasedV1,
@@ -48,15 +56,50 @@ fn main() {
         DType::F32,
     )
     .expect("compatibility");
-    let scope = CacheScope::new(CacheNamespace::Project, "project:synthetic").expect("scope");
+    let scope = CacheAuthorizationScope::new(
+        CacheNamespace::Project,
+        KnowledgeIdentity::new("owner.synthetic").expect("owner"),
+        Some(KnowledgeIdentity::new("project.synthetic").expect("project")),
+        None,
+        None,
+    )
+    .expect("scope");
     let tokens = (0..256_u32).collect::<Vec<_>>();
+    let binding = CacheBinding::new(
+        CacheRuntimeIdentity::new(
+            KnowledgeIdentity::new("logical.synthetic").expect("logical model"),
+            compatibility.model_id().clone(),
+            KnowledgeIdentity::new("artifact.synthetic").expect("artifact"),
+            ArtifactDigest::Sha384(compatibility.model_artifact_hash()),
+            compatibility.backend_id().clone(),
+            KnowledgeIdentity::new("version.1").expect("backend version"),
+            KnowledgeIdentity::new("backend.synthetic").expect("backend instance"),
+            KnowledgeIdentity::new("engine.synthetic").expect("engine instance"),
+        )
+        .expect("runtime identity"),
+        KnowledgeIdentity::new("tokenizer.synthetic").expect("tokenizer"),
+        Sha256Digest::from_bytes([2; 32]),
+        compatibility.architecture_id().clone(),
+        KnowledgeIdentity::new("rope.causal-zero-based-v1").expect("RoPE semantics"),
+        compatibility.kv_dtype(),
+        StaticBundleBinding::new(
+            KnowledgeIdentity::new("bundle.synthetic").expect("bundle"),
+            1,
+            Sha256Digest::from_bytes([3; 32]),
+            Sha256Digest::from_bytes([4; 32]),
+        )
+        .expect("bundle binding"),
+        scope.clone(),
+        CacheSensitivity::Internal,
+        256,
+    )
+    .expect("cache binding");
     store
         .create_from_sequence(
             &cache,
             source,
             compatibility.clone(),
-            scope.clone(),
-            None,
+            binding,
             &tokens,
             &[0.0; 256],
             1,

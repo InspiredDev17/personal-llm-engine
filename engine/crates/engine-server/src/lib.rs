@@ -29,14 +29,20 @@ pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_crypto::EngineResponseSigner;
-use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
+use personalai_engine_crypto::{
+    TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner, hash_sha256,
+};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
 #[cfg(feature = "cpu-reference")]
+use personalai_engine_knowledge_contract::{
+    ArtifactDigest, CacheBinding, KnowledgeIdentity, StaticKnowledgePrefix,
+};
+#[cfg(feature = "cpu-reference")]
 use personalai_engine_kv_cache::{
-    AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheScope,
-    CacheSourceIdentity, KvCacheAttachment, KvCacheCompatibility, KvCacheDescriptor, KvCacheId,
-    ReusableKvCacheLimits, ReusableKvCacheMetrics, ReusableKvCacheStore,
+    AttentionPositionSemantics, CacheRetentionPolicy, KvCacheAttachment, KvCacheCompatibility,
+    KvCacheCreateOutcome, KvCacheDescriptor, KvCacheId, ReusableKvCacheLimits,
+    ReusableKvCacheStore,
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_loader::DirectorySecurityEventSink;
@@ -76,11 +82,11 @@ use personalai_engine_protocol::{
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_protocol::{
     FRAME_HEADER_BYTES, GENERATION_EVENT_AUTH_BYTES, ServiceCacheDescriptor, ServiceCacheId,
-    ServiceCacheInvalidation, ServiceCacheMetrics, ServiceCacheNamespace, ServiceCacheRequest,
-    ServiceCacheResponse, ServiceCacheScope, ServiceCacheSource, ServiceCapabilitySet,
-    ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind, ServiceMetrics,
-    ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody, ServiceResponseBody,
-    ServiceSecurityEvent, ShutdownRejectionReason, encode_signed_service_response,
+    ServiceCacheInvalidation, ServiceCacheMetrics, ServiceCacheRequest, ServiceCacheResponse,
+    ServiceCapabilitySet, ServiceErrorCode, ServiceHealthStatus, ServiceMessageKind,
+    ServiceMetrics, ServiceModelDescriptor, ServiceModelStatus, ServiceRequestBody,
+    ServiceResponseBody, ServiceSecurityEvent, ShutdownRejectionReason,
+    encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_sampling::{Sampler, SamplingConfig};
@@ -453,6 +459,8 @@ pub struct LoadedCpuModel {
     placement: Option<Arc<ExecutionPlacementPlan>>,
     reusable_cache: Option<Arc<ReusableKvCacheStore>>,
     cache_compatibility: KvCacheCompatibility,
+    tokenizer_digest: personalai_engine_types::Sha256Digest,
+    artifact_id: KnowledgeIdentity,
 }
 
 /// Fully loaded, signed model whose complete decoder executes through Metal.
@@ -478,8 +486,7 @@ enum LoadedRuntimeModel {
 struct PendingCacheAttachment {
     model_id: ModelId,
     cache_id: KvCacheId,
-    scope: CacheScope,
-    expected_token_count: u32,
+    binding: CacheBinding,
     expires_at: Instant,
 }
 
@@ -547,8 +554,7 @@ impl LoadedRuntimeModel {
             request,
             sequence_id,
             pending.cache_id,
-            pending.scope,
-            pending.expected_token_count,
+            pending.binding,
             unix_seconds()?,
         )
     }
@@ -694,9 +700,8 @@ impl RuntimeDecoderSession {
             Self::Cpu(session) => session.attach_reusable_cache(
                 &start.store,
                 start.cache_id,
-                &start.scope,
+                &start.binding,
                 &start.compatibility,
-                start.expected_token_count,
                 start.now_unix_seconds,
             ),
             #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -983,6 +988,26 @@ impl LoadedCpuModel {
         &self.cache_compatibility
     }
 
+    fn validate_cache_binding(&self, binding: &CacheBinding) -> Result<(), EngineError> {
+        let runtime = binding.runtime();
+        let expected_tokenizer_id = format!("tokenizer.sha256.{}", self.tokenizer_digest);
+        if runtime.provider_model_id() != &self.model_id
+            || runtime.artifact_id() != &self.artifact_id
+            || runtime.artifact_digest()
+                != ArtifactDigest::Sha384(self.cache_compatibility.model_artifact_hash())
+            || runtime.backend_id() != self.cache_compatibility.backend_id()
+            || binding.tokenizer_digest() != self.tokenizer_digest
+            || binding.tokenizer_id().as_str() != expected_tokenizer_id
+            || binding.architecture_id() != self.cache_compatibility.architecture_id()
+            || binding.kv_dtype() != self.cache_compatibility.kv_dtype()
+        {
+            return Err(EngineError::authentication_failure(
+                "canonical cache binding differs from the loaded model",
+            ));
+        }
+        Ok(())
+    }
+
     /// Prefills and seals one exact static prefix in request-independent state.
     #[allow(clippy::too_many_arguments)]
     pub fn create_reusable_cache(
@@ -990,25 +1015,32 @@ impl LoadedCpuModel {
         budget: &ResourceBudget,
         request_id: RequestId,
         sequence_id: SequenceId,
-        text: &str,
-        scope: CacheScope,
-        source: Option<CacheSourceIdentity>,
+        prefix: &StaticKnowledgePrefix,
+        binding: CacheBinding,
         retention: CacheRetentionPolicy,
         now_unix_seconds: u64,
-    ) -> Result<KvCacheDescriptor, EngineError> {
-        let tokens = self.tokenizer.encode(text)?;
+    ) -> Result<KvCacheCreateOutcome, EngineError> {
+        self.validate_cache_binding(&binding)?;
+        let tokens = self.tokenizer.encode(prefix.as_str())?;
         let token_count = u32::try_from(tokens.len())
             .map_err(|_| EngineError::resource_exhaustion("cache token count exceeds u32"))?;
         if token_count == 0 || token_count > self.model.config().context_limit().get() {
             return Err(EngineError::invalid_input("cache prefix token count is invalid"));
+        }
+        if token_count != binding.token_count()
+            || binding.bundle().ordered_prefix_digest()
+                != personalai_engine_crypto::hash_sha256(prefix.as_bytes())
+        {
+            return Err(EngineError::authentication_failure(
+                "static prefix token count or digest differs from the cache binding",
+            ));
         }
         let mut session = self.model.start_session(budget, request_id, sequence_id)?;
         let logits = session.prefill(&tokens)?;
         session.seal_reusable_cache(
             self.reusable_cache_store()?,
             self.cache_compatibility.clone(),
-            scope,
-            source,
+            binding,
             &tokens,
             &logits,
             now_unix_seconds,
@@ -1022,8 +1054,7 @@ impl LoadedCpuModel {
         request: &GenerationRequest,
         sequence_id: SequenceId,
         cache_id: KvCacheId,
-        scope: CacheScope,
-        expected_token_count: u32,
+        binding: CacheBinding,
         now_unix_seconds: u64,
     ) -> Result<GreedyGeneration, EngineError> {
         start_generation_cursor(
@@ -1039,8 +1070,7 @@ impl LoadedCpuModel {
                 })?),
                 compatibility: self.cache_compatibility.clone(),
                 cache_id,
-                scope,
-                expected_token_count,
+                binding,
                 now_unix_seconds,
             }),
         )
@@ -1284,6 +1314,10 @@ impl LoadedCpuModel {
 }
 
 #[cfg(feature = "cpu-reference")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "loaded model construction keeps independently verified native and canonical tokenizer identities explicit"
+)]
 fn build_loaded_cpu_model(
     model_id: ModelId,
     model: CpuDecoderModel,
@@ -1291,12 +1325,18 @@ fn build_loaded_cpu_model(
     placement: Option<Arc<ExecutionPlacementPlan>>,
     package_hash: ModelPackageHash,
     tokenizer_hash: ModelPackageHash,
+    tokenizer_digest: personalai_engine_types::Sha256Digest,
     budget: &ResourceBudget,
 ) -> Result<LoadedCpuModel, EngineError> {
+    let artifact_id = match placement.as_ref().and_then(|plan| plan.artifact_id()) {
+        Some(value) => KnowledgeIdentity::new(value)?,
+        None => KnowledgeIdentity::new(format!("aipack.{package_hash}"))?,
+    };
     let compatibility = KvCacheCompatibility::new(
         model_id.clone(),
         package_hash,
         tokenizer_hash,
+        tokenizer_digest,
         model.config().architecture_id().clone(),
         model.backend_id()?,
         AttentionPositionSemantics::CausalZeroBasedV1,
@@ -1327,6 +1367,8 @@ fn build_loaded_cpu_model(
         placement,
         reusable_cache,
         cache_compatibility: compatibility,
+        tokenizer_digest,
+        artifact_id,
     })
 }
 
@@ -1506,8 +1548,7 @@ struct CacheGenerationStart {
     store: Arc<ReusableKvCacheStore>,
     compatibility: KvCacheCompatibility,
     cache_id: KvCacheId,
-    scope: CacheScope,
-    expected_token_count: u32,
+    binding: CacheBinding,
     now_unix_seconds: u64,
 }
 
@@ -1541,7 +1582,7 @@ fn start_generation_cursor(
     };
     let uncached_input_count = u32::try_from(input_tokens.len())
         .map_err(|_| EngineError::resource_exhaustion("input token count exceeds u32"))?;
-    let cached_input_count = cache_start.as_ref().map_or(0, |cache| cache.expected_token_count);
+    let cached_input_count = cache_start.as_ref().map_or(0, |cache| cache.binding.token_count());
     let input_count = cached_input_count
         .checked_add(uncached_input_count)
         .ok_or_else(|| EngineError::resource_exhaustion("cached input token count overflows"))?;
@@ -2709,22 +2750,32 @@ fn handle_cache_service_request(
     let now_unix_seconds = unix_seconds()?;
     expire_pending_cache_attachments(pending, now);
     let response = match request {
-        ServiceCacheRequest::Create { model_id, scope, text, source, retention } => {
+        ServiceCacheRequest::Create {
+            model_id,
+            binding,
+            prefix,
+            maximum_cache_bytes,
+            retention,
+        } => {
             let loaded = loaded_cpu(models, model_id)?;
             let budget = model_load_budgets.get(model_id.as_str()).ok_or_else(|| {
                 EngineError::authentication_failure("model budget is unavailable")
             })?;
+            let prefix = StaticKnowledgePrefix::parse(
+                prefix,
+                binding.bundle().ordered_prefix_digest(),
+                personalai_engine_types::MAX_REQUEST_BYTES,
+            )?;
             let sequence_id = SequenceId::new(*next_sequence)?;
             *next_sequence = next_sequence
                 .checked_add(1)
                 .ok_or_else(|| EngineError::resource_exhaustion("sequence ID counter wraps"))?;
-            let descriptor = loaded.create_reusable_cache(
+            let outcome = loaded.create_reusable_cache(
                 budget,
                 request_id,
                 sequence_id,
-                text,
-                cache_scope_from_service(scope)?,
-                source.map(cache_source_from_service).transpose()?,
+                &prefix,
+                binding.as_ref().clone(),
                 CacheRetentionPolicy::new(
                     retention.ttl_seconds(),
                     retention.priority(),
@@ -2732,37 +2783,63 @@ fn handle_cache_service_request(
                 )?,
                 now_unix_seconds,
             )?;
-            ServiceCacheResponse::Created(service_cache_descriptor(&descriptor)?)
+            if outcome.byte_size() > *maximum_cache_bytes {
+                if !outcome.reused() {
+                    loaded
+                        .reusable_cache_store()?
+                        .invalidate_cache(outcome.cache_id(), binding.scope())?;
+                }
+                return Err(EngineError::resource_exhaustion(
+                    "sealed cache exceeds the request maximum",
+                ));
+            }
+            let descriptor = service_cache_descriptor(outcome.descriptor())?;
+            if outcome.reused() {
+                ServiceCacheResponse::Reused(descriptor)
+            } else {
+                ServiceCacheResponse::Created(descriptor)
+            }
         }
         ServiceCacheRequest::Describe { model_id, cache_id, scope } => {
             let loaded = loaded_cpu(models, model_id)?;
-            let descriptor = loaded.reusable_cache_store()?.describe(
+            match loaded.reusable_cache_store()?.describe(
                 KvCacheId::from_hash(cache_id.hash()),
-                &cache_scope_from_service(scope)?,
+                scope,
                 now_unix_seconds,
-            )?;
-            ServiceCacheResponse::Described(service_cache_descriptor(&descriptor)?)
+            ) {
+                Ok(descriptor) => {
+                    ServiceCacheResponse::Described(service_cache_descriptor(&descriptor)?)
+                }
+                Err(EngineError::InvalidInput(_)) => ServiceCacheResponse::Missing,
+                Err(error) => return Err(error),
+            }
         }
         ServiceCacheRequest::List { model_id, scope, maximum } => {
             let loaded = loaded_cpu(models, model_id)?;
-            let descriptors = loaded.reusable_cache_store()?.list(
-                &cache_scope_from_service(scope)?,
-                *maximum,
-                now_unix_seconds,
-            )?;
-            ServiceCacheResponse::Listed(
-                descriptors.iter().map(service_cache_descriptor).collect::<Result<Vec<_>, _>>()?,
-            )
+            let fetch_maximum = maximum
+                .saturating_add(1)
+                .min(personalai_engine_protocol::MAX_SERVICE_CACHE_RESULTS);
+            let mut descriptors =
+                loaded.reusable_cache_store()?.list(scope, fetch_maximum, now_unix_seconds)?;
+            let truncated = descriptors.len() > usize::from(*maximum);
+            descriptors.truncate(usize::from(*maximum));
+            ServiceCacheResponse::Listed {
+                caches: descriptors
+                    .iter()
+                    .map(service_cache_descriptor)
+                    .collect::<Result<Vec<_>, _>>()?,
+                truncated,
+            }
         }
-        ServiceCacheRequest::Attach { model_id, cache_id, scope, expected_token_count } => {
+        ServiceCacheRequest::Attach { model_id, cache_id, target_request_id, binding } => {
             let loaded = loaded_cpu(models, model_id)?;
-            let scope = cache_scope_from_service(scope)?;
+            loaded.validate_cache_binding(binding)?;
             let id = KvCacheId::from_hash(cache_id.hash());
             let descriptor =
-                loaded.reusable_cache_store()?.describe(id, &scope, now_unix_seconds)?;
-            if descriptor.key().token_count() != *expected_token_count {
-                return Err(EngineError::invalid_input(
-                    "cache token count differs from attachment expectation",
+                loaded.reusable_cache_store()?.describe(id, binding.scope(), now_unix_seconds)?;
+            if descriptor.key().binding() != binding.as_ref() {
+                return Err(EngineError::authentication_failure(
+                    "cache binding differs from attachment expectation",
                 ));
             }
             let expires_at = now
@@ -2770,52 +2847,70 @@ fn handle_cache_service_request(
                 .ok_or_else(|| EngineError::resource_exhaustion("cache attachment expiry wraps"))?;
             stage_pending_cache_attachment(
                 pending,
-                request_id,
+                *target_request_id,
                 PendingCacheAttachment {
                     model_id: model_id.clone(),
                     cache_id: id,
-                    scope,
-                    expected_token_count: *expected_token_count,
+                    binding: binding.as_ref().clone(),
                     expires_at,
                 },
                 now,
             )?;
             ServiceCacheResponse::Attached {
                 cache_id: *cache_id,
-                token_count: *expected_token_count,
+                token_count: binding.token_count(),
             }
         }
-        ServiceCacheRequest::Release { target_request_id } => {
-            pending.remove(target_request_id).ok_or_else(|| {
-                EngineError::invalid_input("staged cache attachment is unavailable")
-            })?;
-            ServiceCacheResponse::Released
+        ServiceCacheRequest::Release { target_request_id, cache_id, engine_instance_id, scope } => {
+            match pending.get(target_request_id) {
+                Some(attachment)
+                    if attachment.cache_id == KvCacheId::from_hash(cache_id.hash())
+                        && attachment.binding.scope() == scope
+                        && attachment.binding.runtime().engine_instance_id()
+                            == engine_instance_id =>
+                {
+                    pending.remove(target_request_id);
+                    ServiceCacheResponse::Released
+                }
+                Some(_) => {
+                    return Err(EngineError::authentication_failure(
+                        "cache release identity differs from the staged attachment",
+                    ));
+                }
+                None => ServiceCacheResponse::AlreadyReleased,
+            }
         }
         ServiceCacheRequest::Invalidate { model_id, scope, selector } => {
             let loaded = loaded_cpu(models, model_id)?;
             let store = loaded.reusable_cache_store()?;
-            let scope = cache_scope_from_service(scope)?;
             let count = match selector {
                 ServiceCacheInvalidation::Exact(id) => {
-                    store.invalidate_cache(KvCacheId::from_hash(id.hash()), &scope)?;
-                    1
+                    u32::from(store.invalidate_cache(KvCacheId::from_hash(id.hash()), scope)?)
                 }
-                ServiceCacheInvalidation::Scope => store.invalidate_namespace(&scope)?,
-                ServiceCacheInvalidation::Model => store.invalidate_model()?,
+                ServiceCacheInvalidation::Scope => store.invalidate_namespace(scope)?,
+                ServiceCacheInvalidation::LogicalModel(logical_model_id) => {
+                    store.invalidate_logical_model_in_scope(scope, logical_model_id)?
+                }
                 ServiceCacheInvalidation::Source(source) => store
-                    .invalidate_source_identity_in_scope(
-                        &scope,
-                        cache_source_from_service(*source)?,
+                    .invalidate_source_revision_in_scope(
+                        scope,
+                        source.source_id(),
+                        source.revision_id(),
                     )?,
-                ServiceCacheInvalidation::Revision(revision) => {
-                    store.invalidate_revision_in_scope(&scope, *revision)?
-                }
             };
             ServiceCacheResponse::Invalidated(count)
         }
-        ServiceCacheRequest::Metrics { model_id } => {
-            let metrics = loaded_cpu(models, model_id)?.reusable_cache_store()?.metrics()?;
-            ServiceCacheResponse::Metrics(service_cache_metrics(metrics))
+        ServiceCacheRequest::Metrics { model_id, logical_model_id, scope } => {
+            let loaded = loaded_cpu(models, model_id)?;
+            let descriptors = loaded
+                .reusable_cache_store()?
+                .list(scope, 256, now_unix_seconds)?
+                .into_iter()
+                .filter(|descriptor| {
+                    descriptor.key().binding().runtime().logical_model_id() == logical_model_id
+                })
+                .collect::<Vec<_>>();
+            ServiceCacheResponse::Metrics(service_cache_metrics(&descriptors)?)
         }
     };
     Ok(ServiceResponseBody::Cache(response))
@@ -2866,71 +2961,87 @@ fn loaded_cpu<'a>(
         .cpu()
 }
 
-#[cfg(feature = "cpu-reference")]
-fn cache_scope_from_service(scope: &ServiceCacheScope) -> Result<CacheScope, EngineError> {
-    let namespace = match scope.namespace() {
-        ServiceCacheNamespace::GlobalSafeStatic => CacheNamespace::GlobalSafeStatic,
-        ServiceCacheNamespace::User => CacheNamespace::User,
-        ServiceCacheNamespace::Project => CacheNamespace::Project,
-        ServiceCacheNamespace::Task => CacheNamespace::Task,
-        ServiceCacheNamespace::Agent => CacheNamespace::Agent,
-    };
-    CacheScope::new(namespace, scope.owner())
-}
-
-#[cfg(feature = "cpu-reference")]
-fn cache_source_from_service(
-    source: ServiceCacheSource,
-) -> Result<CacheSourceIdentity, EngineError> {
-    CacheSourceIdentity::new(source.hash(), source.revision())
-}
-
 #[cfg(all(unix, feature = "cpu-reference"))]
 fn service_cache_descriptor(
     descriptor: &KvCacheDescriptor,
 ) -> Result<ServiceCacheDescriptor, EngineError> {
-    let scope = descriptor.key().scope();
-    let namespace = match scope.namespace() {
-        CacheNamespace::GlobalSafeStatic => ServiceCacheNamespace::GlobalSafeStatic,
-        CacheNamespace::User => ServiceCacheNamespace::User,
-        CacheNamespace::Project => ServiceCacheNamespace::Project,
-        CacheNamespace::Task => ServiceCacheNamespace::Task,
-        CacheNamespace::Agent => ServiceCacheNamespace::Agent,
+    let expiry = match descriptor.retention().ttl_seconds() {
+        Some(ttl) => {
+            Some(descriptor.created_at_unix_seconds().checked_add(ttl).ok_or_else(|| {
+                EngineError::resource_exhaustion("cache descriptor expiry overflows")
+            })?)
+        }
+        None => None,
     };
     ServiceCacheDescriptor::new(
         ServiceCacheId::new(descriptor.cache_id().as_hash()),
-        descriptor.key().compatibility().model_id().clone(),
-        ServiceCacheScope::new(namespace, scope.owner())?,
-        descriptor.key().token_count(),
+        descriptor.key().binding().clone(),
         descriptor.byte_size(),
         descriptor.created_at_unix_seconds(),
+        descriptor.created_at_unix_seconds(),
+        expiry,
         descriptor.last_access_unix_seconds(),
         descriptor.hit_count(),
         descriptor.retention().pinned(),
+        descriptor.resident(),
     )
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
-const fn service_cache_metrics(metrics: ReusableKvCacheMetrics) -> ServiceCacheMetrics {
-    ServiceCacheMetrics([
-        metrics.lookup_count,
-        metrics.hit_count,
-        metrics.miss_count,
-        metrics.exact_prefix_hits,
-        metrics.partial_prefix_hits,
-        metrics.tokens_reused,
-        metrics.tokens_recomputed,
-        metrics.bytes_reused,
-        metrics.cpu_cache_bytes,
-        metrics.gpu_cache_bytes,
-        metrics.evictions,
-        metrics.invalidations,
-        metrics.transfer_nanoseconds,
-        metrics.measured_time_saved_nanoseconds,
-        metrics.time_to_first_token_nanoseconds,
-        metrics.prefill_nanoseconds,
+fn service_cache_metrics(
+    descriptors: &[KvCacheDescriptor],
+) -> Result<ServiceCacheMetrics, EngineError> {
+    let mut hits = 0_u64;
+    let mut tokens_reused = 0_u64;
+    let mut bytes_reused = 0_u64;
+    let mut cpu_bytes = 0_u64;
+    for descriptor in descriptors {
+        hits = hits.checked_add(descriptor.hit_count()).ok_or_else(|| {
+            EngineError::resource_exhaustion("scoped cache hit counter overflows")
+        })?;
+        tokens_reused = tokens_reused
+            .checked_add(
+                descriptor
+                    .hit_count()
+                    .checked_mul(u64::from(descriptor.key().token_count()))
+                    .ok_or_else(|| {
+                        EngineError::resource_exhaustion(
+                            "scoped cache reused-token counter overflows",
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion("scoped cache reused-token total overflows")
+            })?;
+        bytes_reused = bytes_reused
+            .checked_add(descriptor.hit_count().checked_mul(descriptor.byte_size()).ok_or_else(
+                || EngineError::resource_exhaustion("scoped cache reused-byte counter overflows"),
+            )?)
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion("scoped cache reused-byte total overflows")
+            })?;
+        cpu_bytes = cpu_bytes.checked_add(descriptor.byte_size()).ok_or_else(|| {
+            EngineError::resource_exhaustion("scoped cache resident bytes overflow")
+        })?;
+    }
+    Ok(ServiceCacheMetrics([
+        hits,
+        hits,
         0,
-    ])
+        hits,
+        0,
+        tokens_reused,
+        0,
+        bytes_reused,
+        cpu_bytes,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]))
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -4483,6 +4594,7 @@ impl EngineService {
             None,
             *registration.expected_hash(),
             hash_package(tokenizer_data),
+            hash_sha256(tokenizer_data),
             budget,
         )
     }
@@ -4553,6 +4665,7 @@ impl EngineService {
             None,
             *registration.expected_hash(),
             hash_package(tokenizer_data),
+            hash_sha256(tokenizer_data),
             budget,
         )
     }
@@ -4661,6 +4774,7 @@ impl EngineService {
             }
             let package_hash = *verified.registration().expected_hash();
             let tokenizer_hash = verified.manifest().tokenizer_hash();
+            let tokenizer_digest = hash_sha256(verified.tokenizer_bytes());
             let model = match placement.mode() {
                 WeightResidencyMode::FullyResident => {
                     let weights = verified.materialize_tensors(&pool)?.into_tensors();
@@ -4686,6 +4800,7 @@ impl EngineService {
                 Some(placement),
                 package_hash,
                 tokenizer_hash,
+                tokenizer_digest,
                 budget,
             )
         })();
@@ -4750,6 +4865,7 @@ impl EngineService {
                 Some(placement),
                 *verified.registration().expected_hash(),
                 verified.manifest().tokenizer_hash(),
+                hash_sha256(verified.tokenizer_bytes()),
                 budget,
             )
         })();
@@ -5032,6 +5148,11 @@ mod tests {
     use personalai_engine_crypto::{
         control_plane_signature_message, engine_response_signature_message,
     };
+    use personalai_engine_knowledge_contract::{
+        ArtifactDigest, CacheAuthorizationScope, CacheBinding, CacheNamespace,
+        CacheRuntimeIdentity, CacheSensitivity, KnowledgeIdentity, SourceRevisionBinding,
+        StaticBundleBinding,
+    };
     use personalai_engine_protocol::{
         AuthenticatedServiceRequest, AuthenticatedServiceResponse, CancellationEnvelope,
         GenerationRequestEnvelope, ServiceMessageKind, attach_cancellation_signature,
@@ -5039,7 +5160,98 @@ mod tests {
     };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
-    use personalai_engine_types::{ContextLimit, ModelHashAlgorithm, ResourceBudget, SignerKeyId};
+    use personalai_engine_types::{
+        ArchitectureId, ContextLimit, DType, ModelHashAlgorithm, ResourceBudget, Sha256Digest,
+        SignerKeyId,
+    };
+
+    fn cache_scope(project: &str) -> CacheAuthorizationScope {
+        CacheAuthorizationScope::new(
+            CacheNamespace::Project,
+            KnowledgeIdentity::new("usr_fixture_owner").unwrap(),
+            Some(KnowledgeIdentity::new(project).unwrap()),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn pending_binding(model_id: &ModelId, token_count: u32) -> CacheBinding {
+        CacheBinding::new(
+            CacheRuntimeIdentity::new(
+                KnowledgeIdentity::new("mdl_logical_fixture").unwrap(),
+                model_id.clone(),
+                KnowledgeIdentity::new("artifact.fixture").unwrap(),
+                ArtifactDigest::Sha384(test_hash()),
+                BackendId::new("cpu-reference").unwrap(),
+                KnowledgeIdentity::new("version.1").unwrap(),
+                KnowledgeIdentity::new("backend.fixture").unwrap(),
+                KnowledgeIdentity::new("engine.fixture").unwrap(),
+            )
+            .unwrap(),
+            KnowledgeIdentity::new("tokenizer.fixture").unwrap(),
+            Sha256Digest::from_bytes([2; 32]),
+            ArchitectureId::new("decoder-rms-rope-swiglu-gqa-v1").unwrap(),
+            KnowledgeIdentity::new("rope.causal-zero-based-v1").unwrap(),
+            DType::F32,
+            StaticBundleBinding::new(
+                KnowledgeIdentity::new("bundle.fixture").unwrap(),
+                1,
+                Sha256Digest::from_bytes([3; 32]),
+                Sha256Digest::from_bytes([4; 32]),
+            )
+            .unwrap(),
+            cache_scope("prj_fixture_project"),
+            CacheSensitivity::Internal,
+            token_count,
+        )
+        .unwrap()
+    }
+
+    fn loaded_cache_binding(
+        loaded: &LoadedCpuModel,
+        prefix: &[u8],
+        scope: CacheAuthorizationScope,
+    ) -> CacheBinding {
+        let token_count = u32::try_from(
+            loaded.tokenizer.encode(std::str::from_utf8(prefix).unwrap()).unwrap().len(),
+        )
+        .unwrap();
+        CacheBinding::new(
+            CacheRuntimeIdentity::new(
+                KnowledgeIdentity::new("mdl_logical_fixture").unwrap(),
+                loaded.model_id.clone(),
+                loaded.artifact_id.clone(),
+                ArtifactDigest::Sha384(loaded.cache_compatibility.model_artifact_hash()),
+                loaded.cache_compatibility.backend_id().clone(),
+                KnowledgeIdentity::new("version.0-1-0").unwrap(),
+                KnowledgeIdentity::new("backend.fixture").unwrap(),
+                KnowledgeIdentity::new("engine.fixture").unwrap(),
+            )
+            .unwrap(),
+            KnowledgeIdentity::new(format!("tokenizer.sha256.{}", loaded.tokenizer_digest))
+                .unwrap(),
+            loaded.tokenizer_digest,
+            loaded.cache_compatibility.architecture_id().clone(),
+            KnowledgeIdentity::new("rope.causal-zero-based-v1").unwrap(),
+            loaded.cache_compatibility.kv_dtype(),
+            StaticBundleBinding::new(
+                KnowledgeIdentity::new("kbundle_fixture").unwrap(),
+                1,
+                Sha256Digest::from_bytes([3; 32]),
+                hash_sha256(prefix),
+            )
+            .unwrap(),
+            scope,
+            CacheSensitivity::Internal,
+            token_count,
+        )
+        .unwrap()
+        .with_source_revision(SourceRevisionBinding::new(
+            KnowledgeIdentity::new("ksr_fixture_source_a").unwrap(),
+            KnowledgeIdentity::new("krv_fixture_revision_a").unwrap(),
+        ))
+    }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
@@ -5049,8 +5261,7 @@ mod tests {
         let original = PendingCacheAttachment {
             model_id: ModelId::new("model-a").unwrap(),
             cache_id: KvCacheId::from_hash(test_hash()),
-            scope: CacheScope::new(CacheNamespace::Project, "project:a").unwrap(),
-            expected_token_count: 3,
+            binding: pending_binding(&ModelId::new("model-a").unwrap(), 3),
             expires_at: now + std::time::Duration::from_secs(30),
         };
         let mut pending = BTreeMap::new();
@@ -7310,7 +7521,11 @@ mod tests {
                 SchedulerLimits::new(8, maximum_active, 4 << 20).expect("limits must validate"),
             )
             .expect("service must construct");
-            let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+            let fixture = DecoderPackageFixtureBuilder::new()
+                .with_context_limit(128)
+                .expect("fixture context must validate")
+                .build()
+                .expect("fixture must build");
             let model_id = ModelId::new("decoder-batch").expect("model ID must validate");
             service
                 .register_configured_model(
@@ -7380,7 +7595,7 @@ mod tests {
                 self.model_id.clone(),
                 prompt,
                 maximum_output_tokens,
-                ContextLimit::new(8).expect("context must validate"),
+                ContextLimit::new(128).expect("context must validate"),
                 self.budget,
             )
             .expect("request must validate")
@@ -7630,19 +7845,22 @@ mod tests {
             .unwrap();
             AuthenticatedServiceRequest::decode(&payload, &trusted).unwrap()
         };
-        let scope = ServiceCacheScope::new(ServiceCacheNamespace::Project, "project:cag").unwrap();
+        let scope = cache_scope("prj_fixture_project");
+        let prefix = b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n1:A".to_vec();
+        let binding = {
+            let loaded =
+                fixture.runtime.models.get(fixture.model_id.as_str()).unwrap().cpu().unwrap();
+            loaded_cache_binding(loaded, &prefix, scope.clone())
+        };
         let create = decode(
             &fixture,
             RequestId::new(9_001).unwrap(),
             101,
             ServiceRequestBody::Cache(ServiceCacheRequest::Create {
                 model_id: fixture.model_id.clone(),
-                scope: scope.clone(),
-                text: "A".to_owned(),
-                source: Some(
-                    ServiceCacheSource::new(ModelPackageHash::from_sha384_bytes([0x31; 48]), 1)
-                        .unwrap(),
-                ),
+                binding: Box::new(binding.clone()),
+                prefix: prefix.clone(),
+                maximum_cache_bytes: 1 << 20,
                 retention: personalai_engine_protocol::ServiceCacheRetention::new(
                     Some(60),
                     10,
@@ -7656,6 +7874,61 @@ mod tests {
             other => panic!("unexpected cache response: {other:?}"),
         };
         assert!(descriptor.token_count() > 0);
+        let repeated_create = decode(
+            &fixture,
+            RequestId::new(9_012).unwrap(),
+            110,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Create {
+                model_id: fixture.model_id.clone(),
+                binding: Box::new(binding.clone()),
+                prefix: prefix.clone(),
+                maximum_cache_bytes: 1 << 20,
+                retention: personalai_engine_protocol::ServiceCacheRetention::new(
+                    Some(60),
+                    10,
+                    false,
+                )
+                .unwrap(),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&repeated_create).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Reused(ref reused))
+                if reused.cache_id() == descriptor.cache_id()
+        ));
+        let undersized_reuse = decode(
+            &fixture,
+            RequestId::new(9_013).unwrap(),
+            111,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Create {
+                model_id: fixture.model_id.clone(),
+                binding: Box::new(binding.clone()),
+                prefix: prefix.clone(),
+                maximum_cache_bytes: 1,
+                retention: personalai_engine_protocol::ServiceCacheRetention::new(
+                    Some(60),
+                    10,
+                    false,
+                )
+                .unwrap(),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&undersized_reuse),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        let loaded = fixture.runtime.models.get(fixture.model_id.as_str()).unwrap().cpu().unwrap();
+        assert!(
+            loaded
+                .reusable_cache_store()
+                .unwrap()
+                .describe(
+                    KvCacheId::from_hash(descriptor.cache_id().hash()),
+                    &scope,
+                    unix_seconds().unwrap(),
+                )
+                .is_ok()
+        );
 
         let cached_request_id = RequestId::new(9_002).unwrap();
         let attach = decode(
@@ -7665,8 +7938,8 @@ mod tests {
             ServiceRequestBody::Cache(ServiceCacheRequest::Attach {
                 model_id: fixture.model_id.clone(),
                 cache_id: descriptor.cache_id(),
-                scope: scope.clone(),
-                expected_token_count: descriptor.token_count(),
+                target_request_id: cached_request_id,
+                binding: Box::new(binding.clone()),
             }),
         );
         assert!(matches!(
@@ -7680,7 +7953,9 @@ mod tests {
             .expect("attachment must stage");
         let loaded = fixture.runtime.models.get(fixture.model_id.as_str()).unwrap();
         let cached_request = fixture.request(9_002, "B", 2);
-        let full_request = fixture.request(9_003, "AB", 2);
+        let mut full_text = String::from_utf8(prefix).unwrap();
+        full_text.push('B');
+        let full_request = fixture.request(9_003, &full_text, 2);
         let mut cached = loaded
             .start_greedy_with_cache(&cached_request, SequenceId::new(40).unwrap(), Some(pending))
             .unwrap();
@@ -7718,6 +7993,8 @@ mod tests {
             103,
             ServiceRequestBody::Cache(ServiceCacheRequest::Metrics {
                 model_id: fixture.model_id.clone(),
+                logical_model_id: binding.runtime().logical_model_id().clone(),
+                scope: scope.clone(),
             }),
         );
         assert!(matches!(
@@ -7726,8 +8003,44 @@ mod tests {
                 if values.0[1] >= 1 && values.0[5] >= u64::from(descriptor.token_count())
         ));
 
-        let wrong_scope =
-            ServiceCacheScope::new(ServiceCacheNamespace::User, "user:other").unwrap();
+        let release_target = RequestId::new(9_010).unwrap();
+        let restage = decode(
+            &fixture,
+            RequestId::new(9_008).unwrap(),
+            107,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Attach {
+                model_id: fixture.model_id.clone(),
+                cache_id: descriptor.cache_id(),
+                target_request_id: release_target,
+                binding: Box::new(binding.clone()),
+            }),
+        );
+        fixture.runtime.handle_service_request(&restage).unwrap();
+        let release_body = ServiceRequestBody::Cache(ServiceCacheRequest::Release {
+            target_request_id: release_target,
+            cache_id: descriptor.cache_id(),
+            engine_instance_id: binding.runtime().engine_instance_id().clone(),
+            scope: scope.clone(),
+        });
+        let release = decode(&fixture, RequestId::new(9_009).unwrap(), 108, release_body.clone());
+        assert_eq!(
+            fixture.runtime.handle_service_request(&release).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Released)
+        );
+        let repeated_release = decode(&fixture, RequestId::new(9_011).unwrap(), 109, release_body);
+        assert_eq!(
+            fixture.runtime.handle_service_request(&repeated_release).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::AlreadyReleased)
+        );
+
+        let wrong_scope = CacheAuthorizationScope::new(
+            CacheNamespace::Owner,
+            KnowledgeIdentity::new("usr_other").unwrap(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let unauthorized = decode(
             &fixture,
             RequestId::new(9_005).unwrap(),
@@ -7749,13 +8062,27 @@ mod tests {
             105,
             ServiceRequestBody::Cache(ServiceCacheRequest::Invalidate {
                 model_id: fixture.model_id.clone(),
-                scope,
+                scope: scope.clone(),
                 selector: ServiceCacheInvalidation::Exact(descriptor.cache_id()),
             }),
         );
         assert_eq!(
             fixture.runtime.handle_service_request(&invalidate).unwrap(),
             ServiceResponseBody::Cache(ServiceCacheResponse::Invalidated(1))
+        );
+        let repeated = decode(
+            &fixture,
+            RequestId::new(9_007).unwrap(),
+            106,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Invalidate {
+                model_id: fixture.model_id.clone(),
+                scope,
+                selector: ServiceCacheInvalidation::Exact(descriptor.cache_id()),
+            }),
+        );
+        assert_eq!(
+            fixture.runtime.handle_service_request(&repeated).unwrap(),
+            ServiceResponseBody::Cache(ServiceCacheResponse::Invalidated(0))
         );
         fixture.cleanup();
     }

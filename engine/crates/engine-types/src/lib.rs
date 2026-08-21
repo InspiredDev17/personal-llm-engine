@@ -228,6 +228,68 @@ pub struct ModelPackageHash {
     digest: [u8; Self::BYTE_LEN],
 }
 
+/// Exact SHA-256 digest used by canonical cross-component content identities.
+///
+/// This is a value type only. Digest computation remains in the reviewed
+/// cryptography crate, and possession of a digest grants no trust or authority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sha256Digest([u8; Self::BYTE_LEN]);
+
+impl Sha256Digest {
+    /// Digest length in bytes.
+    pub const BYTE_LEN: usize = 32;
+    /// Lowercase hexadecimal digest length.
+    pub const HEX_LEN: usize = Self::BYTE_LEN * 2;
+
+    /// Constructs a digest from exactly 32 bytes.
+    pub const fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parses exactly 64 hexadecimal characters.
+    pub fn from_hex(encoded: &str) -> Result<Self, EngineError> {
+        if encoded.len() != Self::HEX_LEN
+            || !encoded.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(EngineError::invalid_field(
+                "sha256_digest",
+                "must contain exactly 64 lowercase hexadecimal characters",
+            ));
+        }
+        let mut bytes = [0_u8; Self::BYTE_LEN];
+        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+            let high = decode_hex_nibble(pair[0]).ok_or_else(|| {
+                EngineError::invalid_field("sha256_digest", "contains non-hexadecimal text")
+            })?;
+            let low = decode_hex_nibble(pair[1]).ok_or_else(|| {
+                EngineError::invalid_field("sha256_digest", "contains non-hexadecimal text")
+            })?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact digest bytes.
+    pub const fn as_bytes(&self) -> &[u8; Self::BYTE_LEN] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Sha256Digest({self})")
+    }
+}
+
 impl ModelPackageHash {
     /// Digest length in bytes.
     pub const BYTE_LEN: usize = 48;
@@ -1605,6 +1667,16 @@ mod tests {
         assert_eq!(digest.as_bytes()[0], 0x01);
         assert_eq!(digest.as_bytes()[31], 0xef);
         assert_eq!(digest.as_bytes()[47], 0xef);
+    }
+
+    #[test]
+    fn canonical_sha256_digest_is_exact_and_lowercase() {
+        let encoded = "0123456789abcdef".repeat(4);
+        let digest = Sha256Digest::from_hex(&encoded).expect("valid canonical SHA-256");
+        assert_eq!(digest.to_string(), encoded);
+        assert_eq!(digest.as_bytes()[0], 0x01);
+        assert!(Sha256Digest::from_hex("00").is_err());
+        assert!(Sha256Digest::from_hex(&"A".repeat(Sha256Digest::HEX_LEN)).is_err());
     }
 
     #[test]

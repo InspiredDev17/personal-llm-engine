@@ -6,10 +6,11 @@ use personalai_engine_arm64::Arm64Backend;
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
 #[cfg(feature = "arm64")]
 use personalai_engine_cpu_reference::{Backend, Operation};
+use personalai_engine_knowledge_contract::CacheBinding;
 use personalai_engine_kv_cache::{
-    CacheRetentionPolicy, CacheScope, CacheSourceIdentity, ContiguousKvCache, KvCacheAttachment,
-    KvCacheCompatibility, KvCacheDescriptor, KvCacheId, KvCacheMetrics, KvTokenWriter,
-    ReusableKvCacheLimits, ReusableKvCacheStore, SequenceHandle,
+    CacheRetentionPolicy, ContiguousKvCache, KvCacheAttachment, KvCacheCompatibility,
+    KvCacheCreateOutcome, KvCacheId, KvCacheMetrics, KvTokenWriter, ReusableKvCacheLimits,
+    ReusableKvCacheStore, SequenceHandle,
 };
 use personalai_engine_loader::{DirectorySecurityEventSink, VerifiedDirectoryPackage};
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
@@ -318,13 +319,12 @@ impl CpuDecoderSession {
         &self,
         store: &ReusableKvCacheStore,
         compatibility: KvCacheCompatibility,
-        scope: CacheScope,
-        source: Option<CacheSourceIdentity>,
+        binding: CacheBinding,
         tokens: &[u32],
         final_logits: &Tensor,
         created_at_unix_seconds: u64,
         retention: CacheRetentionPolicy,
-    ) -> Result<KvCacheDescriptor, EngineError> {
+    ) -> Result<KvCacheCreateOutcome, EngineError> {
         if self.token_count == 0 || usize::try_from(self.token_count).ok() != Some(tokens.len()) {
             return Err(EngineError::invalid_input(
                 "reusable cache tokens differ from committed decoder state",
@@ -334,8 +334,7 @@ impl CpuDecoderSession {
             &self.model.inner.cache,
             self.handle,
             compatibility,
-            scope,
-            source,
+            binding,
             tokens,
             &tensor_f32_values(final_logits)?,
             created_at_unix_seconds,
@@ -348,9 +347,8 @@ impl CpuDecoderSession {
         &mut self,
         store: &ReusableKvCacheStore,
         cache_id: KvCacheId,
-        authorized_scope: &CacheScope,
+        expected_binding: &CacheBinding,
         compatibility: &KvCacheCompatibility,
-        expected_token_count: u32,
         now_unix_seconds: u64,
     ) -> Result<(KvCacheAttachment, Tensor), EngineError> {
         if self.token_count != 0 {
@@ -360,9 +358,8 @@ impl CpuDecoderSession {
         }
         let attachment = store.attach_to_sequence(
             cache_id,
-            authorized_scope,
+            expected_binding,
             compatibility,
-            expected_token_count,
             &self.model.inner.cache,
             self.handle,
             now_unix_seconds,
@@ -372,7 +369,7 @@ impl CpuDecoderSession {
             attachment.final_logits(),
             &self.output_pool,
         )?;
-        self.token_count = expected_token_count;
+        self.token_count = expected_binding.token_count();
         Ok((attachment, logits))
     }
 
@@ -1308,11 +1305,54 @@ fn u32_from_usize(value: usize) -> Result<u32, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personalai_engine_kv_cache::{
-        AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheScope,
-        ReusableKvCacheLimits,
+    use personalai_engine_knowledge_contract::{
+        ArtifactDigest, CacheAuthorizationScope, CacheBinding, CacheNamespace,
+        CacheRuntimeIdentity, CacheSensitivity, KnowledgeIdentity, StaticBundleBinding,
     };
-    use personalai_engine_types::{ArchitectureId, ContextLimit, ModelPackageHash};
+    use personalai_engine_kv_cache::{
+        AttentionPositionSemantics, CacheRetentionPolicy, ReusableKvCacheLimits,
+    };
+    use personalai_engine_types::{ArchitectureId, ContextLimit, ModelPackageHash, Sha256Digest};
+
+    fn reusable_binding(model: &CpuDecoderModel) -> CacheBinding {
+        let model_id = ModelId::new("unregistered-test-model").unwrap();
+        CacheBinding::new(
+            CacheRuntimeIdentity::new(
+                KnowledgeIdentity::new("logical.test").unwrap(),
+                model_id,
+                KnowledgeIdentity::new("artifact.test").unwrap(),
+                ArtifactDigest::Sha384(ModelPackageHash::from_sha384_bytes([1; 48])),
+                model.backend_id().unwrap(),
+                KnowledgeIdentity::new("version.1").unwrap(),
+                KnowledgeIdentity::new("backend.test").unwrap(),
+                KnowledgeIdentity::new("engine.test").unwrap(),
+            )
+            .unwrap(),
+            KnowledgeIdentity::new("tokenizer.test").unwrap(),
+            Sha256Digest::from_bytes([2; 32]),
+            model.config().architecture_id().clone(),
+            KnowledgeIdentity::new("rope.causal-zero-based-v1").unwrap(),
+            model.config().cache_dtype(),
+            StaticBundleBinding::new(
+                KnowledgeIdentity::new("bundle.test").unwrap(),
+                1,
+                Sha256Digest::from_bytes([3; 32]),
+                Sha256Digest::from_bytes([4; 32]),
+            )
+            .unwrap(),
+            CacheAuthorizationScope::new(
+                CacheNamespace::Project,
+                KnowledgeIdentity::new("owner.test").unwrap(),
+                Some(KnowledgeIdentity::new("project.test").unwrap()),
+                None,
+                None,
+            )
+            .unwrap(),
+            CacheSensitivity::Internal,
+            3,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn tiny_decoder_executes_deterministically_and_advances_cache() {
@@ -1404,6 +1444,7 @@ mod tests {
             ModelId::new("unregistered-test-model").unwrap(),
             ModelPackageHash::from_sha384_bytes([1; ModelPackageHash::BYTE_LEN]),
             ModelPackageHash::from_sha384_bytes([2; ModelPackageHash::BYTE_LEN]),
+            Sha256Digest::from_bytes([2; 32]),
             model.config().architecture_id().clone(),
             model.backend_id().unwrap(),
             AttentionPositionSemantics::CausalZeroBasedV1,
@@ -1412,13 +1453,12 @@ mod tests {
             model.config().cache_dtype(),
         )
         .unwrap();
-        let scope = CacheScope::new(CacheNamespace::Project, "project:test").unwrap();
+        let binding = reusable_binding(&model);
         let descriptor = source
             .seal_reusable_cache(
                 &store,
                 compatibility.clone(),
-                scope.clone(),
-                None,
+                binding.clone(),
                 &[1, 2, 3],
                 &prefix_logits,
                 100,
@@ -1430,7 +1470,7 @@ mod tests {
             .start_session(&budget, RequestId::new(11).unwrap(), SequenceId::new(11).unwrap())
             .unwrap();
         let (_lease, restored_logits) = cached
-            .attach_reusable_cache(&store, descriptor.cache_id(), &scope, &compatibility, 3, 101)
+            .attach_reusable_cache(&store, descriptor.cache_id(), &binding, &compatibility, 101)
             .unwrap();
         for index in 0..8 {
             assert!(

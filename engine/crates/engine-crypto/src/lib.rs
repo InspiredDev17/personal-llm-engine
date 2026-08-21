@@ -7,8 +7,8 @@
 //! construction and the underlying signing key zeroizes on drop.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use personalai_engine_types::{EngineError, ModelPackageHash, SignerKeyId};
-use sha2::{Digest, Sha384};
+use personalai_engine_types::{EngineError, ModelPackageHash, Sha256Digest, SignerKeyId};
+use sha2::{Digest, Sha256, Sha384};
 use std::collections::BTreeMap;
 use std::io::Read;
 use zeroize::Zeroize;
@@ -34,6 +34,17 @@ pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 /// Maximum simultaneously accepted Go control-plane verification identities.
 pub const MAX_TRUSTED_CONTROL_PLANE_KEYS: usize = 2;
+
+/// Computes a canonical SHA-256 content digest.
+///
+/// SHA-256 is used only where the pinned Sovereign contract requires it. Model
+/// packages continue to use their separately tagged SHA-384 identity.
+pub fn hash_sha256(bytes: &[u8]) -> Sha256Digest {
+    let digest = Sha256::digest(bytes);
+    let mut exact = [0_u8; Sha256Digest::BYTE_LEN];
+    exact.copy_from_slice(&digest);
+    Sha256Digest::from_bytes(exact)
+}
 
 /// Operator-configured Ed25519 verification key.
 #[derive(Clone, Debug, PartialEq, Eq)]

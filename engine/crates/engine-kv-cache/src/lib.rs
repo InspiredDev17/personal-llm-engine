@@ -10,11 +10,11 @@ pub use contiguous::{
     ContiguousKvCache, KvCacheMetrics, KvCacheStatus, KvTokenWriter, SequenceHandle, SequenceStatus,
 };
 pub use reusable::{
-    AttentionPositionSemantics, CacheNamespace, CacheRetentionPolicy, CacheReusePolicy, CacheScope,
-    CacheSourceIdentity, KvCacheAttachment, KvCacheCompatibility, KvCacheDescriptor, KvCacheHit,
-    KvCacheHitKind, KvCacheId, KvCacheKey, KvCacheLocation, KvCacheLookup, KvCacheMiss,
-    KvCacheState, MAX_CACHE_OWNER_BYTES, MAX_REUSABLE_KV_CACHES, REUSABLE_KV_CACHE_FORMAT_VERSION,
-    ReusableKvCacheLimits, ReusableKvCacheMetrics, ReusableKvCacheStore,
+    AttentionPositionSemantics, CacheRetentionPolicy, CacheReusePolicy, KvCacheAttachment,
+    KvCacheCompatibility, KvCacheCreateOutcome, KvCacheDescriptor, KvCacheHit, KvCacheHitKind,
+    KvCacheId, KvCacheKey, KvCacheLocation, KvCacheLookup, KvCacheMiss, KvCacheState,
+    MAX_REUSABLE_KV_CACHES, REUSABLE_KV_CACHE_FORMAT_VERSION, ReusableKvCacheLimits,
+    ReusableKvCacheMetrics, ReusableKvCacheStore,
 };
 
 /// Maximum transformer layer count accepted by cache planning.

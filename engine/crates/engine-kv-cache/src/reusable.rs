@@ -5,10 +5,13 @@
 
 use crate::{ContiguousKvCache, SequenceHandle};
 use personalai_engine_crypto::hash_package;
+use personalai_engine_knowledge_contract::{
+    ArtifactDigest, CacheAuthorizationScope, CacheBinding, KnowledgeIdentity,
+};
 use personalai_engine_memory::{MemoryOwner, MemoryPool, MemoryReservation};
 use personalai_engine_types::{
     ArchitectureId, BackendId, DType, EngineError, MAX_CONTEXT_TOKENS,
-    MAX_REUSABLE_CACHE_TTL_SECONDS, ModelHashAlgorithm, ModelId, ModelPackageHash,
+    MAX_REUSABLE_CACHE_TTL_SECONDS, ModelHashAlgorithm, ModelId, ModelPackageHash, Sha256Digest,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,8 +21,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub const REUSABLE_KV_CACHE_FORMAT_VERSION: u16 = 1;
 /// Maximum live reusable cache objects in one model store.
 pub const MAX_REUSABLE_KV_CACHES: u32 = 1_024;
-/// Maximum bounded cache owner identifier bytes.
-pub const MAX_CACHE_OWNER_BYTES: usize = 96;
 /// Conservative accounted metadata bytes per reusable cache entry.
 const CACHE_METADATA_BYTES: u64 = 768;
 
@@ -56,99 +57,6 @@ impl fmt::Display for KvCacheId {
     }
 }
 
-/// Closed cache namespace selected by the authenticated Go control plane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum CacheNamespace {
-    /// Reviewed context safe for all callers explicitly authorized to this scope.
-    GlobalSafeStatic = 1,
-    /// One user-owned scope.
-    User = 2,
-    /// One project-owned scope.
-    Project = 3,
-    /// One task-owned scope.
-    Task = 4,
-    /// One agent-owned scope.
-    Agent = 5,
-}
-
-impl CacheNamespace {
-    /// Decodes one closed namespace value.
-    pub fn from_u8(value: u8) -> Result<Self, EngineError> {
-        match value {
-            1 => Ok(Self::GlobalSafeStatic),
-            2 => Ok(Self::User),
-            3 => Ok(Self::Project),
-            4 => Ok(Self::Task),
-            5 => Ok(Self::Agent),
-            _ => Err(EngineError::invalid_input("cache namespace is unsupported")),
-        }
-    }
-}
-
-/// Authenticated logical ownership boundary for one reusable cache.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CacheScope {
-    namespace: CacheNamespace,
-    owner: String,
-}
-
-impl CacheScope {
-    /// Constructs a bounded path-free cache scope.
-    pub fn new(namespace: CacheNamespace, owner: impl Into<String>) -> Result<Self, EngineError> {
-        let owner = owner.into();
-        if owner.is_empty()
-            || owner.len() > MAX_CACHE_OWNER_BYTES
-            || !owner.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-            })
-            || owner.contains("..")
-        {
-            return Err(EngineError::invalid_input(
-                "cache owner is outside the canonical path-free grammar",
-            ));
-        }
-        Ok(Self { namespace, owner })
-    }
-
-    /// Returns the closed namespace.
-    pub const fn namespace(&self) -> CacheNamespace {
-        self.namespace
-    }
-
-    /// Returns the bounded owner identifier.
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
-}
-
-/// Optional content-free source identity and monotonic source revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CacheSourceIdentity {
-    source_hash: ModelPackageHash,
-    revision: u64,
-}
-
-impl CacheSourceIdentity {
-    /// Constructs a source identity with a nonzero revision.
-    pub fn new(source_hash: ModelPackageHash, revision: u64) -> Result<Self, EngineError> {
-        if revision == 0 {
-            return Err(EngineError::invalid_input("cache source revision must be nonzero"));
-        }
-        Ok(Self { source_hash, revision })
-    }
-
-    /// Returns the exact source hash.
-    pub const fn source_hash(self) -> ModelPackageHash {
-        self.source_hash
-    }
-
-    /// Returns the monotonic source revision.
-    pub const fn revision(self) -> u64 {
-        self.revision
-    }
-}
-
 /// Closed positional semantics for cached attention state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -163,6 +71,7 @@ pub struct KvCacheCompatibility {
     model_id: ModelId,
     model_artifact_hash: ModelPackageHash,
     tokenizer_hash: ModelPackageHash,
+    tokenizer_sha256: Sha256Digest,
     architecture_id: ArchitectureId,
     backend_id: BackendId,
     attention_positions: AttentionPositionSemantics,
@@ -178,6 +87,7 @@ impl KvCacheCompatibility {
         model_id: ModelId,
         model_artifact_hash: ModelPackageHash,
         tokenizer_hash: ModelPackageHash,
+        tokenizer_sha256: Sha256Digest,
         architecture_id: ArchitectureId,
         backend_id: BackendId,
         attention_positions: AttentionPositionSemantics,
@@ -198,6 +108,7 @@ impl KvCacheCompatibility {
             model_id,
             model_artifact_hash,
             tokenizer_hash,
+            tokenizer_sha256,
             architecture_id,
             backend_id,
             attention_positions,
@@ -220,6 +131,11 @@ impl KvCacheCompatibility {
     /// Returns the exact tokenizer data hash.
     pub const fn tokenizer_hash(&self) -> ModelPackageHash {
         self.tokenizer_hash
+    }
+
+    /// Returns the canonical SHA-256 tokenizer digest.
+    pub const fn tokenizer_sha256(&self) -> Sha256Digest {
+        self.tokenizer_sha256
     }
 
     /// Returns the reviewed architecture identity.
@@ -257,8 +173,7 @@ impl KvCacheCompatibility {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KvCacheKey {
     compatibility: KvCacheCompatibility,
-    scope: CacheScope,
-    source: Option<CacheSourceIdentity>,
+    binding: CacheBinding,
     ordered_token_hash: ModelPackageHash,
     token_count: u32,
 }
@@ -267,8 +182,7 @@ impl KvCacheKey {
     /// Derives a key from exact ordered token IDs.
     pub fn new(
         compatibility: KvCacheCompatibility,
-        scope: CacheScope,
-        source: Option<CacheSourceIdentity>,
+        binding: CacheBinding,
         tokens: &[u32],
     ) -> Result<Self, EngineError> {
         let token_count = u32::try_from(tokens.len())
@@ -276,13 +190,23 @@ impl KvCacheKey {
         if token_count == 0 || token_count > MAX_CONTEXT_TOKENS {
             return Err(EngineError::invalid_input("cache token count is outside hard bounds"));
         }
-        Ok(Self {
-            compatibility,
-            scope,
-            source,
-            ordered_token_hash: hash_tokens(tokens)?,
-            token_count,
-        })
+        if binding.token_count() != token_count
+            || binding.runtime().provider_model_id() != compatibility.model_id()
+            || binding.architecture_id() != compatibility.architecture_id()
+            || binding.runtime().backend_id() != compatibility.backend_id()
+            || binding.tokenizer_digest() != compatibility.tokenizer_sha256()
+            || binding.kv_dtype() != compatibility.kv_dtype()
+            || binding.rope_semantics_id().as_str() != "rope.causal-zero-based-v1"
+            || !matches!(
+                binding.runtime().artifact_digest(),
+                ArtifactDigest::Sha384(hash) if hash == compatibility.model_artifact_hash()
+            )
+        {
+            return Err(EngineError::authentication_failure(
+                "canonical cache binding differs from loaded execution identity",
+            ));
+        }
+        Ok(Self { compatibility, binding, ordered_token_hash: hash_tokens(tokens)?, token_count })
     }
 
     /// Returns the exact compatibility descriptor.
@@ -291,13 +215,13 @@ impl KvCacheKey {
     }
 
     /// Returns the exact authorization scope.
-    pub const fn scope(&self) -> &CacheScope {
-        &self.scope
+    pub const fn binding(&self) -> &CacheBinding {
+        &self.binding
     }
 
-    /// Returns optional source identity.
-    pub const fn source(&self) -> Option<CacheSourceIdentity> {
-        self.source
+    /// Returns the exact authorization scope.
+    pub const fn scope(&self) -> &CacheAuthorizationScope {
+        self.binding.scope()
     }
 
     /// Returns the ordered token-sequence hash.
@@ -391,6 +315,33 @@ pub struct KvCacheDescriptor {
     retention: CacheRetentionPolicy,
     resident: bool,
     transfer_cost_nanoseconds: Option<u64>,
+}
+
+/// Deterministic result of sealing a reusable cache key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvCacheCreateOutcome {
+    descriptor: KvCacheDescriptor,
+    reused: bool,
+}
+
+impl KvCacheCreateOutcome {
+    /// Returns the exact immutable cache descriptor.
+    pub const fn descriptor(&self) -> &KvCacheDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns whether the exact pre-existing cache object was reused.
+    pub const fn reused(&self) -> bool {
+        self.reused
+    }
+}
+
+impl std::ops::Deref for KvCacheCreateOutcome {
+    type Target = KvCacheDescriptor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.descriptor
+    }
 }
 
 impl KvCacheDescriptor {
@@ -663,13 +614,12 @@ impl ReusableKvCacheStore {
         cache: &ContiguousKvCache,
         handle: SequenceHandle,
         compatibility: KvCacheCompatibility,
-        scope: CacheScope,
-        source: Option<CacheSourceIdentity>,
+        binding: CacheBinding,
         tokens: &[u32],
         final_logits: &[f32],
         created_at_unix_seconds: u64,
         retention: CacheRetentionPolicy,
-    ) -> Result<KvCacheDescriptor, EngineError> {
+    ) -> Result<KvCacheCreateOutcome, EngineError> {
         if created_at_unix_seconds == 0 {
             return Err(EngineError::invalid_input("cache creation time must be nonzero"));
         }
@@ -691,7 +641,7 @@ impl ReusableKvCacheStore {
         if final_logits.is_empty() || final_logits.iter().any(|value| !value.is_finite()) {
             return Err(EngineError::invalid_input("cache final logits are empty or non-finite"));
         }
-        let key = KvCacheKey::new(compatibility, scope, source, tokens)?;
+        let key = KvCacheKey::new(compatibility, binding, tokens)?;
         let cache_id = key.cache_id()?;
         let mut state = self.lock_state()?;
         evict_expired_locked(&mut state, created_at_unix_seconds)?;
@@ -699,7 +649,10 @@ impl ReusableKvCacheStore {
             if existing.descriptor.key != key {
                 return Err(EngineError::internal_invariant("cache identifier collision"));
             }
-            return Ok(existing.descriptor.clone());
+            return Ok(KvCacheCreateOutcome {
+                descriptor: existing.descriptor.clone(),
+                reused: true,
+            });
         }
 
         let kv_bytes = cache.copy_committed_prefix(handle, token_count)?;
@@ -777,14 +730,14 @@ impl ReusableKvCacheStore {
         state
             .entries
             .insert(cache_id, CacheEntry { descriptor: descriptor.clone(), data, expires_at });
-        Ok(descriptor)
+        Ok(KvCacheCreateOutcome { descriptor, reused: false })
     }
 
     /// Finds the longest sealed cache whose exact token sequence prefixes the request.
     pub fn lookup_longest_prefix(
         &self,
         compatibility: &KvCacheCompatibility,
-        scope: &CacheScope,
+        scope: &CacheAuthorizationScope,
         requested_tokens: &[u32],
         now_unix_seconds: u64,
     ) -> Result<KvCacheLookup, EngineError> {
@@ -842,9 +795,8 @@ impl ReusableKvCacheStore {
     pub fn attach_to_sequence(
         &self,
         cache_id: KvCacheId,
-        authorized_scope: &CacheScope,
+        expected_binding: &CacheBinding,
         compatibility: &KvCacheCompatibility,
-        expected_token_count: u32,
         cache: &ContiguousKvCache,
         handle: SequenceHandle,
         now_unix_seconds: u64,
@@ -856,20 +808,18 @@ impl ReusableKvCacheStore {
             state.metrics.miss_count = increment(state.metrics.miss_count, "cache miss counter")?;
             return Err(EngineError::invalid_input("reusable cache ID is unavailable"));
         };
-        if entry.descriptor.key.scope() != authorized_scope {
+        if entry.descriptor.key.scope() != expected_binding.scope() {
             state.metrics.miss_count = increment(state.metrics.miss_count, "cache miss counter")?;
             return Err(EngineError::authentication_failure("cache scope is not authorized"));
         }
         if entry.descriptor.key.compatibility() != compatibility
+            || entry.descriptor.key.binding() != expected_binding
             || compatibility.model_id() != cache.model_id()
         {
             state.metrics.miss_count = increment(state.metrics.miss_count, "cache miss counter")?;
             return Err(EngineError::authentication_failure("cache compatibility differs"));
         }
-        if entry.descriptor.key.token_count() != expected_token_count {
-            state.metrics.miss_count = increment(state.metrics.miss_count, "cache miss counter")?;
-            return Err(EngineError::invalid_input("cache token count differs from expectation"));
-        }
+        let expected_token_count = expected_binding.token_count();
         if hash_cache_data(&entry.data.tokens, &entry.data.kv_bytes, &entry.data.final_logits)?
             != entry.data.content_hash
         {
@@ -895,7 +845,7 @@ impl ReusableKvCacheStore {
     pub fn describe(
         &self,
         cache_id: KvCacheId,
-        authorized_scope: &CacheScope,
+        authorized_scope: &CacheAuthorizationScope,
         now_unix_seconds: u64,
     ) -> Result<KvCacheDescriptor, EngineError> {
         let mut state = self.lock_state()?;
@@ -913,7 +863,7 @@ impl ReusableKvCacheStore {
     /// Lists a bounded deterministic cache descriptor prefix for one exact scope.
     pub fn list(
         &self,
-        authorized_scope: &CacheScope,
+        authorized_scope: &CacheAuthorizationScope,
         maximum: u16,
         now_unix_seconds: u64,
     ) -> Result<Vec<KvCacheDescriptor>, EngineError> {
@@ -941,13 +891,12 @@ impl ReusableKvCacheStore {
     pub fn invalidate_cache(
         &self,
         cache_id: KvCacheId,
-        authorized_scope: &CacheScope,
-    ) -> Result<(), EngineError> {
+        authorized_scope: &CacheAuthorizationScope,
+    ) -> Result<bool, EngineError> {
         let mut state = self.lock_state()?;
-        let entry = state
-            .entries
-            .get(&cache_id)
-            .ok_or_else(|| EngineError::invalid_input("reusable cache ID is unavailable"))?;
+        let Some(entry) = state.entries.get(&cache_id) else {
+            return Ok(false);
+        };
         if entry.descriptor.key.scope() != authorized_scope {
             return Err(EngineError::authentication_failure("cache scope is not authorized"));
         }
@@ -957,11 +906,14 @@ impl ReusableKvCacheStore {
         remove_entry(&mut state, cache_id, false)?;
         state.metrics.invalidations =
             increment(state.metrics.invalidations, "invalidation counter")?;
-        Ok(())
+        Ok(true)
     }
 
     /// Invalidates every idle cache in an exact scope.
-    pub fn invalidate_namespace(&self, scope: &CacheScope) -> Result<u32, EngineError> {
+    pub fn invalidate_namespace(
+        &self,
+        scope: &CacheAuthorizationScope,
+    ) -> Result<u32, EngineError> {
         let mut state = self.lock_state()?;
         let ids = state
             .entries
@@ -983,63 +935,48 @@ impl ReusableKvCacheStore {
         Ok(count)
     }
 
-    /// Invalidates idle caches bound to one exact source hash.
-    pub fn invalidate_source(&self, source_hash: ModelPackageHash) -> Result<u32, EngineError> {
-        self.invalidate_matching(|entry| {
-            entry.descriptor.key.source().is_some_and(|source| source.source_hash() == source_hash)
-        })
-    }
-
-    /// Invalidates idle caches with one exact source hash inside one authorized scope.
-    pub fn invalidate_source_in_scope(
+    /// Invalidates idle caches for one exact logical model inside one scope.
+    pub fn invalidate_logical_model_in_scope(
         &self,
-        scope: &CacheScope,
-        source_hash: ModelPackageHash,
+        scope: &CacheAuthorizationScope,
+        logical_model_id: &KnowledgeIdentity,
     ) -> Result<u32, EngineError> {
         self.invalidate_matching(|entry| {
             entry.descriptor.key.scope() == scope
-                && entry
-                    .descriptor
-                    .key
-                    .source()
-                    .is_some_and(|source| source.source_hash() == source_hash)
+                && entry.descriptor.key.binding().runtime().logical_model_id() == logical_model_id
         })
     }
 
-    /// Invalidates idle caches with one exact source identity inside one scope.
-    pub fn invalidate_source_identity_in_scope(
+    /// Invalidates idle caches for one exact bundle revision inside one scope.
+    pub fn invalidate_bundle_revision_in_scope(
         &self,
-        scope: &CacheScope,
-        source_identity: CacheSourceIdentity,
-    ) -> Result<u32, EngineError> {
-        self.invalidate_matching(|entry| {
-            entry.descriptor.key.scope() == scope
-                && entry.descriptor.key.source() == Some(source_identity)
-        })
-    }
-
-    /// Invalidates idle caches bound to one exact source revision.
-    pub fn invalidate_revision(&self, revision: u64) -> Result<u32, EngineError> {
-        if revision == 0 {
-            return Err(EngineError::invalid_input("cache revision must be nonzero"));
-        }
-        self.invalidate_matching(|entry| {
-            entry.descriptor.key.source().is_some_and(|source| source.revision() == revision)
-        })
-    }
-
-    /// Invalidates idle caches with one exact revision inside one authorized scope.
-    pub fn invalidate_revision_in_scope(
-        &self,
-        scope: &CacheScope,
+        scope: &CacheAuthorizationScope,
+        bundle_id: &KnowledgeIdentity,
         revision: u64,
     ) -> Result<u32, EngineError> {
         if revision == 0 {
-            return Err(EngineError::invalid_input("cache revision must be nonzero"));
+            return Err(EngineError::invalid_input("bundle revision must be nonzero"));
         }
         self.invalidate_matching(|entry| {
+            let binding = entry.descriptor.key.binding();
             entry.descriptor.key.scope() == scope
-                && entry.descriptor.key.source().is_some_and(|source| source.revision() == revision)
+                && binding.bundle().bundle_id() == bundle_id
+                && binding.bundle().bundle_revision() == revision
+        })
+    }
+
+    /// Invalidates idle caches for one exact canonical source revision in one scope.
+    pub fn invalidate_source_revision_in_scope(
+        &self,
+        scope: &CacheAuthorizationScope,
+        source_id: &KnowledgeIdentity,
+        revision_id: &KnowledgeIdentity,
+    ) -> Result<u32, EngineError> {
+        self.invalidate_matching(|entry| {
+            entry.descriptor.key.scope() == scope
+                && entry.descriptor.key.binding().source_revision().is_some_and(|source| {
+                    source.source_id() == source_id && source.revision_id() == revision_id
+                })
         })
     }
 
@@ -1212,25 +1149,79 @@ fn encode_key(key: &KvCacheKey) -> Result<Vec<u8>, EngineError> {
     append_text(&mut bytes, key.compatibility.model_id().as_str())?;
     bytes.extend_from_slice(key.compatibility.model_artifact_hash().as_bytes());
     bytes.extend_from_slice(key.compatibility.tokenizer_hash().as_bytes());
+    bytes.extend_from_slice(key.compatibility.tokenizer_sha256().as_bytes());
     append_text(&mut bytes, key.compatibility.architecture_id().as_str())?;
     append_text(&mut bytes, key.compatibility.backend_id().as_str())?;
     bytes.push(key.compatibility.attention_positions() as u8);
     bytes.extend_from_slice(&key.compatibility.rope_theta_bits.to_le_bytes());
     bytes.extend_from_slice(&key.compatibility.rope_scaling_bits.to_le_bytes());
     bytes.push(dtype_code(key.compatibility.kv_dtype())?);
-    bytes.push(key.scope.namespace() as u8);
-    append_text(&mut bytes, key.scope.owner())?;
-    match key.source {
-        None => bytes.push(0),
-        Some(source) => {
-            bytes.push(1);
-            bytes.extend_from_slice(source.source_hash().as_bytes());
-            bytes.extend_from_slice(&source.revision().to_le_bytes());
-        }
-    }
+    append_binding(&mut bytes, key.binding())?;
     bytes.extend_from_slice(key.ordered_token_hash.as_bytes());
     bytes.extend_from_slice(&key.token_count.to_le_bytes());
     Ok(bytes)
+}
+
+fn append_binding(bytes: &mut Vec<u8>, binding: &CacheBinding) -> Result<(), EngineError> {
+    let runtime = binding.runtime();
+    append_text(bytes, runtime.logical_model_id().as_str())?;
+    append_text(bytes, runtime.provider_model_id().as_str())?;
+    append_text(bytes, runtime.artifact_id().as_str())?;
+    match runtime.artifact_digest() {
+        ArtifactDigest::Sha256(digest) => {
+            bytes.push(1);
+            bytes.extend_from_slice(digest.as_bytes());
+        }
+        ArtifactDigest::Sha384(digest) => {
+            bytes.push(2);
+            bytes.extend_from_slice(digest.as_bytes());
+        }
+    }
+    append_text(bytes, runtime.backend_id().as_str())?;
+    append_text(bytes, runtime.backend_version().as_str())?;
+    append_text(bytes, runtime.backend_instance_id().as_str())?;
+    append_text(bytes, runtime.engine_instance_id().as_str())?;
+    append_text(bytes, binding.tokenizer_id().as_str())?;
+    bytes.extend_from_slice(binding.tokenizer_digest().as_bytes());
+    append_text(bytes, binding.architecture_id().as_str())?;
+    append_text(bytes, binding.rope_semantics_id().as_str())?;
+    bytes.push(dtype_code(binding.kv_dtype())?);
+    let bundle = binding.bundle();
+    append_text(bytes, bundle.bundle_id().as_str())?;
+    bytes.extend_from_slice(&bundle.bundle_revision().to_le_bytes());
+    bytes.extend_from_slice(bundle.bundle_digest().as_bytes());
+    bytes.extend_from_slice(bundle.ordered_prefix_digest().as_bytes());
+    match binding.source_revision() {
+        Some(source) => {
+            bytes.push(1);
+            append_text(bytes, source.source_id().as_str())?;
+            append_text(bytes, source.revision_id().as_str())?;
+        }
+        None => bytes.push(0),
+    }
+    let scope = binding.scope();
+    bytes.push(scope.namespace() as u8);
+    append_text(bytes, scope.owner_id().as_str())?;
+    append_optional_identity(bytes, scope.project_id())?;
+    append_optional_identity(bytes, scope.task_id())?;
+    append_optional_identity(bytes, scope.agent_id())?;
+    bytes.push(binding.sensitivity() as u8);
+    bytes.extend_from_slice(&binding.token_count().to_le_bytes());
+    Ok(())
+}
+
+fn append_optional_identity(
+    bytes: &mut Vec<u8>,
+    identity: Option<&KnowledgeIdentity>,
+) -> Result<(), EngineError> {
+    match identity {
+        Some(identity) => {
+            bytes.push(1);
+            append_text(bytes, identity.as_str())?;
+        }
+        None => bytes.push(0),
+    }
+    Ok(())
 }
 
 fn append_text(bytes: &mut Vec<u8>, value: &str) -> Result<(), EngineError> {
@@ -1433,7 +1424,11 @@ fn increment(value: u64, reason: &'static str) -> Result<u64, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personalai_engine_types::{RequestId, ResourceBudget, SequenceId};
+    use personalai_engine_knowledge_contract::{
+        CacheNamespace, CacheRuntimeIdentity, CacheSensitivity, SourceRevisionBinding,
+        StaticBundleBinding,
+    };
+    use personalai_engine_types::{RequestId, ResourceBudget, SequenceId, Sha256Digest};
 
     fn hash(byte: u8) -> ModelPackageHash {
         ModelPackageHash::from_sha384_bytes([byte; ModelPackageHash::BYTE_LEN])
@@ -1444,6 +1439,7 @@ mod tests {
             model_id.clone(),
             hash(1),
             hash(2),
+            Sha256Digest::from_bytes([2; 32]),
             ArchitectureId::new("decoder-rms-rope-swiglu-gqa-v1").unwrap(),
             BackendId::new("cpu-reference").unwrap(),
             AttentionPositionSemantics::CausalZeroBasedV1,
@@ -1454,7 +1450,59 @@ mod tests {
         .unwrap()
     }
 
-    fn cache_and_store() -> (ContiguousKvCache, ReusableKvCacheStore, CacheScope) {
+    fn cache_scope(owner: &str) -> CacheAuthorizationScope {
+        CacheAuthorizationScope::new(
+            CacheNamespace::Project,
+            KnowledgeIdentity::new("owner.test").unwrap(),
+            Some(KnowledgeIdentity::new(owner).unwrap()),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn binding(
+        model_id: &ModelId,
+        scope: CacheAuthorizationScope,
+        token_count: u32,
+        revision: u64,
+    ) -> CacheBinding {
+        CacheBinding::new(
+            CacheRuntimeIdentity::new(
+                KnowledgeIdentity::new("logical.test").unwrap(),
+                model_id.clone(),
+                KnowledgeIdentity::new("artifact.test").unwrap(),
+                ArtifactDigest::Sha384(hash(1)),
+                BackendId::new("cpu-reference").unwrap(),
+                KnowledgeIdentity::new("version.1").unwrap(),
+                KnowledgeIdentity::new("backend.test").unwrap(),
+                KnowledgeIdentity::new("engine.test").unwrap(),
+            )
+            .unwrap(),
+            KnowledgeIdentity::new("tokenizer.test").unwrap(),
+            Sha256Digest::from_bytes([2; 32]),
+            ArchitectureId::new("decoder-rms-rope-swiglu-gqa-v1").unwrap(),
+            KnowledgeIdentity::new("rope.causal-zero-based-v1").unwrap(),
+            DType::F32,
+            StaticBundleBinding::new(
+                KnowledgeIdentity::new("bundle.test").unwrap(),
+                revision,
+                Sha256Digest::from_bytes([3; 32]),
+                Sha256Digest::from_bytes([4; 32]),
+            )
+            .unwrap(),
+            scope,
+            CacheSensitivity::Internal,
+            token_count,
+        )
+        .unwrap()
+        .with_source_revision(SourceRevisionBinding::new(
+            KnowledgeIdentity::new("source.test").unwrap(),
+            KnowledgeIdentity::new(format!("revision.{revision}")).unwrap(),
+        ))
+    }
+
+    fn cache_and_store() -> (ContiguousKvCache, ReusableKvCacheStore, CacheAuthorizationScope) {
         let model_id = ModelId::new("cag-test-model").unwrap();
         let budget = ResourceBudget::new(1 << 20, 1 << 18, 4).unwrap();
         let pool = MemoryPool::new(budget.max_memory_bytes()).unwrap();
@@ -1463,7 +1511,7 @@ mod tests {
         let cache = ContiguousKvCache::new(model_id.clone(), plan, 4, pool.clone()).unwrap();
         let limits = ReusableKvCacheLimits::new(8, 1 << 17, headroom, pool.limit_bytes()).unwrap();
         let store = ReusableKvCacheStore::new(model_id, pool, limits).unwrap();
-        let scope = CacheScope::new(CacheNamespace::Project, "project:alpha").unwrap();
+        let scope = cache_scope("project.alpha");
         (cache, store, scope)
     }
 
@@ -1500,8 +1548,7 @@ mod tests {
                 &cache,
                 handle,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 3, 1),
                 &[1, 2, 3],
                 &[0.1, 0.2],
                 100,
@@ -1538,8 +1585,7 @@ mod tests {
                 &cache,
                 source,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 2, 1),
                 &[4, 5],
                 &[0.3, 0.4],
                 100,
@@ -1551,9 +1597,8 @@ mod tests {
         let attachment = store
             .attach_to_sequence(
                 descriptor.cache_id(),
-                &scope,
+                descriptor.key().binding(),
                 &compatibility(cache.model_id()),
-                2,
                 &cache,
                 destination,
                 101,
@@ -1563,7 +1608,7 @@ mod tests {
         assert_eq!(attachment.tokens(), &[4, 5]);
         cache.cancel_sequence(destination).unwrap();
         assert_eq!(cache.token_count(source).unwrap(), 2);
-        let wrong_scope = CacheScope::new(CacheNamespace::Project, "project:beta").unwrap();
+        let wrong_scope = cache_scope("project.beta");
         assert!(store.describe(descriptor.cache_id(), &wrong_scope, 102).is_err());
         let mut wrong = compatibility(cache.model_id());
         wrong.rope_theta_bits = 20_000.0_f32.to_bits();
@@ -1571,7 +1616,14 @@ mod tests {
             cache.create_sequence(RequestId::new(3).unwrap(), SequenceId::new(3).unwrap()).unwrap();
         assert!(
             store
-                .attach_to_sequence(descriptor.cache_id(), &scope, &wrong, 2, &cache, empty, 103,)
+                .attach_to_sequence(
+                    descriptor.cache_id(),
+                    descriptor.key().binding(),
+                    &wrong,
+                    &cache,
+                    empty,
+                    103,
+                )
                 .is_err()
         );
     }
@@ -1585,8 +1637,7 @@ mod tests {
                 &cache,
                 first,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 1, 1),
                 &[1],
                 &[0.1],
                 100,
@@ -1600,8 +1651,7 @@ mod tests {
                 &cache,
                 second,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 1, 1),
                 &[2],
                 &[0.2],
                 102,
@@ -1630,8 +1680,7 @@ mod tests {
                 &cache,
                 handle,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 1, 1),
                 &[7],
                 &[0.7],
                 100,
@@ -1657,7 +1706,14 @@ mod tests {
                 KvCacheLookup::Miss(KvCacheMiss::NoCompatiblePrefix)
             );
         }
-        let other_scope = CacheScope::new(CacheNamespace::Task, "project:alpha").unwrap();
+        let other_scope = CacheAuthorizationScope::new(
+            CacheNamespace::Task,
+            KnowledgeIdentity::new("owner.test").unwrap(),
+            Some(KnowledgeIdentity::new("project.alpha").unwrap()),
+            Some(KnowledgeIdentity::new("task.other").unwrap()),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             store
                 .lookup_longest_prefix(&compatibility(cache.model_id()), &other_scope, &[7], 102,)
@@ -1676,8 +1732,7 @@ mod tests {
                 &cache,
                 source,
                 compatibility.clone(),
-                scope.clone(),
-                None,
+                binding(cache.model_id(), scope.clone(), 2, 1),
                 &[1, 2],
                 &[0.1, 0.2],
                 100,
@@ -1693,9 +1748,8 @@ mod tests {
                 store
                     .attach_to_sequence(
                         descriptor.cache_id(),
-                        &scope,
+                        descriptor.key().binding(),
                         &compatibility,
-                        2,
                         &cache,
                         first,
                         101,
@@ -1706,9 +1760,8 @@ mod tests {
                 store
                     .attach_to_sequence(
                         descriptor.cache_id(),
-                        &scope,
+                        descriptor.key().binding(),
                         &compatibility,
-                        2,
                         &cache,
                         second,
                         102,
@@ -1734,8 +1787,7 @@ mod tests {
                 &cache,
                 first,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                Some(CacheSourceIdentity::new(hash(7), 1).unwrap()),
+                binding(cache.model_id(), scope.clone(), 1, 1),
                 &[1],
                 &[0.1],
                 100,
@@ -1748,8 +1800,7 @@ mod tests {
                 &cache,
                 second,
                 compatibility(cache.model_id()),
-                scope.clone(),
-                Some(CacheSourceIdentity::new(hash(7), 2).unwrap()),
+                binding(cache.model_id(), scope.clone(), 1, 2),
                 &[2],
                 &[0.2],
                 101,
@@ -1760,10 +1811,63 @@ mod tests {
             store.migrate(first_descriptor.cache_id(), KvCacheLocation::GpuMemory),
             Err(EngineError::NotImplemented(_))
         ));
-        assert_eq!(store.invalidate_revision_in_scope(&scope, 1).unwrap(), 1);
+        assert_eq!(
+            store
+                .invalidate_source_revision_in_scope(
+                    &scope,
+                    &KnowledgeIdentity::new("source.test").unwrap(),
+                    &KnowledgeIdentity::new("revision.1").unwrap(),
+                )
+                .unwrap(),
+            1
+        );
         assert!(store.describe(first_descriptor.cache_id(), &scope, 102).is_err());
         assert!(store.describe(second_descriptor.cache_id(), &scope, 102).is_ok());
         assert_eq!(store.invalidate_model().unwrap(), 1);
         assert!(store.describe(second_descriptor.cache_id(), &scope, 103).is_err());
+    }
+
+    #[test]
+    fn exact_invalidation_is_idempotent_single_match_and_restart_is_empty() {
+        let (cache, store, scope) = cache_and_store();
+        let first = filled_sequence(&cache, 1, 1, 1);
+        let first_descriptor = store
+            .create_from_sequence(
+                &cache,
+                first,
+                compatibility(cache.model_id()),
+                binding(cache.model_id(), scope.clone(), 1, 1),
+                &[1],
+                &[0.1],
+                100,
+                CacheRetentionPolicy::explicit(),
+            )
+            .unwrap();
+        let second = filled_sequence(&cache, 2, 2, 1);
+        let second_descriptor = store
+            .create_from_sequence(
+                &cache,
+                second,
+                compatibility(cache.model_id()),
+                binding(cache.model_id(), scope.clone(), 1, 2),
+                &[2],
+                &[0.2],
+                101,
+                CacheRetentionPolicy::explicit(),
+            )
+            .unwrap();
+        assert!(store.invalidate_cache(first_descriptor.cache_id(), &scope).unwrap());
+        assert!(!store.invalidate_cache(first_descriptor.cache_id(), &scope).unwrap());
+        assert!(store.describe(second_descriptor.cache_id(), &scope, 102).is_ok());
+
+        let budget = ResourceBudget::new(1 << 20, 1 << 18, 4).unwrap();
+        let restart_pool = MemoryPool::new(budget.max_memory_bytes()).unwrap();
+        let restart = ReusableKvCacheStore::new(
+            cache.model_id().clone(),
+            restart_pool,
+            ReusableKvCacheLimits::new(8, 1 << 17, 1 << 16, 1 << 20).unwrap(),
+        )
+        .unwrap();
+        assert!(restart.describe(second_descriptor.cache_id(), &scope, 103).is_err());
     }
 }

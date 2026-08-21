@@ -13,10 +13,14 @@ ranking, cross-document composition, and selective recomputation are unsupported
 
 ## Identity and exact-prefix rule
 
-`KvCacheKey` binds the model ID, exact signed package SHA-384, tokenizer SHA-384, architecture,
-actual backend, cache format version, zero-based causal-position semantics, exact RoPE theta and
-scaling bits, K/V dtype, namespace, bounded owner, optional source hash/revision, ordered token
-SHA-384, and token count. `KvCacheId` is a deterministic SHA-384 over the canonical key.
+`KvCacheKey` binds the full narrow projection of Sovereign Knowledge 1.1 `CacheBinding`: logical
+model ID, provider model ID, artifact ID and digest, tokenizer ID plus SHA-256 and native SHA-384,
+architecture, backend ID/version/instance, engine instance, cache format, zero-based causal/RoPE
+semantics, exact RoPE theta/scaling bits, K/V dtype, static bundle ID/revision/digests, optional
+source/revision identity, authorization scope, sensitivity, ordered-token SHA-384, and token count.
+`KvCacheId` is a deterministic SHA-384 over that complete canonicalized key. Attach compares the
+entire immutable binding, so changing any execution, bundle, scope, sensitivity, or runtime fact
+fails closed rather than downgrading compatibility.
 
 Lookup is byte-for-byte token-prefix matching. It chooses the longest compatible cached token
 sequence. Whitespace, tokenization, document order, model revision, tokenizer, RoPE, backend, K/V
@@ -25,13 +29,17 @@ never a compatibility signal.
 
 ## Request flow
 
-1. An authenticated `CreateReusableCache` request names a loaded registered model, scope, bounded
-   prompt text, optional exact source identity, and retention settings.
+1. An authenticated `CreateReusableCache` request names a loaded registered model, complete
+   canonical binding, exact Memory Vault prefix bytes, a per-request cache-byte ceiling, and
+   bounded retention settings. The prefix must begin with
+   `SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n` and contain canonical decimal byte-length frames.
+   NUL-bearing, malformed, truncated, oversized, or SHA-256-mismatched bytes fail before
+   tokenization. The engine never trims, normalizes, reconstructs, or reorders those bytes.
 2. The engine tokenizes, prefills a request-local sequence, copies only committed K/V bytes, stores
    final-prefix logits, verifies finite data, hashes the sealed contents, and destroys the source
    sequence.
-3. `AttachCache` stages a one-shot logical binding under the service envelope request ID.
-4. The generation request with that same ID contains only the uncached continuation text. It is
+3. `AttachCache` stages a one-shot full binding under an explicit target generation request ID.
+4. The generation request with that target ID contains only the uncached continuation text. It is
    encoded without a second BOS token.
 5. The engine copies the sealed prefix into a new sequence and continues prefill/decode at the
    cached token position. The sealed object is held through an immutable lease and is not mutated.
@@ -44,8 +52,11 @@ would cross that boundary can make separately tokenized pieces differ from token
 text; Go must qualify and use boundaries whose exact token sequence is intended. Direct internal
 lookup accepts full token sequences and supports longest exact-prefix selection.
 
-Optional cache TTL is explicitly bounded to 365 days. A longer-lived cache must be renewed through
-fresh authenticated policy rather than encoded as an effectively unbounded expiration.
+Canonical service creation requires a TTL bounded to 365 days. A longer-lived cache must be
+renewed through fresh authenticated policy rather than encoded as an effectively unbounded
+expiration. An exact duplicate create reports `reused`, describe distinguishes `missing`, and a
+bounded list reports whether it was truncated. Exact invalidation and release are idempotent: a
+repeated operation reports zero removed or `already_released` without broadening its selector.
 
 ## Protocol operations
 
@@ -56,9 +67,16 @@ closed selectors only; no path, tensor offset, raw K/V bytes, backend plugin, or
 Kinds 22 through 26 remain reserved for the canonical inference-runtime-v3 service bridge. Cache
 operations must never reuse or reinterpret those message numbers.
 
-The protocol extension is repository-local until the corresponding canonical
-Sovereign-AI-Contracts revision is published. It must not be treated as a competing source of
-cross-repository truth.
+The authenticated binary payload is an internal transport adapter behind Sovereign Knowledge
+1.1.0 at Contracts commit `f3f6881d1661a088eef5dfbf7b51be4c747f1093`; its canonical schema
+SHA-256 is `4976b42a04c35efbbf9f00be71d2e26343399d1c8528811eecf6fa4aa07451f9`.
+`engine-knowledge-contract` contains only the execution-safe closed projection and pinned fixture
+digests. It is not a competing public contract. The current Contracts Rust crate cannot compile
+Knowledge 1.1 under `runtime-v3` alone because its lifecycle module imports the `full`-gated
+knowledge module. Pulling `full` would import control-plane domains and JSON dependencies that are
+prohibited here, so the engine does not depend directly on that broad feature. AI-Avenger must
+perform canonical JSON validation and translate only validated fields into this adapter; activating
+the experimental contract remains an explicit downstream decision.
 
 ## Unsupported selective recomposition
 

@@ -75,6 +75,14 @@ SBOM, or made available at runtime. CI installs the separately pinned
 `cargo-fuzz 0.13.2` orchestrator and Rust nightly, runs bounded campaigns, and
 does not execute Python, Node, TypeScript, downloaded scripts, or model code.
 
+The internal `engine-knowledge-contract` crate introduces no external package.
+It depends only on `engine-types` and the existing audited hash primitives in
+`engine-crypto`. It pins the audited Sovereign-AI-Contracts commit, schema
+digest, and lifecycle fixture digests while carrying only closed execution
+facts. The broader Contracts `full` Rust feature is intentionally not imported:
+it would add unrelated control-plane domains and JSON dependencies to the
+inference data plane.
+
 ## Feature and build controls
 
 - Disable unnecessary direct default features.

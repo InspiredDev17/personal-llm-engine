@@ -8,6 +8,7 @@ description = "Explicit bounded local framing protocol for the PersonalAI native
 
 [dependencies]
 personalai-engine-crypto.workspace = true
+personalai-engine-knowledge-contract.workspace = true
 personalai-engine-types.workspace = true
 
 [dev-dependencies]

@@ -8,6 +8,7 @@ description = "Bounded KV-cache planning and sequence state for the PersonalAI n
 
 [dependencies]
 personalai-engine-crypto.workspace = true
+personalai-engine-knowledge-contract.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-tensor.workspace = true
 personalai-engine-types.workspace = true
