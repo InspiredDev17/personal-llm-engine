@@ -133,7 +133,7 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
 }
 
 #[test]
-fn unicode_16_dependencies_are_exact_tokenizer_only_and_not_yet_runtime_authority() {
+fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() {
     let root = engine_root();
     let workspace_manifest =
         fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
@@ -161,19 +161,42 @@ fn unicode_16_dependencies_are_exact_tokenizer_only_and_not_yet_runtime_authorit
         }
     }
 
+    let adapter_path = crates.join("engine-tokenizer/src/qwen_runtime.rs");
     for crate_entry in fs::read_dir(&crates).expect("crate directory must be readable") {
         let source_root = crate_entry.expect("crate entry").path().join("src");
         for source_path in collect_files(&source_root, "rs") {
             let source = fs::read_to_string(&source_path).expect("source must be readable");
+            let is_private_adapter = source_path == adapter_path;
             for marker in ["unicode_general_category", "unicode_normalization"] {
-                assert!(
-                    !source.contains(marker),
-                    "dependency admission must not activate model-selected Unicode behavior yet: {}",
+                assert_eq!(
+                    source.contains(marker),
+                    is_private_adapter,
+                    "Unicode runtime authority must remain confined to the private Qwen adapter: {}",
                     source_path.display()
                 );
             }
         }
     }
+
+    let adapter = fs::read_to_string(&adapter_path).expect("private adapter source must exist");
+    for required in [
+        "use unicode_general_category::{GeneralCategory, get_general_category};",
+        "use unicode_normalization::UnicodeNormalization;",
+        "unicode_normalization::UNICODE_VERSION == REQUIRED_UNICODE_VERSION",
+        "unicode_general_category::UNICODE_VERSION == required_category_version",
+    ] {
+        assert!(adapter.contains(required), "private adapter boundary changed: {required}");
+    }
+
+    let tokenizer_root = fs::read_to_string(crates.join("engine-tokenizer/src/lib.rs"))
+        .expect("tokenizer root must be readable");
+    assert!(tokenizer_root.contains("mod qwen_runtime;"));
+    assert!(!tokenizer_root.contains("pub mod qwen_runtime"));
+    assert!(!tokenizer_root.contains("pub use qwen_runtime"));
+    assert!(tokenizer_root.contains("let _ = inspect_qwen25_aiptok(data, pool)?;"));
+    assert!(tokenizer_root.contains(
+        "AIPTok v2/Qwen2.5 execution remains disabled until exact source conversion and production-table token-ID conformance are qualified"
+    ));
 
     let fuzz_lock = fs::read_to_string(root.join("fuzz/Cargo.lock")).expect("fuzz lock must exist");
     let tokenizer_package = fuzz_lock

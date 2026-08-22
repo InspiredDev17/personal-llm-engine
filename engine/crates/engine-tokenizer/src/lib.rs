@@ -322,7 +322,7 @@ impl FirstPartyBpeTokenizer {
         if data.get(..AIPTOK_QWEN25_MAGIC.len()) == Some(AIPTOK_QWEN25_MAGIC.as_slice()) {
             let _ = inspect_qwen25_aiptok(data, pool)?;
             return Err(EngineError::unsupported_tokenizer(
-                "AIPTok v2/Qwen2.5 execution remains disabled until exact NFC and Unicode-category semantics are qualified",
+                "AIPTok v2/Qwen2.5 execution remains disabled until exact source conversion and production-table token-ID conformance are qualified",
             ));
         }
         let admission = parse_header(data)?;

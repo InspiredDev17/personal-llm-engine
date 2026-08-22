@@ -57,8 +57,9 @@ source formats; it opens only an already converted registered directory.
 The sole executable tokenizer family is AIPTok Byte-Level BPE v1. It preserves
 exact input bytes, has mandatory byte fallback and fixed decoder behavior. A
 separate `AIPTOK02` Qwen2.5 data-only parser foundation validates closed tables
-but cannot create an executable tokenizer until exact NFC and Unicode-category
-semantics are dependency-reviewed and independently qualified. Neither format
+but cannot create an executable tokenizer until exact source conversion and
+production-table token-ID conformance are independently qualified. Its private
+Unicode-16 adapter does not change that public execution gate. Neither format
 contains programmable normalization, arbitrary pre-tokenizers, chat templates,
 roles, tools, prompt-file, policy, or remote-code behavior. Go assembles chat
 text and retains every policy boundary. Rust treats prompt text and explicit

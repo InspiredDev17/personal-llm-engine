@@ -3,8 +3,8 @@
 //! This module defines and validates the immutable tables needed by the exact
 //! Qwen2.5 byte-level BPE profile. A private runtime core consumes these tables,
 //! but the public tokenizer factory still validates this format and returns
-//! `UnsupportedTokenizer` until exact NFC and Unicode property semantics are
-//! independently qualified.
+//! `UnsupportedTokenizer` until exact source conversion and production-table
+//! token-ID conformance are independently qualified.
 
 use super::{
     MAX_BPE_MERGE_RULES, MAX_SPECIAL_TOKENS, MAX_TOKEN_PIECE_BYTES, MAX_VOCABULARY_SIZE,
