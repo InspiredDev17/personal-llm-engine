@@ -392,16 +392,27 @@ impl Qwen25AipTokDescriptor {
         self.content_hash
     }
 
-    /// Returns whether counts match the exact pinned Qwen2.5 1.5B tokenizer.
+    /// Returns whether the five production-cardinality fields match the pinned
+    /// Qwen2.5 1.5B tokenizer.
+    ///
+    /// This deliberately excludes special-token roles and required token IDs.
+    /// The parser validates those identity fields separately whenever any
+    /// pinned production cardinality is present, preventing a partial pinned
+    /// profile from being downgraded to the generic structural parser.
     pub const fn matches_pinned_qwen25_1_5b_counts(self) -> bool {
         self.model_vocabulary_size == AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE
             && self.defined_token_count == AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT
             && self.bpe_vocabulary_size == AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE
             && self.merge_count == AIPTOK_QWEN25_PINNED_MERGE_COUNT
             && self.added_token_count == AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT
-            && self.special_token_count == PINNED_QWEN25_SPECIAL_TOKEN_COUNT
-            && self.beginning_of_sequence_token == AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID
-            && self.end_of_sequence_token == AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID
+    }
+
+    const fn has_any_pinned_qwen25_1_5b_count(self) -> bool {
+        self.model_vocabulary_size == AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE
+            || self.defined_token_count == AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT
+            || self.bpe_vocabulary_size == AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE
+            || self.merge_count == AIPTOK_QWEN25_PINNED_MERGE_COUNT
+            || self.added_token_count == AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT
     }
 
     /// Validates one token ID against defined tokenizer data, not merely logits.
@@ -413,6 +424,45 @@ impl Qwen25AipTokDescriptor {
         }
         Ok(())
     }
+}
+
+fn validate_pinned_qwen25_header_identity(
+    descriptor: Qwen25AipTokDescriptor,
+) -> Result<(), EngineError> {
+    if !descriptor.has_any_pinned_qwen25_1_5b_count() {
+        return Ok(());
+    }
+    if !descriptor.matches_pinned_qwen25_1_5b_counts() {
+        return Err(corrupt("AIPTok v2 partial pinned Qwen2.5 cardinality is forbidden"));
+    }
+    if descriptor.special_token_count != PINNED_QWEN25_SPECIAL_TOKEN_COUNT
+        || descriptor.beginning_of_sequence_token != AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID
+        || descriptor.end_of_sequence_token != AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID
+    {
+        return Err(corrupt("AIPTok v2 pinned Qwen2.5 header identity differs"));
+    }
+    Ok(())
+}
+
+fn validate_pinned_qwen25_added_token_identity(
+    descriptor: Qwen25AipTokDescriptor,
+    observed: &[(&[u8], AipTokQwen25AddedRole)],
+) -> Result<(), EngineError> {
+    validate_pinned_qwen25_header_identity(descriptor)?;
+    if !descriptor.matches_pinned_qwen25_1_5b_counts() {
+        return Ok(());
+    }
+    if observed.len() != PINNED_QWEN25_ADDED_TOKENS.len() {
+        return Err(corrupt("AIPTok v2 pinned Qwen2.5 added-token count differs"));
+    }
+    for ((observed_literal, observed_role), (expected_literal, expected_role)) in
+        observed.iter().zip(PINNED_QWEN25_ADDED_TOKENS)
+    {
+        if *observed_role != expected_role || *observed_literal != expected_literal.as_bytes() {
+            return Err(corrupt("AIPTok v2 pinned Qwen2.5 added-token profile differs"));
+        }
+    }
+    Ok(())
 }
 
 struct Header {
@@ -566,20 +616,22 @@ fn parse_header(data: &[u8]) -> Result<Header, EngineError> {
     if hash_package(&data[AIPTOK_QWEN25_HEADER_BYTES..]) != content_hash {
         return Err(corrupt("AIPTok v2 content hash does not match canonical tables"));
     }
+    let descriptor = Qwen25AipTokDescriptor {
+        model_vocabulary_size,
+        defined_token_count,
+        bpe_vocabulary_size,
+        merge_count,
+        added_token_count,
+        special_token_count,
+        beginning_of_sequence_token,
+        end_of_sequence_token,
+        maximum_input_bytes,
+        maximum_produced_tokens,
+        content_hash,
+    };
+    validate_pinned_qwen25_header_identity(descriptor)?;
     Ok(Header {
-        descriptor: Qwen25AipTokDescriptor {
-            model_vocabulary_size,
-            defined_token_count,
-            bpe_vocabulary_size,
-            merge_count,
-            added_token_count,
-            special_token_count,
-            beginning_of_sequence_token,
-            end_of_sequence_token,
-            maximum_input_bytes,
-            maximum_produced_tokens,
-            content_hash,
-        },
+        descriptor,
         maximum_piece_bytes,
         vocabulary_offset,
         merge_offset,
@@ -713,7 +765,7 @@ fn parse_added_tokens(
         return Err(corrupt("AIPTok v2 added-token table length is noncanonical"));
     }
     let mut cursor = header.added_offset;
-    let mut literals = Vec::new();
+    let mut observed = Vec::new();
     let mut bos_count = 0_u32;
     let mut eos_count = 0_u32;
     for index in 0..header.descriptor.added_token_count {
@@ -754,42 +806,14 @@ fn parse_added_tokens(
             }
             AipTokQwen25AddedRole::Special | AipTokQwen25AddedRole::Ordinary => {}
         }
-        literals.push(&vocabulary.pieces[u32_to_usize(token)?]);
+        observed.push((vocabulary.pieces[u32_to_usize(token)?].as_ref(), role));
     }
     if bos_count != 1 || eos_count != 1 {
         return Err(corrupt("AIPTok v2 required added-token roles are missing or duplicated"));
     }
-    if header.descriptor.matches_pinned_qwen25_1_5b_counts() {
-        for (index, (expected_literal, expected_role)) in
-            PINNED_QWEN25_ADDED_TOKENS.iter().enumerate()
-        {
-            let token = header
-                .descriptor
-                .bpe_vocabulary_size
-                .checked_add(
-                    u32::try_from(index)
-                        .map_err(|_| corrupt("pinned Qwen2.5 added-token index overflows"))?,
-                )
-                .ok_or_else(|| corrupt("pinned Qwen2.5 added-token ID overflows"))?;
-            let record_offset = header
-                .added_offset
-                .checked_add(
-                    index
-                        .checked_mul(ADDED_RECORD_BYTES)
-                        .ok_or_else(|| corrupt("pinned Qwen2.5 record offset overflows"))?,
-                )
-                .ok_or_else(|| corrupt("pinned Qwen2.5 record offset overflows"))?;
-            let observed_role =
-                AipTokQwen25AddedRole::from_wire(read_u16(data, checked_add(record_offset, 4)?)?)?;
-            if observed_role != *expected_role
-                || vocabulary.pieces[u32_to_usize(token)?].as_ref() != expected_literal.as_bytes()
-            {
-                return Err(corrupt("AIPTok v2 pinned Qwen2.5 added-token profile differs"));
-            }
-        }
-    }
-    for (index, literal) in literals.iter().enumerate() {
-        if literals.iter().enumerate().any(|(other_index, other)| {
+    validate_pinned_qwen25_added_token_identity(header.descriptor, &observed)?;
+    for (index, (literal, _)) in observed.iter().enumerate() {
+        if observed.iter().enumerate().any(|(other_index, (other, _))| {
             index != other_index && (literal.starts_with(other) || other.starts_with(literal))
         }) {
             return Err(corrupt("AIPTok v2 added-token literals have a prefix collision"));
@@ -880,6 +904,29 @@ mod tests {
     fn rehash(bytes: &mut [u8]) {
         let digest = hash_package(&bytes[AIPTOK_QWEN25_HEADER_BYTES..]);
         bytes[112..160].copy_from_slice(digest.as_bytes());
+    }
+
+    fn pinned_descriptor() -> Qwen25AipTokDescriptor {
+        Qwen25AipTokDescriptor {
+            model_vocabulary_size: AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE,
+            defined_token_count: AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT,
+            bpe_vocabulary_size: AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE,
+            merge_count: AIPTOK_QWEN25_PINNED_MERGE_COUNT,
+            added_token_count: AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT,
+            special_token_count: PINNED_QWEN25_SPECIAL_TOKEN_COUNT,
+            beginning_of_sequence_token: AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID,
+            end_of_sequence_token: AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID,
+            maximum_input_bytes: 4096,
+            maximum_produced_tokens: 4096,
+            content_hash: ModelPackageHash::from_sha384_bytes([0; ModelPackageHash::BYTE_LEN]),
+        }
+    }
+
+    fn pinned_added_tokens() -> Vec<(&'static [u8], AipTokQwen25AddedRole)> {
+        PINNED_QWEN25_ADDED_TOKENS
+            .iter()
+            .map(|(literal, role)| (literal.as_bytes(), *role))
+            .collect()
     }
 
     #[test]
@@ -1046,5 +1093,76 @@ mod tests {
             PINNED_QWEN25_ADDED_TOKENS[2],
             ("<|im_end|>", AipTokQwen25AddedRole::EndOfSequence)
         );
+    }
+
+    #[test]
+    fn pinned_production_identity_enforces_exact_fields_and_undefined_tail() {
+        let descriptor = pinned_descriptor();
+        let observed = pinned_added_tokens();
+        validate_pinned_qwen25_added_token_identity(descriptor, &observed)
+            .expect("the reviewed fixed profile must validate");
+        assert!(descriptor.matches_pinned_qwen25_1_5b_counts());
+        assert_eq!(descriptor.model_vocabulary_size() - descriptor.defined_token_count(), 271);
+        descriptor
+            .validate_token(descriptor.defined_token_count() - 1)
+            .expect("last defined token remains selectable");
+        for token in descriptor.defined_token_count()..descriptor.model_vocabulary_size() {
+            assert!(descriptor.validate_token(token).is_err());
+        }
+
+        let mut wrong_special_count = descriptor;
+        wrong_special_count.special_token_count -= 1;
+        assert!(wrong_special_count.matches_pinned_qwen25_1_5b_counts());
+        assert!(validate_pinned_qwen25_header_identity(wrong_special_count).is_err());
+
+        let mut begin_token_mismatch = descriptor;
+        begin_token_mismatch.beginning_of_sequence_token += 1;
+        assert!(begin_token_mismatch.matches_pinned_qwen25_1_5b_counts());
+        assert!(validate_pinned_qwen25_header_identity(begin_token_mismatch).is_err());
+
+        let mut end_token_mismatch = descriptor;
+        end_token_mismatch.end_of_sequence_token += 1;
+        assert!(end_token_mismatch.matches_pinned_qwen25_1_5b_counts());
+        assert!(validate_pinned_qwen25_header_identity(end_token_mismatch).is_err());
+
+        let mut partial_cardinality = descriptor;
+        partial_cardinality.merge_count -= 1;
+        assert!(validate_pinned_qwen25_header_identity(partial_cardinality).is_err());
+
+        let mut wrong_literal = observed.clone();
+        wrong_literal[1].0 = b"<|im_start_changed|>";
+        assert!(validate_pinned_qwen25_added_token_identity(descriptor, &wrong_literal).is_err());
+
+        let mut wrong_role = observed;
+        wrong_role[1].1 = AipTokQwen25AddedRole::Ordinary;
+        assert!(validate_pinned_qwen25_added_token_identity(descriptor, &wrong_role).is_err());
+    }
+
+    #[test]
+    fn partial_pinned_cardinality_and_behavior_mutations_fail_in_parser_path() {
+        let valid = fixture().encode().expect("fixture must encode");
+        let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
+
+        let mut partial_cardinality = valid.clone();
+        partial_cardinality[28..32]
+            .copy_from_slice(&AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE.to_le_bytes());
+        assert!(matches!(
+            inspect_qwen25_aiptok(&partial_cardinality, &pool),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+
+        let mut wrong_flags = valid.clone();
+        wrong_flags[26..28].copy_from_slice(&FLAG_NO_IMPLICIT_BOS.to_le_bytes());
+        assert!(matches!(
+            inspect_qwen25_aiptok(&wrong_flags, &pool),
+            Err(EngineError::UnsupportedTokenizer(_))
+        ));
+
+        let mut wrong_profile = valid;
+        wrong_profile[92..96].copy_from_slice(&(UNICODE_PROFILE_QWEN25_FIXED_V1 + 1).to_le_bytes());
+        assert!(matches!(
+            inspect_qwen25_aiptok(&wrong_profile, &pool),
+            Err(EngineError::UnsupportedTokenizer(_))
+        ));
     }
 }

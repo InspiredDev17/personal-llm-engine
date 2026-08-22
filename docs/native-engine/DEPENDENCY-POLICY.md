@@ -68,12 +68,16 @@ AIPTok v2's data-only Qwen2.5 parser also adds no external dependency. Exact
 Qwen execution requires Unicode NFC and Unicode General Category `L`/`N`, which
 the Rust standard library does not provide. `unicode-normalization 0.1.25` and
 `unicode-general-category 1.1.0` were identified as possible narrow
-general-purpose components, not approved or added dependencies. Their source,
-features, build behavior, Unicode-version semantics, transitive graph,
-licensing, offline vendor material and independent conformance evidence must be
-reviewed under this policy before activation. Handwritten partial normalization,
-an approximate regex, or use of an existing transitive proc-macro Unicode table
-as runtime authority is prohibited.
+general-purpose components, not approved or added dependencies. They cannot be
+approved as that pair: the reviewed releases expose Unicode 17 and Unicode 16
+semantics respectively, so their combined boundary behavior is not one exact
+Unicode profile. Any future selection must use one consistent reviewed Unicode
+version, encode that version in AIPTok, and carry version-bound conformance
+vectors. Source, features, build behavior, Unicode-version semantics,
+transitive graph, licensing, offline vendor material and independent
+conformance evidence must be reviewed under this policy before activation.
+Handwritten partial normalization, an approximate regex, or use of an existing
+transitive proc-macro Unicode table as runtime authority is prohibited.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact

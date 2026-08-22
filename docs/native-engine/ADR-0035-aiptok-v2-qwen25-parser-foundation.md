@@ -15,9 +15,11 @@ Rust's standard library does not implement Unicode NFC or Unicode General
 Category `L`/`N`. A handwritten partial Unicode database or approximate regex
 would create false compatibility. The dependency review identified
 `unicode-normalization` and `unicode-general-category` as plausible narrow
-general-purpose building blocks, but their sources are not in the locked
-offline vendor graph and no dependency approval or independent conformance
-evidence exists in this revision.
+general-purpose building blocks, but their reviewed releases use different
+Unicode versions (17 and 16 respectively) and therefore are not an acceptable
+pair. Their sources are not in the locked offline vendor graph and no
+dependency approval or independent version-bound conformance evidence exists
+in this revision.
 
 ## Decision
 
@@ -33,10 +35,16 @@ and a 256-entry raw-byte/base-token permutation. Parsing is non-recursive, uses
 checked arithmetic, reserves aggregate memory first, rejects trailing data,
 validates every merge and token reference, and rejects undefined tail IDs.
 
-For the production-sized pinned profile, the parser additionally binds exact
-counts and the 22 reviewed added-token literals/roles. The parser exposes only
-content-free immutable descriptor facts. It does not expose an executable
-tokenizer.
+Production-cardinality recognition is separate from exact profile identity.
+If any of the five pinned production counts is present, all five counts must
+match; the parser then requires the exact special count, BOS/EOS IDs, fixed
+header behavior flags/profile, and all 22 reviewed added-token literals/roles.
+A partial or near-pinned table cannot downgrade itself into generic structural
+fixture mode. Tests exercise the fixed-size production identity validator with
+all exact values (including the 271 undefined model-output IDs) without
+allocating a 151,665-entry fixture, while compact parser-path fixtures prove
+the same fail-closed dispatch. The parser exposes only content-free immutable
+descriptor facts. It does not expose an executable tokenizer.
 
 The public tokenizer factory recognizes `AIPTOK02`, fully validates it, and
 then returns `UnsupportedTokenizer`. This preserves corruption-before-
