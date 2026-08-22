@@ -10,7 +10,10 @@ Unicode authority. The separately admitted `unicode-normalization 0.1.24` and
 `unicode-general-category 1.1.0` both declare Unicode 16.0 data, but the core
 did not invoke them. Substituting Rust `std` character predicates or building a
 complete normalized `String` before checking its size would respectively make
-token boundaries compiler-dependent or permit unaccounted output growth.
+token boundaries compiler-dependent or permit unaccounted output growth. The
+upstream NFC iterator also retains spillable `TinyVec` buffers and uses stable
+sort for canonical ordering; merely charging expected output bytes would leave
+that temporary workspace outside the engine memory contract.
 
 The fixed contraction alternative is case-insensitive only for the literal
 ASCII suffixes `'s`, `'t`, `'re`, `'ve`, `'m`, `'ll`, and `'d`. Unicode 16
@@ -30,12 +33,21 @@ The adapter:
 
 1. requires both dependency data-version constants to equal `(16, 0, 0)` and
    otherwise reports a version value rejected by the existing core gate;
-2. consumes the NFC iterator one scalar at a time and appends each encoded
-   scalar through `BoundedNormalizedText`, so checked output growth occurs
-   before every write and no complete unbounded normalized output is built;
-3. maps `Lu`, `Ll`, `Lt`, `Lm`, and `Lo` to `Letter`, maps `Nd`, `Nl`, and `No`
+2. compares the allocation-free `stream_safe()` view with the original input
+   before NFC. If Unicode-16 NFKD would exceed 30 consecutive nonstarters and
+   insert U+034F CGJ, the engine rejects the request; it never forwards an
+   inserted CGJ or transforms input to make it admissible;
+3. uses a reviewed local vendor patch that expands both normalization inline
+   buffers from 4 to 32 entries and replaces stable `sort_by_key` with stable
+   in-place insertion sort. Admitted input therefore cannot spill either
+   buffer or allocate sort scratch;
+4. reserves a conservative fixed 4 KiB iterator/sort workspace through the
+   engine memory pool for the lifetime of NFC, separately reserves the maximum
+   normalized output, then appends each NFC scalar through
+   `BoundedNormalizedText`, checking growth before every write;
+5. maps `Lu`, `Ll`, `Lt`, `Lm`, and `Lo` to `Letter`, maps `Nd`, `Nl`, and `No`
    to `Number`, and maps every other General Category to `Other`; and
-4. uses a finite first-party Unicode-16 default-simple-fold mapping for ASCII
+6. uses a finite first-party Unicode-16 default-simple-fold mapping for ASCII
    case, U+017F to `s`, and U+212A to `k`.
 
 Unicode White_Space remains the closed scalar set already encoded by the fixed
@@ -46,12 +58,14 @@ normalizer graph, executable configuration, network path, or new dependency.
 
 Tests pin both dependency version constants and cover Latin and Hangul
 composition, canonical combining-mark ordering, NFC expansion at U+0344,
-output-bound rejection before growth, and deterministic normalized runtime
-decode. Classification is checked across every valid Unicode scalar against
-the Unicode-16 General Category family abbreviation, with explicit examples
-for all five `L*` and all three `N*` categories plus unassigned boundary
-scalars. Contraction tests cover ASCII case, U+017F, U+212A, and rejection of
-full, Turkic, non-ASCII, and compatibility-only alternatives.
+output-bound rejection before growth, 30/31 nonstarter boundaries, explicit
+CGJ preservation/reset behavior, hostile long combining sequences, low-pool
+rejection, accounting release, no-panic behavior, and deterministic normalized
+runtime decode. Classification is checked across every valid Unicode scalar
+against the Unicode-16 General Category family abbreviation, with explicit
+examples for all five `L*` and all three `N*` categories plus unassigned
+boundary scalars. Contraction tests cover ASCII case, U+017F, U+212A, and
+rejection of full, Turkic, non-ASCII, and compatibility-only alternatives.
 
 These are portable conformance checks for the private adapter. They are not
 evidence for the absent 151,665-entry production tokenizer table, its exact
@@ -60,6 +74,11 @@ conversion, or end-to-end token-ID parity.
 ## Consequences and activation gate
 
 - The `AIPTOK02` format and public tokenizer factory do not change.
+- The vendored `unicode-normalization 0.1.24` source is locally hardened at the
+  two iterator-buffer declarations and canonical pending-sort implementation.
+  Cargo's retained-file checksums cover those exact patched bytes; upstream
+  package identity, license, Unicode tables, API and archive checksum remain
+  recorded separately.
 - Public construction continues to parse and validate v2, then returns
   `UnsupportedTokenizer`.
 - The offline importer still emits no Qwen tokenizer or model package.

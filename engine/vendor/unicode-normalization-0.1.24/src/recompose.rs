@@ -27,7 +27,7 @@ enum RecompositionState {
 pub struct Recompositions<I> {
     iter: Decompositions<I>,
     state: RecompositionState,
-    buffer: TinyVec<[char; 4]>,
+    buffer: TinyVec<[char; 32]>,
     composee: Option<char>,
     last_ccc: Option<u8>,
 }

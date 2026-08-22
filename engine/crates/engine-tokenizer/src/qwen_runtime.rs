@@ -23,6 +23,15 @@ use unicode_normalization::UnicodeNormalization;
 const REQUIRED_UNICODE_VERSION: (u8, u8, u8) = (16, 0, 0);
 const SCANNER_BYTES_PER_SCALAR: u64 = 64;
 const PENDING_UTF8_BYTES: u64 = 4;
+// UAX15-D4 counts compatibility-decomposed nonstarters. The adapter uses its
+// allocation-free stream-safe iterator only as a reject-only precheck: it
+// never forwards an inserted CGJ or transforms input to satisfy the bound.
+const MAX_NFC_COMPATIBILITY_NONSTARTERS: usize = 30;
+// The locally audited normalization patch keeps 32 entries inline and replaces
+// stable sort with in-place insertion sort. This fixed charge conservatively
+// accounts for both iterator buffers and their bounded stack workspace while
+// the separate output reservation accounts for the normalized String.
+const NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES: u64 = 4 * 1024;
 const CONTRACTION_SUFFIXES: [&[u8]; 7] = [b"s", b"t", b"re", b"ve", b"m", b"ll", b"d"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +91,7 @@ impl TrustedQwen25Unicode16 for Qwen25Unicode16Adapter {
         input: &str,
         output: &mut BoundedNormalizedText,
     ) -> Result<(), EngineError> {
+        validate_nfc_nonstarter_bound(input)?;
         for scalar in input.nfc() {
             let mut encoded = [0_u8; 4];
             output.push_str(scalar.encode_utf8(&mut encoded))?;
@@ -115,6 +125,25 @@ impl TrustedQwen25Unicode16 for Qwen25Unicode16Adapter {
             _ => None,
         }
     }
+}
+
+fn validate_nfc_nonstarter_bound(input: &str) -> Result<(), EngineError> {
+    if input.chars().stream_safe().eq(input.chars()) {
+        Ok(())
+    } else {
+        Err(EngineError::resource_exhaustion(
+            "Qwen NFC compatibility-decomposed nonstarter sequence exceeds the fixed limit",
+        ))
+    }
+}
+
+fn normalization_reservation_bytes(output_bytes: usize) -> Result<u64, EngineError> {
+    let output_bytes = u64::try_from(output_bytes).map_err(|_| {
+        EngineError::resource_exhaustion("Qwen normalization output size is not representable")
+    })?;
+    output_bytes
+        .checked_add(NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES)
+        .ok_or_else(|| EngineError::resource_exhaustion("Qwen normalization reservation overflows"))
 }
 
 struct BoundedNormalizedText {
@@ -646,10 +675,8 @@ impl Qwen25RuntimeCore {
         }
         self.validate_special_policy(policy)?;
         let normalized_limit = maximum_input.min(MAX_REQUEST_BYTES);
-        let _normalization =
-            self.tables.pool.reserve(u64::try_from(normalized_limit).map_err(|_| {
-                EngineError::resource_exhaustion("Qwen normalization bound is not representable")
-            })?)?;
+        let _normalization_reservation =
+            self.tables.pool.reserve(normalization_reservation_bytes(normalized_limit)?)?;
         let mut normalized_storage = BoundedNormalizedText::new(normalized_limit)?;
         profile.normalize_nfc(input, &mut normalized_storage)?;
         let normalized = normalized_storage.as_str();
@@ -897,6 +924,7 @@ mod tests {
         AipTokQwen25AddedToken, AipTokQwen25Definition, AipTokQwen25Merge,
         AipTokQwen25VocabularyEntry,
     };
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
 
     #[derive(Debug, Clone, Copy)]
@@ -1121,6 +1149,71 @@ mod tests {
         assert_eq!(unicode_general_category::UNICODE_VERSION, (16, 0, 0));
         assert!(Qwen25Unicode16Adapter::versions_match());
         assert_eq!(Qwen25Unicode16Adapter.unicode_version(), REQUIRED_UNICODE_VERSION);
+    }
+
+    #[test]
+    fn fixed_normalization_charge_covers_the_pinned_bounded_iterators() {
+        assert_eq!(MAX_NFC_COMPATIBILITY_NONSTARTERS, 30);
+        let inline_slots = 32_usize;
+        let tuple_buffer_bytes =
+            inline_slots.checked_mul(size_of::<(u8, char)>()).expect("test bound fits");
+        let scalar_buffer_bytes =
+            inline_slots.checked_mul(size_of::<char>()).expect("test bound fits");
+        let conservative_total = tuple_buffer_bytes
+            .checked_add(scalar_buffer_bytes)
+            .and_then(|bytes| bytes.checked_mul(4))
+            .expect("test bound fits");
+        assert!(
+            usize::try_from(NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES)
+                .is_ok_and(|reserved| reserved >= conservative_total)
+        );
+        assert_eq!(
+            normalization_reservation_bytes(4096).expect("reservation fits"),
+            4096 + NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES
+        );
+        if usize::BITS == 64 {
+            assert!(normalization_reservation_bytes(usize::MAX).is_err());
+        }
+    }
+
+    #[test]
+    fn stream_safe_precheck_accepts_thirty_and_rejects_thirty_one_without_mutation() {
+        let profile = Qwen25Unicode16Adapter;
+        let mark = "\u{0315}";
+        let admitted = format!("a{}b{}", mark.repeat(30), mark.repeat(30));
+        validate_nfc_nonstarter_bound(&admitted).expect("starter resets the compatibility run");
+        let expected = admitted.nfc().collect::<String>();
+        let mut output = BoundedNormalizedText::new(expected.len()).expect("output allocates");
+        profile.normalize_nfc(&admitted, &mut output).expect("thirty nonstarters pass");
+        assert_eq!(output.as_str(), expected);
+
+        let rejected = format!("a{}", mark.repeat(31));
+        let mut untouched = BoundedNormalizedText::new(rejected.len()).expect("output allocates");
+        assert!(matches!(
+            profile.normalize_nfc(&rejected, &mut untouched),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert!(untouched.as_str().is_empty());
+
+        // Each U+0344 decomposes to two leading nonstarters under the UAX15-D4
+        // NFKD count, so the guard is not a raw input-scalar count.
+        validate_nfc_nonstarter_bound(&"\u{0344}".repeat(15))
+            .expect("thirty decomposed nonstarters pass");
+        assert!(validate_nfc_nonstarter_bound(&"\u{0344}".repeat(16)).is_err());
+
+        let with_explicit_cgj = format!(
+            "{}\u{034F}{}",
+            mark.repeat(MAX_NFC_COMPATIBILITY_NONSTARTERS),
+            mark.repeat(MAX_NFC_COMPATIBILITY_NONSTARTERS)
+        );
+        validate_nfc_nonstarter_bound(&with_explicit_cgj)
+            .expect("an explicit CGJ resets and remains caller data");
+        let mut preserved =
+            BoundedNormalizedText::new(with_explicit_cgj.len()).expect("CGJ output allocates");
+        profile
+            .normalize_nfc(&with_explicit_cgj, &mut preserved)
+            .expect("explicit CGJ input normalizes");
+        assert_eq!(preserved.as_str(), with_explicit_cgj);
     }
 
     #[test]
@@ -1353,6 +1446,43 @@ mod tests {
             core.encode("\u{0344}", SpecialTokenPolicy::Reject, &Qwen25Unicode16Adapter),
             Err(EngineError::ResourceExhaustion(_))
         ));
+        assert_eq!(pool.used_bytes().expect("metrics work"), baseline);
+    }
+
+    #[test]
+    fn normalization_workspace_admission_fails_before_iteration_and_releases_accounting() {
+        let data = fixture(4096, 4096);
+        let probe_pool = MemoryPool::new(16 * 1024 * 1024).expect("probe pool validates");
+        let _probe = Qwen25RuntimeCore::load_test_fixture(&data, &probe_pool).expect("tables load");
+        let persistent = probe_pool.used_bytes().expect("metrics work");
+        let normalization = normalization_reservation_bytes(4096).expect("bound fits");
+        let capacity = persistent
+            .checked_add(normalization)
+            .and_then(|bytes| bytes.checked_sub(1))
+            .expect("test capacity fits");
+        let pool = MemoryPool::new(capacity).expect("limited pool validates");
+        let core = Qwen25RuntimeCore::load_test_fixture(&data, &pool).expect("tables load");
+        let baseline = pool.used_bytes().expect("metrics work");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            core.encode("a", SpecialTokenPolicy::Reject, &Qwen25Unicode16Adapter)
+        }));
+        assert!(result.is_ok(), "pool rejection must not panic");
+        assert!(matches!(result.expect("no panic"), Err(EngineError::ResourceExhaustion(_))));
+        assert_eq!(pool.used_bytes().expect("metrics work"), baseline);
+    }
+
+    #[test]
+    fn hostile_long_nonstarter_input_fails_without_panic_or_pool_leak() {
+        let pool = MemoryPool::new(64 * 1024 * 1024).expect("pool validates");
+        let core = Qwen25RuntimeCore::load_test_fixture(&fixture(32 * 1024, 32 * 1024), &pool)
+            .expect("tables load");
+        let baseline = pool.used_bytes().expect("metrics work");
+        let hostile = "\u{0315}".repeat(10_000);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            core.encode(&hostile, SpecialTokenPolicy::Reject, &Qwen25Unicode16Adapter)
+        }));
+        assert!(result.is_ok(), "hostile combining input must not panic");
+        assert!(matches!(result.expect("no panic"), Err(EngineError::ResourceExhaustion(_))));
         assert_eq!(pool.used_bytes().expect("metrics work"), baseline);
     }
 

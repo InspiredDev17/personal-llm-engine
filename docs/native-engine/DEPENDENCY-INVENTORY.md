@@ -11,9 +11,9 @@ loading, or GPU kernels.
 | `ed25519-dalek 3.0.0` | BSD-3-Clause | Direct strict Ed25519 verification and role-separated package/response/release signing; only the `zeroize` feature is enabled |
 | `zeroize 1.8.2` | Apache-2.0 OR MIT | Direct audited clearing of owner-provided response and offline release-signing seeds plus Ed25519 signing state; no derive feature |
 | `libc 0.2.189` | MIT OR Apache-2.0 | Direct Unix constants `O_NOFOLLOW`/`O_CLOEXEC` for safe package/replay/release opens, isolated checked `flock` for exclusive journal ownership, isolated `sigaction` install/restore for graceful shutdown, isolated read-only effective-user/peer-credential calls for UDS admission, and isolated `PROT_READ|MAP_PRIVATE`/`munmap` tensor-shard mapping; no executable mapping or dynamic link discovery |
-| `unicode-normalization 0.1.24` | MIT OR Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 NFC primitive admitted for a future separately reviewed AIPTok v2 runtime; defaults and all direct features are disabled because NFC iterators work through its `no_std` + `alloc` path, and this crate supplies no tokenizer graph, regex, model rule, I/O, or authority |
-| `unicode-general-category 1.1.0` | Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 General Category lookup admitted for future fixed `L`/`N` classification; defaults disabled, no features or dependency, and no model-selected classification |
-| `tinyvec 1.12.0` | Zlib OR Apache-2.0 OR MIT | Transitive safe bounded storage beneath Unicode normalization; only `alloc` plus its empty default feature resolve, with no optional serialization/schema/debug features |
+| `unicode-normalization 0.1.24` | MIT OR Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 NFC and allocation-free stream-safe primitives behind the private AIPTok v2 adapter; defaults and all direct features are disabled, its two iterator buffers are locally hardened to 32 inline entries, canonical pending marks use stable in-place insertion sort, and it supplies no tokenizer graph, regex, model rule, I/O, or authority |
+| `unicode-general-category 1.1.0` | Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 General Category lookup used by the private fixed `L`/`N` classifier; defaults disabled, no features or dependency, and no model-selected classification |
+| `tinyvec 1.12.0` | Zlib OR Apache-2.0 OR MIT | Transitive safe inline storage beneath Unicode normalization; only `alloc` plus its empty default feature resolve, but the private adapter's reject-only 30-nonstarter gate and local inline-32 patch prevent heap spill on admitted NFC input |
 | `tinyvec_macros 0.1.1` | MIT OR Apache-2.0 OR Zlib | Transitive ordinary declarative macro support selected by `tinyvec/alloc`; not a proc macro and has no dependency or build script |
 | `digest 0.11.3` | MIT OR Apache-2.0 | SHA-2 trait/internal support |
 | `block-buffer 0.12.1` | MIT OR Apache-2.0 | SHA-2 fixed-block buffering |
@@ -56,11 +56,12 @@ implementation. They do not fetch remote code, inspect model data, or ship as a
 runtime model capability. Any version, feature, source, or package-set change
 requires renewal of this record and the automated exact-allowlist test.
 
-The four Unicode entries are admitted supply-chain inputs only. The private
-scanner/BPE/decode core adds no package to this inventory, is not publicly
-constructible, and does not yet call the admitted Unicode primitives. Qwen2.5
-tokenization and execution therefore remain explicitly unsupported. Their
-resolved graph is
+The four Unicode entries remain narrowly admitted supply-chain inputs. The
+private scanner/BPE/decode core and its adapter add no package to this
+inventory and are not publicly constructible. The adapter now invokes bounded
+NFC, stream-safe classification and General Category lookup, but Qwen2.5
+tokenization and execution remain explicitly unsupported pending exact source
+conversion and production-table token-ID replay. Their resolved graph is
 `engine-tokenizer -> unicode-normalization 0.1.24 -> tinyvec 1.12.0 ->
 tinyvec_macros 0.1.1` plus the independent
 `engine-tokenizer -> unicode-general-category 1.1.0` edge. Only
@@ -72,6 +73,12 @@ Both direct crates declare Unicode 16.0.0. The vendored normalization and
 category table SHA-256 values are respectively
 `69a0faad67afe03146d80ff5b2d889d1898cbfe8f7677a24f012148f6fd27348`
 and `9a06bcac89a552d169aec1411438ab948391a218cbfef8c71bf186cd39ec5268`.
+The normalizer's upstream archive identity remains unchanged, while the
+retained-file map now binds the reviewed local hardening hashes
+`e8b45213ea08474e807cec0a5c4a442f4fc3ed5d3b92f76806ca0df6d1a3f671`
+for `src/decompose.rs` and
+`c1b489f6402b96d3b6b55d7ccd08a22d066fc66b7c14331cf579d4c2d10bb963`
+for `src/recompose.rs`.
 The normalization archive's unused executable `scripts/unicode.py`, the
 category archive's unused external generator `Makefile`, and ignored
 package-local `Cargo.lock` files from the category and `tinyvec` archives were

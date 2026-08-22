@@ -32,7 +32,7 @@ pub struct Decompositions<I> {
     // 2) "Ready" characters which are sorted and ready to emit on demand;
     // 3) A "pending" block which stills needs more characters for us to be able
     //    to sort in canonical order and is not safe to emit.
-    buffer: TinyVec<[(u8, char); 4]>,
+    buffer: TinyVec<[(u8, char); 32]>,
     ready: Range<usize>,
 }
 
@@ -82,9 +82,18 @@ impl<I> Decompositions<I> {
 
     #[inline]
     fn sort_pending(&mut self) {
-        // NB: `sort_by_key` is stable, so it will preserve the original text's
-        // order within a combining class.
-        self.buffer[self.ready.end..].sort_by_key(|k| k.0);
+        // The engine rejects UAX15-D4 non-stream-safe input before constructing
+        // this iterator, so this slice has at most 30 nonstarters. Stable
+        // insertion sort is bounded here, preserves equal-class order, and
+        // needs no allocator-backed sort scratch.
+        let pending = &mut self.buffer[self.ready.end..];
+        for index in 1..pending.len() {
+            let mut cursor = index;
+            while cursor > 0 && pending[cursor - 1].0 > pending[cursor].0 {
+                pending.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+        }
     }
 
     #[inline]

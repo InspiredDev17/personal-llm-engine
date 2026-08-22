@@ -382,8 +382,11 @@ the fixed pre-tokenizer state machine, deterministic byte-map/BPE, explicit
 added/special-token policies, strict decode, and bounded incremental decode.
 Unicode NFC/category/case-fold behavior enters only through an engine-owned
 private adapter that checks both Unicode-16 data versions, bounds NFC output,
-maps all `L*`/`N*` categories and pins the finite simple fold. The public
-factory still validates the structure and returns `UnsupportedTokenizer`; no
+rejects an NFKD stream-safe view that would require a CGJ after 30
+nonstarters, keeps both locally hardened NFC buffers inline, accounts fixed
+iterator workspace, maps all `L*`/`N*` categories and pins the finite simple
+fold. The public factory still validates the structure and returns
+`UnsupportedTokenizer`; no
 service or importer path can construct the core. ADR-0035 records the format
 gate, ADR-0036 records the inert runtime, and ADR-0037 records the private
 Unicode adapter.

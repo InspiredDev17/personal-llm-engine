@@ -82,6 +82,18 @@ adapter remain nonconstructible through public APIs. This does not establish
 Qwen tokenizer parity or activate Qwen packages; exact source conversion and
 production-table token-ID conformance remain required.
 
+The private adapter rejects input whose Unicode-16 NFKD stream-safe view would
+insert a CGJ after more than 30 consecutive nonstarters; it never forwards the
+inserted CGJ or transforms over-limit input. The vendored normalizer is locally
+hardened so both internal four-entry `TinyVec` buffers have 32 inline entries,
+and canonical pending marks use stable in-place insertion sort rather than an
+allocator-backed stable sort. Thus every admitted NFC run stays inline and has
+no sort allocation. A conservative fixed 4 KiB workspace charge remains held
+in the engine memory pool across NFC, separately from the bounded normalized
+output reservation. Architecture tests pin the reject-only precheck, buffer
+sizes, insertion-sort implementation, workspace charge, and retained-file
+hashes.
+
 Both direct crates have defaults disabled and no features selected. NFC's
 iterator API is available through `unicode-normalization`'s `no_std` + `alloc`
 path, so its empty `std` feature is intentionally not enabled. The former
@@ -103,9 +115,12 @@ Admission review on 2026-08-22 found:
   decomposition/composition implementation in `src/normalize.rs`: one unsafe
   function, four unsafe expressions/blocks, and five checked
   `char::from_u32_unchecked` conversions guarded by documented Unicode scalar
-  range invariants. The unused executable Python table generator was pruned
-  from the vendored tree and removed from Cargo's retained-file checksum map;
-  the original archive checksum remains recorded.
+  range invariants. The two iterator buffer declarations and canonical pending
+  sort carry the reviewed local allocation-bound patch described above; their
+  exact patched SHA-256 values are recorded in Cargo's retained-file map. The
+  unused executable Python table generator was pruned from the vendored tree
+  and removed from that map. The upstream archive checksum, license, table data,
+  public API, and package identity remain recorded and unchanged.
 - `unicode-general-category 1.1.0` (published 2025-09-16; crates.io owners
   `wezm` and the YesLogic developers team) is Apache-2.0. Its archive SHA-256 is
   `0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f`.
@@ -134,13 +149,12 @@ Admission review on 2026-08-22 found:
   `bf5c0d245a92671908518d7e765914d437954ed6` (2026-08-21) and reported no
   vulnerability. This is cached advisory evidence, not a live registry audit.
 
-Removal is mechanical while runtime use remains absent: delete the two direct
-`engine-tokenizer` dependency entries, regenerate the exact lock/vendor/SBOM,
-and remove these four vendor directories. After tokenizer activation, removal
-also requires a reviewed first-party replacement that passes the same Unicode
-16 normalization/category vectors. Handwritten partial normalization, an
-approximate regex, or use of a proc-macro Unicode table as runtime authority is
-prohibited.
+Removal now requires a reviewed first-party replacement that passes the same
+Unicode-16 normalization/category, nonstarter-bound, memory-accounting, and
+tokenizer vectors. Delete the two direct `engine-tokenizer` dependency entries,
+regenerate the exact lock/vendor/SBOM, and remove these four vendor directories
+only as one reviewed slice. Handwritten partial normalization, an approximate
+regex, or use of a proc-macro Unicode table as runtime authority is prohibited.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact

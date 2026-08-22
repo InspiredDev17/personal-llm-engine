@@ -184,6 +184,10 @@ fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() 
         "use unicode_normalization::UnicodeNormalization;",
         "unicode_normalization::UNICODE_VERSION == REQUIRED_UNICODE_VERSION",
         "unicode_general_category::UNICODE_VERSION == required_category_version",
+        "const MAX_NFC_COMPATIBILITY_NONSTARTERS: usize = 30;",
+        "const NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES: u64 = 4 * 1024;",
+        "input.chars().stream_safe().eq(input.chars())",
+        ".reserve(normalization_reservation_bytes(normalized_limit)?)?;",
     ] {
         assert!(adapter.contains(required), "private adapter boundary changed: {required}");
     }
@@ -243,6 +247,30 @@ fn reviewed_unicode_16_vendor_boundaries_remain_pinned() {
     assert_eq!(normalize_source.matches("unsafe {").count(), 4);
     assert_eq!(normalize_source.matches("from_u32_unchecked").count(), 5);
     assert!(normalize_source.contains("is_hangul_syllable(c)"));
+
+    let decomposition_source =
+        fs::read_to_string(normalization.join("src/decompose.rs")).expect("decomposer source");
+    assert!(decomposition_source.contains("buffer: TinyVec<[(u8, char); 32]>,"));
+    assert!(decomposition_source.contains("while cursor > 0"));
+    assert!(decomposition_source.contains("pending.swap(cursor - 1, cursor)"));
+    assert!(!decomposition_source.contains("sort_by_key"));
+    let recomposition_source =
+        fs::read_to_string(normalization.join("src/recompose.rs")).expect("recomposer source");
+    assert!(recomposition_source.contains("buffer: TinyVec<[char; 32]>,"));
+    let stream_safe_source =
+        fs::read_to_string(normalization.join("src/stream_safe.rs")).expect("stream-safe source");
+    assert!(stream_safe_source.contains("pub(crate) const MAX_NONSTARTERS: usize = 30;"));
+    let normalization_checksums = fs::read_to_string(normalization.join(".cargo-checksum.json"))
+        .expect("normalizer retained-file checksums must exist");
+    for required in [
+        "\"src/decompose.rs\": \"e8b45213ea08474e807cec0a5c4a442f4fc3ed5d3b92f76806ca0df6d1a3f671\"",
+        "\"src/recompose.rs\": \"c1b489f6402b96d3b6b55d7ccd08a22d066fc66b7c14331cf579d4c2d10bb963\"",
+    ] {
+        assert!(
+            normalization_checksums.contains(required),
+            "normalizer hardening checksum drifted: {required}"
+        );
+    }
 
     let normalization_manifest =
         fs::read_to_string(normalization.join("Cargo.toml")).expect("normalizer manifest");
