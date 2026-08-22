@@ -35,20 +35,33 @@ The shared pinned tokenizer is not representable by `PAIBPE01`:
 - it defines token IDs through 151664 while model embeddings contain 151936
   rows.
 
-The importer therefore performs bounded, non-recursive source inspection but
-emits no lossy AIPTok conversion. A separate `AIPTOK02` foundation validates
+The importer therefore performs bounded, non-recursive source inspection and
+now converts only the exact 7,031,645-byte, SHA-256-pinned source into canonical
+`AIPTOK02`; it still emits no model package. The converter preserves source ID
+order, reverses the GPT-2 byte-symbol alphabet, resolves merge results by exact
+source-symbol concatenation, retains all 22 trusted added-token roles, and
+self-validates through the existing parser. The output is exactly 4,613,135
+bytes with SHA-256 `c154a79da4917e0c851130b5989f53f1f582fe5965e44429a038727398f873ef`
+and SHA-384
+`f1b418104aedb90abc6ee892ef5b71db2b02c2c0c82a9f8e162487d933ffdd636b9ae077eed806f011c251cfea5187cc`.
+A separate `AIPTOK02` foundation validates
 the closed data tables, byte map, merge graph, added-token roles, undefined
-model-vocabulary tail and hard limits. A private runtime core retains those
+model-vocabulary tail and hard limits. A crate-private runtime core retains those
 immutable tables and implements the exact fixed scanner state logic,
 deterministic byte-map/BPE, added-token policy, decode and incremental decode.
-It cannot be constructed publicly. A private adapter now checks the admitted
+The narrow package-bound constructor revalidates the complete serialized
+tokenizer hash before exposing the exact pinned profile; it is not used by the
+ordinary service factory. A private adapter checks the admitted
 normalization/category tables are both Unicode 16.0, streams NFC into an
 engine-bounded output, maps all General Category `L*`/`N*` values, and pins the
 finite default-simple-fold mappings that reach ASCII, including U+017F LONG S.
-The public factory still validates and returns `UnsupportedTokenizer`. Adding
+The ordinary factory still validates and returns `UnsupportedTokenizer`. Adding
 a general regex crate or pretending byte-only tokenization is equivalent is
-prohibited. Exact source conversion and replay of independent production-table
-token-ID vectors are required before packaging. See ADR-0035 through ADR-0037.
+prohibited. A feature-gated offline diagnostic replays 23 fixed production
+encode/special-policy checks, all 271 undefined-tail IDs, and full/incremental
+decode parity;
+it returns no tokenizer handle and accepts no caller-selected text. Packaging
+and activation remain separate closed gates. See ADR-0035 through ADR-0037.
 
 The independently derived activation vectors and their current evidence level
 are recorded in [QWEN25-TOKENIZER-VECTORS.md](QWEN25-TOKENIZER-VECTORS.md).
@@ -57,24 +70,82 @@ The sampling runtime now has a separate immutable selectable-token-domain
 boundary. Deterministic tests model the exact Qwen counts and prove that IDs
 151665 through 151935 cannot influence greedy, temperature, top-k, top-p,
 min-p, or repetition-penalty selection even when every reserved row has the
-largest logit. This is portable safety scaffolding only. Current service load
-code still derives only the legacy all-vocabulary domain after exact AIPTok v1
-vocabulary equality. The data-only AIPTok v2 parser proves the Qwen prefix
-cardinality but deliberately refuses tokenizer construction, so the service
-cannot derive or execute that domain until exact Unicode/tokenizer execution,
-conversion, and activation are reviewed.
+largest logit. Trusted loader-side domain derivation now selects either the
+legacy all-vocabulary domain or the exact tokenizer-defined prefix after
+checking model-row equality and the complete tokenizer hash. The ordinary
+service still cannot construct or execute the Qwen tokenizer, so the remaining
+runtime, registry, package-emission, backend, signing, Foundry, and
+owner-activation gates remain closed.
 
 ## Package boundary
 
 `PAIDIR01` v1.1 and the scalar Qwen correctness scaffold now exist without
 changing v1.0. That does not activate the source profile: v1.1 deliberately
-requires engine 0.2.0 while the current engine is 0.1.0, the exact tokenizer
-converter/executable runtime remains absent, Registry V2 remains legacy-only,
+requires engine 0.2.0 while the current engine is 0.1.0, ordinary-service
+tokenizer construction remains disabled, Registry V2 remains legacy-only,
 and the full profile exceeds the scalar oracle ceiling without a qualified optimized
 backend. Package emission therefore still returns `NotImplemented`; none of
 these source files are approved, signed, activated, or loadable.
-Every public package/import entry performs this unsupported-target check before
+An internal ARM64 backend selection no longer risks legacy interleaved RoPE:
+the decoder resolves the Qwen architecture first and uses the exact split-half
+correctness operation. That narrow parity guard neither supplies a production
+Qwen backend nor changes the engine-version, package, Registry V2, tokenizer,
+service, qualification, signing or owner-activation gates.
+Every public importer package/emission entry performs this unsupported-target check before
 path inspection, source reads, shard parsing, tensor conversion, or allocation.
+
+An explicit startup-only metadata-readiness policy now permits trusted owner
+code to inspect a registered future package without making it loadable. The
+default is disabled and neither the CLI nor authenticated client protocol can
+enable it. Inspection verifies the signed catalog, package signer, closed file
+set, manifest, tokenizer, provenance, shard identities, protected file
+metadata, exact Qwen architecture profile, package-bound `AIPTOK02` runtime
+tables, selectable token domain, and owner Runtime-v3 model/package/artifact/
+backend/version/instance identities. It deliberately does not hash tensor-shard
+contents or reserve/model-load their runtime resources. Its typed result always
+reports service ineligibility and the remaining engine-version, Registry V2,
+qualification, tensor-verification, resource-admission, tokenizer-service and
+owner-activation blockers. Ordinary load still rejects v1.1 at engine 0.1.0,
+and ordinary tokenizer construction still rejects `AIPTOK02`.
+
+The loader parser also has a content-free cross-repository conformance vector
+from the Model Foundry candidate encoder. It contains the complete canonical
+338-tensor BF16 name/shape inventory, not placeholder tensors, and binds the
+exact tokenizer identity and one 3,087,428,608-byte shard identity without
+including that shard. Engine encoding and parsing reproduce the Foundry
+manifest length/digest (65,472 bytes, SHA-384
+`a8f31f32b09d44fa66e103d004412e8af3787edc6d94f7cf1dd6ad0123151fb22ee2799db00818e904083d943e6d829e`)
+and catalog length/digest (528 bytes, SHA-384
+`86651018b34498e8639dac2276655d074a3a8ae8eaf976ca242431a569276e456d1626e5209456cf29517ab2c86fd11b`).
+This proves deterministic metadata-format parity only. The vector is unsigned,
+contains synthetic content digests, and grants no package trust,
+qualification, tensor-content evidence, or activation authority.
+
+A second, separately owner-selected startup policy can now turn that verified
+metadata into an ARM64 execution-preparation record. It reuses the exact
+package-bound tokenizer, retains the 151,936-row/151,665-selectable token
+domain, revalidates the complete Runtime-v3 identity, and derives the bounded
+full-context per-sequence KV requirement (1,879,048,192 bytes for this profile)
+under the caller's memory, KV and concurrency ceilings. Cancellation is checked
+before package work and between preparation stages. The ARM64 compute check
+retains checked operation arithmetic but does not apply the scalar
+correctness-oracle ceiling to a different backend. This creates no model,
+reservation, execution lease, protocol or CLI command; its result always says
+execution is not activated, and accelerated-backend qualification remains an
+explicit blocker.
+
+An executable ARM64 load is intentionally still absent. The exact signed v1.1
+manifest requires engine 0.2.0 while the current loader truthfully enforces
+0.1.0; owner startup policy is not authority to bypass that signed minimum.
+The ordinary loader now has a cancellation-aware full-content path that hashes
+large shard mappings in 1 MiB chunks and drops partial state on cancellation.
+Tensor materialization likewise polls snapshot hashing/copying and conversion;
+BF16/F16 conversion writes directly to the accounted F32 destination instead
+of retaining another owned source tensor, and quantized conversion polls at
+fixed block boundaries. These are portable load prerequisites, not permission
+to accept the Qwen package. The 0.2.0 implementation contract, exact Foundry
+qualification, complete real-package verification, production ARM64 evidence,
+and a separate activation decision remain mandatory.
 
 The portable preflight now requires one absolute normalized owner-private
 ingress root, one safe direct-child artifact name, an owner-private `source/`
@@ -113,10 +184,25 @@ content-free diagnostic for an operator-held tokenizer is available as:
 cargo run --locked -p personalai-engine-model-importer --example verify_qwen25_sources -- INGRESS_ROOT ARTIFACT_NAME
 ```
 
+Exact tokenizer conversion and fixed-vector replay use standard input and write
+only content-free identities/counts:
+
+```text
+cargo run --locked -p personalai-engine-model-importer --example verify_qwen25_tokenizer_conversion < tokenizer.json
+```
+
+The source parser accepts only the exact 7,031,645-byte input, fixed counts and
+bounded 256-byte token/512-byte merge strings. The encoded tokenizer is further
+bounded by the 64-MiB tokenizer-data ceiling; the diagnostic gives table/runtime
+inspection a 128-MiB `MemoryPool`. Lookup keys borrow the ordered source table
+and are dropped before encoding. One local diagnostic run observed 79,008 KiB
+peak RSS; that is environment evidence, not a cross-platform production memory
+claim.
+
 Exact local validation of the shared 7,031,645-byte tokenizer was performed
 during implementation; the file itself is intentionally not committed. This is
-parser evidence only, not model qualification, tokenizer numerical
-conformance, license approval, package signing, or production activation. The
+conversion and fixed-corpus conformance evidence only, not model qualification,
+license approval, package signing, or production activation. The
 closed JSON cursor uses a deliberately stricter numeric subset: negative zero
 and leading integer zeroes are rejected, while standard exponent grammar is
 retained because the pinned config spells epsilon as `1e-06`.

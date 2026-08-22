@@ -55,10 +55,14 @@ earlier, so v1.1 remains unreachable in the production service today.
 
 Resident Qwen execution would read the embedding tensor directly for logits,
 so the tied output is not separately allocated or counted. Streamed planning
-retains a logical `output.weight` alias to that exact source range. ARM64 and
-Metal do not implement this new semantic profile and therefore reject it
-explicitly. Package placement binds the actual manifest revision rather than
-assuming v1.0.
+retains a logical `output.weight` alias to that exact source range. An internal
+ARM64-selected decoder now preserves Qwen split-half RoPE by dispatching that
+operation to the scalar correctness implementation before the generic ARM64
+interleaved-RoPE operation can be selected. Exact bit parity and a negative
+interleaved-layout control test protect this boundary. This is correctness
+scaffolding, not an optimized or qualified Qwen ARM64 backend; ordinary service
+admission remains closed. Metal still has no Qwen semantic-profile path.
+Package placement binds the actual manifest revision rather than assuming v1.0.
 
 ## Evidence and boundaries
 
@@ -67,8 +71,9 @@ the future-version production rejection, invalid epsilon/tied/scaling
 declarations, the exact inventory, unreviewed configuration rejection, required
 bias shape/presence, tied-output validation and unique resident accounting,
 split-half RoPE, bias execution, deterministic tiny two-layer grouped-query
-prefill/decode, cached-versus-full parity, and exact 1.5B scalar compute
-rejection before weight materialization.
+prefill/decode, cached-versus-full parity, exact split-half parity under an
+internal ARM64 selection, rejection of the legacy interleaved layout, and exact
+1.5B scalar compute rejection before weight materialization.
 
 An offline transition slice now performs descriptor-bound inspection of the
 three pinned config identities, the shared exact tokenizer graph/identity, and
@@ -84,7 +89,7 @@ Existing AIPTok remains the only runtime tokenizer. The current authenticated
 service first rejects v1.1 as requiring a future runtime; a second explicit
 tokenizer gate prevents a future compatible runtime from silently applying
 AIPTok's incompatible preserve-bytes/no-pretokenizer/BOS profile. Model Foundry
-must finish the exact offline tokenizer conversion, connect future package
+must independently accept the exact offline tokenizer conversion, connect future package
 emission to an owned verified descriptor rather than reopening a path, issue
 new signed provenance and registry artifacts, and produce independent
 real-model numeric vectors. A separately

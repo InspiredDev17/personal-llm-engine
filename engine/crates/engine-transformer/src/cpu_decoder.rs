@@ -281,7 +281,7 @@ impl CpuDecoderModel {
         sequence_id: SequenceId,
     ) -> Result<CpuDecoderSession, EngineError> {
         let plan = TransformerPlan::new(self.inner.config.clone(), budget)?;
-        plan.require_executable_architecture()?;
+        validate_selected_backend_step_compute(&self.inner.config, &self.inner.backend, 0)?;
         if plan.kv_cache() != self.inner.cache.plan() {
             return Err(EngineError::internal_invariant(
                 "request and model KV-cache layouts differ",
@@ -417,7 +417,11 @@ impl CpuDecoderSession {
         if self.token_count >= self.model.inner.config.context_limit().get() {
             return Err(EngineError::resource_exhaustion("decoder context capacity is exhausted"));
         }
-        check_operation_count(&self.model.inner.config, self.token_count)?;
+        validate_selected_backend_step_compute(
+            &self.model.inner.config,
+            &self.model.inner.backend,
+            self.token_count,
+        )?;
         let workspace_bytes = workspace_bytes(&self.model.inner.config, self.token_count)?;
         let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
         let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
@@ -505,7 +509,11 @@ impl CpuDecoderSession {
             return Err(EngineError::resource_exhaustion("decoder context capacity is exhausted"));
         }
         let (package, plan) = self.model.streamed_weights()?;
-        check_operation_count(&self.model.inner.config, self.token_count)?;
+        validate_selected_backend_step_compute(
+            &self.model.inner.config,
+            &self.model.inner.backend,
+            self.token_count,
+        )?;
         let workspace_bytes = workspace_bytes(&self.model.inner.config, self.token_count)?;
         let _workspace = self.scratch_pool.reserve(workspace_bytes)?;
         let hidden = usize_from_u32(self.model.inner.config.hidden_dimension())?;
@@ -916,26 +924,16 @@ impl CpuDecoderSession {
         position: u32,
         theta: f32,
     ) -> Result<(), EngineError> {
-        #[cfg(feature = "arm64")]
-        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
-            let input = Tensor::from_f32_values(
-                TensorShape::new([u64::from(head_count), u64::from(head_dimension)])?,
-                values,
-                &self.scratch_pool,
-            )?;
-            let output = backend.execute_operation(
-                &Operation::Rope { position, theta },
-                &[&input],
-                &self.scratch_pool,
-            )?;
-            values.copy_from_slice(&tensor_f32_values(&output)?);
-            return Ok(());
-        }
-        if is_qwen2(&self.model.inner.config) {
-            apply_qwen2_rope(values, head_count, head_dimension, position, theta)
-        } else {
-            apply_rope(values, head_count, head_dimension, position, theta)
-        }
+        apply_decoder_rope(
+            &self.model.inner.config,
+            &self.model.inner.backend,
+            &self.scratch_pool,
+            values,
+            head_count,
+            head_dimension,
+            position,
+            theta,
+        )
     }
 
     #[cfg_attr(
@@ -995,11 +993,6 @@ fn validate_model_configuration(
         FIRST_PARTY_DECODER_ARCHITECTURE_ID | QWEN2_DECODER_ARCHITECTURE_ID
     ) {
         return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
-    }
-    if is_qwen2(config) && !matches!(backend, DecoderCpuBackend::Scalar) {
-        return Err(EngineError::not_implemented(
-            "Qwen2.5 semantics are scaffolded only by the scalar CPU reference backend",
-        ));
     }
     if config.head_dimension() % 2 != 0 {
         return Err(EngineError::corrupt_model_package(
@@ -1276,6 +1269,45 @@ fn apply_qwen2_rope(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_decoder_rope(
+    config: &TransformerConfig,
+    backend: &DecoderCpuBackend,
+    scratch_pool: &MemoryPool,
+    values: &mut [f32],
+    head_count: u32,
+    head_dimension: u32,
+    position: u32,
+    theta: f32,
+) -> Result<(), EngineError> {
+    // Qwen2.5 uses split-half rotary pairs. The generic ARM64 graph operation
+    // is intentionally the legacy interleaved layout, so architecture
+    // selection must happen before backend dispatch. Keep this correctness
+    // path explicit until a separately reviewed ARM64 split-half operation
+    // exists.
+    if is_qwen2(config) {
+        return apply_qwen2_rope(values, head_count, head_dimension, position, theta);
+    }
+    #[cfg(feature = "arm64")]
+    if let DecoderCpuBackend::Arm64(backend) = backend {
+        let input = Tensor::from_f32_values(
+            TensorShape::new([u64::from(head_count), u64::from(head_dimension)])?,
+            values,
+            scratch_pool,
+        )?;
+        let output = backend.execute_operation(
+            &Operation::Rope { position, theta },
+            &[&input],
+            scratch_pool,
+        )?;
+        values.copy_from_slice(&tensor_f32_values(&output)?);
+        return Ok(());
+    }
+    #[cfg(not(feature = "arm64"))]
+    let _ = (backend, scratch_pool);
+    apply_rope(values, head_count, head_dimension, position, theta)
+}
+
 fn softmax(values: &mut [f32]) -> Result<(), EngineError> {
     let maximum = values
         .iter()
@@ -1437,8 +1469,29 @@ fn scalar_step_operation_count(
     Ok(total)
 }
 
-fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<(), EngineError> {
-    validate_scalar_step_compute(config, position)
+fn validate_selected_backend_step_compute(
+    config: &TransformerConfig,
+    backend: &DecoderCpuBackend,
+    position: u32,
+) -> Result<(), EngineError> {
+    match backend {
+        DecoderCpuBackend::Scalar => validate_scalar_step_compute(config, position),
+        #[cfg(feature = "arm64")]
+        DecoderCpuBackend::Arm64(_) => validate_arm64_step_compute(config, position),
+    }
+}
+
+#[cfg(feature = "arm64")]
+pub(crate) fn validate_arm64_step_compute(
+    config: &TransformerConfig,
+    position: u32,
+) -> Result<(), EngineError> {
+    // Keep all checked dimension/operation arithmetic. The scalar reference
+    // ceiling describes the correctness oracle and is not an ARM64 work
+    // ceiling. Package, memory, KV, context, concurrency, and cancellation
+    // bounds remain independently enforced by their existing gates.
+    let _ = scalar_step_operation_count(config, position)?;
+    Ok(())
 }
 
 fn workspace_bytes(config: &TransformerConfig, position: u32) -> Result<u64, EngineError> {
@@ -1834,6 +1887,69 @@ mod tests {
         assert_ne!(qwen.map(f32::to_bits), legacy.map(f32::to_bits));
         assert!(apply_qwen2_rope(&mut [0.0; 3], 1, 4, 0, 10_000.0).is_err());
         assert!(apply_qwen2_rope(&mut [0.0; 3], 1, 3, 0, 10_000.0).is_err());
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen2_arm64_selection_preserves_exact_split_half_rope() {
+        let pool = MemoryPool::new(1 << 20).expect("pool must validate");
+        let arm64 =
+            DecoderCpuBackend::Arm64(Arm64Backend::new().expect("ARM64 backend must construct"));
+        let mut scalar_values = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut arm64_values = scalar_values;
+        apply_decoder_rope(
+            &qwen2_config(),
+            &DecoderCpuBackend::Scalar,
+            &pool,
+            &mut scalar_values,
+            1,
+            4,
+            1,
+            10_000.0,
+        )
+        .expect("scalar Qwen2.5 RoPE must execute");
+        apply_decoder_rope(&qwen2_config(), &arm64, &pool, &mut arm64_values, 1, 4, 1, 10_000.0)
+            .expect("ARM64-selected Qwen2.5 RoPE must execute");
+        assert_eq!(
+            arm64_values.map(f32::to_bits),
+            scalar_values.map(f32::to_bits),
+            "Qwen split-half semantics must be backend-independent"
+        );
+
+        let input = Tensor::from_f32_values(
+            TensorShape::new([1, 4]).unwrap(),
+            &[1.0, 2.0, 3.0, 4.0],
+            &pool,
+        )
+        .unwrap();
+        let DecoderCpuBackend::Arm64(legacy_backend) = arm64 else {
+            unreachable!("test explicitly selected ARM64")
+        };
+        let interleaved = legacy_backend
+            .execute_operation(&Operation::Rope { position: 1, theta: 10_000.0 }, &[&input], &pool)
+            .expect("legacy interleaved ARM64 RoPE must execute for the negative control");
+        let interleaved = tensor_f32_values(&interleaved).unwrap();
+        assert_ne!(
+            arm64_values.map(f32::to_bits).as_slice(),
+            interleaved.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            "the Qwen dispatch test must detect accidental legacy interleaved routing"
+        );
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn exact_qwen25_compute_admission_is_backend_aware_without_unbounding_arithmetic() {
+        let config = qwen25_15b_config();
+        assert!(matches!(
+            validate_selected_backend_step_compute(&config, &DecoderCpuBackend::Scalar, 0),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        let arm64 =
+            DecoderCpuBackend::Arm64(Arm64Backend::new().expect("ARM64 backend must construct"));
+        validate_selected_backend_step_compute(&config, &arm64, 0)
+            .expect("ARM64 preparation must not inherit the scalar oracle ceiling");
+        validate_selected_backend_step_compute(&config, &arm64, config.context_limit().get() - 1)
+            .expect("last admitted position must retain checked operation arithmetic");
     }
 
     #[cfg(all(feature = "arm64", target_arch = "aarch64"))]

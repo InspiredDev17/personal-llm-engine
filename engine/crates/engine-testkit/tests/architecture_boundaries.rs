@@ -133,6 +133,10 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one boundary test keeps the complete Unicode and owner-gated Qwen construction confinement visible"
+)]
 fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() {
     let root = engine_root();
     let workspace_manifest =
@@ -202,8 +206,34 @@ fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() 
     assert!(!tokenizer_root.contains("pub use qwen_runtime"));
     assert!(tokenizer_root.contains("let _ = inspect_qwen25_aiptok(data, pool)?;"));
     assert!(tokenizer_root.contains(
-        "AIPTok v2/Qwen2.5 execution remains disabled until exact source conversion and production-table token-ID conformance are qualified"
+        "AIPTok v2/Qwen2.5 execution remains disabled pending package binding, independent qualification, and owner activation"
     ));
+    assert!(tokenizer_root.contains("pub fn build_package_bound_qwen25_tokenizer("));
+    assert!(tokenizer_root.contains("if observed != expected_serialized_hash"));
+    assert!(tokenizer_root.contains("qwen_runtime::Qwen25RuntimeCore::load(data, pool)?"));
+    assert!(tokenizer_root.contains("Ok(Box::new(FirstPartyBpeTokenizer::parse(data, pool)?))"));
+
+    let server = fs::read_to_string(crates.join("engine-server/src/lib.rs"))
+        .expect("server source must be readable");
+    assert!(server.contains("fn validate_service_tokenizer_semantics("));
+    assert!(server.contains("if architecture == QWEN2_DECODER_ARCHITECTURE_ID"));
+    let readiness_start = server
+        .find("pub fn inspect_experimental_qwen_readiness(")
+        .expect("explicit owner-gated readiness boundary must exist");
+    let readiness_end = server[readiness_start..]
+        .find("    /// Admits a request only when its model ID exists")
+        .map(|offset| readiness_start + offset)
+        .expect("readiness boundary must end before ordinary admission");
+    let readiness = &server[readiness_start..readiness_end];
+    assert!(readiness.contains("build_package_bound_qwen25_tokenizer("));
+    assert!(readiness.contains("OwnerApprovedMetadataInspection"));
+    let outside_readiness = format!("{}{}", &server[..readiness_start], &server[readiness_end..]);
+    assert!(
+        !outside_readiness.contains("build_package_bound_qwen25_tokenizer("),
+        "package-bound Qwen construction escaped the owner-gated metadata readiness boundary"
+    );
+
+    assert_qwen_diagnostic_feature_is_offline_importer_only(&crates);
 
     let fuzz_lock = fs::read_to_string(root.join("fuzz/Cargo.lock")).expect("fuzz lock must exist");
     let tokenizer_package = fuzz_lock
@@ -225,6 +255,32 @@ fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() 
         "name = \"unicode-normalization\"\nversion = \"0.1.24\"",
     ] {
         assert!(fuzz_lock.contains(required), "fuzz lock omitted {required}");
+    }
+}
+
+fn assert_qwen_diagnostic_feature_is_offline_importer_only(crates: &Path) {
+    let tokenizer_manifest =
+        fs::read_to_string(crates.join("engine-tokenizer/Cargo.toml")).expect("tokenizer manifest");
+    assert!(
+        tokenizer_manifest.contains("[features]\ndefault = []\nqwen25-conformance-diagnostic = []")
+    );
+    let importer_manifest = fs::read_to_string(crates.join("engine-model-importer/Cargo.toml"))
+        .expect("importer manifest");
+    assert!(importer_manifest.contains(
+        "personalai-engine-tokenizer = { workspace = true, features = [\"qwen25-conformance-diagnostic\"] }"
+    ));
+    for manifest_path in collect_files(crates, "Cargo.toml") {
+        if manifest_path == crates.join("engine-model-importer/Cargo.toml")
+            || manifest_path == crates.join("engine-tokenizer/Cargo.toml")
+        {
+            continue;
+        }
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest must be readable");
+        assert!(
+            !manifest.contains("qwen25-conformance-diagnostic"),
+            "Qwen conformance diagnostic must remain confined to the offline importer: {}",
+            manifest_path.display()
+        );
     }
 }
 
@@ -1011,6 +1067,41 @@ fn selectable_token_domain_is_not_client_protocol_authority() {
                 source.display()
             );
         }
+    }
+}
+
+#[test]
+fn experimental_qwen_readiness_is_not_client_or_cli_activation_authority() {
+    let root = engine_root();
+    for source in collect_files(&root.join("crates/engine-protocol/src"), "rs") {
+        let contents = fs::read_to_string(&source).expect("protocol source must be readable");
+        for prohibited in [
+            "QwenPackageReadiness",
+            "QwenReadinessBlocker",
+            "QwenArm64ExecutionPreparation",
+            "ExperimentalQwenReadinessPolicy",
+            "experimental_qwen_readiness",
+            "prepare_experimental_qwen_arm64_execution",
+        ] {
+            assert!(
+                !contents.contains(prohibited),
+                "client protocol must not expose Qwen readiness authority {prohibited:?}: {}",
+                source.display()
+            );
+        }
+    }
+    let cli = fs::read_to_string(root.join("crates/engine-cli/src/main.rs"))
+        .expect("CLI source must be readable");
+    for prohibited in [
+        "experimental-qwen-readiness",
+        "OwnerApprovedMetadataInspection",
+        "OwnerApprovedArm64ExecutionPreparation",
+        "prepare-experimental-qwen-arm64-execution",
+    ] {
+        assert!(
+            !cli.contains(prohibited),
+            "ordinary CLI must not activate experimental Qwen readiness: {prohibited}"
+        );
     }
 }
 

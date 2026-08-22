@@ -303,9 +303,43 @@ impl<'a> QuantizedTensor<'a> {
 
     /// Materializes canonical F32 execution storage under the supplied aggregate pool.
     pub fn dequantize(self, pool: &MemoryPool) -> Result<Tensor, EngineError> {
+        self.dequantize_cancellable(pool, || false)
+    }
+
+    /// Materializes F32 execution storage while polling between fixed blocks.
+    ///
+    /// A cancellation error drops the partially initialized destination and
+    /// releases its aggregate memory reservation before returning.
+    pub fn dequantize_cancellable(
+        self,
+        pool: &MemoryPool,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Tensor, EngineError> {
+        if is_cancelled() {
+            return Err(EngineError::cancellation(None));
+        }
         let mut output = MutableTensor::zeros(DType::F32, self.shape.clone(), pool)?;
-        for index in 0..self.shape.element_count() {
-            output.set_f32_value(usize_from_u64(index)?, self.value(index)?)?;
+        let mut decoded = [0.0_f32; BLOCK_VALUES];
+        let mut output_index = 0_usize;
+        for block in 0..self.block_count {
+            if is_cancelled() {
+                return Err(EngineError::cancellation(None));
+            }
+            let used = self.decode_block(block, &mut decoded)?;
+            for value in decoded.iter().copied().take(used) {
+                output.set_f32_value(output_index, value)?;
+                output_index = output_index.checked_add(1).ok_or_else(|| {
+                    EngineError::resource_exhaustion("AIPQ output index overflows")
+                })?;
+            }
+        }
+        if output_index != usize_from_u64(self.shape.element_count())? {
+            return Err(EngineError::internal_invariant(
+                "AIPQ dequantization did not initialize the exact output",
+            ));
+        }
+        if is_cancelled() {
+            return Err(EngineError::cancellation(None));
         }
         Ok(output)
     }
@@ -840,5 +874,27 @@ mod tests {
             assert_eq!(output.shape().dimensions(), &[2, 2]);
             assert!(output.as_bytes().iter().any(|byte| *byte != 0));
         }
+    }
+
+    #[test]
+    fn cancellable_dequantization_releases_partial_destination() {
+        use std::cell::Cell;
+
+        let tensor_shape = shape(65);
+        let values = (0_i16..65).map(f32::from).collect::<Vec<_>>();
+        let encoded = quantize(Quantization::AipQ8V1, &tensor_shape, &values).unwrap();
+        let quantized =
+            QuantizedTensor::parse(Quantization::AipQ8V1, &tensor_shape, encoded.bytes()).unwrap();
+        let pool = MemoryPool::new(65 * 4).unwrap();
+        let checks = Cell::new(0_usize);
+        let error = quantized
+            .dequantize_cancellable(&pool, || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 3
+            })
+            .expect_err("dequantization must poll between fixed blocks");
+        assert!(matches!(error, EngineError::Cancellation(_)));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 }

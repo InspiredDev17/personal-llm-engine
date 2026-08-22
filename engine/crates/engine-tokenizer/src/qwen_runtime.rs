@@ -2,15 +2,16 @@
 //!
 //! This module is intentionally private. It implements deterministic fixed
 //! pre-tokenizer, BPE, added-token, and decoding mechanics over already parsed
-//! AIPTok v2 tables. The public tokenizer factory remains fail-closed until the
-//! admitted Unicode-16 primitives are wired through the private adapter below.
-//! Public construction remains disabled until exact source conversion and
-//! production-table token-ID replay are independently qualified.
+//! AIPTok v2 tables. The exact runtime is constructible only through the
+//! package-hash-bound tokenizer API. The ordinary service factory remains
+//! fail-closed pending independent qualification and explicit owner activation.
 
 use super::qwen_v2::{
     AipTokQwen25AddedRole, Qwen25LoadedTables, Qwen25MergeRule, load_qwen25_tables,
 };
 use super::{MAX_SPECIAL_TOKENS, SpecialTokenPolicy, TEMPORARY_BYTES_PER_INPUT_TOKEN, checked_add};
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+use personalai_engine_crypto::hash_package;
 use personalai_engine_memory::{MemoryPool, MemoryReservation};
 use personalai_engine_types::{EngineError, MAX_REQUEST_BYTES, MAX_TOKEN_COUNT};
 use std::cmp::Reverse;
@@ -39,6 +40,10 @@ const NFC_DECOMPOSITION_INLINE_SCALARS: usize = 64;
 const NFC_RECOMPOSITION_INLINE_SCALARS: usize = 32;
 const NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES: u64 = 4 * 1024;
 const CONTRACTION_SUFFIXES: [&[u8]; 7] = [b"s", b"t", b"re", b"ve", b"m", b"ll", b"d"];
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+const PINNED_QWEN25_AIPTOK_SHA384: &str = "sha384:f1b418104aedb90abc6ee892ef5b71db2b02c2c0c82a9f8e162487d933ffdd636b9ae077eed806f011c251cfea5187cc";
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+const PINNED_QWEN25_TABLE_SHA384: &str = "sha384:2c343d7ddc0952d346fb215fe2d2c8723deafffe7412ff19a252ae33a0eefd35dca3d2f41bd6a354ad5beb0755a54baa";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GeneralClass {
@@ -399,14 +404,14 @@ struct BpeNode {
 }
 
 #[derive(Debug)]
-struct Qwen25RuntimeCore {
+pub(super) struct Qwen25RuntimeCore {
     tables: Qwen25LoadedTables,
     added_by_first_byte: [Vec<usize>; 256],
     _added_index_reservation: Option<MemoryReservation>,
 }
 
 impl Qwen25RuntimeCore {
-    fn load(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
+    pub(super) fn load(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
         let tables = load_qwen25_tables(data, pool)?;
         if !tables.descriptor.matches_pinned_qwen25_1_5b_counts() {
             return Err(EngineError::unsupported_tokenizer(
@@ -417,7 +422,7 @@ impl Qwen25RuntimeCore {
     }
 
     #[cfg(test)]
-    fn load_test_fixture(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
+    pub(super) fn load_test_fixture(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
         Self::from_tables(load_qwen25_tables(data, pool)?)
     }
 
@@ -490,7 +495,23 @@ impl Qwen25RuntimeCore {
         Ok(Some(added.role))
     }
 
-    fn token_piece(&self, token: u32) -> Result<&[u8], EngineError> {
+    pub(super) fn descriptor(&self) -> super::qwen_v2::Qwen25AipTokDescriptor {
+        self.tables.descriptor
+    }
+
+    pub(super) fn maximum_piece_bytes(&self) -> Result<u16, EngineError> {
+        self.tables
+            .pieces
+            .iter()
+            .map(|piece| piece.len())
+            .max()
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| {
+                EngineError::internal_invariant("Qwen maximum token piece is unavailable")
+            })
+    }
+
+    pub(super) fn token_piece(&self, token: u32) -> Result<&[u8], EngineError> {
         self.tables
             .pieces
             .get(self.token_index(token)?)
@@ -498,11 +519,11 @@ impl Qwen25RuntimeCore {
             .ok_or_else(|| EngineError::internal_invariant("Qwen token piece is unavailable"))
     }
 
-    fn vocabulary_lookup(&self, piece: &[u8]) -> Option<u32> {
+    pub(super) fn vocabulary_lookup(&self, piece: &[u8]) -> Option<u32> {
         self.tables.vocabulary.get(piece).copied()
     }
 
-    fn is_special_token(&self, token: u32) -> Result<bool, EngineError> {
+    pub(super) fn is_special_token(&self, token: u32) -> Result<bool, EngineError> {
         Ok(self.added_role(token)?.is_some_and(AipTokQwen25AddedRole::is_special))
     }
 
@@ -740,6 +761,14 @@ impl Qwen25RuntimeCore {
         Ok(output)
     }
 
+    pub(super) fn encode_reviewed(
+        &self,
+        input: &str,
+        policy: SpecialTokenPolicy<'_>,
+    ) -> Result<Vec<u32>, EngineError> {
+        self.encode(input, policy, &Qwen25Unicode16Adapter)
+    }
+
     fn encode_pretoken_bytes(&self, bytes: &[u8]) -> Result<Vec<u32>, EngineError> {
         if bytes.len()
             > usize::try_from(self.tables.descriptor.maximum_input_bytes()).unwrap_or(usize::MAX)
@@ -768,7 +797,7 @@ impl Qwen25RuntimeCore {
         Ok(())
     }
 
-    fn decode_bytes(&self, tokens: &[u32]) -> Result<Vec<u8>, EngineError> {
+    pub(super) fn decode_bytes(&self, tokens: &[u32]) -> Result<Vec<u8>, EngineError> {
         self.validate_tokens(tokens)?;
         let mut length = 0_usize;
         for token in tokens {
@@ -800,10 +829,133 @@ impl Qwen25RuntimeCore {
         Ok(output)
     }
 
-    fn decode(&self, tokens: &[u32]) -> Result<String, EngineError> {
+    pub(super) fn decode(&self, tokens: &[u32]) -> Result<String, EngineError> {
         String::from_utf8(self.decode_bytes(tokens)?)
             .map_err(|_| EngineError::invalid_input("Qwen token sequence is not valid UTF-8"))
     }
+}
+
+/// Replays the fixed, independently derived production token-ID corpus without
+/// exposing a constructible tokenizer or accepting caller-selected inputs.
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+pub(super) fn verify_pinned_qwen25_production_vectors(
+    data: &[u8],
+    pool: &MemoryPool,
+) -> Result<u32, EngineError> {
+    if hash_package(data).to_string() != PINNED_QWEN25_AIPTOK_SHA384 {
+        return Err(EngineError::corrupt_model_package(
+            "Qwen2.5 AIPTok conversion identity is not pinned",
+        ));
+    }
+    let core = Qwen25RuntimeCore::load(data, pool)?;
+    if core.tables.descriptor.content_hash().to_string() != PINNED_QWEN25_TABLE_SHA384 {
+        return Err(EngineError::corrupt_model_package(
+            "Qwen2.5 tokenizer table identity is not pinned",
+        ));
+    }
+    let profile = Qwen25Unicode16Adapter;
+    let vectors: [(&str, &[u32], &str); 17] = [
+        ("Hello world", &[9707, 1879], "Hello world"),
+        ("I'm WE'RE he'd", &[40, 2776, 19677, 94153, 566, 4172], "I'm WE'RE he'd"),
+        ("abc123Ⅷ½", &[13683, 16, 17, 18, 70467, 100, 26062], "abc123Ⅷ½"),
+        ("Hello, world!!!\n", &[9707, 11, 1879, 79295], "Hello, world!!!\n"),
+        ("A\r\nB\n\n", &[32, 319, 33, 271], "A\r\nB\n\n"),
+        ("A  B ", &[32, 220, 425, 220], "A  B "),
+        ("\t\r\n", &[4474], "\t\r\n"),
+        ("Cafe\u{0301}", &[34, 2577, 963], "Café"),
+        ("\u{1100}\u{1161}", &[19969], "가"),
+        ("\u{0301}b", &[53839, 65], "\u{0301}b"),
+        ("\0A", &[188, 32], "\0A"),
+        ("A中Ж", &[32, 15946, 132_042], "A中Ж"),
+        (" !?", &[753, 30], " !?"),
+        (" 😀\n", &[90316, 198], " 😀\n"),
+        ("\u{00A0}!", &[4102, 0], "\u{00A0}!"),
+        ("\u{200B}!", &[15692, 0], "\u{200B}!"),
+        (
+            "a\u{1ACF}\u{0315}\u{0300}\u{05AE}b",
+            &[64, 157, 104, 237, 146, 106, 96549, 136, 243, 65],
+            "a\u{1ACF}\u{05AE}\u{0300}\u{0315}b",
+        ),
+    ];
+    for (input, expected, decoded) in vectors {
+        let observed = core.encode(input, SpecialTokenPolicy::Reject, &profile)?;
+        if observed != expected {
+            return Err(EngineError::internal_invariant(
+                "pinned Qwen2.5 production token-ID vector changed",
+            ));
+        }
+        verify_pinned_qwen25_decode(&core, &observed, decoded)?;
+    }
+
+    if core.encode("<|im_start|>", SpecialTokenPolicy::Reject, &profile).is_ok() {
+        return Err(EngineError::internal_invariant(
+            "pinned Qwen2.5 special-token rejection changed",
+        ));
+    }
+    for (input, policy, expected, decoded) in [
+        ("Hello", SpecialTokenPolicy::Reject, &[9707_u32][..], "Hello"),
+        ("<|im_start|>", SpecialTokenPolicy::AllowAll, &[151_644][..], ""),
+        (
+            "<|im_start|>",
+            SpecialTokenPolicy::TreatAsOrdinaryBytes,
+            &[27, 91, 318, 4906, 91, 29][..],
+            "<|im_start|>",
+        ),
+        ("<tool_call>", SpecialTokenPolicy::Reject, &[151_657][..], "<tool_call>"),
+        (
+            "<tool_call>",
+            SpecialTokenPolicy::TreatAsOrdinaryBytes,
+            &[27, 14172, 13429, 29][..],
+            "<tool_call>",
+        ),
+    ] {
+        let observed = core.encode(input, policy, &profile)?;
+        if observed != expected {
+            return Err(EngineError::internal_invariant(
+                "pinned Qwen2.5 added-token vector changed",
+            ));
+        }
+        verify_pinned_qwen25_decode(&core, &observed, decoded)?;
+    }
+    for token in
+        core.tables.descriptor.defined_token_count()..core.tables.descriptor.model_vocabulary_size()
+    {
+        if core.decode_bytes(&[token]).is_ok() {
+            return Err(EngineError::internal_invariant(
+                "pinned Qwen2.5 undefined tokenizer tail became decodable",
+            ));
+        }
+    }
+    u32::try_from(vectors.len() + 6)
+        .map_err(|_| EngineError::internal_invariant("Qwen2.5 vector count overflows"))
+}
+
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+fn verify_pinned_qwen25_decode(
+    core: &Qwen25RuntimeCore,
+    tokens: &[u32],
+    expected: &str,
+) -> Result<(), EngineError> {
+    if core.decode(tokens)? != expected {
+        return Err(EngineError::internal_invariant(
+            "pinned Qwen2.5 production decode vector changed",
+        ));
+    }
+    let mut decoder = Qwen25IncrementalDecoder::new(core)?;
+    let mut observed = String::new();
+    observed.try_reserve_exact(expected.len()).map_err(|_| {
+        EngineError::resource_exhaustion("Qwen conformance output allocation failed")
+    })?;
+    for token in tokens {
+        observed.push_str(&decoder.push(*token)?);
+    }
+    decoder.finish()?;
+    if observed != expected {
+        return Err(EngineError::internal_invariant(
+            "pinned Qwen2.5 incremental decode vector changed",
+        ));
+    }
+    Ok(())
 }
 
 struct Qwen25IncrementalDecoder<'a> {

@@ -21,11 +21,11 @@ pub use qwen25_config_json::{
 #[cfg(unix)]
 pub use qwen25_source_preflight::{Qwen25SourcePreflightReport, preflight_qwen25_ingress};
 pub use qwen25_tokenizer_json::{
-    QWEN25_ADDED_TOKEN_COUNT, QWEN25_BOS_TOKEN_ID, QWEN25_BPE_VOCABULARY_SIZE,
-    QWEN25_DEFINED_TOKEN_COUNT, QWEN25_EOS_TOKEN_ID, QWEN25_MERGE_COUNT,
-    QWEN25_MODEL_VOCABULARY_SIZE, QWEN25_TOKENIZER_BYTES, QWEN25_TOKENIZER_JSON_SOURCE_FORMAT,
-    QWEN25_TOKENIZER_SHA256, Qwen25TokenizerDescriptor, convert as convert_qwen25_tokenizer_json,
-    inspect as inspect_qwen25_tokenizer_json,
+    QWEN25_ADDED_TOKEN_COUNT, QWEN25_AIPTOK_BYTES, QWEN25_AIPTOK_SHA256, QWEN25_AIPTOK_SHA384,
+    QWEN25_BOS_TOKEN_ID, QWEN25_BPE_VOCABULARY_SIZE, QWEN25_DEFINED_TOKEN_COUNT,
+    QWEN25_EOS_TOKEN_ID, QWEN25_MERGE_COUNT, QWEN25_MODEL_VOCABULARY_SIZE, QWEN25_TOKENIZER_BYTES,
+    QWEN25_TOKENIZER_JSON_SOURCE_FORMAT, QWEN25_TOKENIZER_SHA256, Qwen25TokenizerDescriptor,
+    convert as convert_qwen25_tokenizer_json, inspect as inspect_qwen25_tokenizer_json,
 };
 
 pub use safetensors::{
@@ -644,7 +644,7 @@ fn finish_package(
 fn ensure_package_target_supported(spec: &ImportSpec) -> Result<(), EngineError> {
     if spec.mapping == SourceMapping::Qwen25SafetensorsV1 {
         Err(EngineError::not_implemented(
-            "Qwen2.5 package emission remains disabled pending exact tokenizer conversion, engine 0.2 activation, registry admission, and optimized-backend qualification",
+            "Qwen2.5 package emission remains disabled pending reviewed package binding, independent package acceptance, engine 0.2 activation, registry admission, and optimized-backend qualification",
         ))
     } else {
         Ok(())
@@ -1680,7 +1680,8 @@ mod tests {
     use super::*;
     use personalai_engine_crypto::TrustedSigner;
     use personalai_engine_loader::{
-        ModelRegistry, RegistrationMode, RegistrySelectionV2, VerifiedDirectoryPackage,
+        DirectoryLoadCancellationProbe, ModelRegistry, RegistrationMode, RegistrySelectionV2,
+        VerifiedDirectoryPackage,
     };
     use personalai_engine_model_format::{
         DIRECTORY_MANIFEST_HEADER_BYTES, DIRECTORY_QWEN2_MANIFEST_VERSION,
@@ -2213,6 +2214,23 @@ mod tests {
         ))
     }
 
+    struct CancelAfterChecks {
+        checks: AtomicU64,
+        cancel_at: u64,
+    }
+
+    impl CancelAfterChecks {
+        const fn new(cancel_at: u64) -> Self {
+            Self { checks: AtomicU64::new(0), cancel_at }
+        }
+    }
+
+    impl DirectoryLoadCancellationProbe for CancelAfterChecks {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::AcqRel) + 1 >= self.cancel_at
+        }
+    }
+
     #[cfg(unix)]
     fn load_cpu_profile(profile: QuantizationProfile) -> personalai_engine_server::LoadedCpuModel {
         let (model, root, store, package_path) =
@@ -2698,6 +2716,17 @@ mod tests {
                 reason: ModelPackageRejection::Corrupt,
             }]
         );
+        let mut cancellable_events = Vec::new();
+        assert!(matches!(
+            registry.load_registered_directory_cancellable(
+                spec().model_id(),
+                &budget,
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut |event| cancellable_events.push(event),
+            ),
+            Err(EngineError::NotImplemented(_))
+        ));
+        assert_eq!(cancellable_events, loader_events);
 
         let config = ServiceConfig::new(&store, &runtime, runtime.join("engine.sock"))
             .expect("service config must validate");
@@ -2814,10 +2843,28 @@ mod tests {
                 )
                 .expect("quantized package must register");
             let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+            let mut cancellation_events = Vec::new();
+            let cancellation = CancelAfterChecks::new(6);
+            assert!(matches!(
+                registry.load_registered_directory_cancellable(
+                    spec.model_id(),
+                    &budget,
+                    &cancellation,
+                    &mut |event| cancellation_events.push(event),
+                ),
+                Err(EngineError::Cancellation(_))
+            ));
+            assert!(cancellation_events.is_empty());
             let loaded = registry
                 .load_registered_directory(spec.model_id(), &budget, &mut |_| {})
                 .expect("signed quantized package must load");
             let pool = MemoryPool::new(1 << 20).expect("model pool must validate");
+            let materialization_cancellation = CancelAfterChecks::new(9);
+            assert!(matches!(
+                loaded.materialize_tensors_cancellable(&pool, &materialization_cancellation),
+                Err(EngineError::Cancellation(_))
+            ));
+            assert_eq!(pool.statistics().expect("metrics must read").reserved_bytes(), 0);
             let tensors =
                 loaded.materialize_tensors(&pool).expect("quantized tensors must materialize");
             assert!(pool.statistics().expect("metrics must read").reserved_bytes() > 0);

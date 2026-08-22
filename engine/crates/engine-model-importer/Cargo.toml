@@ -13,7 +13,7 @@ personalai-engine-memory.workspace = true
 personalai-engine-model-format.workspace = true
 personalai-engine-quantization.workspace = true
 personalai-engine-tensor.workspace = true
-personalai-engine-tokenizer.workspace = true
+personalai-engine-tokenizer = { workspace = true, features = ["qwen25-conformance-diagnostic"] }
 personalai-engine-types.workspace = true
 zeroize.workspace = true
 

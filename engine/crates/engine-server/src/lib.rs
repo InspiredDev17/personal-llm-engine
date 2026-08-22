@@ -62,8 +62,6 @@ use personalai_engine_kv_cache::{
     KvCacheCreateOutcome, KvCacheDescriptor, KvCacheId, ReusableKvCacheLimits,
     ReusableKvCacheStore,
 };
-#[cfg(all(unix, feature = "cpu-reference"))]
-use personalai_engine_loader::DirectorySecurityEventSink;
 use personalai_engine_loader::ModelRegistry;
 pub use personalai_engine_loader::RegistrySelectionV2;
 #[cfg(all(
@@ -75,6 +73,10 @@ pub use personalai_engine_loader::RegistrySelectionV2;
     )
 ))]
 use personalai_engine_loader::VerifiedDirectoryPackage;
+#[cfg(all(unix, feature = "cpu-reference"))]
+use personalai_engine_loader::{
+    DIRECTORY_LOADER_ENGINE_VERSION, DirectorySecurityEventSink, RegistrationMode,
+};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 #[cfg(all(feature = "cpu-reference", test))]
@@ -117,12 +119,15 @@ use personalai_engine_scheduler::{Scheduler, SchedulerLimits};
 use personalai_engine_tensor::Tensor;
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_tokenizer::{
-    EncodeOptions, IncrementalDecoder, SpecialTokenPolicy, Tokenizer, build_tokenizer,
+    EncodeOptions, IncrementalDecoder, SpecialTokenPolicy, Tokenizer, TokenizerSpec,
+    build_package_bound_qwen25_tokenizer, build_tokenizer,
 };
 #[cfg(feature = "arm64")]
 use personalai_engine_transformer::Arm64Backend;
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 pub use personalai_engine_transformer::MetalBackend;
+#[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+use personalai_engine_transformer::validate_qwen2_arm64_session_resources;
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_transformer::{
@@ -132,8 +137,8 @@ use personalai_engine_transformer::{
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 use personalai_engine_transformer::{MetalDecoderModel, MetalDecoderSession};
 use personalai_engine_types::{
-    BackendId, EngineError, GenerationRequest, MAX_FRAME_BYTES, ModelId, ModelPackageHash,
-    RequestId,
+    ArchitectureId, BackendId, ContextLimit, DType, EngineError, GenerationRequest,
+    MAX_FRAME_BYTES, ModelId, ModelPackageHash, RequestId, Sha256Digest,
 };
 #[cfg(feature = "cpu-reference")]
 use personalai_engine_types::{
@@ -272,6 +277,22 @@ pub struct ServiceConfig {
     model_root: PathBuf,
     runtime_root: PathBuf,
     socket_path: PathBuf,
+    experimental_qwen_readiness: ExperimentalQwenReadinessPolicy,
+}
+
+/// Owner startup policy for non-executable Qwen package inspection.
+///
+/// This setting is not part of any client protocol and does not alter package
+/// admission, the service tokenizer gate, the engine version, or generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExperimentalQwenReadinessPolicy {
+    /// The production-safe default.
+    #[default]
+    Disabled,
+    /// Permit metadata-only pre-activation inspection from trusted startup code.
+    OwnerApprovedMetadataInspection,
+    /// Permit bounded ARM64 execution preparation without service activation.
+    OwnerApprovedArm64ExecutionPreparation,
 }
 
 impl ServiceConfig {
@@ -305,7 +326,25 @@ impl ServiceConfig {
                 "engine socket path exceeds the portable hard limit",
             ));
         }
-        Ok(Self { model_root, runtime_root, socket_path })
+        Ok(Self {
+            model_root,
+            runtime_root,
+            socket_path,
+            experimental_qwen_readiness: ExperimentalQwenReadinessPolicy::Disabled,
+        })
+    }
+
+    /// Applies an explicit owner startup decision for metadata-only inspection.
+    ///
+    /// The CLI does not currently expose this setting, so ordinary production
+    /// startup remains disabled. Request and model data cannot change it.
+    #[must_use]
+    pub const fn with_experimental_qwen_readiness(
+        mut self,
+        policy: ExperimentalQwenReadinessPolicy,
+    ) -> Self {
+        self.experimental_qwen_readiness = policy;
+        self
     }
 
     /// Returns the local configuration-owned model root.
@@ -321,6 +360,235 @@ impl ServiceConfig {
     /// Returns the Unix-domain-socket path without opening it.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Returns the trusted startup-only readiness policy.
+    pub const fn experimental_qwen_readiness(&self) -> ExperimentalQwenReadinessPolicy {
+        self.experimental_qwen_readiness
+    }
+}
+
+/// One deterministic reason that Qwen package evidence cannot authorize service.
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QwenReadinessBlocker {
+    /// Signed tensor identities were inspected, but tensor contents remain for load admission.
+    TensorContentVerificationDeferred,
+    /// Registry V2 has no canonical Qwen/AIPTok v2 compatibility profile.
+    CanonicalRegistryProfileUnavailable,
+    /// Owner-pinned registration is package trust, not Model Foundry qualification.
+    ProductionQualificationNotProven,
+    /// The signed package requires a newer runtime version.
+    RequiredEngineVersionUnavailable,
+    /// The ordinary service factory still rejects AIPTok v2/Qwen execution.
+    OrdinaryServiceActivationClosed,
+    /// Full tensor-backed runtime resource admission remains for ordinary load.
+    RuntimeResourceAdmissionDeferred,
+    /// Current bounded scalar reference execution rejects this configuration.
+    ReferenceExecutionAdmissionDenied,
+    /// The selected accelerated backend lacks production qualification for this profile.
+    SelectedBackendQualificationNotProven,
+}
+
+/// Content-free, non-authorizing Qwen package pre-activation evidence.
+///
+/// This is an engine-internal domain object, not a cross-repository wire
+/// contract. It proves exact metadata/tokenizer/runtime binding only; it never
+/// represents qualification, full shard verification, model load, or service
+/// eligibility.
+#[cfg(all(unix, feature = "cpu-reference"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QwenPackageReadiness {
+    model_id: ModelId,
+    package_hash: ModelPackageHash,
+    artifact_id: ArtifactAuthorityId,
+    registration_mode: RegistrationMode,
+    registry_sequence: Option<u64>,
+    registry_entry_hash: Option<ModelPackageHash>,
+    manifest_version: (u16, u16),
+    required_engine_version: (u16, u16, u16),
+    current_engine_version: (u16, u16, u16),
+    architecture_id: ArchitectureId,
+    tokenizer_hash: ModelPackageHash,
+    tokenizer_digest: Sha256Digest,
+    model_vocabulary_size: u32,
+    selectable_token_domain: SelectableTokenDomain,
+    context_limit: ContextLimit,
+    rope_theta_bits: u32,
+    rope_scaling_bits: u32,
+    storage_dtype: DType,
+    cache_dtype: DType,
+    quantization_id: u8,
+    runtime_identity: RuntimeIdentityBinding,
+    blockers: Vec<QwenReadinessBlocker>,
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
+impl QwenPackageReadiness {
+    /// Returns the exact package model identity.
+    pub const fn model_id(&self) -> &ModelId {
+        &self.model_id
+    }
+
+    /// Returns the exact signed hash-catalog identity.
+    pub const fn package_hash(&self) -> ModelPackageHash {
+        self.package_hash
+    }
+
+    /// Returns the exact owner/runtime artifact identity.
+    pub const fn artifact_id(&self) -> &ArtifactAuthorityId {
+        &self.artifact_id
+    }
+
+    /// Returns the trusted local registration mode.
+    pub const fn registration_mode(&self) -> RegistrationMode {
+        self.registration_mode
+    }
+
+    /// Returns the selected signed registry sequence when one exists.
+    pub const fn registry_sequence(&self) -> Option<u64> {
+        self.registry_sequence
+    }
+
+    /// Returns the exact signed registry-envelope digest when one exists.
+    pub const fn registry_entry_hash(&self) -> Option<ModelPackageHash> {
+        self.registry_entry_hash
+    }
+
+    /// Returns the canonical directory-manifest version.
+    pub const fn manifest_version(&self) -> (u16, u16) {
+        self.manifest_version
+    }
+
+    /// Returns the package-required engine version.
+    pub const fn required_engine_version(&self) -> (u16, u16, u16) {
+        self.required_engine_version
+    }
+
+    /// Returns the currently enforced directory-loader version.
+    pub const fn current_engine_version(&self) -> (u16, u16, u16) {
+        self.current_engine_version
+    }
+
+    /// Returns the exact architecture identity.
+    pub const fn architecture_id(&self) -> &ArchitectureId {
+        &self.architecture_id
+    }
+
+    /// Returns the exact package tokenizer SHA-384 identity.
+    pub const fn tokenizer_hash(&self) -> ModelPackageHash {
+        self.tokenizer_hash
+    }
+
+    /// Returns the exact package tokenizer SHA-256 identity used by cache binding.
+    pub const fn tokenizer_digest(&self) -> Sha256Digest {
+        self.tokenizer_digest
+    }
+
+    /// Returns the model/logit row count.
+    pub const fn model_vocabulary_size(&self) -> u32 {
+        self.model_vocabulary_size
+    }
+
+    /// Returns the package-defined sampling domain count.
+    pub const fn selectable_token_count(&self) -> u32 {
+        self.selectable_token_domain.selectable_token_count()
+    }
+
+    /// Returns the exact model/package/tokenizer-bound sampling domain.
+    pub const fn selectable_token_domain(&self) -> SelectableTokenDomain {
+        self.selectable_token_domain
+    }
+
+    /// Returns the exact model context ceiling.
+    pub const fn context_limit(&self) -> ContextLimit {
+        self.context_limit
+    }
+
+    /// Returns the bit-exact RoPE theta declaration.
+    pub const fn rope_theta_bits(&self) -> u32 {
+        self.rope_theta_bits
+    }
+
+    /// Returns the bit-exact RoPE scaling declaration.
+    pub const fn rope_scaling_bits(&self) -> u32 {
+        self.rope_scaling_bits
+    }
+
+    /// Returns the exact package storage dtype.
+    pub const fn storage_dtype(&self) -> DType {
+        self.storage_dtype
+    }
+
+    /// Returns the exact runtime KV-cache dtype derived from model configuration.
+    pub const fn cache_dtype(&self) -> DType {
+        self.cache_dtype
+    }
+
+    /// Returns the closed directory-manifest quantization identifier.
+    pub const fn quantization_id(&self) -> u8 {
+        self.quantization_id
+    }
+
+    /// Returns the exact owner-configured Runtime-v3 identity binding.
+    pub const fn runtime_identity(&self) -> &RuntimeIdentityBinding {
+        &self.runtime_identity
+    }
+
+    /// Returns deterministic non-authorizing blockers.
+    pub fn blockers(&self) -> &[QwenReadinessBlocker] {
+        &self.blockers
+    }
+
+    /// Always reports false while this pre-activation evidence type exists.
+    pub const fn is_service_eligible(&self) -> bool {
+        false
+    }
+}
+
+/// Bounded, content-free ARM64 preparation evidence for one exact Qwen model.
+///
+/// This proves metadata identity, tokenizer/domain binding, and request-session
+/// resource admission only. It is not a loaded model, execution lease,
+/// qualification decision, or service activation result.
+#[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QwenArm64ExecutionPreparation {
+    readiness: QwenPackageReadiness,
+    session_kv_bytes: u64,
+    maximum_concurrent_sequences: u32,
+}
+
+#[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+impl QwenArm64ExecutionPreparation {
+    /// Returns the complete exact package/runtime readiness binding.
+    pub const fn readiness(&self) -> &QwenPackageReadiness {
+        &self.readiness
+    }
+
+    /// Returns the immutable selectable token domain for future execution.
+    pub const fn selectable_token_domain(&self) -> SelectableTokenDomain {
+        self.readiness.selectable_token_domain()
+    }
+
+    /// Returns the exact Runtime-v3 identity selected by owner configuration.
+    pub const fn runtime_identity(&self) -> &RuntimeIdentityBinding {
+        self.readiness.runtime_identity()
+    }
+
+    /// Returns the checked full-context per-sequence KV byte requirement.
+    pub const fn session_kv_bytes(&self) -> u64 {
+        self.session_kv_bytes
+    }
+
+    /// Returns the request budget's explicit concurrency ceiling.
+    pub const fn maximum_concurrent_sequences(&self) -> u32 {
+        self.maximum_concurrent_sequences
+    }
+
+    /// Always false until separate package, qualification, and activation gates close.
+    pub const fn is_execution_activated(&self) -> bool {
+        false
     }
 }
 
@@ -1361,6 +1629,31 @@ impl LoadedCpuModel {
 }
 
 #[cfg(feature = "cpu-reference")]
+fn derive_selectable_token_domain(
+    model_vocabulary_size: u32,
+    tokenizer: &TokenizerSpec,
+    package_hash: ModelPackageHash,
+    tokenizer_hash: ModelPackageHash,
+) -> Result<SelectableTokenDomain, EngineError> {
+    if tokenizer.model_vocabulary_size() != model_vocabulary_size {
+        return Err(EngineError::corrupt_model_package(
+            "model and tokenizer logit vocabulary sizes differ",
+        ));
+    }
+    if tokenizer.serialized_data_hash() != tokenizer_hash {
+        return Err(EngineError::corrupt_model_package(
+            "loaded tokenizer identity differs from the verified package binding",
+        ));
+    }
+    SelectableTokenDomain::from_verified_tokenizer_counts(
+        model_vocabulary_size,
+        tokenizer.selectable_token_count(),
+        package_hash,
+        tokenizer_hash,
+    )
+}
+
+#[cfg(feature = "cpu-reference")]
 #[allow(
     clippy::too_many_arguments,
     reason = "loaded model construction keeps independently verified native and canonical tokenizer identities explicit"
@@ -1375,9 +1668,9 @@ fn build_loaded_cpu_model(
     tokenizer_digest: personalai_engine_types::Sha256Digest,
     budget: &ResourceBudget,
 ) -> Result<LoadedCpuModel, EngineError> {
-    let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+    let selectable_token_domain = derive_selectable_token_domain(
         model.config().vocabulary_size(),
-        tokenizer.spec().vocabulary_size(),
+        tokenizer.spec(),
         package_hash,
         tokenizer_hash,
     )?;
@@ -4743,6 +5036,191 @@ impl EngineService {
         self.registry.register_registry_v2(selection)
     }
 
+    /// Inspects an exact signed Qwen package without making it executable.
+    ///
+    /// The gate is trusted startup configuration, not request data. Inspection
+    /// authenticates package metadata, parses the package-bound tokenizer,
+    /// derives the non-expandable token domain, and binds an exact owner
+    /// Runtime-v3 identity. It does not hash tensor contents, qualify a model,
+    /// raise resource ceilings, load weights, or alter ordinary service gates.
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pre-activation evidence keeps independently trusted package, runtime, backend, budget, and event inputs explicit"
+    )]
+    pub fn inspect_experimental_qwen_readiness(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        backend: &RuntimeBackend,
+        runtime_config: &RuntimeV3ServiceConfig,
+        runtime_identity: &RuntimeIdentityBinding,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<QwenPackageReadiness, EngineError> {
+        if self.config.experimental_qwen_readiness()
+            != ExperimentalQwenReadinessPolicy::OwnerApprovedMetadataInspection
+        {
+            return Err(EngineError::not_implemented(
+                "experimental Qwen metadata readiness inspection is disabled",
+            ));
+        }
+        self.inspect_qwen_readiness_bound(
+            model_id,
+            budget,
+            backend,
+            runtime_config,
+            runtime_identity,
+            events,
+        )
+        .map(|(readiness, _)| readiness)
+    }
+
+    /// Prepares exact Qwen2.5 ARM64 session resources without loading weights
+    /// or activating ordinary service execution.
+    ///
+    /// This path is available only through explicit trusted startup policy. It
+    /// preserves package/tokenizer/runtime identity binding, derives the exact
+    /// non-expandable sampling domain, validates complete per-sequence KV
+    /// resources and checks cancellation between bounded preparation stages.
+    #[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preparation keeps owner package, runtime, backend, cancellation, budget, and event authorities explicit"
+    )]
+    pub fn prepare_experimental_qwen_arm64_execution(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        backend: &RuntimeBackend,
+        runtime_config: &RuntimeV3ServiceConfig,
+        runtime_identity: &RuntimeIdentityBinding,
+        cancelled: &AtomicBool,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<QwenArm64ExecutionPreparation, EngineError> {
+        if self.config.experimental_qwen_readiness()
+            != ExperimentalQwenReadinessPolicy::OwnerApprovedArm64ExecutionPreparation
+        {
+            return Err(EngineError::not_implemented(
+                "experimental Qwen ARM64 execution preparation is disabled",
+            ));
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(EngineError::cancellation(None));
+        }
+        if !matches!(backend, RuntimeBackend::Arm64(_)) {
+            return Err(EngineError::not_implemented(
+                "experimental Qwen preparation requires owner-selected ARM64",
+            ));
+        }
+        let (readiness, config) = self.inspect_qwen_readiness_bound(
+            model_id,
+            budget,
+            backend,
+            runtime_config,
+            runtime_identity,
+            events,
+        )?;
+        finalize_qwen_arm64_execution_preparation(readiness, &config, budget, cancelled)
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact readiness binding keeps independently trusted package, runtime, backend, budget, and event inputs explicit"
+    )]
+    fn inspect_qwen_readiness_bound(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        backend: &RuntimeBackend,
+        runtime_config: &RuntimeV3ServiceConfig,
+        runtime_identity: &RuntimeIdentityBinding,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<(QwenPackageReadiness, TransformerConfig), EngineError> {
+        let metadata = self
+            .registry
+            .inspect_registered_directory_readiness_metadata(model_id, budget, events)?;
+        let manifest = metadata.manifest();
+        if manifest.architecture_id().as_str() != QWEN2_DECODER_ARCHITECTURE_ID {
+            return Err(EngineError::unsupported_architecture(manifest.architecture_id().clone()));
+        }
+        let registration = metadata.registration();
+        let backend_id = backend.backend_id()?;
+        runtime_identity.revalidate_engine_owned(
+            registration.model_id(),
+            registration.expected_hash(),
+            &backend_id,
+            runtime_config.backend_version(),
+            runtime_config.backend_instance_id(),
+            runtime_config.engine_instance_id(),
+        )?;
+        let expected_artifact = match registration.registry_artifact_id() {
+            Some(value) => value.to_owned(),
+            None => owner_pinned_artifact_id(*registration.expected_hash())?.as_str().to_owned(),
+        };
+        if runtime_identity.artifact_id().as_str() != expected_artifact {
+            return Err(EngineError::authentication_failure(
+                "Qwen readiness artifact identity differs from package registration",
+            ));
+        }
+
+        let pool = MemoryPool::from_budget(budget)?;
+        let tokenizer = build_package_bound_qwen25_tokenizer(
+            metadata.tokenizer_bytes(),
+            manifest.tokenizer_hash(),
+            &pool,
+        )?;
+        let config = TransformerConfig::from_directory_manifest(manifest)?;
+        let selectable_token_domain = derive_selectable_token_domain(
+            config.vocabulary_size(),
+            tokenizer.spec(),
+            *registration.expected_hash(),
+            manifest.tokenizer_hash(),
+        )?;
+        let reference_admission_denied = if matches!(backend, RuntimeBackend::CpuReference) {
+            match validate_qwen_scalar_service_admission(&config, budget) {
+                Ok(()) => false,
+                Err(EngineError::ResourceExhaustion(_)) => true,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let blockers = qwen_readiness_blockers(
+            registration.mode(),
+            manifest.required_engine_version(),
+            reference_admission_denied,
+            !matches!(backend, RuntimeBackend::CpuReference),
+        );
+        Ok((
+            QwenPackageReadiness {
+                model_id: registration.model_id().clone(),
+                package_hash: *registration.expected_hash(),
+                artifact_id: runtime_identity.artifact_id().clone(),
+                registration_mode: registration.mode(),
+                registry_sequence: registration.registry_sequence(),
+                registry_entry_hash: registration.registry_entry_hash(),
+                manifest_version: manifest.format_version(),
+                required_engine_version: manifest.required_engine_version(),
+                current_engine_version: DIRECTORY_LOADER_ENGINE_VERSION,
+                architecture_id: manifest.architecture_id().clone(),
+                tokenizer_hash: manifest.tokenizer_hash(),
+                tokenizer_digest: hash_sha256(metadata.tokenizer_bytes()),
+                model_vocabulary_size: tokenizer.spec().model_vocabulary_size(),
+                selectable_token_domain,
+                context_limit: manifest.context_limit(),
+                rope_theta_bits: manifest.rope_theta().to_bits(),
+                rope_scaling_bits: manifest.rope_scaling().to_bits(),
+                storage_dtype: manifest.storage_dtype(),
+                cache_dtype: config.cache_dtype(),
+                quantization_id: manifest.quantization().id(),
+                runtime_identity: runtime_identity.clone(),
+                blockers,
+            },
+            config,
+        ))
+    }
+
     /// Admits a request only when its model ID exists in local configuration.
     pub fn admit(&mut self, request: GenerationRequest) -> Result<AdmissionReceipt, EngineError> {
         let request_id = request.request_id();
@@ -4789,7 +5267,7 @@ impl EngineService {
         let config = TransformerConfig::from_manifest(parsed.manifest())?;
         let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
         let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
-        if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+        if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
             ));
@@ -4854,7 +5332,7 @@ impl EngineService {
         let config = TransformerConfig::from_manifest(parsed.manifest())?;
         let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
         let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
-        if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+        if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
             ));
@@ -4960,7 +5438,7 @@ impl EngineService {
             validate_qwen_scalar_service_admission(&config, budget)?;
             let tokenizer =
                 Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
-            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+            if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
                 return Err(EngineError::corrupt_model_package(
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
@@ -5060,7 +5538,7 @@ impl EngineService {
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
                 Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
-            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+            if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
                 return Err(EngineError::corrupt_model_package(
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
@@ -5125,14 +5603,14 @@ impl EngineService {
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
                 Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
-            if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+            if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
                 return Err(EngineError::corrupt_model_package(
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
             }
-            let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+            let selectable_token_domain = derive_selectable_token_domain(
                 config.vocabulary_size(),
-                tokenizer.spec().vocabulary_size(),
+                tokenizer.spec(),
                 *verified.registration().expected_hash(),
                 verified.manifest().tokenizer_hash(),
             )?;
@@ -5209,14 +5687,14 @@ impl EngineService {
         let config = TransformerConfig::from_manifest(parsed.manifest())?;
         let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
         let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
-        if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
+        if tokenizer.spec().model_vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
             ));
         }
-        let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+        let selectable_token_domain = derive_selectable_token_domain(
             config.vocabulary_size(),
-            tokenizer.spec().vocabulary_size(),
+            tokenizer.spec(),
             *registration.expected_hash(),
             hash_package(tokenizer_data),
         )?;
@@ -5391,6 +5869,58 @@ fn validate_service_tokenizer_semantics(architecture: &str) -> Result<(), Engine
     Ok(())
 }
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn qwen_readiness_blockers(
+    registration_mode: RegistrationMode,
+    required_engine_version: (u16, u16, u16),
+    reference_admission_denied: bool,
+    selected_backend_qualification_missing: bool,
+) -> Vec<QwenReadinessBlocker> {
+    let mut blockers = vec![QwenReadinessBlocker::TensorContentVerificationDeferred];
+    if registration_mode == RegistrationMode::OwnerPinned {
+        blockers.push(QwenReadinessBlocker::CanonicalRegistryProfileUnavailable);
+        blockers.push(QwenReadinessBlocker::ProductionQualificationNotProven);
+    }
+    if required_engine_version > DIRECTORY_LOADER_ENGINE_VERSION {
+        blockers.push(QwenReadinessBlocker::RequiredEngineVersionUnavailable);
+    }
+    blockers.push(QwenReadinessBlocker::OrdinaryServiceActivationClosed);
+    blockers.push(QwenReadinessBlocker::RuntimeResourceAdmissionDeferred);
+    if reference_admission_denied {
+        blockers.push(QwenReadinessBlocker::ReferenceExecutionAdmissionDenied);
+    }
+    if selected_backend_qualification_missing {
+        blockers.push(QwenReadinessBlocker::SelectedBackendQualificationNotProven);
+    }
+    blockers
+}
+
+#[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+fn finalize_qwen_arm64_execution_preparation(
+    readiness: QwenPackageReadiness,
+    config: &TransformerConfig,
+    budget: &ResourceBudget,
+    cancelled: &AtomicBool,
+) -> Result<QwenArm64ExecutionPreparation, EngineError> {
+    if readiness.runtime_identity().backend_id().as_str() != "arm64" {
+        return Err(EngineError::authentication_failure(
+            "Qwen ARM64 preparation runtime identity names another backend",
+        ));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(EngineError::cancellation(None));
+    }
+    let plan = validate_qwen2_arm64_session_resources(config, budget)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(EngineError::cancellation(None));
+    }
+    Ok(QwenArm64ExecutionPreparation {
+        readiness,
+        session_kv_bytes: plan.kv_cache().bytes(),
+        maximum_concurrent_sequences: budget.max_concurrent_sequences(),
+    })
+}
+
 #[cfg(feature = "cpu-reference")]
 fn validate_qwen_scalar_service_admission(
     config: &TransformerConfig,
@@ -5428,7 +5958,7 @@ mod tests {
 
     #[cfg(feature = "cpu-reference")]
     #[test]
-    fn qwen25_service_fails_closed_until_exact_tokenizer_semantics_exist() {
+    fn qwen25_service_remains_closed_pending_activation() {
         assert!(matches!(
             validate_service_tokenizer_semantics(QWEN2_DECODER_ARCHITECTURE_ID),
             Err(EngineError::UnsupportedTokenizer(_))
@@ -5636,12 +6166,267 @@ mod tests {
         )
         .expect("normal paths must validate");
         assert_eq!(config.socket_path(), Path::new("/run/user/501/personalai-engine/engine.sock"));
+        assert_eq!(config.experimental_qwen_readiness(), ExperimentalQwenReadinessPolicy::Disabled);
+        assert_eq!(
+            config
+                .clone()
+                .with_experimental_qwen_readiness(
+                    ExperimentalQwenReadinessPolicy::OwnerApprovedMetadataInspection,
+                )
+                .experimental_qwen_readiness(),
+            ExperimentalQwenReadinessPolicy::OwnerApprovedMetadataInspection
+        );
+        assert_eq!(
+            config
+                .clone()
+                .with_experimental_qwen_readiness(
+                    ExperimentalQwenReadinessPolicy::OwnerApprovedArm64ExecutionPreparation,
+                )
+                .experimental_qwen_readiness(),
+            ExperimentalQwenReadinessPolicy::OwnerApprovedArm64ExecutionPreparation
+        );
         assert!(ServiceConfig::new("models", "/run/engine", "/run/engine/engine.sock").is_err());
         assert!(ServiceConfig::new("/models", "/run/engine", "/tmp/engine.sock").is_err());
         assert!(ServiceConfig::new("/models", "/models", "/models/engine.sock").is_err());
         assert!(
             ServiceConfig::new("/models", "/models/runtime", "/models/runtime/engine.sock")
                 .is_err()
+        );
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn qwen_readiness_gate_precedes_registry_filesystem_and_event_access() {
+        let service = service();
+        let model_id = ModelId::new("qwen25-readiness").expect("model ID must validate");
+        let runtime_config = RuntimeV3ServiceConfig::new(
+            RuntimeInstanceId::new("version.1").expect("backend version"),
+            RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+            RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+            1,
+            1 << 20,
+            1_000,
+        )
+        .expect("runtime config must validate");
+        let identity = RuntimeIdentityBinding::new(
+            LogicalModelId::new("mdl_qwen-readiness").expect("logical model ID"),
+            model_id.clone(),
+            ArtifactAuthorityId::new("art_qwen-readiness").expect("artifact ID"),
+            test_hash(),
+            BackendId::new("cpu-reference").expect("backend ID"),
+            runtime_config.backend_version().clone(),
+            runtime_config.backend_instance_id().clone(),
+            runtime_config.engine_instance_id().clone(),
+        );
+        let budget =
+            ResourceBudget::new(1 << 20, 1 << 19, 1).expect("readiness budget must validate");
+        let mut events = Vec::new();
+        let error = service
+            .inspect_experimental_qwen_readiness(
+                &model_id,
+                &budget,
+                &RuntimeBackend::CpuReference,
+                &runtime_config,
+                &identity,
+                &mut |event| events.push(event),
+            )
+            .expect_err("default-disabled readiness must fail before package lookup");
+        assert!(matches!(error, EngineError::NotImplemented(_)));
+        assert!(events.is_empty(), "disabled inspection must not touch package admission events");
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    fn qwen_arm64_preparation_fixture() -> (QwenPackageReadiness, TransformerConfig) {
+        let model_id = ModelId::new("qwen2.5-1.5b-instruct-989aa798").unwrap();
+        let package_hash = test_hash();
+        let tokenizer_hash = ModelPackageHash::from_sha384_bytes([7; ModelPackageHash::BYTE_LEN]);
+        let artifact_id = ArtifactAuthorityId::new("art_qwen25-preparation").unwrap();
+        let runtime_identity = RuntimeIdentityBinding::new(
+            LogicalModelId::new("mdl_qwen25-preparation").unwrap(),
+            model_id.clone(),
+            artifact_id.clone(),
+            package_hash,
+            BackendId::new("arm64").unwrap(),
+            RuntimeInstanceId::new("version.1").unwrap(),
+            RuntimeInstanceId::new("backend.instance-1").unwrap(),
+            RuntimeInstanceId::new("engine.instance-1").unwrap(),
+        );
+        let domain = SelectableTokenDomain::contiguous_tokenizer_prefix(
+            151_936,
+            151_665,
+            package_hash,
+            tokenizer_hash,
+        )
+        .unwrap();
+        let config = TransformerConfig::new_decoder(
+            ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID).unwrap(),
+            28,
+            1_536,
+            12,
+            2,
+            151_936,
+            ContextLimit::new(32_768).unwrap(),
+            DType::F32,
+            8_960,
+            1.0e-6,
+            1_000_000.0,
+        )
+        .unwrap();
+        let readiness = QwenPackageReadiness {
+            model_id,
+            package_hash,
+            artifact_id,
+            registration_mode: RegistrationMode::OwnerPinned,
+            registry_sequence: None,
+            registry_entry_hash: None,
+            manifest_version: (1, 1),
+            required_engine_version: (0, 2, 0),
+            current_engine_version: DIRECTORY_LOADER_ENGINE_VERSION,
+            architecture_id: ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID).unwrap(),
+            tokenizer_hash,
+            tokenizer_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LEN]),
+            model_vocabulary_size: 151_936,
+            selectable_token_domain: domain,
+            context_limit: ContextLimit::new(32_768).unwrap(),
+            rope_theta_bits: 1_000_000.0_f32.to_bits(),
+            rope_scaling_bits: 1.0_f32.to_bits(),
+            storage_dtype: DType::BFloat16,
+            cache_dtype: DType::F32,
+            quantization_id: 0,
+            runtime_identity,
+            blockers: qwen_readiness_blockers(
+                RegistrationMode::OwnerPinned,
+                (0, 2, 0),
+                false,
+                true,
+            ),
+        };
+        (readiness, config)
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_arm64_preparation_is_bounded_identity_bound_and_never_activated() {
+        let (readiness, config) = qwen_arm64_preparation_fixture();
+        let budget = ResourceBudget::new(6_u64 << 30, 2_u64 << 30, 2).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let prepared = finalize_qwen_arm64_execution_preparation(
+            readiness.clone(),
+            &config,
+            &budget,
+            &cancelled,
+        )
+        .expect("bounded ARM64 preparation must validate");
+        assert_eq!(prepared.session_kv_bytes(), 1_879_048_192);
+        assert_eq!(prepared.maximum_concurrent_sequences(), 2);
+        assert_eq!(prepared.selectable_token_domain().selectable_token_count(), 151_665);
+        assert_eq!(prepared.runtime_identity(), readiness.runtime_identity());
+        assert!(!prepared.is_execution_activated());
+
+        let denied = ResourceBudget::new(6_u64 << 30, 1_u64 << 30, 2).unwrap();
+        assert!(matches!(
+            finalize_qwen_arm64_execution_preparation(
+                readiness.clone(),
+                &config,
+                &denied,
+                &cancelled,
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            finalize_qwen_arm64_execution_preparation(readiness, &config, &budget, &cancelled,),
+            Err(EngineError::Cancellation(_))
+        ));
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_arm64_preparation_gate_precedes_package_and_cancellation_work() {
+        let service = service();
+        let (readiness, _) = qwen_arm64_preparation_fixture();
+        let runtime_config = RuntimeV3ServiceConfig::new(
+            readiness.runtime_identity().backend_version().clone(),
+            readiness.runtime_identity().backend_instance_id().clone(),
+            readiness.runtime_identity().engine_instance_id().clone(),
+            1,
+            6_u64 << 30,
+            1_000,
+        )
+        .unwrap();
+        let budget = ResourceBudget::new(6_u64 << 30, 2_u64 << 30, 1).unwrap();
+        let mut events = Vec::new();
+        let error = service
+            .prepare_experimental_qwen_arm64_execution(
+                readiness.model_id(),
+                &budget,
+                &RuntimeBackend::arm64().unwrap(),
+                &runtime_config,
+                readiness.runtime_identity(),
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .expect_err("default-disabled preparation must precede package lookup");
+        assert!(matches!(error, EngineError::NotImplemented(_)));
+        assert!(events.is_empty());
+
+        let enabled = ServiceConfig::new(
+            "/var/lib/personalai/models",
+            "/run/user/501/personalai-engine",
+            "/run/user/501/personalai-engine/engine.sock",
+        )
+        .unwrap()
+        .with_experimental_qwen_readiness(
+            ExperimentalQwenReadinessPolicy::OwnerApprovedArm64ExecutionPreparation,
+        );
+        let enabled = EngineService::new(
+            enabled,
+            SchedulerLimits::new(8, 2, 1 << 20).expect("limits must validate"),
+        )
+        .unwrap();
+        let error = enabled
+            .prepare_experimental_qwen_arm64_execution(
+                readiness.model_id(),
+                &budget,
+                &RuntimeBackend::CpuReference,
+                &runtime_config,
+                readiness.runtime_identity(),
+                &AtomicBool::new(false),
+                &mut |event| events.push(event),
+            )
+            .expect_err("scalar selection must not enter ARM64 preparation");
+        assert!(matches!(error, EngineError::NotImplemented(_)));
+        assert!(events.is_empty());
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn qwen_readiness_blockers_are_deterministic_and_never_claim_service_eligibility() {
+        assert_eq!(
+            qwen_readiness_blockers(RegistrationMode::OwnerPinned, (0, 2, 0), true, false),
+            vec![
+                QwenReadinessBlocker::TensorContentVerificationDeferred,
+                QwenReadinessBlocker::CanonicalRegistryProfileUnavailable,
+                QwenReadinessBlocker::ProductionQualificationNotProven,
+                QwenReadinessBlocker::RequiredEngineVersionUnavailable,
+                QwenReadinessBlocker::OrdinaryServiceActivationClosed,
+                QwenReadinessBlocker::RuntimeResourceAdmissionDeferred,
+                QwenReadinessBlocker::ReferenceExecutionAdmissionDenied,
+            ]
+        );
+        assert_eq!(
+            qwen_readiness_blockers(
+                RegistrationMode::ModelFoundryRegistryV2,
+                DIRECTORY_LOADER_ENGINE_VERSION,
+                false,
+                true,
+            ),
+            vec![
+                QwenReadinessBlocker::TensorContentVerificationDeferred,
+                QwenReadinessBlocker::OrdinaryServiceActivationClosed,
+                QwenReadinessBlocker::RuntimeResourceAdmissionDeferred,
+                QwenReadinessBlocker::SelectedBackendQualificationNotProven,
+            ]
         );
     }
 
@@ -6359,7 +7144,20 @@ mod tests {
         );
         assert_eq!(verified.model_package_hash(), fixture.package_hash());
         assert_eq!(verified.model_vocabulary_size(), loaded.model().config().vocabulary_size());
-        assert_eq!(verified.selectable_token_count(), loaded.tokenizer().spec().vocabulary_size());
+        assert_eq!(
+            verified.selectable_token_count(),
+            loaded.tokenizer().spec().selectable_token_count()
+        );
+        assert_eq!(verified.tokenizer_hash(), loaded.tokenizer().spec().serialized_data_hash());
+        assert!(
+            derive_selectable_token_domain(
+                verified.model_vocabulary_size(),
+                loaded.tokenizer().spec(),
+                verified.model_package_hash(),
+                ModelPackageHash::from_sha384_bytes([0xa5; ModelPackageHash::BYTE_LEN]),
+            )
+            .is_err()
+        );
 
         loaded.selectable_token_domain = SelectableTokenDomain::contiguous_tokenizer_prefix(
             verified.model_vocabulary_size(),

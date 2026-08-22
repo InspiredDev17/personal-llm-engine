@@ -521,6 +521,26 @@ impl TransformerPlan {
     }
 }
 
+/// Validates the model-independent session resources for the exact Qwen2.5
+/// ARM64 preparation boundary.
+///
+/// This performs checked compute-dimension arithmetic and derives the complete
+/// bounded KV plan. It neither loads weights nor activates service execution,
+/// and it deliberately does not apply the scalar correctness-oracle operation
+/// ceiling to the independently selected ARM64 backend.
+#[cfg(all(feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+pub fn validate_qwen2_arm64_session_resources(
+    config: &TransformerConfig,
+    budget: &ResourceBudget,
+) -> Result<TransformerPlan, EngineError> {
+    if config.architecture_id().as_str() != QWEN2_DECODER_ARCHITECTURE_ID {
+        return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
+    }
+    let plan = TransformerPlan::new(config.clone(), budget)?;
+    cpu_decoder::validate_arm64_step_compute(config, 0)?;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +564,36 @@ mod tests {
         assert!(matches!(
             plan.require_executable_architecture(),
             Err(EngineError::UnsupportedArchitecture(_))
+        ));
+    }
+
+    #[cfg(all(feature = "cpu-reference", feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen25_arm64_preparation_retains_exact_kv_resource_admission() {
+        let config = TransformerConfig::new_decoder(
+            ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID).unwrap(),
+            28,
+            1_536,
+            12,
+            2,
+            151_936,
+            ContextLimit::new(32_768).unwrap(),
+            DType::F32,
+            8_960,
+            1.0e-6,
+            1_000_000.0,
+        )
+        .unwrap();
+        let admitted = ResourceBudget::new(6_u64 << 30, 2_u64 << 30, 2).unwrap();
+        let plan = validate_qwen2_arm64_session_resources(&config, &admitted)
+            .expect("exact Qwen ARM64 metadata must fit an explicit KV budget");
+        assert_eq!(plan.kv_cache().bytes(), 1_879_048_192);
+        assert_eq!(plan.kv_cache().token_capacity(), 32_768);
+
+        let denied = ResourceBudget::new(6_u64 << 30, 1_u64 << 30, 2).unwrap();
+        assert!(matches!(
+            validate_qwen2_arm64_session_resources(&config, &denied),
+            Err(EngineError::ResourceExhaustion(_))
         ));
     }
 

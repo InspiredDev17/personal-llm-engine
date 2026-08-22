@@ -46,6 +46,34 @@ pub struct SelectableTokenDomain {
 }
 
 impl SelectableTokenDomain {
+    /// Derives the exact domain from already verified model and tokenizer counts.
+    ///
+    /// Equal counts preserve the legacy entire-vocabulary profile. A smaller
+    /// tokenizer-defined prefix creates a reserved model tail. This constructor
+    /// accepts no client policy and cannot widen beyond `selectable_token_count`.
+    pub fn from_verified_tokenizer_counts(
+        model_vocabulary_size: u32,
+        selectable_token_count: u32,
+        model_package_hash: ModelPackageHash,
+        tokenizer_hash: ModelPackageHash,
+    ) -> Result<Self, EngineError> {
+        if selectable_token_count == model_vocabulary_size {
+            Self::entire_model_vocabulary(
+                model_vocabulary_size,
+                selectable_token_count,
+                model_package_hash,
+                tokenizer_hash,
+            )
+        } else {
+            Self::contiguous_tokenizer_prefix(
+                model_vocabulary_size,
+                selectable_token_count,
+                model_package_hash,
+                tokenizer_hash,
+            )
+        }
+    }
+
     /// Binds the legacy case where every model logit ID is tokenizer-defined.
     pub fn entire_model_vocabulary(
         model_vocabulary_size: u32,
@@ -1017,6 +1045,32 @@ mod tests {
                 MAX_VOCABULARY_SIZE.saturating_add(1),
                 hash(1),
                 hash(2)
+            )
+            .is_err()
+        );
+        let legacy =
+            SelectableTokenDomain::from_verified_tokenizer_counts(260, 260, hash(3), hash(4))
+                .expect("equal verified counts preserve the legacy domain");
+        assert_eq!(legacy.kind(), SelectableTokenDomainKind::EntireModelVocabulary);
+        let qwen = SelectableTokenDomain::from_verified_tokenizer_counts(
+            151_936,
+            151_665,
+            hash(5),
+            hash(6),
+        )
+        .expect("the exact Qwen undefined tail forms a bounded prefix");
+        assert_eq!(qwen.kind(), SelectableTokenDomainKind::ContiguousTokenizerPrefix);
+        assert_eq!(qwen.model_vocabulary_size(), 151_936);
+        assert_eq!(qwen.selectable_token_count(), 151_665);
+        assert!(qwen.contains(151_664));
+        assert!(!qwen.contains(151_665));
+        assert!(!qwen.contains(151_935));
+        assert!(
+            SelectableTokenDomain::from_verified_tokenizer_counts(
+                151_665,
+                151_936,
+                hash(5),
+                hash(6),
             )
             .is_err()
         );

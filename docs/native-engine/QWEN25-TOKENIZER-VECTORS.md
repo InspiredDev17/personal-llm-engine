@@ -5,13 +5,15 @@
 These are independently derived vectors for the pinned 7,031,645-byte
 `tokenizer.json` whose SHA-256 is
 `c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539`.
-They are activation targets, not evidence that the current public runtime can
-tokenize Qwen input. This revision executes the scanner-boundary vectors against
+They remain non-activating evidence; the current public runtime cannot tokenize
+Qwen input. This revision executes the scanner-boundary vectors against
 trusted synthetic Unicode classifications and exercises BPE against compact
-first-party tables. A private adapter now replays the normalization, category,
-and contraction-boundary vectors against the admitted Unicode-16 data, but it
-cannot replay production token IDs until exact source conversion exists. The
-production table is not committed.
+first-party tables. A private adapter replays the normalization, category, and
+contraction-boundary vectors against the admitted Unicode-16 data. A
+feature-gated content-free offline diagnostic now also replays all listed
+production token IDs, full decode, and incremental decode against the exact
+canonical conversion. The production table is not committed or returned by
+that diagnostic.
 
 | Input notation | Fixed scanner chunks | Expected token IDs |
 | --- | --- | --- |

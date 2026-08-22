@@ -69,9 +69,12 @@ examples for all five `L*` and all three `N*` categories plus unassigned
 boundary scalars. Contraction tests cover ASCII case, U+017F, U+212A, and
 rejection of full, Turkic, non-ASCII, and compatibility-only alternatives.
 
-These are portable conformance checks for the private adapter. They are not
-evidence for the absent 151,665-entry production tokenizer table, its exact
-conversion, or end-to-end token-ID parity.
+These are portable conformance checks for the private adapter. A later bounded
+offline converter now authenticates the pinned source, emits the complete
+151,665-entry canonical `AIPTOK02` table, and replays the independently derived
+production encode, full-decode, and incremental-decode vectors through the
+private runtime core. That remains conversion/conformance evidence, not
+package qualification or activation evidence.
 
 ## Consequences and activation gate
 
@@ -83,8 +86,10 @@ conversion, or end-to-end token-ID parity.
   recorded separately.
 - Public construction continues to parse and validate v2, then returns
   `UnsupportedTokenizer`.
-- The offline importer still emits no Qwen tokenizer or model package.
-- Activation still requires deterministic conversion of the exact pinned
-  `tokenizer.json`, replay of the independent production token-ID vectors, the
-  already documented runtime/registry/backend/signing/Foundry gates, and owner
-  approval.
+- The offline importer can return canonical tokenizer bytes only through its
+  exact-source conversion API and content-free diagnostic; it still emits no
+  Qwen model package.
+- Exact pinned-source conversion and private production-vector replay are now
+  complete portable evidence. Activation still requires reviewed package
+  binding and independent acceptance plus the documented engine-version,
+  registry, optimized-backend, signing, Foundry, and owner-approval gates.

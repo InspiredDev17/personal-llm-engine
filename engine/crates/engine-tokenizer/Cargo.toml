@@ -6,6 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 description = "First-party tokenizer contracts and bounded tokenizer metadata"
 
+[features]
+default = []
+qwen25-conformance-diagnostic = []
+
 [dependencies]
 personalai-engine-crypto.workspace = true
 personalai-engine-memory.workspace = true

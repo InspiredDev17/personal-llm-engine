@@ -1,10 +1,10 @@
 //! Bounded data-only AIPTok v2 parser foundation for the pinned Qwen2.5 profile.
 //!
 //! This module defines and validates the immutable tables needed by the exact
-//! Qwen2.5 byte-level BPE profile. A private runtime core consumes these tables,
-//! but the public tokenizer factory still validates this format and returns
-//! `UnsupportedTokenizer` until exact source conversion and production-table
-//! token-ID conformance are independently qualified.
+//! Qwen2.5 byte-level BPE profile. The exact package-bound constructor consumes
+//! these tables, while the ordinary tokenizer factory still validates this
+//! format and returns `UnsupportedTokenizer` pending independent qualification
+//! and explicit owner activation.
 
 use super::{
     MAX_BPE_MERGE_RULES, MAX_SPECIAL_TOKENS, MAX_TOKEN_PIECE_BYTES, MAX_VOCABULARY_SIZE,
@@ -374,6 +374,11 @@ impl Qwen25AipTokDescriptor {
 
     /// Confirms that the profile never inserts BOS without explicit caller input.
     pub const fn inserts_bos(self) -> bool {
+        false
+    }
+
+    /// Confirms that the profile never inserts EOS without explicit caller input.
+    pub const fn inserts_eos(self) -> bool {
         false
     }
 
@@ -1010,6 +1015,7 @@ mod tests {
         assert_eq!(descriptor.defined_token_count(), 262);
         assert_eq!(descriptor.unknown_token(), None);
         assert!(!descriptor.inserts_bos());
+        assert!(!descriptor.inserts_eos());
         descriptor.validate_token(261).expect("last defined ID works");
         assert!(descriptor.validate_token(262).is_err());
         assert!(!descriptor.matches_pinned_qwen25_1_5b_counts());

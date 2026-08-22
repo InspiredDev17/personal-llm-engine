@@ -78,9 +78,10 @@ two version constants, streams NFC scalars into an engine-bounded output, and
 maps every General Category `L*`/`N*` value. The fixed contraction matcher uses
 an engine-owned Unicode-16 simple-fold table only for mappings that reach ASCII
 (ASCII case, U+017F LONG S, and U+212A KELVIN SIGN). The runtime core and
-adapter remain nonconstructible through public APIs. This does not establish
-Qwen tokenizer parity or activate Qwen packages; exact source conversion and
-production-table token-ID conformance remain required.
+adapter remain nonconstructible through ordinary public APIs. Exact pinned
+source conversion and fixed-corpus conformance now run only through a
+feature-gated offline diagnostic; that evidence does not activate Qwen
+packages or expose a tokenizer handle.
 
 The private adapter rejects input whose Unicode-16 NFKD stream-safe view would
 insert a CGJ after more than 30 consecutive nonstarters; it never forwards the

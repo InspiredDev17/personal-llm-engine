@@ -13,7 +13,8 @@ mod registry_v2;
 
 #[cfg(unix)]
 pub use directory_loader::{
-    DirectorySecurityEventSink, LoadedDirectoryTensors, VerifiedDirectoryPackage,
+    DIRECTORY_LOADER_ENGINE_VERSION, DirectoryLoadCancellationProbe, DirectorySecurityEventSink,
+    LoadedDirectoryTensors, VerifiedDirectoryPackage, VerifiedDirectoryReadinessMetadata,
 };
 #[cfg(unix)]
 use registry_v2::read_verified_registry_selection_v2;
@@ -333,6 +334,36 @@ impl ModelRegistry {
         events: &mut impl DirectorySecurityEventSink,
     ) -> Result<VerifiedDirectoryPackage, EngineError> {
         directory_loader::load(self, model_id, budget, events)
+    }
+
+    /// Opens and verifies one registered directory package with cooperative cancellation.
+    ///
+    /// This preserves every ordinary package, engine-version, and identity gate;
+    /// cancellation grants no ability to inspect or execute a future package.
+    #[cfg(unix)]
+    pub fn load_registered_directory_cancellable(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        cancellation: &dyn DirectoryLoadCancellationProbe,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<VerifiedDirectoryPackage, EngineError> {
+        directory_loader::load_cancellable(self, model_id, budget, cancellation, events)
+    }
+
+    /// Verifies a registered directory package's signed metadata only.
+    ///
+    /// Tensor bytes are not mapped or hashed and the current engine-version
+    /// admission gate is not bypassed. The result is therefore pre-activation
+    /// evidence, never an executable package or qualification decision.
+    #[cfg(unix)]
+    pub fn inspect_registered_directory_readiness_metadata(
+        &self,
+        model_id: &ModelId,
+        budget: &ResourceBudget,
+        events: &mut impl DirectorySecurityEventSink,
+    ) -> Result<VerifiedDirectoryReadinessMetadata, EngineError> {
+        directory_loader::inspect_readiness_metadata(self, model_id, budget, events)
     }
 
     /// Produces a bounded metadata-only pre-load plan.

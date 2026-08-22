@@ -16,6 +16,9 @@ pub type TensorError = EngineError;
 /// Maximum logical alignment accepted in tensor metadata.
 pub const MAX_TENSOR_ALIGNMENT: u64 = 2 * 1024 * 1024;
 
+/// Maximum source bytes processed between cooperative conversion checks.
+const CONVERSION_CANCELLATION_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Execution device selected by trusted engine configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Device {
@@ -506,9 +509,42 @@ impl MutableTensor {
         source: &[u8],
         pool: &MemoryPool,
     ) -> Result<Self, TensorError> {
-        let storage = Self::copy_from_bytes(dtype, shape.clone(), source, pool)?;
+        Self::convert_storage_to_f32_cancellable(dtype, shape, source, pool, || false)
+    }
+
+    /// Converts validated floating storage while polling cooperative cancellation.
+    ///
+    /// BF16/F16 source bytes are decoded directly into the aggregate-accounted
+    /// F32 destination. This avoids retaining a second owned copy of a large
+    /// package tensor during load. The caller still owns and authenticates the
+    /// immutable source bytes; cancellation never returns partially initialized
+    /// tensor state.
+    pub fn convert_storage_to_f32_cancellable(
+        dtype: DType,
+        shape: TensorShape,
+        source: &[u8],
+        pool: &MemoryPool,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, TensorError> {
+        let expected_bytes = usize_from_u64(shape.byte_len(dtype)?)?;
+        if source.len() != expected_bytes {
+            return Err(EngineError::invalid_input(
+                "tensor source length does not match its type and shape",
+            ));
+        }
+        check_conversion_cancelled(&mut is_cancelled)?;
         if dtype == DType::F32 {
-            return Ok(storage);
+            let mut output = Self::zeros(dtype, shape, pool)?;
+            for (offset, chunk) in source.chunks(CONVERSION_CANCELLATION_CHUNK_BYTES).enumerate() {
+                check_conversion_cancelled(&mut is_cancelled)?;
+                let byte_offset =
+                    offset.checked_mul(CONVERSION_CANCELLATION_CHUNK_BYTES).ok_or_else(|| {
+                        EngineError::resource_exhaustion("tensor copy offset overflows")
+                    })?;
+                output.copy_storage_range_from(byte_offset, chunk)?;
+            }
+            check_conversion_cancelled(&mut is_cancelled)?;
+            return Ok(output);
         }
         if !matches!(dtype, DType::F16 | DType::BFloat16) {
             return Err(EngineError::not_implemented(
@@ -516,9 +552,24 @@ impl MutableTensor {
             ));
         }
         let mut output = Self::zeros(DType::F32, shape, pool)?;
+        let elements_per_check = (CONVERSION_CANCELLATION_CHUNK_BYTES / 2).max(1);
         for index in 0..usize_from_u64(output.shape().element_count())? {
-            output.set_f32_value(index, storage.numeric_f32_value(index)?)?;
+            if index % elements_per_check == 0 {
+                check_conversion_cancelled(&mut is_cancelled)?;
+            }
+            let bits = read_u16(source, u64_from_usize(index)?)?;
+            let value = match dtype {
+                DType::F16 => f16_bits_to_f32(bits),
+                DType::BFloat16 => bf16_bits_to_f32(bits),
+                _ => {
+                    return Err(EngineError::internal_invariant(
+                        "validated conversion type changed",
+                    ));
+                }
+            };
+            output.set_f32_value(index, value)?;
         }
+        check_conversion_cancelled(&mut is_cancelled)?;
         Ok(output)
     }
 
@@ -901,6 +952,10 @@ fn u64_from_usize(value: usize) -> Result<u64, TensorError> {
         .map_err(|_| EngineError::resource_exhaustion("tensor value is not representable"))
 }
 
+fn check_conversion_cancelled(is_cancelled: &mut impl FnMut() -> bool) -> Result<(), TensorError> {
+    if is_cancelled() { Err(EngineError::cancellation(None)) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1068,48 @@ mod tests {
         assert_eq!(values(&bf16)[..2], [1.0, -2.0]);
         assert!(bf16.numeric_f32_value(2).unwrap().is_finite());
         assert!(bf16.numeric_f32_value(3).unwrap().is_finite());
+    }
+
+    #[test]
+    fn bf16_conversion_uses_only_destination_storage_and_preserves_values() {
+        let pool = MemoryPool::new(16).unwrap();
+        let source = [0x00, 0x3f, 0x00, 0xc0, 0x01, 0x00, 0x7f, 0x7f];
+        let converted = MutableTensor::convert_storage_to_f32(
+            DType::BFloat16,
+            TensorShape::new([4]).unwrap(),
+            &source,
+            &pool,
+        )
+        .expect("conversion must not retain a second owned BF16 tensor");
+        assert_eq!(converted.f32_value(0).unwrap().to_bits(), 0.5_f32.to_bits());
+        assert_eq!(converted.f32_value(1).unwrap().to_bits(), (-2.0_f32).to_bits());
+        assert!(converted.f32_value(2).unwrap().is_finite());
+        assert!(converted.f32_value(3).unwrap().is_finite());
+        assert_eq!(pool.used_bytes().unwrap(), 16);
+    }
+
+    #[test]
+    fn cancellable_bf16_conversion_drops_partial_destination() {
+        use std::cell::Cell;
+
+        let elements = 65_536_usize;
+        let pool = MemoryPool::new(u64::try_from(elements * 4).unwrap()).unwrap();
+        let source = vec![0_u8; elements * 2];
+        let checks = Cell::new(0_usize);
+        let error = MutableTensor::convert_storage_to_f32_cancellable(
+            DType::BFloat16,
+            TensorShape::new([u64::try_from(elements).unwrap()]).unwrap(),
+            &source,
+            &pool,
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 3
+            },
+        )
+        .expect_err("conversion must observe cancellation between bounded chunks");
+        assert!(matches!(error, EngineError::Cancellation(_)));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 
     #[test]

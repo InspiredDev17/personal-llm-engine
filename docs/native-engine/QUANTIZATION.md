@@ -80,6 +80,16 @@ the quantization crate separately provides scalar matrix-vector and
 matrix-matrix kernels that operate directly on validated AIPQ bytes. Those
 kernels are the correctness reference, not a performance claim.
 
+The ARM64 matrix-vector path now preserves that non-materializing property. It
+decodes one canonical 32-value block into fixed stack scratch, intersects it
+with the current row (including blocks that straddle row boundaries), and
+accumulates directly against the already-accounted input tensor. It polls
+cancellation at row and block boundaries and allocates only the exact output
+tensor from the aggregate pool. Deterministic tests cover AIPQ8 and AIPQ4,
+scalar-reference tolerance, exact repeatability and execution with a pool that
+cannot hold a full F32 weight copy. These tests establish bounded mechanics,
+not production performance or model quality.
+
 ## Numerical evidence and limitations
 
 The deterministic two-layer synthetic fixture compares the same prompt and

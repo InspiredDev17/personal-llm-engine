@@ -68,9 +68,10 @@ single-file tensor identities, canonical tensor names/shapes, Q/K/V biases, and
 tied output. It still emits only the legacy profile; the Model Foundry Registry
 V2 compatibility string remains legacy-only, so neither component can create
 or approve a Qwen2.5 v1.1 artifact. Activation requires a reviewed first-party
-tokenizer runtime implementing the exact fixed Qwen NFC/category/ByteLevel and
-no-implicit-BOS semantics without arbitrary tokenizer graphs or chat templates,
-exact descriptor preflight bound to the securely opened source, v1.1 emission,
+tokenizer runtime activation implementing the exact fixed Qwen
+NFC/category/ByteLevel and no-implicit-BOS semantics without arbitrary
+tokenizer graphs or chat templates, exact descriptor preflight bound to the
+securely opened source, v1.1 emission,
 independent numeric vectors, engine 0.2, a qualified optimized backend, and a
 new signed registry decision. AIPTok v1 cannot be relabeled as that tokenizer.
 The production engine does not infer or manufacture any of those supply-chain
@@ -90,11 +91,15 @@ reopening a path based on a previous diagnostic result.
 bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
 records, exact byte mapping, special roles, declared resource limits, table
 hash, undefined logit tail, and the pinned 22-token suffix when production
-counts are present. The importer cannot emit it from `tokenizer.json`. A private
-scanner/BPE/decode runtime core and its version-checked bounded Unicode-16
-adapter remain unreachable from public construction; activation is fail-closed
-pending exact conversion and production-table conformance gates in ADR-0035
-through ADR-0037.
+counts are present. The importer converts only the exact source into a pinned
+4,613,135-byte canonical `AIPTOK02`; it does not place those bytes into a model
+package. A private scanner/BPE/decode runtime core and its version-checked
+bounded Unicode-16 adapter are reachable only through a narrow constructor that
+revalidates the complete tokenizer hash from an independently verified package.
+A feature-gated offline diagnostic binds the complete output identity and
+replays the fixed production encode/decode corpus without returning a tokenizer
+handle. Package emission, registry admission, ordinary service selection and
+activation remain fail-closed under ADR-0035 through ADR-0037.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:
 its first step is estimated at 1,543,712,768 checked operations, including the

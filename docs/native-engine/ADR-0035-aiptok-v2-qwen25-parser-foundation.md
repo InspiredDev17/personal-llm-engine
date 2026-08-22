@@ -17,8 +17,10 @@ would create false compatibility. A follow-up dependency review admitted the
 version-matched general-purpose pair `unicode-normalization 0.1.24` and
 `unicode-general-category 1.1.0`, both fixed to Unicode 16.0.0, into the locked
 offline vendor graph. Defaults and all direct features are disabled. This is a
-supply-chain admission only: runtime source does not call either crate in this
-revision, and independent Qwen tokenizer conformance has not been established.
+bounded supply-chain admission: a later private adapter now uses only these
+reviewed Unicode primitives, and a feature-gated offline diagnostic replays
+independently derived production tokenizer vectors. Neither dependency is
+selectable by a package or request.
 
 ## Decision
 
@@ -49,26 +51,24 @@ The public tokenizer factory recognizes `AIPTOK02`, fully validates it, and
 then returns `UnsupportedTokenizer`. This preserves corruption-before-
 activation error precedence while ensuring no caller can accidentally obtain
 approximate encode, decode, or incremental-decode behavior. The offline Qwen
-converter continues to emit no package.
+converter can now emit canonical tokenizer bytes through a dedicated
+exact-source conversion API, but continues to emit no package.
 
 ## Activation gate
 
-Execution and importer emission require all of the following in a later
-reviewed change:
+The portable tokenizer mechanics originally listed here are now implemented
+behind closed boundaries: bounded Unicode-16 normalization/classification,
+the fixed Qwen scanner and GPT-2 byte mapping, deterministic
+encode/decode/incremental decode with explicit special-token policy,
+independent vectors and hard-bound tests, and exact deterministic conversion
+of the pinned `tokenizer.json` into `AIPTOK02`.
 
-1. use the approved, locked, offline-vendored Unicode 16
-   normalization/category primitives in a bounded first-party implementation;
-2. exact implementation of the pinned Qwen pre-tokenizer and GPT-2 byte-symbol
-   mapping with no arbitrary regex or tokenizer graph;
-3. deterministic encode/decode/incremental-decode and explicit allowed-special
-   APIs under existing resource accounting;
-4. independent vectors covering NFC, Unicode categories, combining text,
-   special collisions, all bytes, undefined IDs, thread determinism and hard
-   token limits;
-5. exact conversion of the pinned `tokenizer.json` into `AIPTOK02`, with
-   provenance and byte-for-byte deterministic evidence;
-6. engine-version, Model Foundry Registry V2, optimized-backend, signing and
-   activation approvals already required by ADR-0033.
+Execution and importer package emission remain disabled. Activation still
+requires reviewed binding of the exact converted tokenizer to an independently
+accepted package, engine 0.2 compatibility, Model Foundry Registry V2
+admission, a qualified optimized backend, package signing and promotion, and
+explicit owner approval as required by ADR-0033. None of those authorities is
+granted by successful conversion or conformance replay.
 
 Until every gate closes, a signed package containing AIPTok v2 remains
 unexecutable. Parsing proves structural integrity only; it does not prove
@@ -83,5 +83,6 @@ tokenizer equivalence, model quality, package approval, or production safety.
   model-provided code is added. The admitted Unicode primitives remain general
   Unicode algorithms/data, not tokenizer implementations; their one reviewed
   offline table build script cannot read model input.
-- Exact Qwen tokenization remains an explicit blocker rather than an
-  approximate implementation hidden behind a success type.
+- The exact Qwen implementation remains private and feature-gated for offline
+  conformance; ordinary public tokenizer construction stays fail-closed until
+  the remaining package and activation gates close.

@@ -1,17 +1,15 @@
 //! First-party, bounded AIPTok tokenizer formats.
 //!
-//! AIPTok v1 preserves input bytes exactly and remains the only executable
-//! profile. The separate AIPTok v2/Qwen2.5 wire parser validates a fixed,
-//! data-only byte-level BPE profile. A private, non-constructible runtime core
-//! implements its fixed scanner/BPE/decode mechanics behind an explicit trusted
-//! Unicode-16 interface. A private version-checked adapter now supplies bounded
-//! NFC, General Category, and closed simple-fold semantics. The public factory
-//! remains fail-closed until source conversion and production-table token-ID
-//! replay are independently qualified.
+//! AIPTok v1 preserves input bytes exactly and remains the only tokenizer
+//! accepted by the ordinary service factory. The separate AIPTok v2/Qwen2.5
+//! parser validates a fixed byte-level BPE profile. An exact, package-hash-bound
+//! constructor exposes its reviewed runtime mechanics to trusted loader work,
+//! while ordinary service admission remains fail-closed pending independent
+//! qualification and explicit owner activation.
 
 #[allow(
     dead_code,
-    reason = "the reviewed Qwen runtime core and Unicode-16 adapter remain private until source conversion and production-table conformance are qualified"
+    reason = "reviewed Qwen diagnostic and incremental-decoder internals remain non-service surfaces pending owner activation"
 )]
 mod qwen_runtime;
 mod qwen_v2;
@@ -37,6 +35,18 @@ use std::sync::Arc;
 
 /// Maximum vocabulary size accepted by the engine.
 pub use personalai_engine_types::MAX_VOCABULARY_SIZE;
+
+/// Replays the fixed pinned Qwen2.5 production conformance corpus.
+///
+/// This content-free diagnostic accepts no caller-selected text and returns no
+/// tokenizer handle. Ordinary service `AIPTOK02` construction remains disabled.
+#[cfg(feature = "qwen25-conformance-diagnostic")]
+pub fn verify_pinned_qwen25_production_vectors(
+    data: &[u8],
+    pool: &MemoryPool,
+) -> Result<u32, EngineError> {
+    qwen_runtime::verify_pinned_qwen25_production_vectors(data, pool)
+}
 
 /// Exact AIPTok Byte-Level BPE v1 magic.
 pub const AIPTOK_MAGIC: [u8; 8] = *b"AIPTOK01";
@@ -72,7 +82,7 @@ type SpecialLiteral = (Box<[u8]>, u32);
 pub enum TokenizerFormat {
     /// AIPTok Byte-Level BPE v1.
     AipTokByteLevelBpeV1,
-    /// Data-only AIPTok v2/Qwen2.5 format; runtime activation remains disabled.
+    /// Package-bound AIPTok v2/Qwen2.5 format; service activation remains disabled.
     AipTokQwen25ByteLevelBpeV2,
 }
 
@@ -81,6 +91,8 @@ pub enum TokenizerFormat {
 pub enum NormalizationPolicy {
     /// Preserve the exact caller-supplied bytes.
     PreserveBytes,
+    /// Normalize valid UTF-8 to NFC using the reviewed Unicode 16.0 profile.
+    Unicode16Nfc,
 }
 
 /// Behavior when a byte has no learned vocabulary entry.
@@ -95,6 +107,32 @@ pub enum UnknownTokenPolicy {
 pub enum DecoderBehavior {
     /// Concatenate ordinary token bytes and omit special/control tokens.
     ConcatenateBytesSkipSpecial,
+}
+
+/// Profile-owned control tokens inserted by [`Tokenizer::encode`].
+///
+/// Explicit [`EncodeOptions`] remain capable of requesting either control token
+/// when a caller is already authorized to provide those options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImplicitControlTokenPolicy {
+    /// Insert neither BOS nor EOS.
+    None,
+    /// Insert BOS only.
+    BeginningOfSequence,
+    /// Insert EOS only.
+    EndOfSequence,
+    /// Insert BOS and EOS.
+    BeginningAndEnd,
+}
+
+impl ImplicitControlTokenPolicy {
+    const fn inserts_beginning_of_sequence(self) -> bool {
+        matches!(self, Self::BeginningOfSequence | Self::BeginningAndEnd)
+    }
+
+    const fn inserts_end_of_sequence(self) -> bool {
+        matches!(self, Self::EndOfSequence | Self::BeginningAndEnd)
+    }
 }
 
 /// Role assigned to one declared special token.
@@ -179,16 +217,20 @@ impl Default for EncodeOptions<'_> {
 pub struct TokenizerSpec {
     format: TokenizerFormat,
     normalization: NormalizationPolicy,
-    unknown_policy: UnknownTokenPolicy,
+    unknown_policy: Option<UnknownTokenPolicy>,
     decoder_behavior: DecoderBehavior,
-    vocabulary_size: u32,
+    model_vocabulary_size: u32,
+    defined_token_count: u32,
+    selectable_token_count: u32,
     beginning_of_sequence_token: u32,
     end_of_sequence_token: u32,
-    unknown_token: u32,
+    unknown_token: Option<u32>,
+    implicit_control_tokens: ImplicitControlTokenPolicy,
     maximum_piece_bytes: u16,
     maximum_input_bytes: u32,
     maximum_produced_tokens: u32,
     content_hash: ModelPackageHash,
+    serialized_data_hash: ModelPackageHash,
 }
 
 impl TokenizerSpec {
@@ -200,17 +242,32 @@ impl TokenizerSpec {
     pub const fn normalization(&self) -> NormalizationPolicy {
         self.normalization
     }
-    /// Returns the byte-fallback unknown policy.
-    pub const fn unknown_policy(&self) -> UnknownTokenPolicy {
+    /// Returns the unknown-token policy, or `None` when the profile has no UNK.
+    pub const fn unknown_policy(&self) -> Option<UnknownTokenPolicy> {
         self.unknown_policy
     }
     /// Returns the fixed decoder policy.
     pub const fn decoder_behavior(&self) -> DecoderBehavior {
         self.decoder_behavior
     }
-    /// Returns the declared contiguous vocabulary size.
+    /// Returns the number of token IDs backed by tokenizer data.
+    ///
+    /// This compatibility accessor is equal to [`Self::defined_token_count`].
+    /// Model/logit row compatibility must use [`Self::model_vocabulary_size`].
     pub const fn vocabulary_size(&self) -> u32 {
-        self.vocabulary_size
+        self.defined_token_count
+    }
+    /// Returns the exact model/logit row count required by the tokenizer profile.
+    pub const fn model_vocabulary_size(&self) -> u32 {
+        self.model_vocabulary_size
+    }
+    /// Returns the number of token IDs with immutable tokenizer definitions.
+    pub const fn defined_token_count(&self) -> u32 {
+        self.defined_token_count
+    }
+    /// Returns the contiguous prefix eligible for model sampling.
+    pub const fn selectable_token_count(&self) -> u32 {
+        self.selectable_token_count
     }
     /// Returns the required BOS token.
     pub const fn beginning_of_sequence_token(&self) -> u32 {
@@ -220,9 +277,21 @@ impl TokenizerSpec {
     pub const fn end_of_sequence_token(&self) -> u32 {
         self.end_of_sequence_token
     }
-    /// Returns the required unknown marker.
-    pub const fn unknown_token(&self) -> u32 {
+    /// Returns the unknown marker, or `None` when the profile has no UNK.
+    pub const fn unknown_token(&self) -> Option<u32> {
         self.unknown_token
+    }
+    /// Returns the profile-owned implicit BOS/EOS behavior.
+    pub const fn implicit_control_tokens(&self) -> ImplicitControlTokenPolicy {
+        self.implicit_control_tokens
+    }
+    /// Reports whether [`Tokenizer::encode`] inserts BOS.
+    pub const fn inserts_beginning_of_sequence(&self) -> bool {
+        self.implicit_control_tokens.inserts_beginning_of_sequence()
+    }
+    /// Reports whether [`Tokenizer::encode`] inserts EOS.
+    pub const fn inserts_end_of_sequence(&self) -> bool {
+        self.implicit_control_tokens.inserts_end_of_sequence()
     }
     /// Returns the maximum bytes in one token piece.
     pub const fn maximum_piece_bytes(&self) -> u16 {
@@ -240,6 +309,10 @@ impl TokenizerSpec {
     pub const fn content_hash(&self) -> ModelPackageHash {
         self.content_hash
     }
+    /// Returns SHA-384 over the complete canonical tokenizer serialization.
+    pub const fn serialized_data_hash(&self) -> ModelPackageHash {
+        self.serialized_data_hash
+    }
 
     /// Validates a bounded sequence of token identifiers.
     pub fn validate_tokens(&self, tokens: &[u32]) -> Result<(), EngineError> {
@@ -250,10 +323,27 @@ impl TokenizerSpec {
         {
             return Err(EngineError::invalid_input("token sequence exceeds the tokenizer limit"));
         }
-        if tokens.iter().any(|token| *token >= self.vocabulary_size) {
+        if tokens.iter().any(|token| *token >= self.defined_token_count) {
             return Err(EngineError::invalid_input(
-                "token sequence contains an out-of-vocabulary identifier",
+                "token sequence contains an undefined tokenizer identifier",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_metadata(&self) -> Result<(), EngineError> {
+        if self.model_vocabulary_size == 0
+            || self.model_vocabulary_size > MAX_VOCABULARY_SIZE
+            || self.defined_token_count == 0
+            || self.defined_token_count > self.model_vocabulary_size
+            || self.selectable_token_count == 0
+            || self.selectable_token_count > self.defined_token_count
+            || self.beginning_of_sequence_token >= self.defined_token_count
+            || self.end_of_sequence_token >= self.defined_token_count
+            || self.unknown_token.is_some_and(|token| token >= self.defined_token_count)
+            || self.unknown_policy.is_some() != self.unknown_token.is_some()
+        {
+            return Err(corrupt("tokenizer metadata counts or token identities are invalid"));
         }
         Ok(())
     }
@@ -263,7 +353,7 @@ impl TokenizerSpec {
 pub trait Tokenizer: Send + Sync {
     /// Returns immutable tokenizer metadata.
     fn spec(&self) -> &TokenizerSpec;
-    /// Encodes UTF-8 with BOS enabled and literal special text rejected.
+    /// Encodes UTF-8 with profile-owned implicit controls and special text rejected.
     fn encode(&self, input: &str) -> Result<Vec<u32>, EngineError>;
     /// Encodes UTF-8 with explicit special/control behavior.
     fn encode_with_options(
@@ -322,13 +412,13 @@ impl FirstPartyBpeTokenizer {
         if data.get(..AIPTOK_QWEN25_MAGIC.len()) == Some(AIPTOK_QWEN25_MAGIC.as_slice()) {
             let _ = inspect_qwen25_aiptok(data, pool)?;
             return Err(EngineError::unsupported_tokenizer(
-                "AIPTok v2/Qwen2.5 execution remains disabled until exact source conversion and production-table token-ID conformance are qualified",
+                "AIPTok v2/Qwen2.5 execution remains disabled pending package binding, independent qualification, and owner activation",
             ));
         }
         let admission = parse_header(data)?;
         let reservation_bytes = persistent_reservation_bytes(
             data.len(),
-            admission.spec.vocabulary_size,
+            admission.spec.defined_token_count,
             admission.merge_count,
         )?;
         let reservation = pool.reserve(reservation_bytes)?;
@@ -556,7 +646,7 @@ impl FirstPartyBpeTokenizer {
     }
 
     fn token_index(&self, token: u32) -> Result<usize, EngineError> {
-        if token >= self.spec.vocabulary_size {
+        if token >= self.spec.defined_token_count {
             return Err(EngineError::invalid_input(
                 "token identifier is outside the tokenizer vocabulary",
             ));
@@ -572,7 +662,14 @@ impl Tokenizer for FirstPartyBpeTokenizer {
     }
 
     fn encode(&self, input: &str) -> Result<Vec<u32>, EngineError> {
-        self.encode_with_options(input, EncodeOptions::default())
+        self.encode_with_options(
+            input,
+            EncodeOptions::new(
+                self.spec.inserts_beginning_of_sequence(),
+                self.spec.inserts_end_of_sequence(),
+                SpecialTokenPolicy::Reject,
+            ),
+        )
     }
 
     fn encode_with_options(
@@ -641,6 +738,163 @@ impl Tokenizer for FirstPartyBpeTokenizer {
     fn is_special_token(&self, token: u32) -> Result<bool, EngineError> {
         Ok(self.special[self.token_index(token)?])
     }
+}
+
+/// Exact Qwen2.5 tokenizer constructed from one already verified package file.
+///
+/// This type has no public constructor. Trusted loader code must use
+/// [`build_package_bound_qwen25_tokenizer`] with the tokenizer hash from an
+/// independently authenticated package manifest. Constructing this tokenizer
+/// does not qualify a model or authorize ordinary service execution.
+#[derive(Debug)]
+pub struct PackageBoundQwen25Tokenizer {
+    spec: TokenizerSpec,
+    core: qwen_runtime::Qwen25RuntimeCore,
+}
+
+impl PackageBoundQwen25Tokenizer {
+    fn from_core(
+        serialized_data_hash: ModelPackageHash,
+        core: qwen_runtime::Qwen25RuntimeCore,
+    ) -> Result<Self, EngineError> {
+        let descriptor = core.descriptor();
+        let spec = TokenizerSpec {
+            format: TokenizerFormat::AipTokQwen25ByteLevelBpeV2,
+            normalization: NormalizationPolicy::Unicode16Nfc,
+            unknown_policy: None,
+            decoder_behavior: DecoderBehavior::ConcatenateBytesSkipSpecial,
+            model_vocabulary_size: descriptor.model_vocabulary_size(),
+            defined_token_count: descriptor.defined_token_count(),
+            selectable_token_count: descriptor.defined_token_count(),
+            beginning_of_sequence_token: descriptor.beginning_of_sequence_token(),
+            end_of_sequence_token: descriptor.end_of_sequence_token(),
+            unknown_token: descriptor.unknown_token(),
+            implicit_control_tokens: ImplicitControlTokenPolicy::None,
+            maximum_piece_bytes: core.maximum_piece_bytes()?,
+            maximum_input_bytes: descriptor.maximum_input_bytes(),
+            maximum_produced_tokens: descriptor.maximum_produced_tokens(),
+            content_hash: descriptor.content_hash(),
+            serialized_data_hash,
+        };
+        spec.validate_metadata()?;
+        if descriptor.inserts_bos() != spec.inserts_beginning_of_sequence()
+            || descriptor.inserts_eos() != spec.inserts_end_of_sequence()
+        {
+            return Err(EngineError::internal_invariant(
+                "Qwen tokenizer implicit control policy changed",
+            ));
+        }
+        Ok(Self { spec, core })
+    }
+
+    fn add_explicit_controls(
+        &self,
+        mut tokens: Vec<u32>,
+        options: EncodeOptions<'_>,
+    ) -> Result<Vec<u32>, EngineError> {
+        let additional = usize::from(options.add_beginning_of_sequence)
+            .checked_add(usize::from(options.add_end_of_sequence))
+            .ok_or_else(|| EngineError::resource_exhaustion("control token count overflows"))?;
+        let projected = tokens
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| EngineError::resource_exhaustion("encoded token count overflows"))?;
+        if projected > usize::try_from(self.spec.maximum_produced_tokens()).unwrap_or(usize::MAX) {
+            return Err(EngineError::resource_exhaustion(
+                "encoded token count exceeds the tokenizer limit",
+            ));
+        }
+        tokens
+            .try_reserve(additional)
+            .map_err(|_| EngineError::resource_exhaustion("control token allocation failed"))?;
+        if options.add_beginning_of_sequence {
+            tokens.insert(0, self.spec.beginning_of_sequence_token());
+        }
+        if options.add_end_of_sequence {
+            tokens.push(self.spec.end_of_sequence_token());
+        }
+        self.spec.validate_tokens(&tokens)?;
+        Ok(tokens)
+    }
+}
+
+impl Tokenizer for PackageBoundQwen25Tokenizer {
+    fn spec(&self) -> &TokenizerSpec {
+        &self.spec
+    }
+
+    fn encode(&self, input: &str) -> Result<Vec<u32>, EngineError> {
+        self.encode_with_options(
+            input,
+            EncodeOptions::new(
+                self.spec.inserts_beginning_of_sequence(),
+                self.spec.inserts_end_of_sequence(),
+                SpecialTokenPolicy::Reject,
+            ),
+        )
+    }
+
+    fn encode_with_options(
+        &self,
+        input: &str,
+        options: EncodeOptions<'_>,
+    ) -> Result<Vec<u32>, EngineError> {
+        let tokens = self.core.encode_reviewed(input, options.special_tokens)?;
+        self.add_explicit_controls(tokens, options)
+    }
+
+    fn encode_bytes_with_options(
+        &self,
+        input: &[u8],
+        options: EncodeOptions<'_>,
+    ) -> Result<Vec<u32>, EngineError> {
+        let input = std::str::from_utf8(input).map_err(|_| {
+            EngineError::invalid_input("Qwen2.5 tokenizer input must be valid UTF-8")
+        })?;
+        self.encode_with_options(input, options)
+    }
+
+    fn decode(&self, tokens: &[u32]) -> Result<String, EngineError> {
+        self.core.decode(tokens)
+    }
+
+    fn decode_bytes(&self, tokens: &[u32]) -> Result<Vec<u8>, EngineError> {
+        self.core.decode_bytes(tokens)
+    }
+
+    fn token_piece(&self, token: u32) -> Result<&[u8], EngineError> {
+        self.core.token_piece(token)
+    }
+
+    fn vocabulary_lookup(&self, piece: &[u8]) -> Option<u32> {
+        self.core.vocabulary_lookup(piece)
+    }
+
+    fn is_special_token(&self, token: u32) -> Result<bool, EngineError> {
+        self.core.is_special_token(token)
+    }
+}
+
+/// Constructs the exact pinned Qwen2.5 tokenizer from package-verified bytes.
+///
+/// `expected_serialized_hash` must come from an independently authenticated
+/// package manifest. This function revalidates that full-file binding before it
+/// parses any runtime tables. It deliberately remains separate from
+/// [`build_tokenizer`], which ordinary service loading uses and which continues
+/// to reject AIPTok v2.
+pub fn build_package_bound_qwen25_tokenizer(
+    data: &[u8],
+    expected_serialized_hash: ModelPackageHash,
+    pool: &MemoryPool,
+) -> Result<PackageBoundQwen25Tokenizer, EngineError> {
+    let observed = hash_package(data);
+    if observed != expected_serialized_hash {
+        return Err(corrupt("package-bound Qwen tokenizer identity differs"));
+    }
+    PackageBoundQwen25Tokenizer::from_core(
+        expected_serialized_hash,
+        qwen_runtime::Qwen25RuntimeCore::load(data, pool)?,
+    )
 }
 
 /// Stateful strict UTF-8 decoder for token-at-a-time generation.
@@ -930,6 +1184,10 @@ impl ParsedTokenizerData {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "closed fixed-header validation and immutable spec construction remain linear"
+)]
 fn parse_header(data: &[u8]) -> Result<ParsedHeader, EngineError> {
     if data.len() < AIPTOK_HEADER_BYTES
         || u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_TOKENIZER_DATA_BYTES
@@ -1006,21 +1264,27 @@ fn parse_header(data: &[u8]) -> Result<ParsedHeader, EngineError> {
         return Err(corrupt("AIPTok offsets, total length, or reserved data are invalid"));
     }
     let expected_hash = parse_content_hash(data)?;
+    let spec = TokenizerSpec {
+        format: TokenizerFormat::AipTokByteLevelBpeV1,
+        normalization: NormalizationPolicy::PreserveBytes,
+        unknown_policy: Some(UnknownTokenPolicy::ByteFallback),
+        decoder_behavior: DecoderBehavior::ConcatenateBytesSkipSpecial,
+        model_vocabulary_size: vocabulary_size,
+        defined_token_count: vocabulary_size,
+        selectable_token_count: vocabulary_size,
+        beginning_of_sequence_token: bos,
+        end_of_sequence_token: eos,
+        unknown_token: Some(unknown),
+        implicit_control_tokens: ImplicitControlTokenPolicy::BeginningOfSequence,
+        maximum_piece_bytes,
+        maximum_input_bytes,
+        maximum_produced_tokens,
+        content_hash: expected_hash,
+        serialized_data_hash: hash_package(data),
+    };
+    spec.validate_metadata()?;
     Ok(ParsedHeader {
-        spec: TokenizerSpec {
-            format: TokenizerFormat::AipTokByteLevelBpeV1,
-            normalization: NormalizationPolicy::PreserveBytes,
-            unknown_policy: UnknownTokenPolicy::ByteFallback,
-            decoder_behavior: DecoderBehavior::ConcatenateBytesSkipSpecial,
-            vocabulary_size,
-            beginning_of_sequence_token: bos,
-            end_of_sequence_token: eos,
-            unknown_token: unknown,
-            maximum_piece_bytes,
-            maximum_input_bytes,
-            maximum_produced_tokens,
-            content_hash: expected_hash,
-        },
+        spec,
         merge_count,
         special_count,
         vocabulary_offset,
@@ -1040,7 +1304,7 @@ fn parse_content_hash(data: &[u8]) -> Result<ModelPackageHash, EngineError> {
 }
 
 fn parse_vocabulary(data: &[u8], header: &ParsedHeader) -> Result<ParsedVocabulary, EngineError> {
-    let count = u32_to_usize(header.spec.vocabulary_size)?;
+    let count = u32_to_usize(header.spec.defined_token_count)?;
     let mut pieces = Vec::new();
     let mut special = Vec::new();
     let mut vocabulary = BTreeMap::new();
@@ -1053,7 +1317,7 @@ fn parse_vocabulary(data: &[u8], header: &ParsedHeader) -> Result<ParsedVocabula
     let mut cursor = header.vocabulary_offset;
     let mut actual_maximum = 0_usize;
     let mut observed_specials = 0_u32;
-    for expected_id in 0..header.spec.vocabulary_size {
+    for expected_id in 0..header.spec.defined_token_count {
         let token_id = read_u32(data, cursor)?;
         let flags = read_u16(data, checked_add(cursor, 4)?)?;
         let length = usize::from(read_u16(data, checked_add(cursor, 6)?)?);
@@ -1131,7 +1395,7 @@ fn parse_merges(
         let result = read_u32(data, checked_add(cursor, 12)?)?;
         cursor = checked_add(cursor, MERGE_RULE_BYTES)?;
         if rank != expected_rank
-            || [left, right, result].iter().any(|token| *token >= header.spec.vocabulary_size)
+            || [left, right, result].iter().any(|token| *token >= header.spec.defined_token_count)
             || result < 256
             || result == left
             || result == right
@@ -1160,7 +1424,7 @@ fn parse_merges(
             return Err(corrupt("AIPTok merge pair or result is duplicated"));
         }
     }
-    for token in 256..header.spec.vocabulary_size {
+    for token in 256..header.spec.defined_token_count {
         let index = u32_to_usize(token)?;
         if !vocabulary.special[index] && !results.contains(&token) {
             return Err(corrupt("AIPTok ordinary vocabulary token lacks one defining merge"));
@@ -1188,7 +1452,7 @@ fn parse_specials(
         let token = read_u32(data, cursor)?;
         let role = SpecialTokenRole::from_wire(read_u32(data, checked_add(cursor, 4)?)?)?;
         cursor = checked_add(cursor, SPECIAL_RECORD_BYTES)?;
-        if token >= header.spec.vocabulary_size
+        if token >= header.spec.defined_token_count
             || previous.is_some_and(|value| token <= value)
             || !vocabulary.special[u32_to_usize(token)?]
             || roles.insert(token, role).is_some()
@@ -1198,10 +1462,12 @@ fn parse_specials(
         previous = Some(token);
         literals.push((vocabulary.pieces[u32_to_usize(token)?].clone(), token));
     }
+    let unknown =
+        header.spec.unknown_token.ok_or_else(|| corrupt("AIPTok v1 unknown token is absent"))?;
     for (required, role) in [
         (header.spec.beginning_of_sequence_token, SpecialTokenRole::BeginningOfSequence),
         (header.spec.end_of_sequence_token, SpecialTokenRole::EndOfSequence),
-        (header.spec.unknown_token, SpecialTokenRole::Unknown),
+        (unknown, SpecialTokenRole::Unknown),
     ] {
         if roles.get(&required) != Some(&role) {
             return Err(corrupt("AIPTok required special-token role is missing"));
@@ -1212,7 +1478,7 @@ fn parse_specials(
             && ![
                 header.spec.beginning_of_sequence_token,
                 header.spec.end_of_sequence_token,
-                header.spec.unknown_token,
+                unknown,
             ]
             .contains(token)
     }) {
@@ -1368,6 +1634,61 @@ mod tests {
         (bytes, tokenizer)
     }
 
+    fn qwen_definition(maximum_tokens: u32) -> AipTokQwen25Definition {
+        let mut vocabulary = (0_u32..256)
+            .map(|token_id| AipTokQwen25VocabularyEntry {
+                token_id,
+                bytes: vec![255_u8 - u8::try_from(token_id).expect("base ID fits")],
+            })
+            .collect::<Vec<_>>();
+        vocabulary.extend([
+            AipTokQwen25VocabularyEntry { token_id: 256, bytes: b"ab".to_vec() },
+            AipTokQwen25VocabularyEntry { token_id: 257, bytes: b"abc".to_vec() },
+            AipTokQwen25VocabularyEntry { token_id: 258, bytes: b"<|endoftext|>".to_vec() },
+            AipTokQwen25VocabularyEntry { token_id: 259, bytes: b"<|im_start|>".to_vec() },
+            AipTokQwen25VocabularyEntry { token_id: 260, bytes: b"<|im_end|>".to_vec() },
+            AipTokQwen25VocabularyEntry { token_id: 261, bytes: b"<tool_call>".to_vec() },
+        ]);
+        AipTokQwen25Definition {
+            vocabulary,
+            bpe_vocabulary_size: 258,
+            model_vocabulary_size: 270,
+            merges: vec![
+                AipTokQwen25Merge { rank: 0, left: 158, right: 157, result: 256 },
+                AipTokQwen25Merge { rank: 1, left: 256, right: 156, result: 257 },
+            ],
+            added_tokens: vec![
+                AipTokQwen25AddedToken {
+                    token_id: 258,
+                    role: AipTokQwen25AddedRole::BeginningOfSequence,
+                },
+                AipTokQwen25AddedToken { token_id: 259, role: AipTokQwen25AddedRole::Special },
+                AipTokQwen25AddedToken {
+                    token_id: 260,
+                    role: AipTokQwen25AddedRole::EndOfSequence,
+                },
+                AipTokQwen25AddedToken { token_id: 261, role: AipTokQwen25AddedRole::Ordinary },
+            ],
+            byte_token_ids: std::array::from_fn(|byte| {
+                u32::try_from(255_usize - byte).expect("byte map index fits")
+            }),
+            beginning_of_sequence_token: 258,
+            end_of_sequence_token: 260,
+            maximum_input_bytes: 4096,
+            maximum_produced_tokens: maximum_tokens,
+        }
+    }
+
+    fn test_qwen_tokenizer() -> (Vec<u8>, PackageBoundQwen25Tokenizer) {
+        let data = qwen_definition(4096).encode().expect("Qwen fixture must encode");
+        let pool = MemoryPool::new(64 * 1024 * 1024).expect("pool validates");
+        let core = qwen_runtime::Qwen25RuntimeCore::load_test_fixture(&data, &pool)
+            .expect("synthetic Qwen tables must load");
+        let tokenizer = PackageBoundQwen25Tokenizer::from_core(hash_package(&data), core)
+            .expect("synthetic package binding must validate");
+        (data, tokenizer)
+    }
+
     fn two_merge_definition() -> AipTokDefinition {
         let mut value = definition(MAX_TOKEN_COUNT);
         for entry in value.vocabulary.iter_mut().skip(257) {
@@ -1400,7 +1721,89 @@ mod tests {
         }
         assert_eq!(tokenizer.encode("ab").expect("merge input must encode"), vec![257, 256]);
         assert_eq!(tokenizer.vocabulary_lookup(b"ab"), Some(256));
-        assert_eq!(tokenizer.spec().unknown_policy(), UnknownTokenPolicy::ByteFallback);
+        assert_eq!(tokenizer.spec().unknown_policy(), Some(UnknownTokenPolicy::ByteFallback));
+        assert_eq!(tokenizer.spec().unknown_token(), Some(259));
+        assert_eq!(tokenizer.spec().model_vocabulary_size(), tokenizer.spec().vocabulary_size());
+        assert_eq!(tokenizer.spec().defined_token_count(), tokenizer.spec().vocabulary_size());
+        assert_eq!(tokenizer.spec().selectable_token_count(), tokenizer.spec().vocabulary_size());
+        assert_eq!(
+            tokenizer.spec().implicit_control_tokens(),
+            ImplicitControlTokenPolicy::BeginningOfSequence
+        );
+        assert!(tokenizer.spec().inserts_beginning_of_sequence());
+        assert!(!tokenizer.spec().inserts_end_of_sequence());
+    }
+
+    #[test]
+    fn package_bound_qwen_spec_and_runtime_preserve_exact_undefined_tail() {
+        let (data, tokenizer) = test_qwen_tokenizer();
+        let spec = tokenizer.spec();
+        assert_eq!(spec.format(), TokenizerFormat::AipTokQwen25ByteLevelBpeV2);
+        assert_eq!(spec.normalization(), NormalizationPolicy::Unicode16Nfc);
+        assert_eq!(spec.model_vocabulary_size(), 270);
+        assert_eq!(spec.defined_token_count(), 262);
+        assert_eq!(spec.vocabulary_size(), 262);
+        assert_eq!(spec.selectable_token_count(), 262);
+        assert_eq!(spec.unknown_policy(), None);
+        assert_eq!(spec.unknown_token(), None);
+        assert_eq!(spec.implicit_control_tokens(), ImplicitControlTokenPolicy::None);
+        assert!(!spec.inserts_beginning_of_sequence());
+        assert!(!spec.inserts_end_of_sequence());
+        assert_eq!(spec.serialized_data_hash(), hash_package(&data));
+
+        assert_eq!(tokenizer.encode("abc").expect("Qwen text encodes"), vec![257]);
+        assert_eq!(
+            tokenizer
+                .encode_with_options(
+                    "abc",
+                    EncodeOptions::new(true, true, SpecialTokenPolicy::Reject),
+                )
+                .expect("explicit controls remain explicit"),
+            vec![258, 257, 260]
+        );
+        assert_eq!(tokenizer.decode(&[257]).expect("Qwen token decodes"), "abc");
+        assert_eq!(tokenizer.vocabulary_lookup(b"abc"), Some(257));
+        assert!(tokenizer.token_piece(261).is_ok());
+        for undefined in 262..270 {
+            assert!(spec.validate_tokens(&[undefined]).is_err());
+            assert!(tokenizer.token_piece(undefined).is_err());
+            assert!(tokenizer.decode_bytes(&[undefined]).is_err());
+            assert!(tokenizer.is_special_token(undefined).is_err());
+        }
+        assert!(
+            tokenizer.encode_bytes_with_options(&[0xff], EncodeOptions::byte_round_trip()).is_err()
+        );
+    }
+
+    #[test]
+    fn exact_qwen_constructor_revalidates_identity_and_rejects_unpinned_or_malformed_data() {
+        let data = qwen_definition(4096).encode().expect("Qwen fixture must encode");
+        let pool = MemoryPool::new(64 * 1024 * 1024).expect("pool validates");
+        assert!(matches!(
+            build_package_bound_qwen25_tokenizer(
+                &data,
+                ModelPackageHash::from_sha384_bytes([0; ModelPackageHash::BYTE_LEN]),
+                &pool,
+            ),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+        assert!(matches!(
+            build_package_bound_qwen25_tokenizer(&data, hash_package(&data), &pool),
+            Err(EngineError::UnsupportedTokenizer(_))
+        ));
+        assert!(matches!(build_tokenizer(&data, &pool), Err(EngineError::UnsupportedTokenizer(_))));
+
+        let mut malformed = data.clone();
+        malformed[112] ^= 1;
+        assert!(matches!(
+            build_package_bound_qwen25_tokenizer(&malformed, hash_package(&malformed), &pool,),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+        let truncated = &data[..data.len() - 1];
+        assert!(matches!(
+            build_package_bound_qwen25_tokenizer(truncated, hash_package(truncated), &pool),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
     }
 
     #[test]

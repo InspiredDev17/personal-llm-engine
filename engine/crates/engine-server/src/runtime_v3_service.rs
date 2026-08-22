@@ -103,6 +103,16 @@ impl RuntimeV3ServiceConfig {
     pub const fn engine_instance_id(&self) -> &RuntimeInstanceId {
         &self.engine_instance_id
     }
+
+    /// Returns the owner-configured backend implementation version.
+    pub const fn backend_version(&self) -> &RuntimeInstanceId {
+        &self.backend_version
+    }
+
+    /// Returns the owner-configured backend process or device identity.
+    pub const fn backend_instance_id(&self) -> &RuntimeInstanceId {
+        &self.backend_instance_id
+    }
 }
 
 #[derive(Debug)]

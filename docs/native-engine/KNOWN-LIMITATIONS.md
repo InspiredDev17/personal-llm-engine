@@ -26,19 +26,43 @@
   provide scalar math evidence only; the exact 1.5B position-zero estimate is
   1,543,712,768 operations and fails the 100,000,000-operation scalar ceiling
   before model materialization. A bounded `AIPTOK02` Qwen table parser and a
-  private fixed scanner/BPE/decode/incremental-decode core now exist. The core
-  has no public constructor and accepts Unicode behavior only through a private
-  trusted Unicode-16 interface. A version-checked private adapter now supplies
+  private fixed scanner/BPE/decode/incremental-decode core now exist. A narrow
+  wrapper can construct the exact pinned profile only after revalidating its
+  complete package tokenizer hash; ordinary service construction remains
+  closed. A startup-only, default-disabled metadata readiness surface can bind
+  a signed future package to that tokenizer, its selectable domain and an exact
+  Runtime-v3 identity, but it deliberately does not verify tensor contents,
+  perform runtime resource admission, or expose an executable result. The core
+  accepts Unicode behavior only through a private trusted
+  Unicode-16 interface. A version-checked private adapter supplies
   bounded NFC, every `L*`/`N*` General Category, and the closed contraction
-  simple-fold mapping. Tokenizer conversion and production token-ID replay
-  remain absent.
+  simple-fold mapping. Exact pinned-source conversion and fixed production
+  encode/decode/incremental-decode replay now pass through an offline,
+  feature-gated content-free diagnostic, but ordinary tokenizer construction
+  remains disabled.
   Offline
   importer emission, the Model Foundry registry compatibility profile, an
   optimized backend, signed package, independent logits, and production
-  qualification remain absent. ARM64 and Metal reject the identifier. A second
-  authenticated-service
+  qualification remain absent. ARM64 uses the exact split-half scalar
+  correctness operation instead of its legacy interleaved RoPE when the Qwen
+  architecture is selected; that is not optimized-backend qualification.
+  Metal ordinary service remains closed. A second authenticated-service
   tokenizer gate prevents AIPTok v1 from being mislabeled after any future
   engine-version activation.
+- A separate default-disabled ARM64 preparation policy now derives the exact
+  selectable domain and bounded per-sequence KV plan from verified metadata.
+  ARM64 session/step admission retains checked operation arithmetic without
+  applying the scalar correctness-oracle ceiling. This is model-independent
+  resource preparation only: it allocates no 3-GB weight set, creates no
+  execution lease, has no client/CLI activation surface, and remains blocked on
+  engine 0.2.0, canonical Registry V2 support, tensor verification, production
+  qualification, optimized Qwen evidence, and explicit owner activation.
+- The package loader can now cooperatively cancel full shard hashing and tensor
+  materialization, and BF16/F16 conversion no longer retains a second owned
+  source tensor. This closes portable cancellation and peak-copy prerequisites
+  only. It does not authorize an internal Qwen load: the signed PAIDIR01 v1.1
+  package requires engine 0.2.0, while the current engine remains 0.1.0, and the
+  qualification and ordinary-service gates remain unresolved.
 - Only synthetic signed tiny packages are qualified. No production model,
   license/provenance review, tokenizer conformance corpus, long-context quality,
   or generated-output acceptance evidence exists.
@@ -46,7 +70,11 @@
   documented synthetic tolerances. Both now run complete signed synthetic-model
   generation through explicit owner-selected UDS execution, and Go pins the
   signed descriptor. ARM64 currently materializes bounded intermediates and KV
-  history around the kernel interface. Production-size canaries and operated
+  history around the kernel interface. Its AIPQ8/AIPQ4 matvec decodes fixed
+  blocks without materializing a full F32 weight tensor, but the ordinary
+  service loader still materializes quantized model weights. Qwen split-half
+  RoPE remains on an exact scalar correctness path when ARM64 is selected; this
+  is not a qualified optimized Qwen backend. Production-size canaries and operated
   CPU rollback evidence do not exist for either accelerated path.
 - The measured 128x128 Metal matvec is a microbenchmark, not production token
   throughput. Prior recorded methodology and numbers remain in [METAL.md](METAL.md).

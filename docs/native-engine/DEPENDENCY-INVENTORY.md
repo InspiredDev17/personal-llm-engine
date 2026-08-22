@@ -58,10 +58,13 @@ requires renewal of this record and the automated exact-allowlist test.
 
 The four Unicode entries remain narrowly admitted supply-chain inputs. The
 private scanner/BPE/decode core and its adapter add no package to this
-inventory and are not publicly constructible. The adapter now invokes bounded
-NFC, stream-safe classification and General Category lookup, but Qwen2.5
-tokenization and execution remain explicitly unsupported pending exact source
-conversion and production-table token-ID replay. Their resolved graph is
+inventory and cannot be selected or configured publicly. A narrow wrapper may
+construct only the pinned full-hash-bound tokenizer profile. The adapter invokes
+bounded NFC, stream-safe classification and General Category lookup. Exact
+pinned-source conversion and fixed-corpus replay are feature-gated offline
+diagnostics; ordinary Qwen2.5 service tokenization and execution remain
+explicitly unsupported.
+Their resolved graph is
 `engine-tokenizer -> unicode-normalization 0.1.24 -> tinyvec 1.12.0 ->
 tinyvec_macros 0.1.1` plus the independent
 `engine-tokenizer -> unicode-general-category 1.1.0` edge. Only

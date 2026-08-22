@@ -32,6 +32,8 @@ pub const MIN_VECTOR_ELEMENTS: usize = 8;
 pub const MATMUL_ROW_TILE: usize = 2;
 /// Fixed column tile matching one 128-bit Advanced SIMD register.
 pub const MATMUL_COLUMN_TILE: usize = 4;
+/// Fixed logical value count in one canonical AIPQ v1 block.
+const AIPQ_V1_BLOCK_VALUES: usize = 32;
 
 /// Trusted execution policy selected by local engine configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,42 +762,79 @@ impl Arm64Backend {
         if columns < MIN_VECTOR_ELEMENTS {
             return weights.matrix_vector(vector, pool);
         }
-        let staging = self.staging_pool(pool);
-        let mut decoded = StagedF32::zeros(
-            addressable(
-                weights.shape().element_count(),
-                "ARM64 quantized tensor is not addressable",
-            )?,
-            &staging,
-        )?;
-        for block in 0..weights.block_count() {
-            let mut codes = [0_i8; 32];
-            let (used, scale) = weights.decode_codes_block(block, &mut codes)?;
-            let mut values = [0.0_f32; 32];
-            accelerated_dequantize_block(&codes, scale, &mut values)?;
-            let start = block.checked_mul(32).ok_or_else(|| {
-                EngineError::resource_exhaustion("ARM64 quantized block offset overflows")
-            })?;
-            decoded.as_mut_slice()[start..start + used].copy_from_slice(&values[..used]);
-        }
-        let vector = f32_values(vector, &staging)?;
-        let mut output = StagedF32::zeros(rows, &staging)?;
-        for (row, destination) in output.as_mut_slice().iter_mut().enumerate() {
+        // AIPQ v1 blocks contain exactly 32 logical values. Decode one block
+        // at a time into fixed stack storage and accumulate only its overlap
+        // with the current row. Scratch is therefore independent of the
+        // weight tensor size; the exact output tensor is the only allocation
+        // added to the caller's already-accounted input tensor.
+        let mut output = MutableTensor::zeros(DType::F32, TensorShape::new([rows_u64])?, pool)?;
+        let mut codes = [0_i8; AIPQ_V1_BLOCK_VALUES];
+        let mut decoded = [0.0_f32; AIPQ_V1_BLOCK_VALUES];
+        let mut input_block = [0.0_f32; AIPQ_V1_BLOCK_VALUES];
+        for row in 0..rows {
             if cancellation.is_cancelled() {
                 return Err(EngineError::cancellation(None));
             }
-            let start = row.checked_mul(columns).ok_or_else(|| {
+            let row_start = row.checked_mul(columns).ok_or_else(|| {
                 EngineError::resource_exhaustion("ARM64 quantized row offset overflows")
             })?;
-            let end = start.checked_add(columns).ok_or_else(|| {
+            let row_end = row_start.checked_add(columns).ok_or_else(|| {
                 EngineError::resource_exhaustion("ARM64 quantized row end overflows")
             })?;
-            *destination = require_finite(accelerated_dot(
-                &decoded.as_slice()[start..end],
-                vector.as_slice(),
-            )?)?;
+            let first_block = row_start / AIPQ_V1_BLOCK_VALUES;
+            let last_block = row_end.checked_sub(1).ok_or_else(|| {
+                EngineError::internal_invariant("ARM64 quantized row is unexpectedly empty")
+            })? / AIPQ_V1_BLOCK_VALUES;
+            let mut accumulator = 0.0_f64;
+            for block in first_block..=last_block {
+                if cancellation.is_cancelled() {
+                    return Err(EngineError::cancellation(None));
+                }
+                let (used, scale) = weights.decode_codes_block(block, &mut codes)?;
+                accelerated_dequantize_block(&codes, scale, &mut decoded)?;
+                let block_start = block.checked_mul(AIPQ_V1_BLOCK_VALUES).ok_or_else(|| {
+                    EngineError::resource_exhaustion("ARM64 quantized block offset overflows")
+                })?;
+                let block_end = block_start.checked_add(used).ok_or_else(|| {
+                    EngineError::resource_exhaustion("ARM64 quantized block end overflows")
+                })?;
+                let overlap_start = row_start.max(block_start);
+                let overlap_end = row_end.min(block_end);
+                let overlap = overlap_end
+                    .checked_sub(overlap_start)
+                    .filter(|count| *count > 0)
+                    .ok_or_else(|| {
+                        EngineError::internal_invariant(
+                            "ARM64 quantized row and decoded block do not overlap",
+                        )
+                    })?;
+                let decoded_start = overlap_start.checked_sub(block_start).ok_or_else(|| {
+                    EngineError::internal_invariant("ARM64 decoded block offset underflows")
+                })?;
+                let decoded_end = decoded_start.checked_add(overlap).ok_or_else(|| {
+                    EngineError::resource_exhaustion("ARM64 decoded block range overflows")
+                })?;
+                let vector_start = overlap_start.checked_sub(row_start).ok_or_else(|| {
+                    EngineError::internal_invariant("ARM64 input block offset underflows")
+                })?;
+                for (offset, destination) in input_block.iter_mut().take(overlap).enumerate() {
+                    let column = vector_start.checked_add(offset).ok_or_else(|| {
+                        EngineError::resource_exhaustion("ARM64 input block index overflows")
+                    })?;
+                    *destination = require_finite(vector.f32_value(column)?)?;
+                }
+                let partial =
+                    accelerated_dot(&decoded[decoded_start..decoded_end], &input_block[..overlap])?;
+                accumulator += f64::from(require_finite(partial)?);
+                if !accumulator.is_finite() {
+                    return Err(EngineError::backend_failure(
+                        "ARM64 quantized matrix-vector accumulator is non-finite",
+                    ));
+                }
+            }
+            output.set_f32_value(row, f32_from_f64(accumulator)?)?;
         }
-        MutableTensor::from_f32_values(TensorShape::new([rows_u64])?, output.as_slice(), pool)
+        Ok(output)
     }
 }
 
@@ -1792,6 +1831,62 @@ mod tests {
                 backend.quantized_matrix_vector(quantized, &vector, &pool, &cancellation),
                 Err(EngineError::Cancellation(_))
             ));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q8_q4_matvec_uses_bounded_scratch_and_exact_pool_accounting() {
+        use personalai_engine_quantization::quantize;
+        const ROWS: usize = 64;
+        const COLUMNS: usize = 64;
+        let backend = Arm64Backend::new().unwrap();
+        let shape = TensorShape::new([ROWS as u64, COLUMNS as u64]).unwrap();
+        let weights = (0..ROWS * COLUMNS)
+            .map(|index| {
+                let centered = i16::try_from(index % 29).unwrap() - 14;
+                f32::from(centered) * 0.03125
+            })
+            .collect::<Vec<_>>();
+        let inputs = (0..COLUMNS)
+            .map(|index| {
+                let centered = i16::try_from(index % 17).unwrap() - 8;
+                f32::from(centered) * 0.0625
+            })
+            .collect::<Vec<_>>();
+
+        for format in [Quantization::AipQ8V1, Quantization::AipQ4V1] {
+            let payload = quantize(format, &shape, &weights).unwrap();
+            let quantized = QuantizedTensor::parse(format, &shape, payload.bytes()).unwrap();
+            let pool = MemoryPool::new(1 << 10).unwrap();
+            let vector = tensor(&pool, [COLUMNS as u64], &inputs);
+            let baseline = pool.used_bytes().unwrap();
+            assert!(matches!(quantized.dequantize(&pool), Err(EngineError::ResourceExhaustion(_))));
+
+            let actual = backend
+                .quantized_matrix_vector(quantized, &vector, &pool, &CancellationToken::new())
+                .expect("bounded block execution must fit without full-tensor staging");
+            assert_eq!(pool.used_bytes().unwrap(), baseline + actual.reserved_bytes());
+            let repeated = backend
+                .quantized_matrix_vector(quantized, &vector, &pool, &CancellationToken::new())
+                .expect("bounded block execution must be deterministic");
+            assert_eq!(
+                values(&actual).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                values(&repeated).into_iter().map(f32::to_bits).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                pool.used_bytes().unwrap(),
+                baseline + actual.reserved_bytes() + repeated.reserved_bytes()
+            );
+            assert_eq!(pool.statistics().unwrap().peak_bytes(), pool.used_bytes().unwrap());
+
+            let oracle_pool = MemoryPool::new(1 << 20).unwrap();
+            let oracle_vector = tensor(&oracle_pool, [COLUMNS as u64], &inputs);
+            let expected = quantized.matrix_vector(&oracle_vector, &oracle_pool).unwrap();
+            assert_close(&actual, &expected, 2.0e-4, 2.0e-4);
+            drop(actual);
+            drop(repeated);
+            assert_eq!(pool.used_bytes().unwrap(), baseline);
         }
     }
 

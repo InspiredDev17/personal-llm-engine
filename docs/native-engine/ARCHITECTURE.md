@@ -27,14 +27,14 @@ Green authority.
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-placement` | immutable verified-artifact placement plans, checked residency accounting, bounded whole-layer staging, and unactivated sparse-expert cache/prefetch mechanics |
-| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed `AIPTOK02` Qwen2.5 parser and private fixed scanner/BPE/decode core; its private adapter pins bounded NFC, all Unicode-16 `L*`/`N*` categories and the finite contraction fold, while immutable v1 remains the only publicly constructible runtime path pending exact conversion and production-table replay |
+| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a package-hash-bound `AIPTOK02` Qwen2.5 tokenizer over a private fixed scanner/BPE/decode core; the exact pinned source has deterministic offline conversion and feature-gated fixed-corpus conformance, while ordinary service construction remains v1-only |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 lifecycle semantics and Knowledge 1.2 exact prefix framing |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
-| `engine-transformer` | closed legacy decoder execution plus Qwen2.5 and sparse-MoE tiny scalar correctness scaffolding, exact dense tensor inventories, resident CPU path and bounded scalar streamed path |
+| `engine-transformer` | closed legacy decoder execution plus Qwen2.5 and sparse-MoE tiny correctness scaffolding, architecture-first Qwen split-half RoPE dispatch, exact dense tensor inventories, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | model/tokenizer-bound selectable token domains plus bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding, bounded canonical Runtime-v3 documents, and the fixed-binary internal Knowledge 1.1 cache adapter |
@@ -171,8 +171,10 @@ before weights are materialized. The CPU service also applies this Qwen-only
 compute admission immediately after trusted configuration conversion and before
 future tokenizer allocation or tensor materialization; current version and
 tokenizer gates remain earlier, and the legacy load order is unchanged. ARM64
-and Metal reject this new architecture rather than invoking their legacy
-adjacent-pair RoPE kernels.
+never invokes its legacy adjacent-pair RoPE kernel for this architecture: it
+uses the exact split-half scalar correctness operation. This is backend
+correctness scaffolding, not an activated or qualified Qwen service. Metal
+ordinary service remains unreachable behind the shared version/tokenizer gates.
 Model metadata cannot define operations, plugins, paths, executable code, or
 kernels.
 
@@ -182,20 +184,57 @@ Its fail-closed Qwen transition can securely preflight an exact owner-private
 source directory by retaining no-follow descriptors, streaming and
 authenticating the pinned digest from the model descriptor, and only then
 allocating its bounded safetensors header and validating the 338-tensor BF16
-inventory; it cannot emit or sign a Qwen package. `engine-tokenizer` recognizes
+inventory; it cannot emit or sign a Qwen package. The offline importer can now
+convert only the exact pinned tokenizer source into canonical `AIPTOK02`, but
+does not install it into a package. `engine-tokenizer` recognizes
 and fully validates a separate data-only `AIPTOK02` table profile. A private
-fixed scanner/BPE/decode core exists, but the public factory deliberately
-returns `UnsupportedTokenizer` rather than constructing an approximate Qwen
-runtime.
+fixed scanner/BPE/decode core exists behind a narrow constructor that requires
+and revalidates the complete tokenizer hash from a verified package. The
+ordinary factory deliberately returns `UnsupportedTokenizer` rather than
+activating Qwen service execution.
 The Model Foundry registry V2 compatibility profile still names manifest v1.0,
-and no exact Qwen tokenizer converter or signed Qwen package exists here. The
+and no signed Qwen package exists here. The
 current service returns the earlier typed future-engine rejection; after an
 eventual runtime revision bump it still reaches the closed tokenizer gate.
 The private Unicode-16 adapter is version-checked and bounded, including exact
 General Category families and the finite simple-fold mappings relevant to the
-fixed contraction expression. Source conversion, production-table token
-replay, Model Foundry admission, and a qualified optimized backend must still
-be implemented and qualified before activation.
+fixed contraction expression. A feature-gated offline diagnostic now replays
+the complete pinned production token-ID corpus without exposing construction.
+Model Foundry admission, package emission, and a qualified optimized backend
+must still be implemented and qualified before activation.
+
+The loader also exposes a metadata-only inspection result for the owner-gated
+experimental readiness path. It authenticates the catalog, manifest,
+tokenizer, provenance and exact shard identities but does not hash shard
+contents, materialize tensors or bypass the current engine-version gate.
+`engine-server` may consume that unforgeable metadata only when its explicit
+startup policy is owner-approved; the default remains disabled and no CLI or
+wire-protocol field exists. The server then revalidates the package-bound Qwen
+tokenizer and sampling domain and binds the existing Runtime-v3 model,
+package, artifact, backend, backend-version, backend-instance and engine-instance
+identities. The resulting content-free evidence type has no eligible state and
+retains explicit blockers for every uncompleted activation gate.
+
+On AArch64 builds only, a distinct startup-only policy may derive bounded
+ARM64 execution-preparation evidence from the same verified metadata. The
+preparation binds the exact selectable token domain and Runtime-v3 identities,
+checks complete per-sequence KV capacity against memory/KV/concurrency budgets,
+and observes cancellation between stages. Decoder session and per-token compute
+validation are backend-aware: scalar execution retains its fixed correctness
+ceiling, while ARM64 retains checked operation arithmetic without inheriting
+that scalar-only ceiling. The preparation has no executable state, is absent
+from client protocol and CLI surfaces, and does not bypass engine-version,
+ordinary tokenizer, Registry V2, tensor verification, qualification, or owner
+activation gates. Metal is not accepted by this preparation path.
+
+Directory admission and tensor materialization now also expose loader-owned
+cooperative-cancellation APIs. They preserve the same registered-ID, signature,
+closed-file-set, engine-version, architecture and identity gates as synchronous
+load. SHA-384 verification and immutable snapshot copying poll at bounded 1 MiB
+chunks; BF16/F16 conversion polls while writing directly into its accounted F32
+destination, and AIPQ conversion polls per fixed block. Cancellation releases
+partial reservations and is not mislabeled as package corruption. These APIs
+do not make the v1.1 Qwen package executable under engine 0.1.0.
 
 ## Trusted execution placement
 
@@ -216,7 +255,9 @@ substrate over immutable unequal-sized architecture stages with at most one
 prefetch worker. Each selected mapping identity and signed per-tensor content
 hash is revalidated before materialization; the exact bytes used for conversion
 are copied into an accounted snapshot and hashed again, closing the
-check-versus-copy race. Unrelated layers are not repeatedly hashed. Cancellation or failure joins the worker and releases staged
+check-versus-copy race. Unrelated layers are not repeatedly hashed. Cancellation
+is also observed inside bounded loader hashing, copying, and conversion work.
+Cancellation or failure joins the worker and releases staged
 reservations. A mapping-identity failure uses the existing typed, content-free
 package-rejection event. The scalar decoder now performs prefill and one-token
 decode directly over these stages and preserves its existing atomic contiguous
@@ -297,6 +338,14 @@ current service intentionally materializes F32 weights until those direct
 kernels are integrated throughout the immutable transformer path. Exact format
 and synthetic accuracy evidence is in [QUANTIZATION.md](QUANTIZATION.md), and
 ADR-0024 records the acceptance boundary.
+
+The ARM64 AIPQ8/AIPQ4 matrix-vector kernel also decodes one fixed 32-value
+block at a time and directly accumulates the current row. It does not allocate
+an F32 copy of the weight tensor. Its only request-pool allocation is the exact
+output tensor; fixed block scratch is stack-bounded, arithmetic and row/block
+ranges are checked, and cancellation is polled at row and block boundaries.
+This portable resource property is not a production throughput or quality
+claim, and the ordinary service still materializes quantized model weights.
 
 `InferenceGraph` is immutable after validation. Nodes use the closed
 first-party `Operation` enum, explicit value IDs, static F32 shape propagation,
@@ -415,11 +464,11 @@ private adapter that checks both Unicode-16 data versions, bounds NFC output,
 rejects an NFKD stream-safe view that would require a CGJ after 30
 nonstarters, keeps both locally hardened NFC buffers inline, accounts fixed
 iterator workspace, maps all `L*`/`N*` categories and pins the finite simple
-fold. The public factory still validates the structure and returns
-`UnsupportedTokenizer`; no
-service or importer path can construct the core. ADR-0035 records the format
-gate, ADR-0036 records the inert runtime, and ADR-0037 records the private
-Unicode adapter.
+fold. The package-bound API can construct the exact pinned runtime after full
+hash revalidation, but the ordinary factory still validates the structure and
+returns `UnsupportedTokenizer`; no service or importer package path invokes the
+constructor. ADR-0035 records the format gate, ADR-0036 records the bounded
+runtime, and ADR-0037 records the private Unicode adapter.
 
 ## Local protocol and authentication
 
@@ -645,7 +694,11 @@ configuration, executes its complete prefill/decode path through the closed
 backend operation interface, and retains scalar fallback for unsupported
 validated cases. The service advertises ARM64 only on an AArch64 build with the
 feature enabled and returns the exact backend in its authenticated model
-descriptor. The Metal feature exposes a real immutable-graph backend,
+descriptor. The generic ARM64 `Rope` graph operation remains the legacy
+interleaved layout. Qwen architecture dispatch runs first and retains the exact
+split-half scalar correctness operation, so selecting ARM64 internally cannot
+silently reinterpret Qwen rotary pairs. This does not open the ordinary Qwen
+service gate or qualify Qwen ARM64 performance. The Metal feature exposes a real immutable-graph backend,
 an embedded SHA-384-identified first-party metallib, a closed 19-kernel C ABI,
   bounded pooling and transfer metrics, scalar fallback, and sequence-isolated
   contiguous device KV storage. Its fixed decoder uploads verified weights once

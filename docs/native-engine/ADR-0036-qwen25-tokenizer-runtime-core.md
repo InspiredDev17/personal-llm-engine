@@ -1,6 +1,6 @@
-# ADR-0036: Private Qwen2.5 tokenizer runtime core
+# ADR-0036: Package-bound Qwen2.5 tokenizer runtime core
 
-- Status: accepted as inert runtime mechanics; public execution disabled
+- Status: accepted as package-bound runtime mechanics; ordinary service execution disabled
 - Date: 2026-08-22
 
 ## Context
@@ -25,8 +25,11 @@ boundary without activating an approximate tokenizer.
 ## Decision
 
 Add a crate-private Qwen2.5 runtime core. It consumes the immutable tables
-retained by the already bounded `AIPTOK02` parser and has no public constructor,
-trait implementation, service path, or importer emission path.
+retained by the already bounded `AIPTOK02` parser. A narrow public wrapper now
+implements the engine tokenizer trait only after revalidating the complete
+serialized tokenizer hash supplied from an independently authenticated package
+manifest. The generic tokenizer factory, service path, and importer package
+emission path remain closed.
 
 The core implements the fixed pre-tokenizer expression as reviewed first-party
 state logic, not as package-provided regex or executable configuration:
@@ -76,12 +79,19 @@ and incremental decode, limits, memory release and thread determinism.
 
 The exact activation targets are retained in
 [QWEN25-TOKENIZER-VECTORS.md](QWEN25-TOKENIZER-VECTORS.md). These tests prove
-the state mechanics and the admitted Unicode-data boundary; they do not prove
-the 151,665-entry pinned tokenizer table. Public construction still
-parses `AIPTOK02` and returns `UnsupportedTokenizer`. Activation still requires:
+the state mechanics and the admitted Unicode-data boundary. The exact pinned
+source is now deterministically converted, and a feature-gated offline
+diagnostic binds the complete canonical output identity and replays the fixed
+production encode, full-decode and incremental-decode vectors. It returns no
+runtime handle and accepts no caller-selected inputs. Trusted loader work may
+construct the exact pinned profile only through
+`build_package_bound_qwen25_tokenizer`; the constructor rechecks the full
+serialization hash and keeps model rows, defined IDs and selectable IDs
+distinct. `build_tokenizer` and ordinary service admission still return
+`UnsupportedTokenizer` for `AIPTOK02`. Activation still requires:
 
-1. deterministic conversion of the exact pinned `tokenizer.json` into
-   `AIPTOK02` and replay of its independently derived token-ID vectors;
+1. independent review/acceptance of the pinned conversion and conformance
+   evidence for package use;
 2. engine-version, Registry V2, optimized-backend, signing, Foundry and owner
    activation approvals already required by ADR-0033 and ADR-0035.
 
@@ -92,7 +102,7 @@ parses `AIPTOK02` and returns `UnsupportedTokenizer`. Activation still requires:
   primitives. ADR-0037's private adapter invokes only their NFC iterator,
   General Category lookup, and version constants. It adds no general regex engine,
   Python, script, network path or model-supplied executable behavior.
-- The remaining production-table evidence is explicit instead of being
-  approximated by compact tables.
+- Production-table evidence is explicit and content-free rather than being
+  approximated by compact tables or exposed through ordinary runtime APIs.
 - The private core can be reviewed and fuzzed further without making Qwen
   packages executable.

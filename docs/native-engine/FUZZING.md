@@ -42,11 +42,11 @@ exercise declared hard-limit behavior.
 The corpus generator is Rust-only and additionally produces valid directory
 manifest/tensor-record/F32-F16-BF16 safetensors/package-name seeds plus
 malformed boundary seeds. It retains the decoder package, executable v1
-tokenizer, data-only v2 tokenizer-table, and frame seeds. The v2 seed exercises
-only bounded format validation; encode/decode/incremental targets remain
-v1-only because the private Unicode adapter does not supply the absent exact
-production-table conversion and public activation gates in ADR-0035 through
-ADR-0037. The decoder seed is generated from
+tokenizer, data-only v2 tokenizer-table, and frame seeds. The v2 fuzz seed still
+exercises bounded format validation only; exact production
+encode/decode/incremental replay instead runs in the feature-gated offline
+diagnostic, while public activation gates in ADR-0035 through ADR-0037 remain
+closed. The decoder seed is generated from
 the current two-layer
 grouped-query-attention fixture, so corpus verification catches stale fixture
 bytes:
