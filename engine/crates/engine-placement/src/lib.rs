@@ -19,6 +19,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+mod sparse_expert;
+
+pub use sparse_expert::{
+    ExpertByteSource, MAX_ACTIVE_EXPERTS_PER_TOKEN, MAX_EXPERT_PREFETCH_DEPTH,
+    MAX_EXPERTS_PER_LAYER, MAX_GLOBAL_EXPERT_PREFETCH_WORKERS, MAX_SPARSE_EXPERT_LAYERS,
+    MAX_TOTAL_EXPERTS, SPARSE_EXPERT_CACHE_SLOT_BYTES, SPARSE_EXPERT_HASH_CHUNK_BYTES,
+    SPARSE_EXPERT_PREFETCH_STACK_BYTES, SparseExpertCache, SparseExpertCacheMetrics,
+    SparseExpertDescriptor, SparseExpertExecutionPlan, SparseExpertId, SparseExpertLayerPlan,
+    SparseExpertLease, SparseExpertPlanIdentity, SparseExpertPrefetchResult,
+    SparseExpertResidencyMode, SparseExpertResourceEnvelope, SparseExpertSelection,
+    SparseExpertStagingBuffer, run_bounded_expert_prefetch,
+};
+
 /// Largest supported trusted decoder-layer population in one placement plan.
 pub const MAX_PLACEMENT_LAYERS: u32 = 4_096;
 /// Hard maximum asynchronous prefetch depth.

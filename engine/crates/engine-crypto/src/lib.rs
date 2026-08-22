@@ -367,10 +367,43 @@ impl TrustedSigner {
 
 /// Computes the canonical SHA-384 identity of complete package bytes.
 pub fn hash_package(package_bytes: &[u8]) -> ModelPackageHash {
-    let digest = Sha384::digest(package_bytes);
-    let mut bytes = [0_u8; ModelPackageHash::BYTE_LEN];
-    bytes.copy_from_slice(&digest);
-    ModelPackageHash::from_sha384_bytes(bytes)
+    let mut accumulator = PackageHashAccumulator::new();
+    accumulator.update(package_bytes);
+    accumulator.finalize()
+}
+
+/// Incremental SHA-384 package-identity accumulator.
+///
+/// This narrow wrapper lets bounded engine readers verify large immutable
+/// regions in cancellation-sized chunks without importing cryptographic
+/// implementation details into loader or placement crates. Callers remain
+/// responsible for canonical framing when hashing multiple logical fields.
+pub struct PackageHashAccumulator(Sha384);
+
+impl PackageHashAccumulator {
+    /// Starts one empty SHA-384 transcript.
+    pub fn new() -> Self {
+        Self(Sha384::new())
+    }
+
+    /// Adds exact bytes to the transcript.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Finalizes the transcript as the engine's SHA-384-tagged digest type.
+    pub fn finalize(self) -> ModelPackageHash {
+        let digest = self.0.finalize();
+        let mut bytes = [0_u8; ModelPackageHash::BYTE_LEN];
+        bytes.copy_from_slice(&digest);
+        ModelPackageHash::from_sha384_bytes(bytes)
+    }
+}
+
+impl Default for PackageHashAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Computes the SHA-384 content digest used by the signature transcript.
@@ -671,6 +704,15 @@ mod tests {
                 "1a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
             )
         );
+    }
+
+    #[test]
+    fn incremental_sha384_matches_single_slice_identity() {
+        let mut accumulator = PackageHashAccumulator::new();
+        accumulator.update(b"a");
+        accumulator.update(b"b");
+        accumulator.update(b"c");
+        assert_eq!(accumulator.finalize(), hash_package(b"abc"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub use runtime::{
     ScratchMetrics,
 };
 
-const OWNER_CATEGORY_COUNT: usize = 14;
+const OWNER_CATEGORY_COUNT: usize = 16;
 
 /// Explicit owner for one engine inference allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,10 @@ pub enum MemoryOwner {
     ModelState(ModelId),
     /// Bounded layer-streaming and backend-prefetch staging owned by one model.
     PlacementStaging(ModelId),
+    /// Immutable routed-expert payloads cached for one verified model.
+    SparseExpertCache(ModelId),
+    /// Durable staging and safety capacity held for sparse-expert execution.
+    SparseExpertStaging(ModelId),
     /// Immutable reusable prefix K/V state owned by one verified model.
     ReusableKvCache(ModelId),
     /// Request prompt/token state.
@@ -61,14 +65,16 @@ impl MemoryOwner {
             Self::Tokenizer(_) => 3,
             Self::ModelState(_) => 4,
             Self::PlacementStaging(_) => 5,
-            Self::ReusableKvCache(_) => 6,
-            Self::RequestPrompt(_) => 7,
-            Self::SequenceKv(_) => 8,
-            Self::RequestScratch(_) => 9,
-            Self::OutputLogits(_) => 10,
-            Self::Sampling(_) => 11,
-            Self::StreamingDecoder(_) => 12,
-            Self::Backend(_) => 13,
+            Self::SparseExpertCache(_) => 6,
+            Self::SparseExpertStaging(_) => 7,
+            Self::ReusableKvCache(_) => 8,
+            Self::RequestPrompt(_) => 9,
+            Self::SequenceKv(_) => 10,
+            Self::RequestScratch(_) => 11,
+            Self::OutputLogits(_) => 12,
+            Self::Sampling(_) => 13,
+            Self::StreamingDecoder(_) => 14,
+            Self::Backend(_) => 15,
         }
     }
 }
@@ -137,6 +143,24 @@ impl MemoryPool {
         bytes: u64,
         owner: MemoryOwner,
     ) -> Result<MemoryReservation, EngineError> {
+        self.reserve_for_preserving(bytes, 0, owner)
+    }
+
+    /// Reserves positive bytes while preserving unreserved capacity at admission.
+    ///
+    /// The availability check is atomic with the reservation: current usage,
+    /// `bytes`, and `preserved_headroom_bytes` must fit beneath the pool limit
+    /// while the accounting lock is held. Only `bytes` are charged to the
+    /// returned reservation; headroom remains available to other owners. This
+    /// is a point-in-time admission check, not a durable partition. Callers
+    /// requiring a lifetime guarantee must retain an explicit reservation for
+    /// that capacity.
+    pub fn reserve_for_preserving(
+        &self,
+        bytes: u64,
+        preserved_headroom_bytes: u64,
+        owner: MemoryOwner,
+    ) -> Result<MemoryReservation, EngineError> {
         if bytes == 0 {
             return Err(EngineError::invalid_input(
                 "memory reservation must contain at least one byte",
@@ -149,10 +173,16 @@ impl MemoryPool {
         let next = state.used_bytes.checked_add(bytes).ok_or_else(|| {
             EngineError::resource_exhaustion("memory reservation accounting overflows")
         })?;
-        if next > self.limit_bytes {
-            return Err(EngineError::resource_exhaustion(
-                "memory reservation exceeds the configured pool",
-            ));
+        let required = next.checked_add(preserved_headroom_bytes).ok_or_else(|| {
+            EngineError::resource_exhaustion("memory reservation headroom accounting overflows")
+        })?;
+        if required > self.limit_bytes {
+            let message = if preserved_headroom_bytes == 0 {
+                "memory reservation exceeds the configured pool"
+            } else {
+                "memory reservation would consume preserved pool headroom"
+            };
+            return Err(EngineError::resource_exhaustion(message));
         }
         let allocation_count = state.allocation_count.checked_add(1).ok_or_else(|| {
             EngineError::resource_exhaustion("memory allocation counter overflows")
@@ -175,6 +205,20 @@ impl MemoryPool {
         reservation: &mut MemoryReservation,
         additional_bytes: u64,
     ) -> Result<(), EngineError> {
+        self.grow_reservation_preserving(reservation, additional_bytes, 0)
+    }
+
+    /// Extends one owned reservation while preserving unreserved capacity at admission.
+    ///
+    /// As with [`Self::reserve_for_preserving`], the check and accounting
+    /// update occur under the same pool lock and only `additional_bytes` are
+    /// charged to the reservation.
+    pub fn grow_reservation_preserving(
+        &self,
+        reservation: &mut MemoryReservation,
+        additional_bytes: u64,
+        preserved_headroom_bytes: u64,
+    ) -> Result<(), EngineError> {
         if additional_bytes == 0 {
             return Ok(());
         }
@@ -194,10 +238,16 @@ impl MemoryPool {
         let used_bytes = state.used_bytes.checked_add(additional_bytes).ok_or_else(|| {
             EngineError::resource_exhaustion("memory reservation accounting overflows")
         })?;
-        if used_bytes > self.limit_bytes {
-            return Err(EngineError::resource_exhaustion(
-                "memory reservation exceeds the configured pool",
-            ));
+        let required = used_bytes.checked_add(preserved_headroom_bytes).ok_or_else(|| {
+            EngineError::resource_exhaustion("memory reservation headroom accounting overflows")
+        })?;
+        if required > self.limit_bytes {
+            let message = if preserved_headroom_bytes == 0 {
+                "memory reservation exceeds the configured pool"
+            } else {
+                "memory reservation would consume preserved pool headroom"
+            };
+            return Err(EngineError::resource_exhaustion(message));
         }
         let category = reservation.owner.category_index();
         let category_bytes = state.by_category[category]
@@ -441,6 +491,37 @@ mod tests {
     }
 
     #[test]
+    fn reservation_preserves_headroom_against_preused_capacity() {
+        let pool = MemoryPool::new(100).expect("pool must validate");
+        let existing = pool.reserve(30).expect("existing use must fit");
+        let reservation = pool
+            .reserve_for_preserving(40, 30, MemoryOwner::Engine)
+            .expect("request plus headroom must exactly fit");
+        assert_eq!(pool.used_bytes().unwrap(), 70);
+        assert_eq!(reservation.bytes(), 40);
+        assert!(pool.reserve_for_preserving(1, 30, MemoryOwner::Engine).is_err());
+        assert_eq!(pool.used_bytes().unwrap(), 70);
+        drop(reservation);
+        assert_eq!(pool.used_bytes().unwrap(), 30);
+        drop(existing);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn preserved_headroom_overflow_fails_without_accounting_changes() {
+        let pool = MemoryPool::new(16).expect("pool must validate");
+        assert!(pool.reserve_for_preserving(1, u64::MAX, MemoryOwner::Engine).is_err());
+        let statistics = pool.statistics().unwrap();
+        assert_eq!(statistics.reserved_bytes(), 0);
+        assert_eq!(statistics.allocation_count(), 0);
+
+        let mut reservation = pool.reserve(1).expect("baseline reservation must fit");
+        assert!(pool.grow_reservation_preserving(&mut reservation, 1, u64::MAX).is_err());
+        assert_eq!(reservation.bytes(), 1);
+        assert_eq!(pool.used_bytes().unwrap(), 1);
+    }
+
+    #[test]
     fn reservation_identity_is_pool_specific() {
         let pool = MemoryPool::new(16).expect("pool must validate");
         let clone = pool.clone();
@@ -464,6 +545,19 @@ mod tests {
         assert_eq!(reservation.bytes(), 8);
         assert_eq!(pool.used_bytes().unwrap(), 8);
         assert!(pool.shrink_reservation(&mut reservation, 8).is_err());
+    }
+
+    #[test]
+    fn reservation_growth_preserves_requested_headroom() {
+        let pool = MemoryPool::new(32).expect("pool must validate");
+        let _existing = pool.reserve(8).expect("existing use must fit");
+        let mut reservation = pool.reserve(8).expect("reservation must fit");
+        pool.grow_reservation_preserving(&mut reservation, 8, 8)
+            .expect("growth and headroom must fit");
+        assert_eq!(reservation.bytes(), 16);
+        assert!(pool.grow_reservation_preserving(&mut reservation, 1, 8).is_err());
+        assert_eq!(reservation.bytes(), 16);
+        assert_eq!(pool.used_bytes().unwrap(), 24);
     }
 
     #[test]

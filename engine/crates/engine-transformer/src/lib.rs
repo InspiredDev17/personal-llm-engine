@@ -4,6 +4,8 @@
 mod cpu_decoder;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_decoder;
+#[cfg(feature = "cpu-reference")]
+mod sparse_moe;
 
 #[cfg(feature = "cpu-reference")]
 pub use cpu_decoder::{CpuDecoderModel, CpuDecoderSession};
@@ -19,6 +21,11 @@ pub use personalai_engine_metal::{
 };
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use personalai_engine_metal::{MetalKvCache, MetalKvCacheMetrics, MetalKvSequenceHandle};
+#[cfg(feature = "cpu-reference")]
+pub use sparse_moe::{
+    MAX_SCALAR_SPARSE_MOE_DIMENSION, MAX_SCALAR_SPARSE_MOE_OPERATIONS, RoutedExpert,
+    ScalarSparseMoeLayer, route_sparse_experts,
+};
 
 use personalai_engine_kv_cache::{
     KvCachePlan, MAX_HEAD_DIMENSION, MAX_KV_HEAD_COUNT, MAX_LAYER_COUNT,

@@ -26,7 +26,7 @@ Green authority.
 | `engine-quantization` | fixed AIPQ8/AIPQ4 validation, deterministic conversion, error measurement and safe scalar reference kernels |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
-| `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
+| `engine-placement` | immutable verified-artifact placement plans, checked residency accounting, bounded whole-layer staging, and unactivated sparse-expert cache/prefetch mechanics |
 | `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed `AIPTOK02` Qwen2.5 parser and private fixed scanner/BPE/decode core; its private adapter pins bounded NFC, all Unicode-16 `L*`/`N*` categories and the finite contraction fold, while immutable v1 remains the only publicly constructible runtime path pending exact conversion and production-table replay |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 lifecycle semantics and Knowledge 1.2 exact prefix framing |
@@ -34,7 +34,7 @@ Green authority.
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
-| `engine-transformer` | closed legacy decoder execution plus Qwen2.5 tiny scalar correctness scaffolding, exact tensor inventories, resident CPU path and bounded scalar streamed path |
+| `engine-transformer` | closed legacy decoder execution plus Qwen2.5 and sparse-MoE tiny scalar correctness scaffolding, exact dense tensor inventories, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | model/tokenizer-bound selectable token domains plus bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding, bounded canonical Runtime-v3 documents, and the fixed-binary internal Knowledge 1.1 cache adapter |
@@ -227,6 +227,35 @@ streaming with ARM64 or Metal. Authenticated clients still provide only a
 registered `ModelId`; the wire exposes no physical plan or placement override.
 `HybridResident` returns an explicit unsupported error.
 
+Sparse expert residency is a separate engine-private axis rather than a new
+dense `WeightResidencyMode`. `engine-placement` now validates canonical expert
+inventories, exact model/artifact/package-digest/package-format/architecture/
+backend/quantization/generation bindings, a canonical complete-plan digest,
+unequal storage and execution sizes,
+full or selected-expert cache ceilings, depth-one prefetch, immutable leases,
+deterministic unpinned LRU eviction, and terminal generation-based
+invalidation. A fixed fallibly allocated slot table is charged for every
+possible expert. Durable aggregate cache/staging guards back bounded child
+pools for actual immutable payloads and zero-initialized scratch; the safety
+guard is deliberately unavailable emergency/OS margin. One serialized miss
+bounds expert I/O and the cache independently checks exact length and SHA-384
+after a pinned path-free source fills an initialized accounted host buffer,
+polling cancellation every 64 KiB. Scoped depth-one prefetch has one worker per
+cache, a process-wide four-worker permit, and an explicit 256 KiB stack request.
+`engine-transformer` provides stable finite top-k routing and a tiny
+exact-plan-bound scalar F32 expert correctness evaluator using the admitted
+staging pool. Fully resident and streamed synthetic expert execution is
+bit-exact.
+
+This foundation registers no production MoE architecture, package revision,
+importer mapping, service capability, or protocol message. It cannot yet admit
+an artifact larger than RAM because the loader conservatively charges complete
+mapped shard extent, and it does not yet execute AIPQ experts without F32
+expansion. ARM64, Metal, CUDA, SSD, and production decoder integration remain
+disabled. [SPARSE-EXPERT-STREAMING.md](SPARSE-EXPERT-STREAMING.md) and ADR-0038
+record the exact boundary. Sparse expert streaming is a capacity fallback, not
+a performance claim.
+
 The placement plan records the parsed package format revision, so a v1.1 Qwen
 artifact cannot be mislabeled as v1.0 after verification. Qwen's tied logical
 output aliases the signed embedding range for streamed execution but is counted
@@ -288,7 +317,8 @@ before output allocation. ADR-0017 records these invariants.
 Every accounted allocation has one engine-owned category: model weights,
 model metadata, tokenizer tables, immutable model state, request prompt,
 sequence KV, request scratch, output logits, sampling state, streaming decoder,
-placement staging, or backend resources. Pools expose current, peak, category and allocation-count
+placement staging, sparse expert cache, sparse expert staging, or backend
+resources. Pools expose current, peak, category and allocation-count
 metrics. A scoped pool changes only the owner label; it shares the exact same
 hard ceiling and counters, so a subcomponent cannot create capacity by nesting
 pools. Loader tensor materialization labels immutable metadata and weights by

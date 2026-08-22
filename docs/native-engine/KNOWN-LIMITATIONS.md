@@ -61,6 +61,17 @@
   clients cannot override it. The V1 descriptor does not report residency mode.
   Hybrid CPU/GPU placement is explicitly unsupported. There is no evidence that
   streaming is faster than residency.
+- A first-party sparse-expert plan/cache/router correctness foundation now
+  exists, including exact identity, bounded memory, immutable leases,
+  deterministic eviction, cancellation-safe depth-one prefetch, and synthetic
+  resident-versus-streamed parity. It is deliberately not wired to a production
+  architecture, package revision, importer, decoder, service capability, or
+  accelerator. Complete shard mappings are still conservatively charged as
+  committed bytes, so model-larger-than-RAM admission is not yet claimed.
+  Prefetch is globally capped at four explicitly sized worker stacks, but the
+  stacks remain OS-managed rather than `MemoryPool` allocations. Production
+  release builds use panic-abort, so trusted source/work callbacks are no-panic
+  boundaries rather than process-isolated plugins.
 - Placement accounting uses conservative logical bytes for mapped content,
   immutable metadata, execution tensors, staged metadata, existing reservations,
   and safety reserve. General allocator/page-table overhead remains part of the
