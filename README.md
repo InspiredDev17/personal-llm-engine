@@ -14,7 +14,8 @@ SHA-384 and strict Ed25519 admission, a configuration-only model registry,
 an explicit exact-owner-selected Model Foundry registry V2 admission mode,
 no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
-tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
+tokenization, a separate fail-closed data-only `AIPTOK02` Qwen2.5 table parser,
+canonical aggregate-accounted tensors with explicit F16/BF16
 storage conversion, deterministic first-party AIPQ8/AIPQ4 package profiles and
 scalar quantized reference kernels, an immutable architecture-owned graph,
 a closed legacy decoder and Qwen2.5 scalar correctness scaffolding,
@@ -62,9 +63,11 @@ production-size canary remains gated. A legally approved real source
 model/package and independent numeric evidence, ARM64 service integration,
 CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
-existing production runtimes. Tokenizer support is intentionally limited to
-AIPTok Byte-Level BPE v1; SentencePiece, Unigram, WordPiece, tiktoken, and
-arbitrary `tokenizer.json` graphs are not supported. The locked dependency
+existing production runtimes. Executable tokenizer support is intentionally
+limited to AIPTok Byte-Level BPE v1. AIPTok v2 only validates closed Qwen2.5
+tables and returns unsupported until exact Unicode/runtime conformance is
+complete; SentencePiece, Unigram, WordPiece, tiktoken, and arbitrary
+`tokenizer.json` graphs are not supported. The locked dependency
 graph is checked in under `engine/vendor`, Cargo is offline/source-replaced by
 default, and
 `release/native-engine.spdx` records package versions, checksums, and licenses.

@@ -1,13 +1,20 @@
 //! Closed inspection gate for the pinned Qwen2.5 byte-level BPE source tokenizer.
 //!
-//! The source graph requires exact NFC normalization plus a Unicode-aware regex
-//! pre-tokenizer. The current `PAIBPE01` runtime deliberately supports neither,
-//! requires an unknown-token ID, and assumes tokenizer/model vocabulary equality.
+//! The source graph requires exact NFC normalization plus a Unicode-aware fixed
+//! pre-tokenizer. Frozen `AIPTOK01` deliberately supports neither, requires an
+//! unknown-token ID, and assumes tokenizer/model vocabulary equality. The
+//! separate `AIPTOK02` parser validates data tables but is not yet executable.
 //! Consequently this module validates the pinned source without emitting an
 //! approved tokenizer package. [`convert`] always fails closed after validation.
 
 use crate::bounded_json::JsonCursor;
 use personalai_engine_crypto::hash_sha256;
+use personalai_engine_tokenizer::{
+    AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT, AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID,
+    AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE, AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT,
+    AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID, AIPTOK_QWEN25_PINNED_MERGE_COUNT,
+    AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE,
+};
 use personalai_engine_types::{EngineError, Sha256Digest};
 use std::collections::{HashMap, HashSet};
 
@@ -19,19 +26,19 @@ pub const QWEN25_TOKENIZER_SHA256: &str =
 /// Exact source tokenizer byte length.
 pub const QWEN25_TOKENIZER_BYTES: usize = 7_031_645;
 /// BPE-model vocabulary entries in the pinned tokenizer source.
-pub const QWEN25_BPE_VOCABULARY_SIZE: u32 = 151_643;
+pub const QWEN25_BPE_VOCABULARY_SIZE: u32 = AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE;
 /// Added-token entries in the pinned tokenizer source.
-pub const QWEN25_ADDED_TOKEN_COUNT: u32 = 22;
+pub const QWEN25_ADDED_TOKEN_COUNT: u32 = AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT;
 /// Total token IDs explicitly defined by the tokenizer source.
-pub const QWEN25_DEFINED_TOKEN_COUNT: u32 = 151_665;
+pub const QWEN25_DEFINED_TOKEN_COUNT: u32 = AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT;
 /// Embedding rows declared by the paired Qwen2.5 model configuration.
-pub const QWEN25_MODEL_VOCABULARY_SIZE: u32 = 151_936;
+pub const QWEN25_MODEL_VOCABULARY_SIZE: u32 = AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE;
 /// Exact BPE merge count in the pinned tokenizer source.
-pub const QWEN25_MERGE_COUNT: u32 = 151_387;
+pub const QWEN25_MERGE_COUNT: u32 = AIPTOK_QWEN25_PINNED_MERGE_COUNT;
 /// Qwen2.5 end-of-text/BOS-compatible token ID. It is not inserted implicitly.
-pub const QWEN25_BOS_TOKEN_ID: u32 = 151_643;
+pub const QWEN25_BOS_TOKEN_ID: u32 = AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID;
 /// Qwen2.5 instruction end token ID.
-pub const QWEN25_EOS_TOKEN_ID: u32 = 151_645;
+pub const QWEN25_EOS_TOKEN_ID: u32 = AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID;
 
 const QWEN25_PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const MAX_SOURCE_TOKEN_BYTES: usize = 256;
@@ -152,7 +159,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Qwen25TokenizerDescriptor, EngineError> {
 pub fn convert(bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
     let _ = inspect(bytes)?;
     Err(EngineError::unsupported_tokenizer(
-        "Qwen2.5 requires reviewed NFC, Unicode regex pre-tokenization, no-unknown semantics, and a sparse model-vocabulary boundary",
+        "AIPTok v2 table parsing exists, but Qwen2.5 conversion remains disabled until exact NFC/category pre-tokenization and executable encode/decode semantics are qualified",
     ))
 }
 

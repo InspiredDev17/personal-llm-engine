@@ -27,7 +27,7 @@ Green authority.
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
-| `engine-tokenizer` | first-party AIPTok Byte-Level BPE v1 format, immutable tables, bounded encode/decode and incremental UTF-8 decode |
+| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed data-only `AIPTOK02` Qwen2.5 table parser; immutable v1 encode/decode/incremental decode remains the only runtime path |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 lifecycle semantics and Knowledge 1.2 exact prefix framing |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
@@ -179,15 +179,16 @@ kernels.
 This is engine-private package/runtime support, not a production model
 approval. The offline importer still produces only the legacy Llama mapping,
 although it now contains the fail-closed Qwen source inspection/mapping
-transition. The Model Foundry registry V2 compatibility profile still names
-manifest v1.0, and no exact Qwen tokenizer converter or signed Qwen package
-exists here. The current service returns the earlier typed future-engine
-rejection;
-after an eventual runtime revision bump it still returns
-`UnsupportedTokenizer` instead of applying AIPTok v1 semantics incorrectly.
-Model Foundry, the tokenizer runtime, and a qualified optimized backend must add
-and qualify those supply-chain/execution artifacts before the Qwen path can be
-activated.
+transition. `engine-tokenizer` recognizes and fully validates a separate
+data-only `AIPTOK02` table profile, but deliberately returns
+`UnsupportedTokenizer` rather than constructing an approximate Qwen runtime.
+The Model Foundry registry V2 compatibility profile still names manifest v1.0,
+and no exact Qwen tokenizer converter or signed Qwen package exists here. The
+current service returns the earlier typed future-engine rejection; after an
+eventual runtime revision bump it still reaches the closed tokenizer gate.
+Exact NFC/category-aware pre-tokenization, encode/decode/incremental decode,
+conversion, independent vectors, Model Foundry admission, and a qualified
+optimized backend must be implemented and qualified before activation.
 
 ## Trusted execution placement
 
@@ -331,8 +332,9 @@ decision and migration gate.
 
 ## Tokenizer boundary
 
-`tokenizer.aiptok` uses magic `AIPTOK01`, version 1.0, a fixed 128-byte
-little-endian header, explicit family/normalization/unknown/decoder IDs,
+The executable `tokenizer.aiptok` profile uses magic `AIPTOK01`, version 1.0,
+a fixed 128-byte little-endian header, explicit
+family/normalization/unknown/decoder IDs,
 contiguous vocabulary IDs, length-prefixed vocabulary bytes, fixed 16-byte
 ranked merge records, fixed 8-byte special-token records, required BOS/EOS/UNK
 IDs, per-package input/output limits, and an internal SHA-384 content hash.
@@ -358,6 +360,19 @@ components, template text, extra fields, lossy mappings, and trailing data fail
 closed. The source metadata SHA-384, filename, and format are signed through
 package provenance. There is no diagnostic mode that can emit an approved
 lossy package.
+
+`AIPTOK02` is a distinct, non-executable Qwen2.5 parser profile; it never
+reinterprets v1. Its fixed 160-byte header declares the closed NFC,
+Unicode-property pre-tokenizer, GPT-2 byte-symbol decoder, no-unknown and
+no-implicit-BOS/EOS behavior identities. Contiguous vocabulary records,
+fixed-width merge/added-token records, a complete 256-byte permutation, checked
+offsets, declared limits, exact special roles, and a SHA-384 table hash are
+validated under aggregate memory accounting. For the pinned production counts,
+the parser also fixes all 22 added-token literals/roles and distinguishes
+151,665 defined token IDs from 151,936 model logits. Undefined tail IDs are
+always invalid. The public runtime validates this structure and then returns
+`UnsupportedTokenizer`; it provides no v2 encode, decode, incremental decode,
+normalization, or pre-tokenizer behavior. ADR-0035 records the activation gate.
 
 ## Local protocol and authentication
 

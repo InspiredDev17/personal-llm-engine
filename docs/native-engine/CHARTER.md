@@ -54,12 +54,15 @@ closed package file set. It has no network, subprocess, plugin, pickle, Python,
 or repository-code execution capability. The production loader cannot import
 source formats; it opens only an already converted registered directory.
 
-The sole tokenizer family is AIPTok Byte-Level BPE v1. It preserves exact
-input bytes, has mandatory byte fallback and fixed decoder behavior, and
-contains no programmable normalization, pre-tokenizer, chat template, role,
-tool, prompt-file, policy, or remote-code behavior. Go assembles chat text and
-retains every policy boundary. Rust treats prompt text and explicit token data
-only as bounded inference input.
+The sole executable tokenizer family is AIPTok Byte-Level BPE v1. It preserves
+exact input bytes, has mandatory byte fallback and fixed decoder behavior. A
+separate `AIPTOK02` Qwen2.5 data-only parser foundation validates closed tables
+but cannot create an executable tokenizer until exact NFC and Unicode-category
+semantics are dependency-reviewed and independently qualified. Neither format
+contains programmable normalization, arbitrary pre-tokenizers, chat templates,
+roles, tools, prompt-file, policy, or remote-code behavior. Go assembles chat
+text and retains every policy boundary. Rust treats prompt text and explicit
+token data only as bounded inference input.
 
 The implemented V1 CPU path is validated by a tiny deterministic test package.
 That fixture is not a production model. No production model is bundled or

@@ -1,9 +1,21 @@
-//! First-party, bounded AIPTok Byte-Level BPE v1 tokenizer.
+//! First-party, bounded AIPTok tokenizer formats.
 //!
-//! AIPTok preserves input bytes exactly. It performs no Unicode or locale
-//! normalization, contains no scripts/templates/plugins, and selects no code.
-//! The only accepted family is a fixed byte-fallback BPE with declarative merge
-//! ranks and an explicit, caller-selected special-token policy.
+//! AIPTok v1 preserves input bytes exactly and remains the only executable
+//! profile. The separate AIPTok v2/Qwen2.5 wire parser validates a fixed,
+//! data-only byte-level BPE profile but deliberately cannot construct a runtime
+//! tokenizer until the exact NFC and Unicode-category implementation is
+//! dependency-reviewed and independently qualified.
+
+mod qwen_v2;
+
+pub use qwen_v2::{
+    AIPTOK_QWEN25_HEADER_BYTES, AIPTOK_QWEN25_MAGIC, AIPTOK_QWEN25_PINNED_ADDED_TOKEN_COUNT,
+    AIPTOK_QWEN25_PINNED_BOS_TOKEN_ID, AIPTOK_QWEN25_PINNED_BPE_VOCABULARY_SIZE,
+    AIPTOK_QWEN25_PINNED_DEFINED_TOKEN_COUNT, AIPTOK_QWEN25_PINNED_EOS_TOKEN_ID,
+    AIPTOK_QWEN25_PINNED_MERGE_COUNT, AIPTOK_QWEN25_PINNED_MODEL_VOCABULARY_SIZE,
+    AipTokQwen25AddedRole, AipTokQwen25AddedToken, AipTokQwen25Definition, AipTokQwen25Merge,
+    AipTokQwen25VocabularyEntry, Qwen25AipTokDescriptor, inspect_qwen25_aiptok,
+};
 
 use personalai_engine_crypto::hash_package;
 use personalai_engine_memory::{MemoryPool, MemoryReservation};
@@ -52,6 +64,8 @@ type SpecialLiteral = (Box<[u8]>, u32);
 pub enum TokenizerFormat {
     /// AIPTok Byte-Level BPE v1.
     AipTokByteLevelBpeV1,
+    /// Data-only AIPTok v2/Qwen2.5 format; runtime activation remains disabled.
+    AipTokQwen25ByteLevelBpeV2,
 }
 
 /// Deliberately narrow input normalization policy.
@@ -297,6 +311,12 @@ pub struct FirstPartyBpeTokenizer {
 impl FirstPartyBpeTokenizer {
     /// Parses canonical AIPTok data under an aggregate memory pool.
     pub fn parse(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
+        if data.get(..AIPTOK_QWEN25_MAGIC.len()) == Some(AIPTOK_QWEN25_MAGIC.as_slice()) {
+            let _ = inspect_qwen25_aiptok(data, pool)?;
+            return Err(EngineError::unsupported_tokenizer(
+                "AIPTok v2/Qwen2.5 execution remains disabled until exact NFC and Unicode-category semantics are qualified",
+            ));
+        }
         let admission = parse_header(data)?;
         let reservation_bytes = persistent_reservation_bytes(
             data.len(),

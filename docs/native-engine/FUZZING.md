@@ -18,8 +18,8 @@ reproducible.
 | Target | Boundary | Per-input ceiling |
 | --- | --- | ---: |
 | `model_package` | complete canonical `ParsedModelPackage` parser | 8 MiB campaign input |
-| `tokenizer_data` | retained first-party AIPTok parser compatibility target | 8 MiB input and 128 MiB accounting pool |
-| `aiptok_parser` | AIPTok Byte-Level BPE v1 parser | 8 MiB input and 128 MiB accounting pool |
+| `tokenizer_data` | retained first-party AIPTok factory compatibility target; validates v1 and data-only v2 before v2's deliberate unsupported result | 8 MiB input and 128 MiB accounting pool |
+| `aiptok_parser` | executable AIPTok v1 plus the fail-closed data-only AIPTok v2/Qwen2.5 table parser | 8 MiB input and 128 MiB accounting pool |
 | `aiptok_encode` | arbitrary byte-oriented encode input | 64 KiB input |
 | `aiptok_decode` | arbitrary little-endian token-ID sequence | 256 KiB input |
 | `aiptok_incremental` | arbitrary incremental decoder token state | 256 KiB input |
@@ -41,8 +41,11 @@ exercise declared hard-limit behavior.
 
 The corpus generator is Rust-only and additionally produces valid directory
 manifest/tensor-record/F32-F16-BF16 safetensors/package-name seeds plus
-malformed boundary seeds. It retains the decoder package, tokenizer, and frame
-seeds. The decoder seed is generated from the current two-layer
+malformed boundary seeds. It retains the decoder package, executable v1
+tokenizer, data-only v2 tokenizer-table, and frame seeds. The v2 seed exercises
+only bounded format validation; encode/decode/incremental targets remain v1-only
+until ADR-0035's exact Unicode gate closes. The decoder seed is generated from
+the current two-layer
 grouped-query-attention fixture, so corpus verification catches stale fixture
 bytes:
 
@@ -93,6 +96,13 @@ corpus. It reached 393 coverage counters and 731 features, stayed below 43 MiB
 RSS, and produced no crash, sanitizer, timeout, or resource-limit artifact.
 Non-fatal local `atos` symbolizer warnings did not stop the campaign. This is
 smoke evidence only, not a completeness claim.
+
+The data-only AIPTok v2 seed received a separate bounded 1,000-run macOS ARM64
+`aiptok_parser` campaign on 2026-08-22 using a temporary one-seed corpus. It
+reached 548 coverage counters and 587 features, stayed at or below 44 MiB RSS,
+and produced no crash, sanitizer, timeout, or resource-limit artifact. The
+local `atos` symbolizer warning was non-fatal. This is parser smoke evidence,
+not Unicode/runtime conformance or production qualification.
 
 After adding valid F16 and BF16 source coverage, the `safetensors_import`
 target received a separate bounded 1,000-run macOS ARM64 smoke campaign on

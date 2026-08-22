@@ -52,6 +52,13 @@ implementation. They do not fetch remote code, inspect model data, or ship as a
 runtime model capability. Any version, feature, source, or package-set change
 requires renewal of this record and the automated exact-allowlist test.
 
+The AIPTok v2 parser foundation changes no package in this inventory. Exact
+Qwen2.5 runtime tokenization needs NFC and Unicode General Category semantics
+that are absent from Rust `std`; potential narrow Unicode crates remain
+unapproved and outside `Cargo.toml`, `Cargo.lock`, the vendor tree, and release
+SBOM. Accordingly this revision parses only data tables and returns an explicit
+unsupported error before execution.
+
 `zeroize 1.8.2` was reviewed on 2026-08-11 as a RustCrypto-maintained memory
 clearing primitive. It has no build script, network, filesystem, process,
 dynamic-loading, AI, or model surface in this graph. Default and derive

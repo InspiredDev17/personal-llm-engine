@@ -6,6 +6,10 @@ use personalai_engine_model_format::{
 use personalai_engine_model_importer::convert_aiptok_metadata;
 use personalai_engine_protocol::{Frame, FrameKind};
 use personalai_engine_testkit::DecoderPackageFixtureBuilder;
+use personalai_engine_tokenizer::{
+    AipTokQwen25AddedRole, AipTokQwen25AddedToken, AipTokQwen25Definition,
+    AipTokQwen25Merge, AipTokQwen25VocabularyEntry,
+};
 use personalai_engine_types::{ContextLimit, DType, ModelId, ModelPackageHash, TensorShape};
 use std::error::Error;
 use std::fs;
@@ -18,11 +22,61 @@ fn write_seed(root: &Path, target: &str, name: &str, bytes: &[u8]) -> Result<(),
     Ok(())
 }
 
+fn qwen_v2_parser_seed() -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut vocabulary = (0_u32..256)
+        .map(|token_id| {
+            Ok(AipTokQwen25VocabularyEntry {
+                token_id,
+                bytes: vec![255_u8 - u8::try_from(token_id)?],
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    vocabulary.extend([
+        AipTokQwen25VocabularyEntry { token_id: 256, bytes: b"ab".to_vec() },
+        AipTokQwen25VocabularyEntry { token_id: 257, bytes: b"abc".to_vec() },
+        AipTokQwen25VocabularyEntry { token_id: 258, bytes: b"<|endoftext|>".to_vec() },
+        AipTokQwen25VocabularyEntry { token_id: 259, bytes: b"<|im_start|>".to_vec() },
+        AipTokQwen25VocabularyEntry { token_id: 260, bytes: b"<|im_end|>".to_vec() },
+        AipTokQwen25VocabularyEntry { token_id: 261, bytes: b"<tool_call>".to_vec() },
+    ]);
+    let byte_token_ids = std::array::from_fn(|byte| {
+        u32::try_from(255_usize - byte).expect("byte-map index remains within u32")
+    });
+    Ok(AipTokQwen25Definition {
+        vocabulary,
+        bpe_vocabulary_size: 258,
+        model_vocabulary_size: 270,
+        merges: vec![
+            AipTokQwen25Merge { rank: 0, left: 158, right: 157, result: 256 },
+            AipTokQwen25Merge { rank: 1, left: 256, right: 156, result: 257 },
+        ],
+        added_tokens: vec![
+            AipTokQwen25AddedToken {
+                token_id: 258,
+                role: AipTokQwen25AddedRole::BeginningOfSequence,
+            },
+            AipTokQwen25AddedToken { token_id: 259, role: AipTokQwen25AddedRole::Special },
+            AipTokQwen25AddedToken {
+                token_id: 260,
+                role: AipTokQwen25AddedRole::EndOfSequence,
+            },
+            AipTokQwen25AddedToken { token_id: 261, role: AipTokQwen25AddedRole::Ordinary },
+        ],
+        byte_token_ids,
+        beginning_of_sequence_token: 258,
+        end_of_sequence_token: 260,
+        maximum_input_bytes: 4096,
+        maximum_produced_tokens: 4096,
+    }
+    .encode()?)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
     let fixture = DecoderPackageFixtureBuilder::new().build()?;
     let parsed = ParsedModelPackage::parse(fixture.bytes())?;
     let tokenizer = parsed.tokenizer_data(fixture.bytes())?;
+    let qwen_v2_tokenizer = qwen_v2_parser_seed()?;
     let capability = Frame::new(FrameKind::Capability, b"capabilities".to_vec())?.encode()?;
     let hash = |byte| ModelPackageHash::from_sha384_bytes([byte; ModelPackageHash::BYTE_LEN]);
     let tensor = DirectoryTensorRecord::new(
@@ -119,8 +173,10 @@ unknown_token_id=258\nmaximum_input_bytes=4096\nmaximum_produced_tokens=4096\n",
     write_seed(&corpus, "model_package", "valid-decoder.paipkg", fixture.bytes())?;
     write_seed(&corpus, "model_package", "truncated-magic", b"PAIMDL")?;
     write_seed(&corpus, "tokenizer_data", "valid-byte-bpe.bin", tokenizer)?;
+    write_seed(&corpus, "tokenizer_data", "valid-qwen-v2.aiptok", &qwen_v2_tokenizer)?;
     write_seed(&corpus, "tokenizer_data", "truncated-magic", b"AIPTOK")?;
     write_seed(&corpus, "aiptok_parser", "valid.aiptok", tokenizer)?;
+    write_seed(&corpus, "aiptok_parser", "valid-qwen-v2.aiptok", &qwen_v2_tokenizer)?;
     write_seed(&corpus, "aiptok_parser", "truncated-magic", b"AIPTOK")?;
     write_seed(&corpus, "aiptok_encode", "utf8-and-null", b"hello \xf0\x9f\xa6\x80\0")?;
     write_seed(&corpus, "aiptok_decode", "mixed-token-ids", &token_sequence)?;

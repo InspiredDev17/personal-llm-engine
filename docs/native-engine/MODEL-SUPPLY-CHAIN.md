@@ -68,13 +68,21 @@ single-file tensor identities, canonical tensor names/shapes, Q/K/V biases, and
 tied output. It still emits only the legacy profile; the Model Foundry Registry
 V2 compatibility string remains legacy-only, so neither component can create
 or approve a Qwen2.5 v1.1 artifact. Activation requires a reviewed first-party
-tokenizer revision implementing the exact fixed Qwen NFC/regex/ByteLevel and
+tokenizer runtime implementing the exact fixed Qwen NFC/category/ByteLevel and
 no-implicit-BOS semantics without arbitrary tokenizer graphs or chat templates,
 exact descriptor preflight bound to the securely opened source, v1.1 emission,
 independent numeric vectors, engine 0.2, a qualified optimized backend, and a
 new signed registry decision. AIPTok v1 cannot be relabeled as that tokenizer.
 The production engine does not infer or manufacture any of those supply-chain
 decisions.
+
+`AIPTOK02` is now reserved as a separate data-only Qwen2.5 table format. Its
+bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
+records, exact byte mapping, special roles, declared resource limits, table
+hash, undefined logit tail, and the pinned 22-token suffix when production
+counts are present. It is not an executable tokenizer and the importer cannot
+emit it from `tokenizer.json`. Runtime construction remains fail-closed pending
+the exact Unicode and conformance gates in ADR-0035.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:
 its first step is estimated at 1,543,712,768 checked operations, including the

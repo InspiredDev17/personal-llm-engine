@@ -5324,7 +5324,7 @@ fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), EngineE
 fn validate_service_tokenizer_semantics(architecture: &str) -> Result<(), EngineError> {
     if architecture == QWEN2_DECODER_ARCHITECTURE_ID {
         return Err(EngineError::unsupported_tokenizer(
-            "Qwen2.5 prompt tokenization is not implemented by AIPTok v1",
+            "AIPTok v2 tables are parseable, but exact Qwen2.5 tokenizer execution remains disabled",
         ));
     }
     Ok(())

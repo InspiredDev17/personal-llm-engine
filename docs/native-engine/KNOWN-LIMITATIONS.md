@@ -25,10 +25,13 @@
   0.2.0 artifacts. The current 0.1.0 loader rejects them. Tiny configurations
   provide scalar math evidence only; the exact 1.5B position-zero estimate is
   1,543,712,768 operations and fails the 100,000,000-operation scalar ceiling
-  before model materialization. The offline importer, standard tokenizer
-  conversion, Model Foundry registry compatibility profile, optimized backend,
-  signed package, independent logits, and production qualification remain
-  absent. ARM64 and Metal reject the identifier. A second authenticated-service
+  before model materialization. A bounded data-only `AIPTOK02` Qwen table
+  parser now exists, but exact NFC/category pre-tokenization,
+  encode/decode/incremental decode and importer conversion do not. Offline
+  importer emission, the Model Foundry registry compatibility profile, an
+  optimized backend, signed package, independent logits, and production
+  qualification remain absent. ARM64 and Metal reject the identifier. A second
+  authenticated-service
   tokenizer gate prevents AIPTok v1 from being mislabeled after any future
   engine-version activation.
 - Only synthetic signed tiny packages are qualified. No production model,

@@ -33,19 +33,23 @@ The shared pinned tokenizer is not representable by `PAIBPE01`:
 - it defines token IDs through 151664 while model embeddings contain 151936
   rows.
 
-The importer therefore performs bounded, non-recursive inspection but emits no
-lossy AIPTok conversion. The transition converter returns
-`UnsupportedTokenizer`. Adding a general regex crate or pretending byte-only
-tokenization is equivalent is prohibited. An exact first-party tokenizer
-runtime plus independent conformance vectors is required before packaging.
+The importer therefore performs bounded, non-recursive source inspection but
+emits no lossy AIPTok conversion. A separate `AIPTOK02` foundation now validates
+the closed data tables, byte map, merge graph, added-token roles, undefined
+model-vocabulary tail and hard limits. The runtime validates that format and
+then returns `UnsupportedTokenizer`: exact NFC, Unicode-category
+pre-tokenization, encode/decode/incremental decode and source conversion remain
+absent. Adding a general regex crate or pretending byte-only tokenization is
+equivalent is prohibited. Approved offline-vendored Unicode support and
+independent conformance vectors are required before packaging. See ADR-0035.
 
 ## Package boundary
 
 `PAIDIR01` v1.1 and the scalar Qwen correctness scaffold now exist without
 changing v1.0. That does not activate the source profile: v1.1 deliberately
 requires engine 0.2.0 while the current engine is 0.1.0, the exact tokenizer
-converter/runtime remains absent, Registry V2 remains legacy-only, and the
-full profile exceeds the scalar oracle ceiling without a qualified optimized
+converter/executable runtime remains absent, Registry V2 remains legacy-only,
+and the full profile exceeds the scalar oracle ceiling without a qualified optimized
 backend. Package emission therefore still returns `NotImplemented`; none of
 these source files are approved, signed, activated, or loadable.
 Every public package/import entry performs this unsupported-target check before
