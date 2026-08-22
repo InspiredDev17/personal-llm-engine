@@ -56,6 +56,7 @@ personalai-engine-scheduler = { path = "crates/engine-scheduler" }
 personalai-engine-protocol = { path = "crates/engine-protocol" }
 personalai-engine-server = { path = "crates/engine-server", default-features = false }
 personalai-engine-testkit = { path = "crates/engine-testkit" }
+sovereign-ai-contracts = { git = "https://github.com/InspiredDev17/Sovereign-AI-Contracts.git", rev = "2c4a7a6afd5625e7def3afec26f18fedac343d11", default-features = false, features = ["runtime-v3"] }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 sha2 = { version = "=0.11.0", default-features = false }
 libc = { version = "=0.2.189", default-features = false }

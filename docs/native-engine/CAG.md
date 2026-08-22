@@ -86,11 +86,12 @@ The engine independently rechecks UTF-8, NUL absence, the 8 MiB canonical ceilin
 positive canonical decimal frames with at most ten length digits, its stricter request-size bound,
 and the ordered-prefix digest before tokenization.
 
-The current Contracts Rust crate still cannot compile Knowledge 1.1 under `runtime-v3` alone
-because its lifecycle module imports the `full`-gated knowledge module. Pulling `full` would import
-control-plane domains and JSON dependencies prohibited here, so the engine does not depend directly
-on that broad feature. Activating either experimental contract remains an explicit downstream
-decision.
+The engine pins Contracts commit
+`2c4a7a6afd5625e7def3afec26f18fedac343d11` and intentionally compiles only its minimal
+`runtime-v3` feature. That feature boundary now builds independently and excludes Knowledge
+lifecycle and control-plane modules by design. CAG therefore remains a reviewed internal binary
+projection of the Knowledge 1.1/1.2 execution facts rather than a second canonical JSON consumer.
+Activating either experimental contract remains an explicit downstream decision.
 
 Portable interoperability was exercised against Memory-Vault commit
 `a25f76ac6ac932ff4dfa7a1ec51441c8020a4a98` and the real AI-Avenger native client at commit

@@ -1,8 +1,9 @@
 # Resolved Dependency Inventory
 
-Source for every entry: locked crates.io registry with checksum in `Cargo.lock`.
-No entry supplies AI, tensor, tokenizer, model-loading, scheduling, serving,
-networking, dynamic loading, or GPU kernels.
+Sources are either the locked crates.io registry checksum in `Cargo.lock` or the
+single exact Sovereign AI Contracts Git commit recorded below. No entry supplies
+AI, tensor, tokenizer, model-loading, scheduling, serving, networking, dynamic
+loading, or GPU kernels.
 
 | Package | License | Purpose and attack-surface justification |
 | --- | --- | --- |
@@ -29,6 +30,22 @@ networking, dynamic loading, or GPU kernels.
 | `unicode-ident 1.0.24` | (MIT OR Apache-2.0) AND Unicode-3.0 | Rust identifier parsing beneath proc macros |
 | `rustc_version 0.4.1` | MIT OR Apache-2.0 | Locked curve build-time compiler capability selection; no fetch |
 | `semver 1.0.28` | MIT OR Apache-2.0 | Version parsing for `rustc_version` |
+| `sovereign-ai-contracts 3.0.0` at `2c4a7a6afd5625e7def3afec26f18fedac343d11` | Apache-2.0 | Direct canonical provider-neutral runtime-v3 data contract; only the minimal `runtime-v3` feature is compiled, excluding cognitive/tool/memory/security authority modules |
+| `serde 1.0.229` | MIT OR Apache-2.0 | Strict bounded runtime-v3 document serialization support beneath the canonical contract |
+| `serde_core 1.0.229` | MIT OR Apache-2.0 | Serde core traits beneath the canonical contract |
+| `serde_derive 1.0.229` | MIT OR Apache-2.0 | Offline compile-time derivation for closed canonical contract documents |
+| `serde_json 1.0.151` | MIT OR Apache-2.0 | Strict JSON decoding/encoding for canonical runtime-v3 documents; no network or filesystem access |
+| `itoa 1.0.18` | MIT OR Apache-2.0 | Integer serialization beneath `serde_json` |
+| `memchr 2.8.3` | Unlicense OR MIT | Bounded byte scanning beneath `serde_json` |
+| `zmij 1.0.23` | MIT | Numeric formatting beneath the locked `serde_json` implementation |
+| `sha2 0.10.9` | MIT OR Apache-2.0 | Canonical runtime-v3 SHA-256 output and idempotency digest validation inside Sovereign Contracts |
+| `digest 0.10.7` | MIT OR Apache-2.0 | SHA-2 0.10 trait/internal support beneath the canonical contract |
+| `block-buffer 0.10.4` | MIT OR Apache-2.0 | SHA-2 0.10 fixed-block buffering |
+| `crypto-common 0.1.7` | MIT OR Apache-2.0 | SHA-2 0.10 shared types |
+| `generic-array 0.14.7` | MIT | Fixed-size digest arrays beneath SHA-2 0.10 |
+| `cpufeatures 0.2.17` | MIT OR Apache-2.0 | Fixed CPU feature selection beneath SHA-2 0.10; no plugin/loading surface |
+| `version_check 0.9.5` | MIT OR Apache-2.0 | Offline compiler capability selection beneath fixed-size crypto arrays |
+| `syn 3.0.3` | MIT OR Apache-2.0 | Offline Serde derive parsing |
 
 The proc-macro/build entries execute only while compiling the locked crypto
 implementation. They do not fetch remote code, inspect model data, or ship as a

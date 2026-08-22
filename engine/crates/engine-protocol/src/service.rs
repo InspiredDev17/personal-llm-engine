@@ -66,6 +66,16 @@ pub enum ServiceMessageKind {
     ModelDescriptor = 20,
     /// Acknowledge delivery of a previously polled security-event prefix.
     AcknowledgeSecurityEvents = 21,
+    /// Query canonical inference-runtime-v3 availability.
+    RuntimeV3Availability = 22,
+    /// Evaluate one canonical inference-runtime-v3 reservation request.
+    RuntimeV3Reserve = 23,
+    /// Apply one canonical inference-runtime-v3 cancellation request.
+    RuntimeV3Cancel = 24,
+    /// Apply one canonical inference-runtime-v3 reservation release.
+    RuntimeV3Release = 25,
+    /// Execute one admitted canonical inference-runtime-v3 request.
+    RuntimeV3Execute = 26,
     /// Create one sealed reusable prefix cache from a loaded registered model.
     CreateReusableCache = 27,
     /// Describe one scope-authorized reusable cache.
@@ -106,6 +116,11 @@ impl ServiceMessageKind {
             19 => Ok(Self::SecurityEvents),
             20 => Ok(Self::ModelDescriptor),
             21 => Ok(Self::AcknowledgeSecurityEvents),
+            22 => Ok(Self::RuntimeV3Availability),
+            23 => Ok(Self::RuntimeV3Reserve),
+            24 => Ok(Self::RuntimeV3Cancel),
+            25 => Ok(Self::RuntimeV3Release),
+            26 => Ok(Self::RuntimeV3Execute),
             27 => Ok(Self::CreateReusableCache),
             28 => Ok(Self::DescribeCache),
             29 => Ok(Self::ListCaches),
@@ -133,6 +148,11 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::RuntimeV3Availability
+                | Self::RuntimeV3Reserve
+                | Self::RuntimeV3Cancel
+                | Self::RuntimeV3Release
+                | Self::RuntimeV3Execute
                 | Self::CreateReusableCache
                 | Self::DescribeCache
                 | Self::ListCaches
@@ -162,6 +182,11 @@ impl ServiceMessageKind {
                 | Self::SecurityEvents
                 | Self::ModelDescriptor
                 | Self::AcknowledgeSecurityEvents
+                | Self::RuntimeV3Availability
+                | Self::RuntimeV3Reserve
+                | Self::RuntimeV3Cancel
+                | Self::RuntimeV3Release
+                | Self::RuntimeV3Execute
                 | Self::CreateReusableCache
                 | Self::DescribeCache
                 | Self::ListCaches
@@ -604,17 +629,27 @@ mod tests {
     }
 
     #[test]
-    fn cache_message_numbers_do_not_collide_with_runtime_v3_reservations() {
-        assert_eq!(ServiceMessageKind::CreateReusableCache as u8, 27);
-        assert_eq!(ServiceMessageKind::CacheMetrics as u8, 33);
-        assert_eq!(
-            ServiceMessageKind::from_byte(27).expect("CAG create kind"),
-            ServiceMessageKind::CreateReusableCache
-        );
-        assert_eq!(
-            ServiceMessageKind::from_byte(33).expect("CAG metrics kind"),
-            ServiceMessageKind::CacheMetrics
-        );
+    fn runtime_v3_and_cache_message_numbers_are_exact_unique_and_closed() {
+        let expected = [
+            ServiceMessageKind::RuntimeV3Availability,
+            ServiceMessageKind::RuntimeV3Reserve,
+            ServiceMessageKind::RuntimeV3Cancel,
+            ServiceMessageKind::RuntimeV3Release,
+            ServiceMessageKind::RuntimeV3Execute,
+            ServiceMessageKind::CreateReusableCache,
+            ServiceMessageKind::DescribeCache,
+            ServiceMessageKind::ListCaches,
+            ServiceMessageKind::AttachCache,
+            ServiceMessageKind::ReleaseCache,
+            ServiceMessageKind::InvalidateCache,
+            ServiceMessageKind::CacheMetrics,
+        ];
+        for (offset, kind) in expected.into_iter().enumerate() {
+            let encoded = 22_u8.checked_add(u8::try_from(offset).expect("bounded offset")).unwrap();
+            assert_eq!(kind as u8, encoded);
+            assert_eq!(ServiceMessageKind::from_byte(encoded).expect("known kind"), kind);
+        }
+        assert!(ServiceMessageKind::from_byte(34).is_err());
     }
 
     #[test]

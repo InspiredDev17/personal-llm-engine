@@ -8,13 +8,14 @@ exact-prefix integration.
 ## Context
 
 Sovereign-AI-Contracts commit
-`2eaa6c23e6334df9b1309dcb28a0a8d15ebb5356` defines the canonical CAG cache
+`2eaa6c23e6334df9b1309dcb28a0a8d15ebb5356` first defined the canonical CAG cache
 lifecycle at version 1.1.0 and exact static-prefix acquisition at version
-1.2.0. The engine already used authenticated fixed binary service kinds 27
-through 33. Directly enabling the Contracts Rust `full` feature would import
-unrelated control-plane domains and general JSON support. The narrower
-`runtime-v3` profile still cannot compile Knowledge 1.1 by itself because its
-lifecycle module imports the `full`-gated knowledge module.
+1.2.0. The engine's current Contracts pin is
+`2c4a7a6afd5625e7def3afec26f18fedac343d11`, whose minimal `runtime-v3`
+feature builds independently and intentionally excludes Knowledge lifecycle
+and control-plane modules. The engine already used authenticated fixed binary
+service kinds 27 through 33. Enabling the Contracts Rust `full` feature would
+still import unrelated control-plane domains and general JSON support.
 
 ## Decision
 

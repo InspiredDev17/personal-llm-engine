@@ -37,8 +37,8 @@ Green authority.
 | `engine-transformer` | fixed decoder configuration, tensor inventory, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
-| `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding and the fixed-binary internal Knowledge 1.1 cache adapter |
-| `engine-server` | service composition, protected UDS and owner-selected CPU/Metal runtime |
+| `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding, bounded canonical Runtime-v3 documents, and the fixed-binary internal Knowledge 1.1 cache adapter |
+| `engine-server` | service composition, protected UDS, owner-selected CPU/Metal runtime, reusable cache lifecycle, and the bounded inference-runtime-v3 semantic reservation lifecycle |
 | `engine-cli` | owner configuration, explicit backend policy and daemon entrypoint |
 | `engine-testkit` | deterministic non-production signed fixtures and boundary tests |
 
@@ -47,6 +47,46 @@ dependency family is the reviewed RustCrypto SHA-384/Ed25519 graph plus `libc`
 constants used by Unix no-follow openers, the isolated nonblocking `flock`
 call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no third-party AI, tensor,
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
+
+The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
+commit `2c4a7a6afd5625e7def3afec26f18fedac343d11`. It does not define or parse a
+second wire format. A strict bounded adapter consumes only canonical v3
+documents decoded by the pinned Contracts implementation, maps them into the
+engine state machine, revalidates engine-owned identity before reservation and
+consumption, and emits canonical decision/result documents. The in-memory state
+machine enforces exact identity/correlation, finite capacity, idempotent replay,
+single consumption, cancellation, release, expiry, terminal identity, and
+resource ceilings. The existing signed, replay-journaled, same-user UDS service
+now carries bounded canonical availability, reservation, cancellation, release,
+and execution documents without assigning them authentication authority.
+Execution is fail-closed unless a backend is explicitly composed; the only
+host-independent implementation in this slice is a compile-time-gated
+deterministic development simulator. Production backend dispatch and durable
+recovery of accepted reservations remain incomplete, so this is not yet an
+operated v3 inference service.
+
+Model unload has one shared fail-closed gate for both the authenticated service
+and the internal runtime API. It refuses unload while the scheduler owns the
+model, while a reusable-cache attachment is staged, or while an unexpired
+Runtime-v3 reservation holds capacity for that exact provider model. Reusable
+cache invalidation occurs only after those ownership checks pass.
+
+Cancellation remains authority-specific. The fixed-binary `Cancel` envelope
+cleans scheduler ownership and any staged reusable-cache attachment for its
+exact request ID; canonical `RuntimeV3Cancel` cleans only the fully correlated
+Runtime-v3 reservation. A control-plane request that owns both states must send
+both authenticated operations. Neither operation guesses the other authority
+from a request ID, and cancellation in one domain cannot cancel an unrelated
+neighbor in the other.
+
+An exact Runtime-v3 execution retry after a lost response returns the retained
+terminal result before re-admission, so it never invokes the backend twice.
+Altered retry content fails closed. Terminal reservation/result receipts remain
+available through the original reservation expiry; when the bounded 16,384
+record set is full, only already-terminal records whose original authority has
+expired are pruned. Active or still-valid replay state is never evicted. This
+retention is in-memory and does not replace the still-required durable accepted-
+reservation recovery gate.
 
 ## Engine release trust flow
 

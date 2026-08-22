@@ -19,8 +19,37 @@ pub const SERVICE_METRIC_COUNT: usize = 17;
 pub const SERVICE_MODEL_STATUS_BYTES: usize = 44;
 /// Maximum sanitized security events returned by one authenticated poll.
 pub const MAX_SERVICE_SECURITY_EVENTS: usize = 128;
+/// Maximum one canonical runtime-v3 JSON document carried inside an already
+/// bounded authenticated service envelope.
+pub const MAX_RUNTIME_V3_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 
 const KNOWN_CAPABILITY_BITS: u64 = 0b11_1111;
+
+/// Opaque bounded canonical runtime-v3 document bytes.
+///
+/// The protocol layer grants no meaning or authority to these bytes. The
+/// engine-server adapter must decode them with the exact pinned Sovereign
+/// Contracts implementation before acting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeV3Document(Vec<u8>);
+
+impl RuntimeV3Document {
+    /// Constructs one non-empty bounded transport document.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, EngineError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_RUNTIME_V3_DOCUMENT_BYTES {
+            return Err(EngineError::invalid_input(
+                "runtime v3 document is empty or exceeds its transport bound",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact document bytes without normalization.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// Closed request payload catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +98,16 @@ pub enum ServiceRequestBody {
     },
     /// Reusable prefix-cache operation.
     Cache(ServiceCacheRequest),
+    /// Query one canonical runtime-v3 availability snapshot.
+    RuntimeV3Availability,
+    /// Evaluate one canonical runtime-v3 reservation request.
+    RuntimeV3Reserve(RuntimeV3Document),
+    /// Apply one canonical runtime-v3 cancellation request.
+    RuntimeV3Cancel(RuntimeV3Document),
+    /// Apply one canonical runtime-v3 reservation release.
+    RuntimeV3Release(RuntimeV3Document),
+    /// Execute one previously admitted canonical runtime-v3 request.
+    RuntimeV3Execute(RuntimeV3Document),
 }
 
 impl ServiceRequestBody {
@@ -89,6 +128,11 @@ impl ServiceRequestBody {
             Self::ModelDescriptor(_) => ServiceMessageKind::ModelDescriptor,
             Self::AcknowledgeSecurityEvents { .. } => ServiceMessageKind::AcknowledgeSecurityEvents,
             Self::Cache(request) => request.kind(),
+            Self::RuntimeV3Availability => ServiceMessageKind::RuntimeV3Availability,
+            Self::RuntimeV3Reserve(_) => ServiceMessageKind::RuntimeV3Reserve,
+            Self::RuntimeV3Cancel(_) => ServiceMessageKind::RuntimeV3Cancel,
+            Self::RuntimeV3Release(_) => ServiceMessageKind::RuntimeV3Release,
+            Self::RuntimeV3Execute(_) => ServiceMessageKind::RuntimeV3Execute,
         }
     }
 
@@ -99,7 +143,8 @@ impl ServiceRequestBody {
             | Self::ListRegisteredModels
             | Self::Health
             | Self::Metrics
-            | Self::ShutdownRequest => Ok(Vec::new()),
+            | Self::ShutdownRequest
+            | Self::RuntimeV3Availability => Ok(Vec::new()),
             Self::LoadModel(model_id)
             | Self::UnloadModel(model_id)
             | Self::ModelStatus(model_id)
@@ -114,6 +159,10 @@ impl ServiceRequestBody {
                 Ok(count.to_le_bytes().to_vec())
             }
             Self::Cache(request) => request.encode(),
+            Self::RuntimeV3Reserve(document)
+            | Self::RuntimeV3Cancel(document)
+            | Self::RuntimeV3Release(document)
+            | Self::RuntimeV3Execute(document) => Ok(document.as_bytes().to_vec()),
         }
     }
 
@@ -170,6 +219,22 @@ impl ServiceRequestBody {
             | ServiceMessageKind::InvalidateCache
             | ServiceMessageKind::CacheMetrics => {
                 Ok(Self::Cache(ServiceCacheRequest::decode(kind, payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Availability => {
+                require_empty(payload)?;
+                Ok(Self::RuntimeV3Availability)
+            }
+            ServiceMessageKind::RuntimeV3Reserve => {
+                Ok(Self::RuntimeV3Reserve(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Cancel => {
+                Ok(Self::RuntimeV3Cancel(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Release => {
+                Ok(Self::RuntimeV3Release(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Execute => {
+                Ok(Self::RuntimeV3Execute(decode_runtime_v3_document(payload)?))
             }
             _ => Err(EngineError::protocol_violation("message type has no service request body")),
         }
@@ -813,6 +878,16 @@ pub enum ServiceResponseBody {
     ShutdownRejected(ShutdownRejectionReason),
     /// Shutdown was accepted through a future separate administrative path.
     ShutdownAccepted,
+    /// Canonical runtime-v3 availability document.
+    RuntimeV3Availability(RuntimeV3Document),
+    /// Canonical runtime-v3 reservation decision document.
+    RuntimeV3Reservation(RuntimeV3Document),
+    /// Exact cancellation was accepted or was an idempotent replay.
+    RuntimeV3Cancelled,
+    /// Exact reservation release was accepted or was an idempotent replay.
+    RuntimeV3Released,
+    /// Canonical identity-bound execution result document.
+    RuntimeV3Execution(RuntimeV3Document),
 }
 
 impl ServiceResponseBody {
@@ -836,6 +911,11 @@ impl ServiceResponseBody {
             Self::Error(_) => ServiceMessageKind::Error,
             Self::ShutdownRejected(_) => ServiceMessageKind::ShutdownRejected,
             Self::ShutdownAccepted => ServiceMessageKind::ShutdownAccepted,
+            Self::RuntimeV3Availability(_) => ServiceMessageKind::RuntimeV3Availability,
+            Self::RuntimeV3Reservation(_) => ServiceMessageKind::RuntimeV3Reserve,
+            Self::RuntimeV3Cancelled => ServiceMessageKind::RuntimeV3Cancel,
+            Self::RuntimeV3Released => ServiceMessageKind::RuntimeV3Release,
+            Self::RuntimeV3Execution(_) => ServiceMessageKind::RuntimeV3Execute,
         }
     }
 
@@ -849,7 +929,9 @@ impl ServiceResponseBody {
             Self::ModelLoaded
             | Self::ModelUnloaded
             | Self::ShutdownAccepted
-            | Self::SecurityEventsAcknowledged => Ok(Vec::new()),
+            | Self::SecurityEventsAcknowledged
+            | Self::RuntimeV3Cancelled
+            | Self::RuntimeV3Released => Ok(Vec::new()),
             Self::Tokenized(tokens) => encode_tokens(tokens),
             Self::Health(state) => Ok(vec![*state as u8]),
             Self::Metrics(metrics) => {
@@ -865,6 +947,9 @@ impl ServiceResponseBody {
             Self::Cache(response) => response.encode(),
             Self::Error(code) => Ok(vec![*code as u8]),
             Self::ShutdownRejected(reason) => Ok(vec![*reason as u8]),
+            Self::RuntimeV3Availability(document)
+            | Self::RuntimeV3Reservation(document)
+            | Self::RuntimeV3Execution(document) => Ok(document.as_bytes().to_vec()),
         }
     }
 
@@ -950,9 +1035,31 @@ impl ServiceResponseBody {
                 require_empty(payload)?;
                 Ok(Self::ShutdownAccepted)
             }
+            ServiceMessageKind::RuntimeV3Availability => {
+                Ok(Self::RuntimeV3Availability(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Reserve => {
+                Ok(Self::RuntimeV3Reservation(decode_runtime_v3_document(payload)?))
+            }
+            ServiceMessageKind::RuntimeV3Cancel => {
+                require_empty(payload)?;
+                Ok(Self::RuntimeV3Cancelled)
+            }
+            ServiceMessageKind::RuntimeV3Release => {
+                require_empty(payload)?;
+                Ok(Self::RuntimeV3Released)
+            }
+            ServiceMessageKind::RuntimeV3Execute => {
+                Ok(Self::RuntimeV3Execution(decode_runtime_v3_document(payload)?))
+            }
             _ => Err(EngineError::protocol_violation("message type has no service response body")),
         }
     }
+}
+
+fn decode_runtime_v3_document(payload: &[u8]) -> Result<RuntimeV3Document, EngineError> {
+    RuntimeV3Document::new(payload.to_vec())
+        .map_err(|_| EngineError::protocol_violation("runtime v3 document length is invalid"))
 }
 
 fn validate_security_event_maximum(maximum: u16) -> Result<(), EngineError> {
@@ -1391,6 +1498,8 @@ mod tests {
 
     #[test]
     fn every_request_body_round_trips_with_its_derived_kind() {
+        let runtime_document = RuntimeV3Document::new(br#"{"contract_version":"3.0.0"}"#.to_vec())
+            .expect("runtime document");
         let bodies = vec![
             ServiceRequestBody::Hello { major: 2, minor: 0 },
             ServiceRequestBody::ListCapabilities,
@@ -1408,6 +1517,11 @@ mod tests {
             ServiceRequestBody::SecurityEvents { maximum: 32 },
             ServiceRequestBody::ModelDescriptor(model("tiny-descriptor")),
             ServiceRequestBody::AcknowledgeSecurityEvents { count: 1 },
+            ServiceRequestBody::RuntimeV3Availability,
+            ServiceRequestBody::RuntimeV3Reserve(runtime_document.clone()),
+            ServiceRequestBody::RuntimeV3Cancel(runtime_document.clone()),
+            ServiceRequestBody::RuntimeV3Release(runtime_document.clone()),
+            ServiceRequestBody::RuntimeV3Execute(runtime_document.clone()),
         ];
         for body in bodies {
             let encoded = body.encode().expect("request body must encode");
@@ -1419,6 +1533,8 @@ mod tests {
 
     #[test]
     fn every_response_body_round_trips_with_its_derived_kind() {
+        let runtime_document = RuntimeV3Document::new(br#"{"contract_version":"3.0.0"}"#.to_vec())
+            .expect("runtime document");
         let capabilities = ServiceCapabilitySet::from_capabilities([
             EngineCapability::CpuReference,
             EngineCapability::UnixDomainSocket,
@@ -1479,6 +1595,11 @@ mod tests {
                 ShutdownRejectionReason::AdministrativeAuthorizationRequired,
             ),
             ServiceResponseBody::ShutdownAccepted,
+            ServiceResponseBody::RuntimeV3Availability(runtime_document.clone()),
+            ServiceResponseBody::RuntimeV3Reservation(runtime_document.clone()),
+            ServiceResponseBody::RuntimeV3Cancelled,
+            ServiceResponseBody::RuntimeV3Released,
+            ServiceResponseBody::RuntimeV3Execution(runtime_document),
         ];
         for body in bodies {
             let encoded = body.encode().expect("response body must encode");
@@ -1496,6 +1617,10 @@ mod tests {
         assert!(ServiceResponseBody::decode(ServiceMessageKind::Health, &[1, 0]).is_err());
         assert!(ServiceResponseBody::decode(ServiceMessageKind::ShutdownAccepted, &[0]).is_err());
         assert!(ServiceRequestBody::decode(ServiceMessageKind::SecurityEvents, &[0, 0]).is_err());
+        assert!(ServiceRequestBody::decode(ServiceMessageKind::RuntimeV3Reserve, &[]).is_err());
+        assert!(
+            ServiceResponseBody::decode(ServiceMessageKind::RuntimeV3Availability, &[]).is_err()
+        );
         assert!(
             ServiceRequestBody::decode(ServiceMessageKind::AcknowledgeSecurityEvents, &[0, 0])
                 .is_err()
@@ -1520,6 +1645,8 @@ mod tests {
 
     #[test]
     fn variable_payloads_reject_ambiguity_and_invalid_values() {
+        assert!(RuntimeV3Document::new(Vec::new()).is_err());
+        assert!(RuntimeV3Document::new(vec![0; MAX_RUNTIME_V3_DOCUMENT_BYTES + 1]).is_err());
         assert!(ServiceRequestBody::decode(ServiceMessageKind::Tokenize, &[5, 0, b'a']).is_err());
         assert!(
             ServiceRequestBody::decode(ServiceMessageKind::Tokenize, &[1, 0, b'm', 0],).is_err()

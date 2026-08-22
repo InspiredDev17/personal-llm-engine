@@ -1,0 +1,344 @@
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use sovereign_ai_contracts::cognitive::{
+    validate_execution_against_request, CognitiveExecutionRequest, CognitiveExecutionResult,
+};
+use sovereign_ai_contracts::common::ContractVersion;
+use sovereign_ai_contracts::identity::{ModelArtifactId, ModelId, RequestId};
+use sovereign_ai_contracts::inference_runtime_v3::{
+    InferenceExecutionRequestV3, InferenceExecutionResultV3, InferenceReservationDecisionV3,
+    InferenceReservationRequestV3, RuntimeAvailabilityV3,
+};
+use sovereign_ai_contracts::knowledge::{
+    canonical_memory_revision_invalidation_digest, canonical_static_knowledge_bundle_digest,
+    validate_memory_revision_invalidation_order, BundleInvalidationState, CacheCompatibility,
+    CacheCompatibilityOutcome, CacheResidency, CacheStatus, CagCacheBuildRequest,
+    CagCacheDescriptor, CagCacheQueryResult, CagEligibility, KnowledgePlanRequest,
+    KnowledgePlanResult, KnowledgePlanStatus, MemoryRevisionInvalidated, StaticBundleReference,
+    StaticKnowledgeBundle,
+};
+use sovereign_ai_contracts::knowledge_prefix::{
+    StaticPrefixMaterialRequest, StaticPrefixMaterialResult,
+};
+use sovereign_ai_contracts::memory::SensitivityClass;
+use sovereign_ai_contracts::qualification_v2::{
+    canonical_model_capability_digest, validate_manifest_revision, ModelCapabilityManifest,
+};
+use sovereign_ai_contracts::{Result, Validate};
+
+#[derive(Deserialize)]
+struct Manifest {
+    contract_version: String,
+    cases: Vec<Case>,
+}
+#[derive(Deserialize)]
+struct Case {
+    name: String,
+    suite: String,
+    mutation: String,
+}
+
+fn fixture<T: DeserializeOwned + Validate>(name: &str) -> T {
+    let path = format!("../fixtures/v1/valid/{name}");
+    let data = std::fs::read(path).expect("read fixture");
+    let value: T = serde_json::from_slice(&data).expect("decode fixture");
+    value.validate().expect("valid fixture");
+    value
+}
+
+#[test]
+fn shared_semantic_fixtures_fail_closed() {
+    let data = std::fs::read("../fixtures/semantic/manifest.json").expect("semantic manifest");
+    let manifest: Manifest = serde_json::from_slice(&data).expect("decode manifest");
+    assert_eq!(manifest.contract_version, "1.0.0");
+    assert!(!manifest.cases.is_empty());
+    for case in manifest.cases {
+        let outcome = match case.suite.as_str() {
+            "runtime_v3" => runtime_mutation(&case.mutation),
+            "cognitive" => cognitive_mutation(&case.mutation),
+            "qualification_v2" => qualification_mutation(&case.mutation),
+            "knowledge" => knowledge_mutation(&case.mutation),
+            "knowledge_prefix" => knowledge_prefix_mutation(&case.mutation),
+            other => panic!("unknown suite {other}"),
+        };
+        assert!(
+            outcome.is_err(),
+            "{} ({}) did not fail closed",
+            case.name,
+            case.mutation
+        );
+    }
+}
+
+fn knowledge_prefix_mutation(mutation: &str) -> Result<()> {
+    let request: StaticPrefixMaterialRequest =
+        fixture("knowledge-prefix-request-project-1.2.0.json");
+    let mut result: StaticPrefixMaterialResult =
+        fixture("knowledge-prefix-result-available-1.2.0.json");
+    match mutation {
+        "bundle_id" => {
+            result.bundle.bundle_id =
+                sovereign_ai_contracts::identity::StaticKnowledgeBundleId::new("kbn_other_bundle")?;
+        }
+        "bundle_revision" => result.bundle.bundle_revision += 1,
+        "bundle_digest" => {
+            result.bundle.bundle_digest =
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        }
+        "scope" => {
+            result.authorization_scope.project_id = Some(
+                sovereign_ai_contracts::identity::ProjectId::new("prj_other")?,
+            );
+        }
+        "sensitivity" => result.sensitivity = SensitivityClass::Public,
+        "expired_request" => return request.validate_at("2026-08-21T12:05:00Z"),
+        "expired_result" => return result.validate_at("2026-08-21T12:04:00Z"),
+        other => panic!("unknown knowledge prefix mutation {other}"),
+    }
+    result.validate_against(&request)
+}
+
+#[test]
+fn knowledge_prefix_rejects_malformed_utf8() {
+    let mut data =
+        br#"{"contract_version":"1.2.0","kind":"knowledge.static_prefix_material_request"}"#
+            .to_vec();
+    let index = data.len() - 2;
+    data[index] = 0xff;
+    assert!(serde_json::from_slice::<StaticPrefixMaterialRequest>(&data).is_err());
+}
+
+#[allow(clippy::too_many_lines)]
+fn knowledge_mutation(mutation: &str) -> Result<()> {
+    let mut descriptor: CagCacheDescriptor = fixture("knowledge-cache-descriptor.json");
+    let mut compatibility = CacheCompatibility {
+        contract_version: ContractVersion,
+        kind: "knowledge.cache_compatibility".into(),
+        request_id: RequestId::new("req_cache_compat_fixture")?,
+        expected: descriptor.binding.clone(),
+        cache_id: Some(descriptor.cache_id.clone()),
+        outcome: CacheCompatibilityOutcome::Compatible,
+        mismatch_reasons: vec![],
+        evaluated_at: "2026-08-21T12:04:00Z".into(),
+    };
+    match mutation {
+        "model_mismatch" => {
+            compatibility.expected.runtime_identity.model_id = ModelId::new("mdl_other")?;
+        }
+        "provider_model_mismatch" => {
+            compatibility.expected.runtime_identity.provider_model_id =
+                "provider.model.other".into();
+        }
+        "artifact_mismatch" => {
+            compatibility.expected.runtime_identity.artifact_id =
+                ModelArtifactId::new("art_other")?;
+        }
+        "tokenizer_mismatch" => {
+            compatibility.expected.tokenizer_digest =
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
+        }
+        "architecture_mismatch" => {
+            compatibility.expected.architecture_id = "transformer.other".into();
+        }
+        "cache_format_mismatch" => compatibility.expected.cache_format_version = "2.0.0".into(),
+        "prefix_mismatch" => {
+            compatibility.expected.bundle.ordered_prefix_digest =
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
+        }
+        "token_count_mismatch" => compatibility.expected.token_count += 1,
+        "scope_mismatch" => {
+            compatibility.expected.scope.project_id =
+                sovereign_ai_contracts::identity::ProjectId::new("prj_other")?;
+        }
+        "sensitivity_downgrade" => {
+            compatibility.expected.sensitivity = SensitivityClass::Public;
+        }
+        "engine_mismatch" => {
+            compatibility.expected.runtime_identity.engine_instance_id = "engine.other".into();
+        }
+        "cache_byte_overflow" => {
+            let mut request: CagCacheBuildRequest = fixture("knowledge-cache-build-request.json");
+            request.maximum_cache_bytes = u64::MAX;
+            return request.validate();
+        }
+        "required_zero_sources" => {
+            let mut request: KnowledgePlanRequest = fixture("knowledge-plan-request.json");
+            request.requirements[0].minimum_sources = 0;
+            return request.validate();
+        }
+        "expired_ready_inventory" => {
+            let mut result: CagCacheQueryResult = fixture("knowledge-cache-query-result.json");
+            result.observed_at = "2026-08-23T00:00:00Z".into();
+            result.expires_at = "2026-08-23T00:01:00Z".into();
+            return result.validate();
+        }
+        "failed_plan_payload" => {
+            let mut result: KnowledgePlanResult = fixture("knowledge-plan-direct.json");
+            result.status = KnowledgePlanStatus::Failed;
+            result.mode = None;
+            result.degraded = true;
+            return result.validate();
+        }
+        "stale_cache" => {
+            return compatibility.validate_against(&descriptor, "2026-08-23T00:00:00Z");
+        }
+        "invalidated_cache" => {
+            descriptor.status = CacheStatus::Invalidated;
+            descriptor.residency = CacheResidency::Absent;
+            descriptor.reason_code = Some("knowledge.cache.invalidated".into());
+        }
+        "bundle_member_order" => {
+            let mut bundle: StaticKnowledgeBundle = fixture("knowledge-static-bundle.json");
+            bundle.ordered_members.swap(0, 1);
+            return bundle.validate();
+        }
+        "invalidated_bundle" => {
+            let mut bundle: StaticKnowledgeBundle = fixture("knowledge-static-bundle.json");
+            bundle.invalidation_state = BundleInvalidationState::Invalidated;
+            bundle.cag_eligibility = CagEligibility::IneligibleInvalidated;
+            bundle.invalidated_at = Some("2026-08-21T13:00:00Z".into());
+            bundle.invalidation_reason = Some("knowledge.bundle.invalidated".into());
+            bundle.bundle_digest = canonical_static_knowledge_bundle_digest(&bundle)?;
+            descriptor.binding.bundle = StaticBundleReference {
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_revision: bundle.bundle_revision,
+                bundle_digest: bundle.bundle_digest.clone(),
+                ordered_prefix_digest: bundle.ordered_prefix_digest.clone(),
+            };
+            return descriptor.validate_usable_against_bundle(&bundle, "2026-08-21T13:01:00Z");
+        }
+        "deleted_source" => {
+            let mut event: MemoryRevisionInvalidated =
+                fixture("knowledge-revision-invalidated.json");
+            event.payload.deleted = true;
+            event.payload.replacement_revision_id = None;
+            event.canonical_digest = canonical_memory_revision_invalidation_digest(&event.payload)?;
+            return descriptor.validate_unaffected_by_invalidation(&event);
+        }
+        "conflicting_replay" | "rollback_sequence" => {
+            let previous: MemoryRevisionInvalidated =
+                fixture("knowledge-revision-invalidated.json");
+            let mut current = previous.clone();
+            if mutation == "conflicting_replay" {
+                current.payload.event_id =
+                    sovereign_ai_contracts::identity::KnowledgeInvalidationEventId::new(
+                        "kie_conflicting_event",
+                    )?;
+            } else {
+                current.payload.sequence -= 1;
+                current.payload.event_id =
+                    sovereign_ai_contracts::identity::KnowledgeInvalidationEventId::new(
+                        "kie_rollback_event",
+                    )?;
+            }
+            current.canonical_digest =
+                canonical_memory_revision_invalidation_digest(&current.payload)?;
+            return validate_memory_revision_invalidation_order(&previous, &current).map(|_| ());
+        }
+        other => panic!("unknown knowledge mutation {other}"),
+    }
+    compatibility.validate_against(&descriptor, "2026-08-21T12:04:00Z")
+}
+
+fn runtime_mutation(mutation: &str) -> Result<()> {
+    let availability: RuntimeAvailabilityV3 = fixture("inference-v3-runtime-availability.json");
+    let reservation: InferenceReservationRequestV3 =
+        fixture("inference-v3-reservation-request.json");
+    let mut decision: InferenceReservationDecisionV3 =
+        fixture("inference-v3-reservation-decision.json");
+    let mut request: InferenceExecutionRequestV3 = fixture("inference-v3-execution-request.json");
+    let mut result: InferenceExecutionResultV3 = fixture("inference-v3-execution-result.json");
+    match mutation {
+        "availability_expired" => availability.validate_fresh_at("2026-08-14T12:01:00Z"),
+        "reservation_expired" => decision.validate_usable_at("2026-08-14T12:02:00Z"),
+        "reservation_identity_mismatch" => {
+            decision.identity.provider_model_id = "runtime-model-2".into();
+            decision.validate_against(&reservation)
+        }
+        "reservation_budget_escalation" => {
+            decision
+                .granted_budget
+                .as_mut()
+                .expect("accepted")
+                .maximum_output_tokens = 513;
+            decision.validate_against(&reservation)
+        }
+        "execution_wrong_engine" => {
+            request.identity.engine_instance_id = "engine.instance-2".into();
+            request.validate_against(&decision)
+        }
+        "execution_artifact_mismatch" => {
+            request.identity.artifact_id = ModelArtifactId::new("art_other")?;
+            request.validate_against(&decision)
+        }
+        "execution_outside_window" => {
+            request.created_at = "2026-08-14T12:02:01Z".into();
+            request.deadline_at = "2026-08-14T12:02:02Z".into();
+            request.validate_against(&decision)
+        }
+        "result_wrong_request" => {
+            result.request_id = RequestId::new("req_other")?;
+            result.validate_against(&request)
+        }
+        "result_model_mismatch" => {
+            result.identity.model_id = ModelId::new("mdl_other")?;
+            result.validate_against(&request)
+        }
+        "result_after_deadline" => {
+            result.completed_at = "2026-08-14T12:00:32Z".into();
+            result.validate_against(&request)
+        }
+        "result_token_escalation" => {
+            result.usage.output_tokens = 513;
+            result.usage.total_tokens = result.usage.input_tokens + result.usage.output_tokens;
+            result.validate_against(&request)
+        }
+        other => panic!("unknown runtime mutation {other}"),
+    }
+}
+
+fn cognitive_mutation(mutation: &str) -> Result<()> {
+    let request: CognitiveExecutionRequest = fixture("cognitive-execution-request.json");
+    let mut result: CognitiveExecutionResult = fixture("cognitive-execution-result.json");
+    match mutation {
+        "wrong_request" => result.request_id = RequestId::new("req_other")?,
+        "wrong_engine" => result.runtime_identity.engine_instance_id = "engine.instance-2".into(),
+        "artifact_mismatch" => {
+            result.runtime_identity.artifact_id = ModelArtifactId::new("art_other")?;
+        }
+        "idempotency_mismatch" => result.idempotency_key = "idem.request-2".into(),
+        "digest_mismatch" => {
+            result.immutable_request_digest =
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        }
+        "resource_escalation" => {
+            result.resource_usage[0].units = request.resource_ceiling.maximum_wall_clock_millis + 1;
+        }
+        "plan_revision_mismatch" => result.plan_revision = request.plan_revision + 1,
+        other => panic!("unknown cognitive mutation {other}"),
+    }
+    validate_execution_against_request(&request, &result)
+}
+
+fn qualification_mutation(mutation: &str) -> Result<()> {
+    let previous: ModelCapabilityManifest = fixture("model-capability-manifest-v2.json");
+    let mut current = previous.clone();
+    current.payload.revision = 2;
+    current.payload.anti_rollback_metadata.sequence = 2;
+    current.payload.previous_revision_digest = Some(previous.canonical_digest.clone());
+    match mutation {
+        "stale_revision" => {
+            current.payload.revision = 1;
+            current.payload.anti_rollback_metadata.sequence = 1;
+        }
+        "artifact_substitution" => {
+            current.payload.runtime_identity.artifact_id = ModelArtifactId::new("art_other")?;
+            for evidence in &mut current.payload.evidence {
+                evidence.artifact_id = ModelArtifactId::new("art_other")?;
+            }
+        }
+        other => panic!("unknown qualification mutation {other}"),
+    }
+    current.canonical_digest = canonical_model_capability_digest(&current.payload)?;
+    validate_manifest_revision(&previous, &current)
+}

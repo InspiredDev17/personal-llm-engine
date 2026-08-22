@@ -40,7 +40,11 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 ## Current allowlist
 
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
-`zeroize 1.8.2`, and `libc 0.2.189`, all with default features disabled.
+`zeroize 1.8.2`, `libc 0.2.189`, and Sovereign AI Contracts commit
+`2c4a7a6afd5625e7def3afec26f18fedac343d11`, all with unnecessary default
+features disabled. The Contracts dependency enables only the minimal
+`runtime-v3` consumer profile; cognitive, tool, memory, security, and other
+control-plane authority modules are excluded from the compiled engine graph.
 SHA-384 and strict Ed25519 are package/control-message/response/release integrity
 mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper
 for AIPTok's internal content hash; it adds no external dependency. The
@@ -64,6 +68,15 @@ The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact
 versions and registry checksums. Architecture tests fail on any unrecorded
 external package or internal crate edge.
+
+The exact Contracts commit is the sole reviewed non-registry source. Cargo's
+source replacement binds that exact Git revision to the checked-in vendor tree,
+and architecture tests reject revision or source drift. Its Serde/JSON and
+SHA-256 dependencies exist only to strictly decode, validate, serialize, and
+bind the provider-neutral runtime-v3 documents owned by Sovereign Contracts.
+They add no socket, filesystem, process, model-loading, scheduler, or inference
+implementation. Replacing this dependency with repository-local wire structs
+is prohibited because it would fork the cross-repository security contract.
 
 Coverage-guided parser testing is isolated in `engine/fuzz`, which is excluded
 from the production workspace and has its own lockfile. Its only new direct

@@ -15,6 +15,10 @@ mod os_lock;
 mod peer_credential;
 #[cfg(unix)]
 mod replay;
+mod runtime_reservations;
+mod runtime_v3_adapter;
+#[cfg(all(unix, feature = "cpu-reference"))]
+mod runtime_v3_service;
 #[cfg(unix)]
 mod transport;
 
@@ -24,14 +28,28 @@ pub use continuous::{
 };
 #[cfg(unix)]
 pub use replay::{DurableReplayJournal, MAX_DURABLE_REPLAY_ENTRIES};
+pub use runtime_reservations::{
+    ArtifactAuthorityId, INFERENCE_RUNTIME_V3_CONTRACT_COMMIT,
+    INFERENCE_RUNTIME_V3_CONTRACT_VERSION, LogicalModelId, MAX_RUNTIME_RESERVATION_RECORDS,
+    MAX_RUNTIME_V3_AVAILABILITY_TTL_MILLIS, ReservationDecision, ReservationDenial, ReservationId,
+    ReservationStatistics, ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId,
+    RuntimeReservationManager, RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
+};
+pub use runtime_v3_adapter::{
+    AdmittedRuntimeExecution, RuntimeIdentityAuthority, RuntimeV3ContractAdapter,
+};
+#[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+pub use runtime_v3_service::RuntimeV3DevelopmentBehavior;
+#[cfg(all(unix, feature = "cpu-reference"))]
+pub use runtime_v3_service::RuntimeV3ServiceConfig;
 #[cfg(unix)]
 pub use transport::{UnixFrameConnection, UnixFrameListener, UnixSocketPolicy};
 
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_crypto::EngineResponseSigner;
-use personalai_engine_crypto::{
-    TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner, hash_sha256,
-};
+#[cfg(feature = "cpu-reference")]
+use personalai_engine_crypto::hash_sha256;
+use personalai_engine_crypto::{TrustedControlPlaneKey, TrustedControlPlaneKeys, TrustedSigner};
 #[cfg(all(feature = "cpu-reference", test))]
 use personalai_engine_crypto::{hash_package, hash_signed_content, verify_package_signature};
 #[cfg(feature = "cpu-reference")]
@@ -215,19 +233,22 @@ impl RuntimeBackend {
             EngineCapability::StreamingGeneration,
             EngineCapability::UnixDomainSocket,
         ];
-        #[cfg(any(
-            all(feature = "arm64", target_arch = "aarch64"),
-            all(feature = "metal", target_os = "macos")
-        ))]
-        let mut capabilities = capabilities;
         #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
-        if matches!(self, Self::Arm64(_)) {
-            capabilities.push(EngineCapability::Arm64);
-        }
+        let capabilities = {
+            let mut capabilities = capabilities;
+            if matches!(self, Self::Arm64(_)) {
+                capabilities.push(EngineCapability::Arm64);
+            }
+            capabilities
+        };
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if matches!(self, Self::Metal(_)) {
-            capabilities.push(EngineCapability::Metal);
-        }
+        let capabilities = {
+            let mut capabilities = capabilities;
+            if matches!(self, Self::Metal(_)) {
+                capabilities.push(EngineCapability::Metal);
+            }
+            capabilities
+        };
         ServiceCapabilitySet::from_capabilities(capabilities)
     }
 
@@ -2381,6 +2402,7 @@ pub struct CpuEngineRuntime {
     draining: bool,
     next_sequence: u64,
     pending_cache_attachments: BTreeMap<RequestId, PendingCacheAttachment>,
+    runtime_v3: Option<runtime_v3_service::RuntimeV3ServiceState>,
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2496,8 +2518,23 @@ fn record_runtime_error_parts(
 fn unload_model_parts(
     service: &EngineService,
     models: &mut BTreeMap<String, LoadedRuntimeModel>,
+    pending_cache_attachments: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    runtime_v3: Option<&runtime_v3_service::RuntimeV3ServiceState>,
     model_id: &ModelId,
 ) -> Result<(), EngineError> {
+    expire_pending_cache_attachments(pending_cache_attachments, Instant::now());
+    if pending_cache_attachments.values().any(|pending| &pending.model_id == model_id) {
+        return Err(EngineError::resource_exhaustion(
+            "model has a staged reusable-cache attachment",
+        ));
+    }
+    if let Some(state) = runtime_v3 {
+        if state.has_active_model(model_id, runtime_v3_now_unix_millis()?)? {
+            return Err(EngineError::resource_exhaustion(
+                "model has an active runtime-v3 reservation",
+            ));
+        }
+    }
     if service.scheduler.has_active_model(model_id) || service.scheduler.has_queued_model(model_id)
     {
         return Err(EngineError::resource_exhaustion(
@@ -2508,6 +2545,7 @@ fn unload_model_parts(
         .get(model_id.as_str())
         .ok_or_else(|| EngineError::invalid_input("model is not loaded"))?;
     loaded.unload_if_idle()?;
+    loaded.invalidate_reusable_model()?;
     if models.remove(model_id.as_str()).is_none() {
         return Err(EngineError::invalid_input("model is not loaded"));
     }
@@ -2638,8 +2676,21 @@ fn handle_service_request_parts(
     draining: bool,
     next_sequence: &mut u64,
     pending_cache_attachments: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    runtime_v3: &mut Option<runtime_v3_service::RuntimeV3ServiceState>,
     request: &AuthenticatedServiceRequest,
 ) -> Result<ServiceResponseBody, EngineError> {
+    if let Some(state) = runtime_v3.as_mut() {
+        if let Some(response) = state.handle(
+            service,
+            models,
+            backend,
+            draining,
+            request.body(),
+            runtime_v3_now_unix_millis()?,
+        )? {
+            return Ok(response);
+        }
+    }
     match request.body() {
         ServiceRequestBody::Hello { major, minor } => {
             if *major == PROTOCOL_MAJOR && *minor == PROTOCOL_MINOR {
@@ -2693,16 +2744,13 @@ fn handle_service_request_parts(
             Ok(ServiceResponseBody::ModelLoaded)
         }
         ServiceRequestBody::UnloadModel(model_id) => {
-            expire_pending_cache_attachments(pending_cache_attachments, Instant::now());
-            if pending_cache_attachments.values().any(|pending| &pending.model_id == model_id) {
-                return Err(EngineError::resource_exhaustion(
-                    "model has a staged reusable-cache attachment",
-                ));
-            }
-            if let Some(loaded) = models.get(model_id.as_str()) {
-                loaded.invalidate_reusable_model()?;
-            }
-            unload_model_parts(service, models, model_id)?;
+            unload_model_parts(
+                service,
+                models,
+                pending_cache_attachments,
+                runtime_v3.as_ref(),
+                model_id,
+            )?;
             Ok(ServiceResponseBody::ModelUnloaded)
         }
         ServiceRequestBody::Tokenize { model_id, text } => {
@@ -2753,9 +2801,17 @@ fn handle_service_request_parts(
             model_load_budgets,
             next_sequence,
             pending_cache_attachments,
+            runtime_v3.as_ref(),
             request.request_id(),
             cache_request,
         ),
+        ServiceRequestBody::RuntimeV3Availability
+        | ServiceRequestBody::RuntimeV3Reserve(_)
+        | ServiceRequestBody::RuntimeV3Cancel(_)
+        | ServiceRequestBody::RuntimeV3Release(_)
+        | ServiceRequestBody::RuntimeV3Execute(_) => Err(EngineError::not_implemented(
+            "runtime v3 authenticated service is not enabled by owner configuration",
+        )),
     }
 }
 
@@ -2769,9 +2825,15 @@ fn handle_cache_service_request(
     model_load_budgets: &BTreeMap<String, ResourceBudget>,
     next_sequence: &mut u64,
     pending: &mut BTreeMap<RequestId, PendingCacheAttachment>,
+    runtime_v3: Option<&runtime_v3_service::RuntimeV3ServiceState>,
     request_id: RequestId,
     request: &ServiceCacheRequest,
 ) -> Result<ServiceResponseBody, EngineError> {
+    let runtime_v3 = runtime_v3.ok_or_else(|| {
+        EngineError::not_implemented(
+            "reusable cache lifecycle requires owner runtime-v3 configuration",
+        )
+    })?;
     let now = Instant::now();
     let now_unix_seconds = unix_seconds()?;
     expire_pending_cache_attachments(pending, now);
@@ -2783,6 +2845,7 @@ fn handle_cache_service_request(
             maximum_cache_bytes,
             retention,
         } => {
+            runtime_v3.validate_cache_runtime_identity(binding.runtime())?;
             let loaded = loaded_cpu(models, model_id)?;
             let budget = model_load_budgets.get(model_id.as_str()).ok_or_else(|| {
                 EngineError::authentication_failure("model budget is unavailable")
@@ -2827,6 +2890,7 @@ fn handle_cache_service_request(
             }
         }
         ServiceCacheRequest::Describe { model_id, cache_id, scope } => {
+            runtime_v3.validate_cache_model(model_id)?;
             let loaded = loaded_cpu(models, model_id)?;
             match loaded.reusable_cache_store()?.describe(
                 KvCacheId::from_hash(cache_id.hash()),
@@ -2841,6 +2905,7 @@ fn handle_cache_service_request(
             }
         }
         ServiceCacheRequest::List { model_id, scope, maximum } => {
+            runtime_v3.validate_cache_model(model_id)?;
             let loaded = loaded_cpu(models, model_id)?;
             let fetch_maximum = maximum
                 .saturating_add(1)
@@ -2858,6 +2923,7 @@ fn handle_cache_service_request(
             }
         }
         ServiceCacheRequest::Attach { model_id, cache_id, target_request_id, binding } => {
+            runtime_v3.validate_cache_runtime_identity(binding.runtime())?;
             let loaded = loaded_cpu(models, model_id)?;
             loaded.validate_cache_binding(binding)?;
             let id = KvCacheId::from_hash(cache_id.hash());
@@ -2895,6 +2961,7 @@ fn handle_cache_service_request(
                         && attachment.binding.runtime().engine_instance_id()
                             == engine_instance_id =>
                 {
+                    runtime_v3.validate_cache_runtime_identity(attachment.binding.runtime())?;
                     pending.remove(target_request_id);
                     ServiceCacheResponse::Released
                 }
@@ -2907,6 +2974,7 @@ fn handle_cache_service_request(
             }
         }
         ServiceCacheRequest::Invalidate { model_id, scope, selector } => {
+            runtime_v3.validate_cache_model(model_id)?;
             let loaded = loaded_cpu(models, model_id)?;
             let store = loaded.reusable_cache_store()?;
             let count = match selector {
@@ -2915,6 +2983,7 @@ fn handle_cache_service_request(
                 }
                 ServiceCacheInvalidation::Scope => store.invalidate_namespace(scope)?,
                 ServiceCacheInvalidation::LogicalModel(logical_model_id) => {
+                    runtime_v3.validate_cache_logical_model(model_id, logical_model_id)?;
                     store.invalidate_logical_model_in_scope(scope, logical_model_id)?
                 }
                 ServiceCacheInvalidation::Source(source) => store
@@ -2927,6 +2996,7 @@ fn handle_cache_service_request(
             ServiceCacheResponse::Invalidated(count)
         }
         ServiceCacheRequest::Metrics { model_id, logical_model_id, scope } => {
+            runtime_v3.validate_cache_logical_model(model_id, logical_model_id)?;
             let loaded = loaded_cpu(models, model_id)?;
             let descriptors = loaded
                 .reusable_cache_store()?
@@ -3079,6 +3149,15 @@ fn unix_seconds() -> Result<u64, EngineError> {
 }
 
 #[cfg(all(unix, feature = "cpu-reference"))]
+fn runtime_v3_now_unix_millis() -> Result<u64, EngineError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EngineError::internal_invariant("system clock is before the Unix epoch"))?;
+    u64::try_from(elapsed.as_millis())
+        .map_err(|_| EngineError::resource_exhaustion("system clock exceeds runtime v3 range"))
+}
+
+#[cfg(all(unix, feature = "cpu-reference"))]
 impl CpuEngineRuntime {
     /// Creates an unloaded runtime with distinct control and response identities.
     pub fn new(
@@ -3175,7 +3254,67 @@ impl CpuEngineRuntime {
             draining: false,
             next_sequence: 1,
             pending_cache_attachments: BTreeMap::new(),
+            runtime_v3: None,
         })
+    }
+
+    /// Enables canonical runtime-v3 status and reservation handling.
+    ///
+    /// This owner-only startup method is not reachable from the client
+    /// protocol and does not qualify or register any model.
+    pub fn enable_runtime_v3(&mut self, config: RuntimeV3ServiceConfig) -> Result<(), EngineError> {
+        if self.runtime_v3.is_some() {
+            return Err(EngineError::invalid_input("runtime v3 service is already enabled"));
+        }
+        self.runtime_v3 = Some(runtime_v3_service::RuntimeV3ServiceState::new(config)?);
+        Ok(())
+    }
+
+    /// Binds one owner-approved control-plane identity to an already
+    /// registered engine model. This does not manufacture qualification.
+    pub fn configure_runtime_v3_model(
+        &mut self,
+        identity: RuntimeIdentityBinding,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .configure_model(&self.service, &self.backend, identity)
+    }
+
+    /// Enables the compile-time-gated deterministic runtime-v3 simulator.
+    /// Default builds do not expose this method, and it cannot be selected by
+    /// any client message.
+    #[cfg(feature = "development-runtime-v3-simulator")]
+    pub fn enable_runtime_v3_development_simulator(
+        &mut self,
+        behavior: RuntimeV3DevelopmentBehavior,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .enable_development_simulator(behavior)
+    }
+
+    /// Derives engine-owned package/backend identity from one registered model
+    /// and binds only the control-plane logical/artifact correlations supplied
+    /// by owner startup configuration.
+    pub fn configure_runtime_v3_registered_model(
+        &mut self,
+        logical_model_id: LogicalModelId,
+        provider_model_id: ModelId,
+        artifact_id: ArtifactAuthorityId,
+    ) -> Result<(), EngineError> {
+        self.runtime_v3
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid_input("runtime v3 service is not enabled"))?
+            .configure_registered_model(
+                &self.service,
+                &self.backend,
+                logical_model_id,
+                provider_model_id,
+                artifact_id,
+            )
     }
 
     /// Installs a trusted load budget for one statically registered model.
@@ -3228,7 +3367,13 @@ impl CpuEngineRuntime {
 
     /// Unloads one idle model. Active or queued ownership fails closed.
     pub fn unload_model(&mut self, model_id: &ModelId) -> Result<(), EngineError> {
-        unload_model_parts(&self.service, &mut self.models, model_id)
+        unload_model_parts(
+            &self.service,
+            &mut self.models,
+            &mut self.pending_cache_attachments,
+            self.runtime_v3.as_ref(),
+            model_id,
+        )
     }
 
     fn handle_service_request(
@@ -3246,6 +3391,7 @@ impl CpuEngineRuntime {
             self.draining,
             &mut self.next_sequence,
             &mut self.pending_cache_attachments,
+            &mut self.runtime_v3,
             request,
         )
     }
@@ -5181,8 +5327,8 @@ mod tests {
     };
     use personalai_engine_protocol::{
         AuthenticatedServiceRequest, AuthenticatedServiceResponse, CancellationEnvelope,
-        GenerationRequestEnvelope, ServiceMessageKind, attach_cancellation_signature,
-        attach_generation_signature, attach_service_signature,
+        GenerationRequestEnvelope, RuntimeV3Document, ServiceMessageKind,
+        attach_cancellation_signature, attach_generation_signature, attach_service_signature,
     };
     #[cfg(feature = "cpu-reference")]
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
@@ -5238,6 +5384,7 @@ mod tests {
         loaded: &LoadedCpuModel,
         prefix: &[u8],
         scope: CacheAuthorizationScope,
+        runtime: &RuntimeIdentityBinding,
     ) -> CacheBinding {
         let token_count = u32::try_from(
             loaded.tokenizer.encode(std::str::from_utf8(prefix).unwrap()).unwrap().len(),
@@ -5245,14 +5392,14 @@ mod tests {
         .unwrap();
         CacheBinding::new(
             CacheRuntimeIdentity::new(
-                KnowledgeIdentity::new("mdl_logical_fixture").unwrap(),
+                KnowledgeIdentity::new(runtime.logical_model_id().as_str()).unwrap(),
                 loaded.model_id.clone(),
-                loaded.artifact_id.clone(),
+                KnowledgeIdentity::new(runtime.artifact_id().as_str()).unwrap(),
                 ArtifactDigest::Sha384(loaded.cache_compatibility.model_artifact_hash()),
                 loaded.cache_compatibility.backend_id().clone(),
-                KnowledgeIdentity::new("version.0-1-0").unwrap(),
-                KnowledgeIdentity::new("backend.fixture").unwrap(),
-                KnowledgeIdentity::new("engine.fixture").unwrap(),
+                KnowledgeIdentity::new(runtime.backend_version().as_str()).unwrap(),
+                KnowledgeIdentity::new(runtime.backend_instance_id().as_str()).unwrap(),
+                KnowledgeIdentity::new(runtime.engine_instance_id().as_str()).unwrap(),
             )
             .unwrap(),
             KnowledgeIdentity::new(format!("tokenizer.sha256.{}", loaded.tokenizer_digest))
@@ -5312,6 +5459,25 @@ mod tests {
         );
         assert!(pending.is_empty());
     }
+    #[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+    use sovereign_ai_contracts::inference::{
+        GenerationParameters as ContractGenerationParameters, InferenceMessage, InferenceRole,
+    };
+    #[cfg(all(unix, feature = "cpu-reference", feature = "development-runtime-v3-simulator"))]
+    use sovereign_ai_contracts::inference_runtime_v3::{
+        ExecutionRequestKindV3, ExecutionStatusV3, InferenceExecutionRequestV3,
+        decode_inference_execution_result_v3, encode_inference_execution_request_v3,
+    };
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    use sovereign_ai_contracts::inference_runtime_v3::{
+        InferenceReservationReleaseV3, InferenceReservationRequestV3,
+        InferenceRuntimeContractVersionV3, ReservationDecisionV3, ReservationReleaseKindV3,
+        ReservationRequestKindV3, RuntimeCancellationRequestKindV3, RuntimeCancellationRequestV3,
+        RuntimeResourceBudgetV3, decode_inference_reservation_decision_v3,
+        decode_runtime_availability_v3, encode_inference_reservation_release_v3,
+        encode_inference_reservation_request_v3, encode_runtime_cancellation_request_v3,
+        runtime_v3_timestamp_from_unix_millis,
+    };
 
     #[test]
     fn config_requires_distinct_normal_local_paths() {
@@ -7484,7 +7650,11 @@ mod tests {
             assert_eq!(cycle_result, (true, true, true));
             assert_eq!(summary.accepted_connections(), u64::from(CONNECTIONS_PER_CYCLE));
             assert_eq!(summary.authenticated_commands(), u64::from(CONNECTIONS_PER_CYCLE));
-            assert_eq!(summary.completed_generations(), u64::from(CONNECTIONS_PER_CYCLE));
+            assert_eq!(
+                summary.completed_generations(),
+                u64::from(CONNECTIONS_PER_CYCLE),
+                "continuous soak cycle {cycle} summary: {summary:?}"
+            );
             assert_eq!(summary.failed_connections(), 0);
             assert!(summary.peak_owned_connections() <= CONNECTIONS_PER_CYCLE);
             assert_eq!(fixture.runtime.service.scheduler.queued_len(), 0);
@@ -7631,6 +7801,77 @@ mod tests {
             self.listener.socket_path().to_path_buf()
         }
 
+        fn runtime_v3_identity(&self) -> RuntimeIdentityBinding {
+            let registration = self
+                .runtime
+                .service
+                .registry
+                .resolve(&self.model_id)
+                .expect("fixture registration");
+            let loaded = self
+                .runtime
+                .models
+                .get(self.model_id.as_str())
+                .expect("fixture model must be loaded")
+                .cpu()
+                .expect("fixture uses CPU model");
+            RuntimeIdentityBinding::new(
+                LogicalModelId::new("mdl_runtime-fixture").expect("logical model ID"),
+                self.model_id.clone(),
+                ArtifactAuthorityId::new(loaded.artifact_id.as_str()).expect("artifact ID"),
+                *registration.expected_hash(),
+                self.runtime.backend.backend_id().expect("backend ID"),
+                RuntimeInstanceId::new("version.1").expect("backend version"),
+                RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+                RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+            )
+        }
+
+        fn enable_runtime_v3(&mut self) -> RuntimeIdentityBinding {
+            let identity = self.runtime_v3_identity();
+            let config = RuntimeV3ServiceConfig::new(
+                RuntimeInstanceId::new("version.1").expect("backend version"),
+                RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+                RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+                2,
+                2 << 20,
+                30_000,
+            )
+            .expect("runtime v3 config");
+            self.runtime.enable_runtime_v3(config).expect("enable runtime v3");
+            self.runtime
+                .configure_runtime_v3_model(identity.clone())
+                .expect("configure runtime v3 model");
+            identity
+        }
+
+        fn authenticated_service_request(
+            &self,
+            nonce: u64,
+            body: &ServiceRequestBody,
+        ) -> AuthenticatedServiceRequest {
+            let request_id = RequestId::new(u128::from(nonce)).expect("request ID");
+            let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+                request_id,
+                nonce,
+                self.control_key_id,
+                body,
+            )
+            .expect("request encode");
+            let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+            let signature = self.control_signing_key.sign(&transcript).to_bytes();
+            let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+            let trusted = TrustedControlPlaneKeys::single(
+                TrustedControlPlaneKey::active(
+                    self.control_key_id,
+                    self.control_signing_key.verifying_key().to_bytes(),
+                )
+                .expect("trusted key"),
+            )
+            .expect("trusted keys");
+            AuthenticatedServiceRequest::decode(&payload, &trusted).expect("request decode")
+        }
+
         fn cleanup(self) {
             use std::fs;
 
@@ -7641,6 +7882,241 @@ mod tests {
             fs::remove_file(replay_path).expect("replay journal must clean");
             fs::remove_dir(self.runtime_root).expect("runtime root must clean");
         }
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated socket transcript proves the complete reservation and execution lifecycle"
+    )]
+    fn authenticated_runtime_v3_availability_reservation_and_release_are_exact() {
+        let mut fixture = BatchRuntimeFixture::new("runtime-v3-contract", 1);
+        let identity = fixture.enable_runtime_v3();
+
+        let availability_request =
+            fixture.authenticated_service_request(41, &ServiceRequestBody::RuntimeV3Availability);
+        let ServiceResponseBody::RuntimeV3Availability(document) = fixture
+            .runtime
+            .handle_service_request(&availability_request)
+            .expect("availability response")
+        else {
+            panic!("runtime v3 availability response kind changed");
+        };
+        let availability =
+            decode_runtime_availability_v3(document.as_bytes()).expect("availability contract");
+        assert_eq!(availability.engine_instance_id, identity.engine_instance_id().as_str());
+        assert_eq!(availability.models.len(), 1);
+        assert_eq!(availability.models[0].identity.provider_model_id, fixture.model_id.as_str());
+
+        let now = runtime_v3_now_unix_millis().expect("service time");
+        let reservation = InferenceReservationRequestV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationRequestKindV3::ReservationRequest,
+            reservation_id: "rsv_service-fixture".to_owned(),
+            request_id: sovereign_ai_contracts::identity::RequestId::new(
+                "req_11111111111111111111111111111111",
+            )
+            .expect("contract request ID"),
+            task_id: sovereign_ai_contracts::identity::TaskId::new("tsk_service-fixture")
+                .expect("contract task ID"),
+            identity: availability.models[0].identity.clone(),
+            budget: RuntimeResourceBudgetV3 {
+                maximum_input_tokens: 1_024,
+                maximum_output_tokens: 64,
+                maximum_inference_memory_bytes: 1 << 20,
+                maximum_execution_millis: 5_000,
+            },
+            idempotency_key: "11".repeat(32),
+            created_at: runtime_v3_timestamp_from_unix_millis(now).expect("created time"),
+            expires_at: runtime_v3_timestamp_from_unix_millis(now + 10_000).expect("expiry time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let reserve_body = ServiceRequestBody::RuntimeV3Reserve(
+            RuntimeV3Document::new(
+                encode_inference_reservation_request_v3(&reservation).expect("reservation"),
+            )
+            .expect("bounded reservation"),
+        );
+        let reserve = fixture.authenticated_service_request(42, &reserve_body);
+        let ServiceResponseBody::RuntimeV3Reservation(document) =
+            fixture.runtime.handle_service_request(&reserve).expect("reservation response")
+        else {
+            panic!("runtime v3 reservation response kind changed");
+        };
+        let decision = decode_inference_reservation_decision_v3(document.as_bytes())
+            .expect("reservation decision");
+        assert_eq!(decision.decision, ReservationDecisionV3::Accepted);
+        assert!(matches!(
+            fixture.runtime.unload_model(&fixture.model_id),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+
+        #[cfg(feature = "development-runtime-v3-simulator")]
+        {
+            let execution_created = runtime_v3_now_unix_millis().expect("execution service time");
+            fixture
+                .runtime
+                .enable_runtime_v3_development_simulator(
+                    RuntimeV3DevelopmentBehavior::fixed_success(
+                        "development runtime v3 fixture output",
+                    )
+                    .expect("development output"),
+                )
+                .expect("enable explicit development simulator");
+            let execution = InferenceExecutionRequestV3 {
+                contract_version: InferenceRuntimeContractVersionV3,
+                kind: ExecutionRequestKindV3::ExecutionRequest,
+                reservation_id: reservation.reservation_id.clone(),
+                request_id: reservation.request_id.clone(),
+                task_id: reservation.task_id.clone(),
+                identity: reservation.identity.clone(),
+                messages: vec![InferenceMessage {
+                    role: InferenceRole::User,
+                    content: "deterministic fixture input".to_owned(),
+                    name: None,
+                }],
+                parameters: ContractGenerationParameters {
+                    max_output_tokens: 8,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: Some(7),
+                    stop_sequences: None,
+                },
+                idempotency_key: "22".repeat(32),
+                created_at: runtime_v3_timestamp_from_unix_millis(execution_created)
+                    .expect("execution creation"),
+                deadline_at: runtime_v3_timestamp_from_unix_millis(now + 9_000)
+                    .expect("execution deadline"),
+                extensions: None,
+                required_extensions: None,
+            };
+            let execution_body = ServiceRequestBody::RuntimeV3Execute(
+                RuntimeV3Document::new(
+                    encode_inference_execution_request_v3(&execution).expect("execution request"),
+                )
+                .expect("bounded execution request"),
+            );
+            let execute = fixture.authenticated_service_request(43, &execution_body);
+            let ServiceResponseBody::RuntimeV3Execution(document) =
+                fixture.runtime.handle_service_request(&execute).expect("execution response")
+            else {
+                panic!("runtime v3 execution response kind changed");
+            };
+            let result = decode_inference_execution_result_v3(document.as_bytes())
+                .expect("execution result");
+            result.validate_against(&execution).expect("result binding");
+            assert_eq!(result.status, ExecutionStatusV3::Succeeded);
+            assert_eq!(result.output.as_deref(), Some("development runtime v3 fixture output"));
+
+            let retry = fixture.authenticated_service_request(45, &execution_body);
+            let ServiceResponseBody::RuntimeV3Execution(replayed) = fixture
+                .runtime
+                .handle_service_request(&retry)
+                .expect("response-loss retry must return the stored terminal result")
+            else {
+                panic!("runtime v3 replay response kind changed");
+            };
+            assert_eq!(replayed.as_bytes(), document.as_bytes());
+        }
+
+        let release = InferenceReservationReleaseV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationReleaseKindV3::ReservationRelease,
+            reservation_id: reservation.reservation_id,
+            request_id: reservation.request_id,
+            task_id: reservation.task_id,
+            reason_code: "owner_release".to_owned(),
+            requested_at: runtime_v3_timestamp_from_unix_millis(now + 1).expect("release time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let release_body = ServiceRequestBody::RuntimeV3Release(
+            RuntimeV3Document::new(
+                encode_inference_reservation_release_v3(&release).expect("release"),
+            )
+            .expect("bounded release"),
+        );
+        let release = fixture.authenticated_service_request(44, &release_body);
+        assert_eq!(
+            fixture.runtime.handle_service_request(&release),
+            Ok(ServiceResponseBody::RuntimeV3Released)
+        );
+        fixture
+            .runtime
+            .unload_model(&fixture.model_id)
+            .expect("released runtime reservation must permit idle model unload");
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    fn authenticated_runtime_v3_availability_round_trips_over_protected_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut fixture = BatchRuntimeFixture::new("runtime-v3-uds", 1);
+        let identity = fixture.enable_runtime_v3();
+        let request_id = RequestId::new(0x5353).expect("request ID");
+        let nonce = 51;
+        let body = ServiceRequestBody::RuntimeV3Availability;
+        let unsigned = AuthenticatedServiceRequest::unsigned_bytes(
+            request_id,
+            nonce,
+            fixture.control_key_id,
+            &body,
+        )
+        .expect("service request");
+        let transcript = control_plane_signature_message(&unsigned).expect("transcript");
+        let signature = fixture.control_signing_key.sign(&transcript).to_bytes();
+        let payload = attach_service_signature(&unsigned, &signature).expect("signature");
+        let encoded = Frame::new(FrameKind::ServiceRequest, payload)
+            .expect("service frame")
+            .encode()
+            .expect("encoded service frame");
+        let socket_path = fixture.socket_path();
+        let response_public_key = fixture.response_public_key;
+        let expected_engine_instance = identity.engine_instance_id().as_str().to_owned();
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("client must connect");
+            stream.write_all(&encoded).expect("request must write");
+            let mut header = [0_u8; FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).expect("response header");
+            let payload_length = usize::try_from(u32::from_le_bytes(
+                header[12..16].try_into().expect("payload length field"),
+            ))
+            .expect("payload length");
+            let mut frame = header.to_vec();
+            frame.resize(FRAME_HEADER_BYTES + payload_length, 0);
+            stream.read_exact(&mut frame[FRAME_HEADER_BYTES..]).expect("response payload");
+            let response = Frame::decode_outbound_exact(&frame).expect("response frame");
+            let engine_key_id = SignerKeyId::from_bytes([0x62; 16]).expect("engine key ID");
+            let verified = AuthenticatedServiceResponse::decode(
+                response.payload(),
+                request_id,
+                nonce,
+                engine_key_id,
+                &response_public_key,
+            )
+            .expect("service response must verify");
+            let ServiceResponseBody::RuntimeV3Availability(document) = verified.body() else {
+                panic!("runtime v3 availability response kind changed");
+            };
+            let availability = decode_runtime_availability_v3(document.as_bytes())
+                .expect("canonical availability");
+            assert_eq!(availability.engine_instance_id, expected_engine_instance);
+            assert_eq!(availability.models.len(), 1);
+        });
+        assert!(matches!(
+            fixture.runtime.serve_one(&fixture.listener),
+            Ok(ServeOutcome::ServiceResponded {
+                request_id: returned,
+                kind: ServiceMessageKind::RuntimeV3Availability,
+            }) if returned == request_id
+        ));
+        client.join().expect("client must finish");
+        fixture.cleanup();
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
@@ -7841,12 +8317,176 @@ mod tests {
 
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
+    fn reusable_cache_lifecycle_requires_owner_runtime_v3_binding() {
+        let mut fixture = BatchRuntimeFixture::new("service-cag-disabled", 1);
+        let request = fixture.authenticated_service_request(
+            99,
+            &ServiceRequestBody::Cache(ServiceCacheRequest::Metrics {
+                model_id: fixture.model_id.clone(),
+                logical_model_id: KnowledgeIdentity::new("mdl_runtime-fixture").unwrap(),
+                scope: cache_scope("prj_fixture_project"),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&request),
+            Err(EngineError::NotImplemented(_))
+        ));
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_and_runtime_v3_cancellation_clean_only_their_bound_state_domains() {
+        let mut fixture = BatchRuntimeFixture::new("runtime-v3-cag-dual-cancel", 1);
+        let identity = fixture.enable_runtime_v3();
+        let request_id = RequestId::new(0x66).expect("request ID");
+        let now = runtime_v3_now_unix_millis().expect("service time");
+        let availability_request =
+            fixture.authenticated_service_request(149, &ServiceRequestBody::RuntimeV3Availability);
+        let ServiceResponseBody::RuntimeV3Availability(availability_document) = fixture
+            .runtime
+            .handle_service_request(&availability_request)
+            .expect("availability response")
+        else {
+            panic!("runtime v3 availability response kind changed");
+        };
+        let availability = decode_runtime_availability_v3(availability_document.as_bytes())
+            .expect("availability contract");
+        let reservation = InferenceReservationRequestV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationRequestKindV3::ReservationRequest,
+            reservation_id: "rsv_dual-cancel-fixture".to_owned(),
+            request_id: sovereign_ai_contracts::identity::RequestId::new(
+                "req_00000000000000000000000000000066",
+            )
+            .expect("canonical request ID"),
+            task_id: sovereign_ai_contracts::identity::TaskId::new("tsk_dual-cancel-fixture")
+                .expect("canonical task ID"),
+            identity: availability.models[0].identity.clone(),
+            budget: RuntimeResourceBudgetV3 {
+                maximum_input_tokens: 1_024,
+                maximum_output_tokens: 64,
+                maximum_inference_memory_bytes: 1 << 20,
+                maximum_execution_millis: 5_000,
+            },
+            idempotency_key: "66".repeat(32),
+            created_at: runtime_v3_timestamp_from_unix_millis(now).expect("created time"),
+            expires_at: runtime_v3_timestamp_from_unix_millis(now + 10_000).expect("expiry time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let reserve_body = ServiceRequestBody::RuntimeV3Reserve(
+            RuntimeV3Document::new(
+                encode_inference_reservation_request_v3(&reservation)
+                    .expect("reservation document"),
+            )
+            .expect("bounded reservation"),
+        );
+        let reserve = fixture.authenticated_service_request(150, &reserve_body);
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&reserve),
+            Ok(ServiceResponseBody::RuntimeV3Reservation(_))
+        ));
+
+        let prefix = b"SOVEREIGN-STATIC-KNOWLEDGE-PREFIX-V1\n1:A";
+        let binding = {
+            let loaded = fixture
+                .runtime
+                .models
+                .get(fixture.model_id.as_str())
+                .expect("fixture model")
+                .cpu()
+                .expect("CPU fixture");
+            loaded_cache_binding(loaded, prefix, cache_scope("prj_dual_cancel"), &identity)
+        };
+        fixture.runtime.pending_cache_attachments.insert(
+            request_id,
+            PendingCacheAttachment {
+                model_id: fixture.model_id.clone(),
+                cache_id: KvCacheId::from_hash(test_hash()),
+                binding,
+                expires_at: Instant::now() + PENDING_CACHE_ATTACHMENT_TTL,
+            },
+        );
+        assert!(matches!(
+            fixture.runtime.unload_model(&fixture.model_id),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+
+        let classic_cancel = signed_cancellation_frame(
+            request_id,
+            151,
+            fixture.control_key_id,
+            &fixture.control_signing_key,
+        );
+        let classic_client = spawn_ordered_write_only_client(fixture.socket_path(), classic_cancel);
+        assert_eq!(
+            fixture.runtime.serve_one(&fixture.listener),
+            Ok(ServeOutcome::CancellationNotFound(request_id))
+        );
+        assert!(classic_client.join().expect("classic cancel client").is_empty());
+        assert!(!fixture.runtime.pending_cache_attachments.contains_key(&request_id));
+        assert!(matches!(
+            fixture.runtime.unload_model(&fixture.model_id),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+
+        let cancellation = RuntimeCancellationRequestV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: RuntimeCancellationRequestKindV3::RuntimeCancellationRequestV3,
+            reservation_id: reservation.reservation_id,
+            request_id: reservation.request_id,
+            task_id: reservation.task_id,
+            cancellation_request_id: sovereign_ai_contracts::identity::RequestId::new(
+                "req_00000000000000000000000000000067",
+            )
+            .expect("canonical cancellation ID"),
+            reason_code: "owner_cancelled".to_owned(),
+            requested_at: runtime_v3_timestamp_from_unix_millis(now).expect("cancellation time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let cancel_body = ServiceRequestBody::RuntimeV3Cancel(
+            RuntimeV3Document::new(
+                encode_runtime_cancellation_request_v3(&cancellation)
+                    .expect("cancellation document"),
+            )
+            .expect("bounded cancellation"),
+        );
+        let cancel = fixture.authenticated_service_request(152, &cancel_body);
+        assert_eq!(
+            fixture.runtime.handle_service_request(&cancel),
+            Ok(ServiceResponseBody::RuntimeV3Cancelled)
+        );
+        fixture
+            .runtime
+            .unload_model(&fixture.model_id)
+            .expect("both cancellation domains are clean");
+        fixture.cleanup();
+    }
+
+    #[cfg(all(unix, feature = "cpu-reference"))]
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the end-to-end protocol fixture intentionally keeps the signed cache lifecycle and parity assertion together"
     )]
     fn authenticated_cag_cache_lifecycle_and_generation_match_full_prefill() {
         let mut fixture = BatchRuntimeFixture::new("service-cag", 2);
+        let runtime_identity = fixture.enable_runtime_v3();
+        let availability =
+            fixture.authenticated_service_request(100, &ServiceRequestBody::RuntimeV3Availability);
+        let ServiceResponseBody::RuntimeV3Availability(document) = fixture
+            .runtime
+            .handle_service_request(&availability)
+            .expect("runtime v3 availability must coexist with cache lifecycle")
+        else {
+            panic!("runtime v3 availability response kind changed");
+        };
+        let availability =
+            decode_runtime_availability_v3(document.as_bytes()).expect("availability contract");
+        assert_eq!(availability.engine_instance_id, runtime_identity.engine_instance_id().as_str());
         let decode = |fixture: &BatchRuntimeFixture,
                       request_id: RequestId,
                       nonce: u64,
@@ -7876,8 +8516,44 @@ mod tests {
         let binding = {
             let loaded =
                 fixture.runtime.models.get(fixture.model_id.as_str()).unwrap().cpu().unwrap();
-            loaded_cache_binding(loaded, &prefix, scope.clone())
+            loaded_cache_binding(loaded, &prefix, scope.clone(), &runtime_identity)
         };
+        let substituted_runtime = RuntimeIdentityBinding::new(
+            runtime_identity.logical_model_id().clone(),
+            runtime_identity.provider_model_id().clone(),
+            runtime_identity.artifact_id().clone(),
+            *runtime_identity.package_hash(),
+            runtime_identity.backend_id().clone(),
+            runtime_identity.backend_version().clone(),
+            runtime_identity.backend_instance_id().clone(),
+            RuntimeInstanceId::new("engine.instance-substituted").unwrap(),
+        );
+        let substituted_binding = {
+            let loaded =
+                fixture.runtime.models.get(fixture.model_id.as_str()).unwrap().cpu().unwrap();
+            loaded_cache_binding(loaded, &prefix, scope.clone(), &substituted_runtime)
+        };
+        let substituted_create = decode(
+            &fixture,
+            RequestId::new(9_014).unwrap(),
+            113,
+            ServiceRequestBody::Cache(ServiceCacheRequest::Create {
+                model_id: fixture.model_id.clone(),
+                binding: Box::new(substituted_binding),
+                prefix: prefix.clone(),
+                maximum_cache_bytes: 1 << 20,
+                retention: personalai_engine_protocol::ServiceCacheRetention::new(
+                    Some(60),
+                    10,
+                    false,
+                )
+                .unwrap(),
+            }),
+        );
+        assert!(matches!(
+            fixture.runtime.handle_service_request(&substituted_create),
+            Err(EngineError::AuthenticationFailure(_))
+        ));
         let create = decode(
             &fixture,
             RequestId::new(9_001).unwrap(),
@@ -7971,6 +8647,10 @@ mod tests {
         assert!(matches!(
             fixture.runtime.handle_service_request(&attach).unwrap(),
             ServiceResponseBody::Cache(ServiceCacheResponse::Attached { .. })
+        ));
+        assert!(matches!(
+            fixture.runtime.unload_model(&fixture.model_id),
+            Err(EngineError::ResourceExhaustion(_))
         ));
         let pending = fixture
             .runtime

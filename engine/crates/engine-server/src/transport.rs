@@ -278,9 +278,15 @@ impl UnixFrameConnection {
 
     /// Stops further inbound reads without closing the outbound event stream.
     pub fn shutdown_inbound(&self) -> Result<(), EngineError> {
-        self.stream
-            .shutdown(Shutdown::Read)
-            .map_err(|_| EngineError::backend_failure("Unix stream read shutdown failed"))
+        match self.stream.shutdown(Shutdown::Read) {
+            Ok(()) => Ok(()),
+            // A client may close immediately after receiving its signed
+            // terminal event. The cancellation watcher is already unable to
+            // receive another command in that state, so ENOTCONN is the same
+            // idempotent terminal condition rather than a failed generation.
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+            Err(_) => Err(EngineError::backend_failure("Unix stream read shutdown failed")),
+        }
     }
 
     /// Reads exactly one inbound frame without trusting its declared allocation size.
@@ -451,6 +457,15 @@ mod tests {
                 .frame_timeout(),
             Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn inbound_shutdown_is_idempotent_after_peer_disconnect() {
+        let (server, peer) = UnixStream::pair().expect("local pair must create");
+        let connection = UnixFrameConnection { stream: server };
+        drop(peer);
+        connection.shutdown_inbound().expect("disconnected inbound shutdown must be terminal");
+        connection.shutdown_inbound().expect("repeated inbound shutdown must be idempotent");
     }
 
     #[test]
