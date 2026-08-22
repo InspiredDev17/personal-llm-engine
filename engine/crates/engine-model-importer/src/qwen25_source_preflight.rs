@@ -349,10 +349,10 @@ impl PinnedSourceFile {
         if before.file_type().is_symlink()
             || !before.is_file()
             || before.uid() != owner_uid
-            || before.mode() & 0o077 != 0
+            || before.mode() & 0o7777 != 0o400
         {
             return Err(EngineError::authentication_failure(format!(
-                "{label} source must be one owner-private regular non-symlink file"
+                "{label} source must be one owner-read-only regular non-symlink file"
             )));
         }
         if !allowed_lengths.contains(&before.len()) {
@@ -458,6 +458,7 @@ fn validate_artifact_name(name: &str) -> Result<(), EngineError> {
     if name.is_empty()
         || name.len() > MAX_ARTIFACT_NAME_BYTES
         || !name.is_ascii()
+        || name.starts_with('.')
         || name.contains("..")
         || name.chars().any(char::is_control)
         || !name
@@ -711,7 +712,7 @@ mod tests {
     #[test]
     fn root_and_artifact_names_fail_closed() {
         assert!(validate_absolute_normal_root(Path::new("relative")).is_err());
-        for name in ["", "../escape", "a/b", "https://example.invalid"] {
+        for name in ["", ".", ".hidden", "../escape", "a/b", "https://example.invalid"] {
             assert!(validate_artifact_name(name).is_err());
         }
 
@@ -720,6 +721,22 @@ mod tests {
         symlink(&root, &linked).expect("directory symlink must create");
         assert!(DirectoryGuard::open(&linked, None, "test root").is_err());
         fs::remove_file(linked).expect("symlink must remove");
+        fs::remove_dir_all(root).expect("temporary tree must remove");
+    }
+
+    #[test]
+    fn source_files_require_exact_read_only_data_permissions() {
+        let root = private_temp("source-file-modes");
+        let path = root.join("model.safetensors");
+        private_file(&path, b"x");
+        let uid = fs::metadata(&root).expect("root metadata").uid();
+        assert!(PinnedSourceFile::open(&path, uid, &[1], "test").is_ok());
+
+        for mode in [0o600, 0o500, 0o700, 0o4500, 0o040] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("test mode must set");
+            assert!(PinnedSourceFile::open(&path, uid, &[1], "test").is_err());
+        }
         fs::remove_dir_all(root).expect("temporary tree must remove");
     }
 }

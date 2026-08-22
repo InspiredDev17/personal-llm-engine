@@ -78,8 +78,10 @@ path inspection, source reads, shard parsing, tensor conversion, or allocation.
 The portable preflight now requires one absolute normalized owner-private
 ingress root, one safe direct-child artifact name, an owner-private `source/`
 directory, and exactly `config.json`, `tokenizer.json`, and
-`model.safetensors`. Directories and files must share the ingress owner and
-grant no group/other permission. Unix opens use `O_NOFOLLOW`, `O_CLOEXEC`, and
+`model.safetensors`. Hidden or dot-alias artifact names are rejected.
+Directories and files must share the ingress owner; source files must have
+exact mode `0400`, with write, execute, and special bits forbidden. Unix opens
+use `O_NOFOLLOW`, `O_CLOEXEC`, and
 `O_DIRECTORY` where applicable; root, artifact, and source directory
 descriptors remain open throughout inspection. File device, inode, length,
 mode, owner, and modification timestamp must agree before open, after open, and
