@@ -70,9 +70,12 @@ Both direct crates declare Unicode 16.0.0. The vendored normalization and
 category table SHA-256 values are respectively
 `69a0faad67afe03146d80ff5b2d889d1898cbfe8f7677a24f012148f6fd27348`
 and `9a06bcac89a552d169aec1411438ab948391a218cbfef8c71bf186cd39ec5268`.
-The normalization archive's unused executable `scripts/unicode.py` and the
-category archive's unused external generator `Makefile` were pruned; Cargo's
-retained-file maps were regenerated while keeping the registry archive hashes.
+The normalization archive's unused executable `scripts/unicode.py`, the
+category archive's unused external generator `Makefile`, and ignored
+package-local `Cargo.lock` files from the category and `tinyvec` archives were
+pruned; Cargo's retained-file maps were regenerated while keeping the registry
+archive hashes. An architecture test requires every remaining retained-file
+path to exist in tracked release content.
 No JavaScript source was present. `unicode-general-category/build.rs` is the
 only new build-time surface: it deterministically reads bundled `src/tables.rs`
 and writes `category.rs` only to `OUT_DIR`, without network, subprocess, native

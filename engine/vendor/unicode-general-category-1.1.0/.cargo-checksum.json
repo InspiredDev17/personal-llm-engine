@@ -3,7 +3,6 @@
     ".cargo_vcs_info.json": "e68dfe117ea1f9afebe3d02abb164c502f5dbdbab2db88d4d706f8bf49d16c85",
     ".github/workflows/ci.yml": "d8425046917d2da8262124056fa918c848288524fa534509dfc4a98c68291355",
     ".gitignore": "6b937008e0a58a438c32574627db6961a4d2aff4bf5c703d4e45cb56ef3b168a",
-    "Cargo.lock": "1b1c39a1e3084a55e795f5b3dd7ee770808e3367a74491a03a1393a6fe9929b6",
     "Cargo.toml": "e1c3cf7b47f6ecd29d83ed6dd6f2953df059603fb91e564619076ccad08f5331",
     "Cargo.toml.orig": "1a6929e005e17736774751c6e93e937ad4c784c49f5bbff7869cb2aa2bdd29ab",
     "LICENSE": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",

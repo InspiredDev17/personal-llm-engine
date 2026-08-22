@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[test]
 #[allow(
@@ -613,6 +614,49 @@ fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
             "vendored release graph contains a prohibited language file: {}",
             path.display()
         );
+    }
+}
+
+#[test]
+fn every_vendor_checksum_path_exists_in_tracked_release_content() {
+    let root = engine_root();
+    let repository = root.parent().expect("engine must have repository parent");
+    let vendor = root.join("vendor");
+    let tracked = tracked_vendor_files(repository);
+    let checksum_maps = collect_files(&vendor, ".cargo-checksum.json");
+    assert!(!checksum_maps.is_empty(), "vendor checksum maps must exist");
+
+    for checksum_map in checksum_maps {
+        let package = checksum_map.parent().expect("checksum map must have package parent");
+        let package_relative =
+            package.strip_prefix(repository).expect("vendored package must be repository relative");
+        let document = fs::read_to_string(&checksum_map).expect("checksum map must be readable");
+        for retained_path in cargo_checksum_file_paths(&document) {
+            let retained_path = Path::new(retained_path);
+            assert!(
+                !retained_path.as_os_str().is_empty()
+                    && retained_path
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "vendor checksum map contains a non-local path: {} in {}",
+                retained_path.display(),
+                checksum_map.display()
+            );
+            let retained_file = package.join(retained_path);
+            assert!(
+                retained_file.is_file(),
+                "vendor checksum map references a missing release file: {}",
+                retained_file.display()
+            );
+            if let Some(tracked) = &tracked {
+                let repository_relative = package_relative.join(retained_path);
+                assert!(
+                    tracked.contains(&repository_relative),
+                    "vendor checksum map references a file excluded from Git release content: {}",
+                    repository_relative.display()
+                );
+            }
+        }
     }
 }
 
@@ -1275,4 +1319,79 @@ fn collect_all_files(root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+fn tracked_vendor_files(repository: &Path) -> Option<BTreeSet<PathBuf>> {
+    if !repository.join(".git").try_exists().expect("Git marker must be inspectable") {
+        // A source archive contains only tracked Git content, so existence is
+        // the equivalent invariant when repository metadata is intentionally absent.
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["ls-files", "-z", "--", "engine/vendor"])
+        .output()
+        .expect("git ls-files must run for the source worktree");
+    assert!(output.status.success(), "git ls-files failed for vendored release content");
+    let output = String::from_utf8(output.stdout).expect("tracked paths must be UTF-8");
+    Some(output.split('\0').filter(|path| !path.is_empty()).map(PathBuf::from).collect())
+}
+
+fn cargo_checksum_file_paths(document: &str) -> Vec<&str> {
+    let files_marker = document.find("\"files\"").expect("checksum map must contain files");
+    let object_offset = document[files_marker..]
+        .find('{')
+        .map(|offset| files_marker + offset)
+        .expect("checksum files value must be an object");
+    let bytes = document.as_bytes();
+    let mut cursor = object_offset + 1;
+    let mut first = true;
+    let mut paths = Vec::new();
+
+    loop {
+        skip_ascii_whitespace(bytes, &mut cursor);
+        assert!(cursor < bytes.len(), "checksum files object must terminate");
+        if bytes[cursor] == b'}' {
+            break;
+        }
+        if !first {
+            assert_eq!(bytes[cursor], b',', "checksum file entries must be comma separated");
+            cursor += 1;
+            skip_ascii_whitespace(bytes, &mut cursor);
+        }
+        first = false;
+        assert_eq!(bytes.get(cursor), Some(&b'\"'), "checksum path must be a JSON string");
+        cursor += 1;
+        let path_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte != b'\"') {
+            assert_ne!(bytes[cursor], b'\\', "escaped vendor paths are not admitted");
+            cursor += 1;
+        }
+        assert!(cursor < bytes.len(), "checksum path string must terminate");
+        let path = &document[path_start..cursor];
+        cursor += 1;
+        skip_ascii_whitespace(bytes, &mut cursor);
+        assert_eq!(bytes.get(cursor), Some(&b':'), "checksum path must have a value");
+        cursor += 1;
+        skip_ascii_whitespace(bytes, &mut cursor);
+        assert_eq!(bytes.get(cursor), Some(&b'\"'), "file checksum must be a JSON string");
+        cursor += 1;
+        let hash_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte != b'\"') {
+            assert!(bytes[cursor].is_ascii_hexdigit(), "file checksum must be hexadecimal");
+            cursor += 1;
+        }
+        assert_eq!(cursor - hash_start, 64, "file checksum must be SHA-256");
+        assert!(cursor < bytes.len(), "file checksum string must terminate");
+        cursor += 1;
+        paths.push(path);
+    }
+    paths
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+        *cursor += 1;
+    }
 }

@@ -119,6 +119,11 @@ Admission review on 2026-08-22 found:
   forbids unsafe code, has no build script/dependency/native link, and has
   archive SHA-256
   `1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20`.
+- The category and `tinyvec` archives' package-local `Cargo.lock` files are
+  ignored upstream and are not runtime, build, or release inputs. They were
+  pruned together with their retained-file-map entries. Architecture tests now
+  require every remaining vendor checksum-map path to exist in Git-tracked
+  content, with a clean `git archive` check proving the no-`.git` release case.
 - `cargo audit --no-fetch` scanned this lock against 1,225 locally cached
   advisories at database commit
   `bf5c0d245a92671908518d7e765914d437954ed6` (2026-08-21) and reported no
