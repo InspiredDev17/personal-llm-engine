@@ -8,6 +8,7 @@ use personalai_engine_types::{ModelPackageHash, RequestId};
 
 const MAX_CAMPAIGN_BYTES: usize = 4096;
 const MAX_FUZZ_VOCABULARY: usize = 128;
+const MAX_FUZZ_ID_SET: usize = 8;
 
 fn u32_at(data: &[u8], offset: usize) -> u32 {
     let mut bytes = [0_u8; 4];
@@ -16,6 +17,15 @@ fn u32_at(data: &[u8], offset: usize) -> u32 {
         bytes[..available].copy_from_slice(&data[offset..offset + available]);
     }
     u32::from_le_bytes(bytes)
+}
+
+fn bounded_ids(data: &[u8], count_offset: usize, values_offset: usize, modulus: u32) -> Vec<u32> {
+    let count = usize::from(data.get(count_offset).copied().unwrap_or(0)) % (MAX_FUZZ_ID_SET + 1);
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        ids.push(u32_at(data, values_offset.saturating_add(index.saturating_mul(4))) % modulus);
+    }
+    ids
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -67,6 +77,19 @@ fuzz_target!(|data: &[u8]| {
     let Ok(domain) = domain else {
         return;
     };
+    let allowed = bounded_ids(data, 540, 544, vocabulary_u32);
+    let disallowed = bounded_ids(data, 576, 580, vocabulary_u32);
+    let stop = bounded_ids(data, 612, 616, vocabulary_u32);
+    let history = bounded_ids(data, 648, 652, vocabulary_u32);
+    let Ok(config) = config.with_allowed_token_ids(&allowed) else {
+        return;
+    };
+    let Ok(config) = config.with_disallowed_token_ids(&disallowed) else {
+        return;
+    };
+    let Ok(config) = config.with_stop_token_ids(&stop) else {
+        return;
+    };
     let Ok(mut sampler) = Sampler::new(
         config,
         domain,
@@ -75,5 +98,5 @@ fuzz_target!(|data: &[u8]| {
     ) else {
         return;
     };
-    let _result = sampler.sample(&tensor, &[]);
+    let _result = sampler.sample(&tensor, &history);
 });

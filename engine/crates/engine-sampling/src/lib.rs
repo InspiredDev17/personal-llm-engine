@@ -511,15 +511,21 @@ pub fn select_next_token(
         if !domain.contains(token_id) {
             continue;
         }
-        if !value.is_finite() {
-            return Err(EngineError::backend_failure("sampling received a non-finite logit"));
+        if value.is_nan() || value == f32::INFINITY {
+            return Err(EngineError::backend_failure(
+                "sampling received NaN or positive-infinite logits",
+            ));
+        }
+        if value == f32::NEG_INFINITY {
+            continue;
         }
         if selected.is_none_or(|(_, best)| value > best) {
             selected = Some((index, value));
         }
     }
-    let selected =
-        selected.ok_or_else(|| EngineError::internal_invariant("validated logits became empty"))?;
+    let selected = selected.ok_or_else(|| {
+        EngineError::backend_failure("sampling probability distribution is empty")
+    })?;
     u32::try_from(selected.0)
         .map_err(|_| EngineError::internal_invariant("selected token ID exceeds u32"))
 }
@@ -551,8 +557,13 @@ pub fn select_next_token_tensor(
             continue;
         }
         let value = logits.f32_value(index)?;
-        if !value.is_finite() {
-            return Err(EngineError::backend_failure("sampling received a non-finite logit"));
+        if value.is_nan() || value == f32::INFINITY {
+            return Err(EngineError::backend_failure(
+                "sampling received NaN or positive-infinite logits",
+            ));
+        }
+        if value == f32::NEG_INFINITY {
+            continue;
         }
         if selected_index.is_none() || value > selected_value {
             selected_index = Some(index);
@@ -560,7 +571,7 @@ pub fn select_next_token_tensor(
         }
     }
     let selected_index = selected_index.ok_or_else(|| {
-        EngineError::internal_invariant("validated token domain contained no selectable ID")
+        EngineError::backend_failure("sampling probability distribution is empty")
     })?;
     u32::try_from(selected_index)
         .map_err(|_| EngineError::internal_invariant("selected token ID exceeds u32"))
@@ -864,6 +875,37 @@ mod tests {
             select_next_token_tensor(&logits, &SamplingConfig::greedy(), domain).unwrap(),
             select_next_token(&[0.5, 2.0, 2.0, -1.0], &SamplingConfig::greedy(), domain).unwrap()
         );
+    }
+
+    #[test]
+    fn tensor_and_slice_compatibility_share_non_finite_policy() {
+        let pool = MemoryPool::new(4096).unwrap();
+        let domain = prefix_domain(4, 3);
+        let config = SamplingConfig::greedy();
+
+        let finite = [f32::NEG_INFINITY, 2.0, f32::NEG_INFINITY, f32::MAX];
+        let finite_tensor = tensor(&finite, &pool);
+        assert_eq!(select_next_token(&finite, &config, domain).unwrap(), 1);
+        assert_eq!(select_next_token_tensor(&finite_tensor, &config, domain).unwrap(), 1);
+
+        let empty = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::MAX];
+        let empty_tensor = tensor(&empty, &pool);
+        for result in [
+            select_next_token(&empty, &config, domain),
+            select_next_token_tensor(&empty_tensor, &config, domain),
+        ] {
+            assert!(matches!(result, Err(EngineError::BackendFailure(_))));
+        }
+
+        for invalid in [[f32::NAN, 1.0, 2.0, f32::MAX], [f32::INFINITY, 1.0, 2.0, f32::MAX]] {
+            let invalid_tensor = tensor(&invalid, &pool);
+            for result in [
+                select_next_token(&invalid, &config, domain),
+                select_next_token_tensor(&invalid_tensor, &config, domain),
+            ] {
+                assert!(matches!(result, Err(EngineError::BackendFailure(_))));
+            }
+        }
     }
 
     #[test]

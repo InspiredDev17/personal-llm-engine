@@ -5423,7 +5423,7 @@ mod tests {
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{
         ArchitectureId, ContextLimit, DType, ModelHashAlgorithm, ResourceBudget, Sha256Digest,
-        SignerKeyId,
+        SignerKeyId, TensorShape,
     };
 
     #[cfg(feature = "cpu-reference")]
@@ -6372,6 +6372,33 @@ mod tests {
         )
         .expect("test-only restricted domain must validate");
         let reserved = loaded.selectable_token_domain().selectable_token_count();
+        let logit_count = usize::try_from(verified.model_vocabulary_size()).unwrap();
+        let mut logits = vec![-1.0_f32; logit_count];
+        logits[65] = 2.0;
+        logits[usize::try_from(reserved).unwrap()] = f32::MAX;
+        let maximal_reserved = Tensor::from_f32_values(
+            TensorShape::new([u64::from(verified.model_vocabulary_size())]).unwrap(),
+            &logits,
+            loaded.model().memory_pool(),
+        )
+        .unwrap();
+        let mut sampler = loaded
+            .sampler(SamplingConfig::greedy(), RequestId::new(703).unwrap())
+            .expect("verified loaded domain must construct its sampler");
+        assert_eq!(sampler.sample(&maximal_reserved, &[]).unwrap(), 65);
+
+        logits[usize::try_from(reserved).unwrap()] = f32::NAN;
+        let nonfinite_reserved = Tensor::from_f32_values(
+            TensorShape::new([u64::from(verified.model_vocabulary_size())]).unwrap(),
+            &logits,
+            loaded.model().memory_pool(),
+        )
+        .unwrap();
+        let mut sampler = loaded
+            .sampler(SamplingConfig::greedy(), RequestId::new(704).unwrap())
+            .expect("verified loaded domain must construct its sampler");
+        assert_eq!(sampler.sample(&nonfinite_reserved, &[]).unwrap(), 65);
+
         let request = GenerationRequest::new(
             RequestId::new(702).unwrap(),
             model_id,
