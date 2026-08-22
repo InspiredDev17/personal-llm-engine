@@ -43,6 +43,17 @@ absent. Adding a general regex crate or pretending byte-only tokenization is
 equivalent is prohibited. Approved offline-vendored Unicode support and
 independent conformance vectors are required before packaging. See ADR-0035.
 
+The sampling runtime now has a separate immutable selectable-token-domain
+boundary. Deterministic tests model the exact Qwen counts and prove that IDs
+151665 through 151935 cannot influence greedy, temperature, top-k, top-p,
+min-p, or repetition-penalty selection even when every reserved row has the
+largest logit. This is portable safety scaffolding only. Current service load
+code still derives only the legacy all-vocabulary domain after exact AIPTok v1
+vocabulary equality. The data-only AIPTok v2 parser proves the Qwen prefix
+cardinality but deliberately refuses tokenizer construction, so the service
+cannot derive or execute that domain until exact Unicode/tokenizer execution,
+conversion, and activation are reviewed.
+
 ## Package boundary
 
 `PAIDIR01` v1.1 and the scalar Qwen correctness scaffold now exist without

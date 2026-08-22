@@ -107,7 +107,7 @@ use personalai_engine_protocol::{
     encode_signed_service_response,
 };
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_sampling::{Sampler, SamplingConfig};
+use personalai_engine_sampling::{Sampler, SamplingConfig, SelectableTokenDomain};
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_scheduler::CancellationOutcome;
 #[cfg(feature = "cpu-reference")]
@@ -480,6 +480,7 @@ pub struct LoadedCpuModel {
     model_id: ModelId,
     model: CpuDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+    selectable_token_domain: SelectableTokenDomain,
     placement: Option<Arc<ExecutionPlacementPlan>>,
     reusable_cache: Option<Arc<ReusableKvCacheStore>>,
     cache_compatibility: KvCacheCompatibility,
@@ -494,6 +495,7 @@ pub struct LoadedMetalModel {
     model_id: ModelId,
     model: MetalDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+    selectable_token_domain: SelectableTokenDomain,
     placement: Option<Arc<ExecutionPlacementPlan>>,
 }
 
@@ -780,6 +782,19 @@ impl LoadedMetalModel {
         self.tokenizer.as_ref()
     }
 
+    /// Returns the verified model/tokenizer token domain enforced by sampling.
+    pub const fn selectable_token_domain(&self) -> SelectableTokenDomain {
+        self.selectable_token_domain
+    }
+
+    fn sampler(
+        &self,
+        sampling: SamplingConfig,
+        request_id: RequestId,
+    ) -> Result<Sampler, EngineError> {
+        Sampler::new(sampling, self.selectable_token_domain, request_id, self.model.memory_pool())
+    }
+
     /// Returns the immutable verified-package placement plan, when this is not
     /// a legacy test fixture.
     pub fn placement(&self) -> Option<&ExecutionPlacementPlan> {
@@ -796,6 +811,7 @@ impl LoadedMetalModel {
             &self.model_id,
             RuntimeDecoderModel::Metal(self.model.clone()),
             Arc::clone(&self.tokenizer),
+            self.selectable_token_domain,
             request,
             sequence_id,
             SamplingConfig::greedy(),
@@ -911,7 +927,7 @@ impl LoadedMetalModel {
             .map_err(|_| {
                 EngineError::resource_exhaustion("generation history allocation failed")
             })?;
-        let mut sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
+        let mut sampler = self.sampler(sampling, request.request_id())?;
         let mut decoder = IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer));
         let mut generated = 0_u32;
         loop {
@@ -982,6 +998,19 @@ impl LoadedCpuModel {
     /// Returns the package tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// Returns the verified model/tokenizer token domain enforced by sampling.
+    pub const fn selectable_token_domain(&self) -> SelectableTokenDomain {
+        self.selectable_token_domain
+    }
+
+    fn sampler(
+        &self,
+        sampling: SamplingConfig,
+        request_id: RequestId,
+    ) -> Result<Sampler, EngineError> {
+        Sampler::new(sampling, self.selectable_token_domain, request_id, self.model.memory_pool())
     }
 
     /// Returns the immutable verified-package placement plan, when this is not
@@ -1077,6 +1106,7 @@ impl LoadedCpuModel {
             &self.model_id,
             RuntimeDecoderModel::Cpu(self.model.clone()),
             Arc::clone(&self.tokenizer),
+            self.selectable_token_domain,
             request,
             sequence_id,
             SamplingConfig::greedy(),
@@ -1116,6 +1146,7 @@ impl LoadedCpuModel {
             &self.model_id,
             RuntimeDecoderModel::Cpu(self.model.clone()),
             Arc::clone(&self.tokenizer),
+            self.selectable_token_domain,
             request,
             sequence_id,
             sampling,
@@ -1277,7 +1308,7 @@ impl LoadedCpuModel {
             .map_err(|_| {
                 EngineError::resource_exhaustion("generation history allocation failed")
             })?;
-        let mut sampler = Sampler::new(sampling, request.request_id(), self.model.memory_pool());
+        let mut sampler = self.sampler(sampling, request.request_id())?;
         let mut decoder = IncrementalDecoder::new_shared(Arc::clone(&self.tokenizer));
         let mut generated = 0_u32;
         loop {
@@ -1344,6 +1375,12 @@ fn build_loaded_cpu_model(
     tokenizer_digest: personalai_engine_types::Sha256Digest,
     budget: &ResourceBudget,
 ) -> Result<LoadedCpuModel, EngineError> {
+    let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+        model.config().vocabulary_size(),
+        tokenizer.spec().vocabulary_size(),
+        package_hash,
+        tokenizer_hash,
+    )?;
     let artifact_id = match placement.as_ref().and_then(|plan| plan.artifact_id()) {
         Some(value) => KnowledgeIdentity::new(value)?,
         None => owner_pinned_artifact_id(package_hash)?,
@@ -1380,6 +1417,7 @@ fn build_loaded_cpu_model(
         model_id,
         model,
         tokenizer,
+        selectable_token_domain,
         placement,
         reusable_cache,
         cache_compatibility: compatibility,
@@ -1591,10 +1629,15 @@ struct CacheGenerationStart {
 }
 
 #[cfg(feature = "cpu-reference")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cursor construction keeps the verified model, tokenizer, and immutable token domain explicit"
+)]
 fn start_generation_cursor(
     model_id: &ModelId,
     model: RuntimeDecoderModel,
     tokenizer: Arc<dyn Tokenizer>,
+    selectable_token_domain: SelectableTokenDomain,
     request: &GenerationRequest,
     sequence_id: SequenceId,
     sampling: SamplingConfig,
@@ -1625,7 +1668,8 @@ fn start_generation_cursor(
         .checked_add(uncached_input_count)
         .ok_or_else(|| EngineError::resource_exhaustion("cached input token count overflows"))?;
     request.validate_tokenized_input(input_count)?;
-    let sampler = Sampler::new(sampling, request.request_id(), model.memory_pool());
+    let sampler =
+        Sampler::new(sampling, selectable_token_domain, request.request_id(), model.memory_pool())?;
     let history = input_tokens.clone();
     Ok(GreedyGeneration {
         request: request.clone(),
@@ -5086,6 +5130,12 @@ impl EngineService {
                     "manifest and tokenizer vocabulary sizes differ",
                 ));
             }
+            let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+                config.vocabulary_size(),
+                tokenizer.spec().vocabulary_size(),
+                *verified.registration().expected_hash(),
+                verified.manifest().tokenizer_hash(),
+            )?;
             let placement = Self::fully_resident_placement(
                 &verified,
                 budget,
@@ -5105,6 +5155,7 @@ impl EngineService {
                 model_id: model_id.clone(),
                 model,
                 tokenizer,
+                selectable_token_domain,
                 placement: Some(placement),
             })
         })();
@@ -5156,15 +5207,19 @@ impl EngineService {
         )?;
         let pool = MemoryPool::from_budget(budget)?;
         let config = TransformerConfig::from_manifest(parsed.manifest())?;
-        let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(
-            parsed.tokenizer_data(package_bytes)?,
-            &pool,
-        )?);
+        let tokenizer_data = parsed.tokenizer_data(package_bytes)?;
+        let tokenizer = Arc::<dyn Tokenizer>::from(build_tokenizer(tokenizer_data, &pool)?);
         if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
             return Err(EngineError::corrupt_model_package(
                 "manifest and tokenizer vocabulary sizes differ",
             ));
         }
+        let selectable_token_domain = SelectableTokenDomain::entire_model_vocabulary(
+            config.vocabulary_size(),
+            tokenizer.spec().vocabulary_size(),
+            *registration.expected_hash(),
+            hash_package(tokenizer_data),
+        )?;
         let mut weights = BTreeMap::new();
         for record in parsed.tensors() {
             let tensor = Tensor::copy_from_bytes(
@@ -5181,7 +5236,13 @@ impl EngineService {
         }
         let model =
             MetalDecoderModel::new_registered(model_id.clone(), config, weights, &pool, backend)?;
-        Ok(LoadedMetalModel { model_id: model_id.clone(), model, tokenizer, placement: None })
+        Ok(LoadedMetalModel {
+            model_id: model_id.clone(),
+            model,
+            tokenizer,
+            selectable_token_domain,
+            placement: None,
+        })
     }
 
     /// Activates and runs the next queued request on an already loaded model.
@@ -5362,7 +5423,7 @@ mod tests {
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{
         ArchitectureId, ContextLimit, DType, ModelHashAlgorithm, ResourceBudget, Sha256Digest,
-        SignerKeyId,
+        SignerKeyId, TensorShape,
     };
 
     #[cfg(feature = "cpu-reference")]
@@ -6271,6 +6332,100 @@ mod tests {
             cancelled_events.as_slice(),
             [InferenceEvent::RequestAccepted { .. }, InferenceEvent::RequestCancelled { .. }]
         ));
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn loaded_model_sampling_domain_is_identity_bound_and_cannot_be_expanded_by_a_request() {
+        let fixture = DecoderPackageFixtureBuilder::new().build().expect("fixture must build");
+        let mut service = service();
+        let model_id = ModelId::new("decoder-domain-bound").expect("model ID must validate");
+        service
+            .register_configured_model(
+                model_id.clone(),
+                "decoder-domain-bound.paimodel",
+                fixture.package_hash(),
+                fixture.trusted_signer().clone(),
+            )
+            .expect("fixture must register");
+        let budget = ResourceBudget::new(1 << 24, 1 << 20, 1).expect("budget must validate");
+        let mut loaded = service
+            .load_registered_cpu_model_bytes(&model_id, fixture.bytes(), &budget)
+            .expect("signed fixture must load");
+        let verified = loaded.selectable_token_domain();
+        assert_eq!(
+            verified.kind(),
+            personalai_engine_sampling::SelectableTokenDomainKind::EntireModelVocabulary
+        );
+        assert_eq!(verified.model_package_hash(), fixture.package_hash());
+        assert_eq!(verified.model_vocabulary_size(), loaded.model().config().vocabulary_size());
+        assert_eq!(verified.selectable_token_count(), loaded.tokenizer().spec().vocabulary_size());
+
+        loaded.selectable_token_domain = SelectableTokenDomain::contiguous_tokenizer_prefix(
+            verified.model_vocabulary_size(),
+            verified
+                .selectable_token_count()
+                .checked_sub(1)
+                .expect("fixture vocabulary is non-empty"),
+            verified.model_package_hash(),
+            verified.tokenizer_hash(),
+        )
+        .expect("test-only restricted domain must validate");
+        let reserved = loaded.selectable_token_domain().selectable_token_count();
+        let logit_count = usize::try_from(verified.model_vocabulary_size()).unwrap();
+        let mut logits = vec![-1.0_f32; logit_count];
+        logits[65] = 2.0;
+        logits[usize::try_from(reserved).unwrap()] = f32::MAX;
+        let maximal_reserved = Tensor::from_f32_values(
+            TensorShape::new([u64::from(verified.model_vocabulary_size())]).unwrap(),
+            &logits,
+            loaded.model().memory_pool(),
+        )
+        .unwrap();
+        let mut sampler = loaded
+            .sampler(SamplingConfig::greedy(), RequestId::new(703).unwrap())
+            .expect("verified loaded domain must construct its sampler");
+        assert_eq!(sampler.sample(&maximal_reserved, &[]).unwrap(), 65);
+
+        logits[usize::try_from(reserved).unwrap()] = f32::NAN;
+        let nonfinite_reserved = Tensor::from_f32_values(
+            TensorShape::new([u64::from(verified.model_vocabulary_size())]).unwrap(),
+            &logits,
+            loaded.model().memory_pool(),
+        )
+        .unwrap();
+        let mut sampler = loaded
+            .sampler(SamplingConfig::greedy(), RequestId::new(704).unwrap())
+            .expect("verified loaded domain must construct its sampler");
+        assert_eq!(sampler.sample(&nonfinite_reserved, &[]).unwrap(), 65);
+
+        let request = GenerationRequest::new(
+            RequestId::new(702).unwrap(),
+            model_id,
+            "AB",
+            1,
+            ContextLimit::new(8).unwrap(),
+            budget,
+        )
+        .expect("request must validate");
+        let error = loaded
+            .start_generation(
+                &request,
+                SequenceId::new(34).unwrap(),
+                SamplingConfig::greedy().with_allowed_token_ids(&[reserved]).unwrap(),
+            )
+            .err()
+            .expect("request cannot expand the loaded model domain");
+        assert!(matches!(error, EngineError::InvalidInput(_)));
+        assert!(!error.to_string().contains(&reserved.to_string()));
+
+        loaded
+            .start_generation(
+                &request,
+                SequenceId::new(35).unwrap(),
+                SamplingConfig::greedy().with_allowed_token_ids(&[65]).unwrap(),
+            )
+            .expect("a request may narrow the trusted domain");
     }
 
     #[cfg(feature = "cpu-reference")]

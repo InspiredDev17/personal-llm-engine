@@ -1,14 +1,15 @@
 //! First-party bounded deterministic token sampling.
 //!
-//! Filtering order is fixed: allow/deny constraints, repetition penalty,
-//! temperature, top-k, min-p, then top-p. Equal scores use the lower token ID.
-//! [`DeterministicRng`] is reproducible xorshift64* state and is explicitly not
-//! suitable for cryptography, secrets, identifiers, or authorization.
+//! Filtering order is fixed: trusted selectable-token domain, request
+//! allow/deny constraints, repetition penalty, temperature, top-k, min-p, then
+//! top-p. Equal scores use the lower token ID. [`DeterministicRng`] is
+//! reproducible xorshift64* state and is explicitly not suitable for
+//! cryptography, secrets, identifiers, or authorization.
 
 use personalai_engine_memory::{MemoryOwner, MemoryPool};
 use personalai_engine_tensor::Tensor;
 use personalai_engine_types::{
-    DType, EngineError, MAX_TOKEN_COUNT, MAX_VOCABULARY_SIZE, RequestId,
+    DType, EngineError, MAX_TOKEN_COUNT, MAX_VOCABULARY_SIZE, ModelPackageHash, RequestId,
 };
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -19,6 +20,124 @@ pub const MAX_TEMPERATURE: f32 = 2.0;
 pub const MIN_REPETITION_PENALTY: f32 = 0.01;
 /// Maximum accepted repetition penalty.
 pub const MAX_REPETITION_PENALTY: f32 = 100.0;
+
+/// Trusted interpretation of the token IDs that a loaded tokenizer can emit
+/// and decode for one exact model logit vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectableTokenDomainKind {
+    /// Every model logit ID is defined by the tokenizer.
+    EntireModelVocabulary,
+    /// The tokenizer defines one contiguous prefix and the model reserves the tail.
+    ContiguousTokenizerPrefix,
+}
+
+/// Immutable model/tokenizer-bound token domain used before every selection.
+///
+/// This is engine-internal execution metadata. It is derived while loading an
+/// already verified model and tokenizer; it is not accepted from generation
+/// clients. Request allow/deny filters may only narrow this domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectableTokenDomain {
+    kind: SelectableTokenDomainKind,
+    model_vocabulary_size: u32,
+    selectable_token_count: u32,
+    model_package_hash: ModelPackageHash,
+    tokenizer_hash: ModelPackageHash,
+}
+
+impl SelectableTokenDomain {
+    /// Binds the legacy case where every model logit ID is tokenizer-defined.
+    pub fn entire_model_vocabulary(
+        model_vocabulary_size: u32,
+        tokenizer_vocabulary_size: u32,
+        model_package_hash: ModelPackageHash,
+        tokenizer_hash: ModelPackageHash,
+    ) -> Result<Self, EngineError> {
+        validate_domain_count(model_vocabulary_size, "model vocabulary")?;
+        validate_domain_count(tokenizer_vocabulary_size, "tokenizer vocabulary")?;
+        if tokenizer_vocabulary_size != model_vocabulary_size {
+            return Err(EngineError::invalid_input(
+                "entire token domain requires identical model and tokenizer vocabularies",
+            ));
+        }
+        Ok(Self {
+            kind: SelectableTokenDomainKind::EntireModelVocabulary,
+            model_vocabulary_size,
+            selectable_token_count: tokenizer_vocabulary_size,
+            model_package_hash,
+            tokenizer_hash,
+        })
+    }
+
+    /// Binds a reviewed tokenizer whose defined IDs are exactly
+    /// `0..selectable_token_count` and whose model reserves a non-empty logit tail.
+    ///
+    /// Callers must derive both counts from already validated architecture and
+    /// tokenizer metadata. This constructor is not part of the client protocol.
+    pub fn contiguous_tokenizer_prefix(
+        model_vocabulary_size: u32,
+        selectable_token_count: u32,
+        model_package_hash: ModelPackageHash,
+        tokenizer_hash: ModelPackageHash,
+    ) -> Result<Self, EngineError> {
+        validate_domain_count(model_vocabulary_size, "model vocabulary")?;
+        validate_domain_count(selectable_token_count, "selectable token count")?;
+        if selectable_token_count >= model_vocabulary_size {
+            return Err(EngineError::invalid_input(
+                "prefix token domain requires a non-empty reserved model tail",
+            ));
+        }
+        Ok(Self {
+            kind: SelectableTokenDomainKind::ContiguousTokenizerPrefix,
+            model_vocabulary_size,
+            selectable_token_count,
+            model_package_hash,
+            tokenizer_hash,
+        })
+    }
+
+    /// Returns the reviewed domain representation.
+    pub const fn kind(self) -> SelectableTokenDomainKind {
+        self.kind
+    }
+
+    /// Returns the exact model logit count required at sampling time.
+    pub const fn model_vocabulary_size(self) -> u32 {
+        self.model_vocabulary_size
+    }
+
+    /// Returns the number of tokenizer-defined selectable IDs.
+    pub const fn selectable_token_count(self) -> u32 {
+        self.selectable_token_count
+    }
+
+    /// Returns the verified model package identity bound at load time.
+    pub const fn model_package_hash(self) -> ModelPackageHash {
+        self.model_package_hash
+    }
+
+    /// Returns the verified tokenizer identity bound at load time.
+    pub const fn tokenizer_hash(self) -> ModelPackageHash {
+        self.tokenizer_hash
+    }
+
+    /// Reports whether one ID belongs to the trusted tokenizer-defined domain.
+    pub const fn contains(self, token_id: u32) -> bool {
+        token_id < self.selectable_token_count
+    }
+
+    fn validate_logit_count(self, count: usize) -> Result<(), EngineError> {
+        validate_logit_count(count)?;
+        let actual = u32::try_from(count)
+            .map_err(|_| EngineError::invalid_input("logit count exceeds u32"))?;
+        if actual != self.model_vocabulary_size {
+            return Err(EngineError::invalid_input(
+                "logit count differs from the bound token domain",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Validated token sampling and stop settings.
 #[derive(Debug, Clone, PartialEq)]
@@ -219,20 +338,32 @@ struct Candidate {
 #[derive(Debug)]
 pub struct Sampler {
     config: SamplingConfig,
+    domain: SelectableTokenDomain,
     random: DeterministicRng,
     pool: MemoryPool,
 }
 
 impl Sampler {
     /// Creates a sampler whose temporary tables are request-accounted.
-    pub fn new(config: SamplingConfig, request_id: RequestId, pool: &MemoryPool) -> Self {
+    pub fn new(
+        config: SamplingConfig,
+        domain: SelectableTokenDomain,
+        request_id: RequestId,
+        pool: &MemoryPool,
+    ) -> Result<Self, EngineError> {
+        validate_config_for_domain(&config, domain)?;
         let random = DeterministicRng::new(config.seed());
-        Self { config, random, pool: pool.scoped(MemoryOwner::Sampling(request_id)) }
+        Ok(Self { config, domain, random, pool: pool.scoped(MemoryOwner::Sampling(request_id)) })
     }
 
     /// Returns the immutable validated settings.
     pub const fn config(&self) -> &SamplingConfig {
         &self.config
+    }
+
+    /// Returns the immutable verified model/tokenizer sampling domain.
+    pub const fn domain(&self) -> SelectableTokenDomain {
+        self.domain
     }
 
     /// Selects from one rank-one F32 logit tensor and prior token history.
@@ -244,27 +375,29 @@ impl Sampler {
         }
         let count = usize::try_from(logits.shape().element_count())
             .map_err(|_| EngineError::resource_exhaustion("logit count is not addressable"))?;
-        validate_logit_count(count)?;
+        self.domain.validate_logit_count(count)?;
         if history.len() > usize::try_from(MAX_TOKEN_COUNT).unwrap_or(usize::MAX) {
             return Err(EngineError::resource_exhaustion("sampling history exceeds token bound"));
         }
-        validate_config_ids_for_vocabulary(&self.config, count)?;
+        validate_config_for_domain(&self.config, self.domain)?;
 
-        let table_bytes = count
+        let selectable_count = usize::try_from(self.domain.selectable_token_count())
+            .map_err(|_| EngineError::resource_exhaustion("token domain is not addressable"))?;
+        let table_bytes = selectable_count
             .checked_mul(size_of::<Candidate>())
-            .and_then(|value| value.checked_add(count))
+            .and_then(|value| value.checked_add(selectable_count))
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| EngineError::resource_exhaustion("sampling table size overflows"))?;
         let _reservation = self.pool.reserve(table_bytes)?;
-        let repeated = repeated_table(history, count)?;
+        let repeated = repeated_table(history, selectable_count, self.domain)?;
         let mut candidates = Vec::new();
-        candidates.try_reserve_exact(count).map_err(|_| {
+        candidates.try_reserve_exact(selectable_count).map_err(|_| {
             EngineError::resource_exhaustion("sampling candidate allocation failed")
         })?;
         for (token_index, repetition_count) in repeated.iter().copied().enumerate() {
             let token_id = u32::try_from(token_index)
                 .map_err(|_| EngineError::internal_invariant("token index exceeds u32"))?;
-            if !eligible(&self.config, token_id) {
+            if !self.domain.contains(token_id) || !eligible(&self.config, token_id) {
                 continue;
             }
             let raw = logits.f32_value(token_index)?;
@@ -352,8 +485,13 @@ impl Sampler {
 }
 
 /// Compatibility greedy selection from a bounded slice.
-pub fn select_next_token(logits: &[f32], config: &SamplingConfig) -> Result<u32, EngineError> {
-    validate_logit_count(logits.len())?;
+pub fn select_next_token(
+    logits: &[f32],
+    config: &SamplingConfig,
+    domain: SelectableTokenDomain,
+) -> Result<u32, EngineError> {
+    domain.validate_logit_count(logits.len())?;
+    validate_config_for_domain(config, domain)?;
     if config.temperature() != 0.0
         || config.top_k().is_some()
         || config.top_p().to_bits() != 1.0_f32.to_bits()
@@ -368,15 +506,26 @@ pub fn select_next_token(logits: &[f32], config: &SamplingConfig) -> Result<u32,
     }
     let mut selected = None;
     for (index, value) in logits.iter().copied().enumerate() {
-        if !value.is_finite() {
-            return Err(EngineError::backend_failure("sampling received a non-finite logit"));
+        let token_id = u32::try_from(index)
+            .map_err(|_| EngineError::internal_invariant("token index exceeds u32"))?;
+        if !domain.contains(token_id) {
+            continue;
+        }
+        if value.is_nan() || value == f32::INFINITY {
+            return Err(EngineError::backend_failure(
+                "sampling received NaN or positive-infinite logits",
+            ));
+        }
+        if value == f32::NEG_INFINITY {
+            continue;
         }
         if selected.is_none_or(|(_, best)| value > best) {
             selected = Some((index, value));
         }
     }
-    let selected =
-        selected.ok_or_else(|| EngineError::internal_invariant("validated logits became empty"))?;
+    let selected = selected.ok_or_else(|| {
+        EngineError::backend_failure("sampling probability distribution is empty")
+    })?;
     u32::try_from(selected.0)
         .map_err(|_| EngineError::internal_invariant("selected token ID exceeds u32"))
 }
@@ -385,6 +534,7 @@ pub fn select_next_token(logits: &[f32], config: &SamplingConfig) -> Result<u32,
 pub fn select_next_token_tensor(
     logits: &Tensor,
     config: &SamplingConfig,
+    domain: SelectableTokenDomain,
 ) -> Result<u32, EngineError> {
     if logits.dtype() != DType::F32 || logits.shape().rank() != 1 {
         return Err(EngineError::invalid_input("sampling requires one rank-one f32 logit tensor"));
@@ -396,24 +546,42 @@ pub fn select_next_token_tensor(
     }
     let count = usize::try_from(logits.shape().element_count())
         .map_err(|_| EngineError::resource_exhaustion("logit count is not addressable"))?;
-    validate_logit_count(count)?;
-    let mut selected_index = 0_usize;
-    let mut selected_value = logits.f32_value(0)?;
-    if !selected_value.is_finite() {
-        return Err(EngineError::backend_failure("sampling received a non-finite logit"));
-    }
-    for index in 1..count {
-        let value = logits.f32_value(index)?;
-        if !value.is_finite() {
-            return Err(EngineError::backend_failure("sampling received a non-finite logit"));
+    domain.validate_logit_count(count)?;
+    validate_config_for_domain(config, domain)?;
+    let mut selected_index = None;
+    let mut selected_value = f32::NEG_INFINITY;
+    for index in 0..count {
+        let token_id = u32::try_from(index)
+            .map_err(|_| EngineError::internal_invariant("token index exceeds u32"))?;
+        if !domain.contains(token_id) {
+            continue;
         }
-        if value > selected_value {
-            selected_index = index;
+        let value = logits.f32_value(index)?;
+        if value.is_nan() || value == f32::INFINITY {
+            return Err(EngineError::backend_failure(
+                "sampling received NaN or positive-infinite logits",
+            ));
+        }
+        if value == f32::NEG_INFINITY {
+            continue;
+        }
+        if selected_index.is_none() || value > selected_value {
+            selected_index = Some(index);
             selected_value = value;
         }
     }
+    let selected_index = selected_index.ok_or_else(|| {
+        EngineError::backend_failure("sampling probability distribution is empty")
+    })?;
     u32::try_from(selected_index)
         .map_err(|_| EngineError::internal_invariant("selected token ID exceeds u32"))
+}
+
+fn validate_domain_count(count: u32, label: &'static str) -> Result<(), EngineError> {
+    if count == 0 || count > MAX_VOCABULARY_SIZE {
+        return Err(EngineError::invalid_input(label));
+    }
+    Ok(())
 }
 
 fn validate_temperature(temperature: f32) -> Result<(), EngineError> {
@@ -457,36 +625,52 @@ fn validate_disjoint(allowed: &[u32], disallowed: &[u32]) -> Result<(), EngineEr
     Ok(())
 }
 
-fn validate_config_ids_for_vocabulary(
+fn validate_config_for_domain(
     config: &SamplingConfig,
-    vocabulary_size: usize,
+    domain: SelectableTokenDomain,
 ) -> Result<(), EngineError> {
-    let vocabulary_size = u32::try_from(vocabulary_size)
-        .map_err(|_| EngineError::resource_exhaustion("vocabulary size exceeds u32"))?;
     if config
         .allowed_token_ids
         .iter()
         .chain(config.disallowed_token_ids.iter())
         .chain(config.stop_token_ids.iter())
-        .any(|id| *id >= vocabulary_size)
+        .any(|id| !domain.contains(*id))
     {
         return Err(EngineError::invalid_input(
-            "sampling token constraint exceeds model vocabulary",
+            "sampling token constraint exceeds the trusted selectable domain",
         ));
     }
-    if config.top_k().is_some_and(|top_k| top_k > vocabulary_size) {
-        return Err(EngineError::invalid_input("sampling top-k exceeds model vocabulary"));
+    let disallowed_count = u32::try_from(config.disallowed_token_ids.len())
+        .map_err(|_| EngineError::resource_exhaustion("disallowed token count exceeds u32"))?;
+    if config.allowed_token_ids.is_empty() && disallowed_count == domain.selectable_token_count() {
+        return Err(EngineError::invalid_input(
+            "sampling constraints leave an empty trusted token domain",
+        ));
+    }
+    if config.top_k().is_some_and(|top_k| top_k > domain.selectable_token_count()) {
+        return Err(EngineError::invalid_input(
+            "sampling top-k exceeds the trusted selectable domain",
+        ));
     }
     Ok(())
 }
 
-fn repeated_table(history: &[u32], vocabulary_size: usize) -> Result<Vec<u8>, EngineError> {
+fn repeated_table(
+    history: &[u32],
+    vocabulary_size: usize,
+    domain: SelectableTokenDomain,
+) -> Result<Vec<u8>, EngineError> {
     let mut repeated = Vec::new();
     repeated
         .try_reserve_exact(vocabulary_size)
         .map_err(|_| EngineError::resource_exhaustion("repetition table allocation failed"))?;
     repeated.resize(vocabulary_size, 0);
     for token in history {
+        if !domain.contains(*token) {
+            return Err(EngineError::invalid_input(
+                "sampling history exceeds the trusted selectable domain",
+            ));
+        }
         let index = usize::try_from(*token)
             .map_err(|_| EngineError::invalid_input("history token exceeds usize"))?;
         let slot = repeated
@@ -531,7 +715,34 @@ fn weight_sum(candidates: &[Candidate]) -> Result<f64, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personalai_engine_types::TensorShape;
+    use personalai_engine_types::{ModelHashAlgorithm, TensorShape};
+
+    fn hash(byte: u8) -> ModelPackageHash {
+        ModelPackageHash::from_bytes(ModelHashAlgorithm::Sha384, [byte; 48])
+    }
+
+    fn entire_domain(vocabulary_size: u32) -> SelectableTokenDomain {
+        SelectableTokenDomain::entire_model_vocabulary(
+            vocabulary_size,
+            vocabulary_size,
+            hash(1),
+            hash(2),
+        )
+        .unwrap()
+    }
+
+    fn prefix_domain(
+        model_vocabulary_size: u32,
+        selectable_token_count: u32,
+    ) -> SelectableTokenDomain {
+        SelectableTokenDomain::contiguous_tokenizer_prefix(
+            model_vocabulary_size,
+            selectable_token_count,
+            hash(1),
+            hash(2),
+        )
+        .unwrap()
+    }
 
     fn tensor(values: &[f32], pool: &MemoryPool) -> Tensor {
         Tensor::from_f32_values(TensorShape::new([values.len() as u64]).unwrap(), values, pool)
@@ -541,10 +752,11 @@ mod tests {
     #[test]
     fn greedy_temperature_zero_and_ties_are_exact() {
         let config = SamplingConfig::greedy();
-        assert_eq!(select_next_token(&[0.5, 2.0, 2.0, -1.0], &config).unwrap(), 1);
+        let domain = entire_domain(4);
+        assert_eq!(select_next_token(&[0.5, 2.0, 2.0, -1.0], &config, domain).unwrap(), 1);
         let pool = MemoryPool::new(4096).unwrap();
         let logits = tensor(&[0.5, 2.0, 2.0, -1.0], &pool);
-        let mut sampler = Sampler::new(config, RequestId::new(1).unwrap(), &pool);
+        let mut sampler = Sampler::new(config, domain, RequestId::new(1).unwrap(), &pool).unwrap();
         assert_eq!(sampler.sample(&logits, &[]).unwrap(), 1);
     }
 
@@ -561,8 +773,10 @@ mod tests {
             .with_min_p(0.1)
             .unwrap()
             .with_seed(42);
-        let mut first = Sampler::new(config.clone(), RequestId::new(1).unwrap(), &pool);
-        let mut second = Sampler::new(config, RequestId::new(2).unwrap(), &pool);
+        let domain = entire_domain(4);
+        let mut first =
+            Sampler::new(config.clone(), domain, RequestId::new(1).unwrap(), &pool).unwrap();
+        let mut second = Sampler::new(config, domain, RequestId::new(2).unwrap(), &pool).unwrap();
         let first_sequence =
             (0..16).map(|_| first.sample(&logits, &[]).unwrap()).collect::<Vec<_>>();
         let second_sequence =
@@ -586,7 +800,9 @@ mod tests {
             .unwrap()
             .with_maximum_generated_tokens(7)
             .unwrap();
-        let mut sampler = Sampler::new(config.clone(), RequestId::new(1).unwrap(), &pool);
+        let mut sampler =
+            Sampler::new(config.clone(), entire_domain(4), RequestId::new(1).unwrap(), &pool)
+                .unwrap();
         assert_eq!(sampler.sample(&logits, &[2]).unwrap(), 3);
         assert!(config.is_stop_token(3));
         assert_eq!(config.maximum_generated_tokens(), 7);
@@ -600,6 +816,8 @@ mod tests {
         assert!(SamplingConfig::new(1.0).unwrap().with_min_p(1.1).is_err());
         assert!(SamplingConfig::new(1.0).unwrap().with_repetition_penalty(0.0).is_err());
         assert!(SamplingConfig::greedy().with_allowed_token_ids(&[1, 1]).is_err());
+        assert!(SamplingConfig::greedy().with_disallowed_token_ids(&[1, 1]).is_err());
+        assert!(SamplingConfig::greedy().with_stop_token_ids(&[1, 1]).is_err());
         assert!(
             SamplingConfig::greedy()
                 .with_allowed_token_ids(&[1])
@@ -611,26 +829,210 @@ mod tests {
         let pool = MemoryPool::new(1 << 20).unwrap();
         for values in [[0.0, f32::NAN], [0.0, f32::INFINITY], [f32::NEG_INFINITY; 2]] {
             let logits = tensor(&values, &pool);
-            let mut sampler =
-                Sampler::new(SamplingConfig::greedy(), RequestId::new(1).unwrap(), &pool);
+            let mut sampler = Sampler::new(
+                SamplingConfig::greedy(),
+                entire_domain(2),
+                RequestId::new(1).unwrap(),
+                &pool,
+            )
+            .unwrap();
             assert!(sampler.sample(&logits, &[]).is_err());
         }
         let logits = tensor(&[1.0, 2.0], &pool);
-        let mut sampler = Sampler::new(
-            SamplingConfig::greedy().with_allowed_token_ids(&[3]).unwrap(),
-            RequestId::new(2).unwrap(),
-            &pool,
+        assert!(
+            Sampler::new(
+                SamplingConfig::greedy().with_allowed_token_ids(&[3]).unwrap(),
+                entire_domain(2),
+                RequestId::new(2).unwrap(),
+                &pool,
+            )
+            .is_err()
         );
-        assert!(sampler.sample(&logits, &[]).is_err());
+        let mut sampler = Sampler::new(
+            SamplingConfig::greedy(),
+            entire_domain(2),
+            RequestId::new(3).unwrap(),
+            &pool,
+        )
+        .unwrap();
+        assert!(sampler.sample(&logits, &[2]).is_err());
+        let mut wrong_model = Sampler::new(
+            SamplingConfig::greedy(),
+            entire_domain(3),
+            RequestId::new(4).unwrap(),
+            &pool,
+        )
+        .unwrap();
+        assert!(wrong_model.sample(&logits, &[]).is_err());
     }
 
     #[test]
     fn tensor_and_slice_compatibility_greedy_match() {
         let pool = MemoryPool::new(64).unwrap();
         let logits = tensor(&[0.5, 2.0, 2.0, -1.0], &pool);
+        let domain = entire_domain(4);
         assert_eq!(
-            select_next_token_tensor(&logits, &SamplingConfig::greedy()).unwrap(),
-            select_next_token(&[0.5, 2.0, 2.0, -1.0], &SamplingConfig::greedy()).unwrap()
+            select_next_token_tensor(&logits, &SamplingConfig::greedy(), domain).unwrap(),
+            select_next_token(&[0.5, 2.0, 2.0, -1.0], &SamplingConfig::greedy(), domain).unwrap()
         );
+    }
+
+    #[test]
+    fn tensor_and_slice_compatibility_share_non_finite_policy() {
+        let pool = MemoryPool::new(4096).unwrap();
+        let domain = prefix_domain(4, 3);
+        let config = SamplingConfig::greedy();
+
+        let finite = [f32::NEG_INFINITY, 2.0, f32::NEG_INFINITY, f32::MAX];
+        let finite_tensor = tensor(&finite, &pool);
+        assert_eq!(select_next_token(&finite, &config, domain).unwrap(), 1);
+        assert_eq!(select_next_token_tensor(&finite_tensor, &config, domain).unwrap(), 1);
+
+        let empty = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::MAX];
+        let empty_tensor = tensor(&empty, &pool);
+        for result in [
+            select_next_token(&empty, &config, domain),
+            select_next_token_tensor(&empty_tensor, &config, domain),
+        ] {
+            assert!(matches!(result, Err(EngineError::BackendFailure(_))));
+        }
+
+        for invalid in [[f32::NAN, 1.0, 2.0, f32::MAX], [f32::INFINITY, 1.0, 2.0, f32::MAX]] {
+            let invalid_tensor = tensor(&invalid, &pool);
+            for result in [
+                select_next_token(&invalid, &config, domain),
+                select_next_token_tensor(&invalid_tensor, &config, domain),
+            ] {
+                assert!(matches!(result, Err(EngineError::BackendFailure(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_reserved_tail_is_excluded_before_every_sampling_filter() {
+        const MODEL_VOCABULARY: usize = 151_936;
+        const SELECTABLE_TOKENS: usize = 151_665;
+        let pool = MemoryPool::new(32 << 20).unwrap();
+        let domain = prefix_domain(
+            u32::try_from(MODEL_VOCABULARY).unwrap(),
+            u32::try_from(SELECTABLE_TOKENS).unwrap(),
+        );
+        let mut values = vec![-10.0_f32; MODEL_VOCABULARY];
+        values[SELECTABLE_TOKENS - 1] = 5.0;
+        values[SELECTABLE_TOKENS..].fill(f32::MAX);
+        let logits = tensor(&values, &pool);
+
+        let configurations = [
+            SamplingConfig::greedy(),
+            SamplingConfig::new(0.7).unwrap().with_top_k(Some(32)).unwrap(),
+            SamplingConfig::new(0.9).unwrap().with_top_p(0.75).unwrap(),
+            SamplingConfig::new(1.0).unwrap().with_min_p(0.25).unwrap(),
+            SamplingConfig::new(0.8)
+                .unwrap()
+                .with_repetition_penalty(2.0)
+                .unwrap()
+                .with_seed(0x51ec_7ab1),
+        ];
+        for (index, config) in configurations.into_iter().enumerate() {
+            let mut sampler = Sampler::new(
+                config,
+                domain,
+                RequestId::new(u128::try_from(index + 1).unwrap()).unwrap(),
+                &pool,
+            )
+            .unwrap();
+            let token = sampler.sample(&logits, &[u32::try_from(SELECTABLE_TOKENS - 1).unwrap()]);
+            assert!(token.unwrap() < u32::try_from(SELECTABLE_TOKENS).unwrap());
+        }
+    }
+
+    #[test]
+    fn non_selectable_non_finite_logits_are_never_observed() {
+        let pool = MemoryPool::new(4096).unwrap();
+        let domain = prefix_domain(5, 3);
+        let logits = tensor(&[1.0, 2.0, 3.0, f32::NAN, f32::INFINITY], &pool);
+        let mut sampler =
+            Sampler::new(SamplingConfig::greedy(), domain, RequestId::new(1).unwrap(), &pool)
+                .unwrap();
+        assert_eq!(sampler.sample(&logits, &[]).unwrap(), 2);
+        assert_eq!(
+            select_next_token(
+                &[1.0, 2.0, 3.0, f32::NAN, f32::INFINITY],
+                &SamplingConfig::greedy(),
+                domain
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn domain_and_request_constraints_fail_closed_without_expansion() {
+        let pool = MemoryPool::new(1 << 20).unwrap();
+        let domain = prefix_domain(6, 4);
+        for config in [
+            SamplingConfig::greedy().with_allowed_token_ids(&[4]).unwrap(),
+            SamplingConfig::greedy().with_disallowed_token_ids(&[5]).unwrap(),
+            SamplingConfig::greedy().with_stop_token_ids(&[4]).unwrap(),
+            SamplingConfig::greedy().with_top_k(Some(5)).unwrap(),
+            SamplingConfig::greedy().with_disallowed_token_ids(&[0, 1, 2, 3]).unwrap(),
+        ] {
+            assert!(Sampler::new(config, domain, RequestId::new(1).unwrap(), &pool).is_err());
+        }
+        let narrowed = SamplingConfig::new(0.8)
+            .unwrap()
+            .with_allowed_token_ids(&[1, 3])
+            .unwrap()
+            .with_disallowed_token_ids(&[0, 2])
+            .unwrap()
+            .with_seed(7);
+        let mut first =
+            Sampler::new(narrowed.clone(), domain, RequestId::new(2).unwrap(), &pool).unwrap();
+        let mut second = Sampler::new(narrowed, domain, RequestId::new(3).unwrap(), &pool).unwrap();
+        let logits = tensor(&[0.0, 0.1, 0.2, 0.3, f32::MAX, f32::MAX], &pool);
+        let first_sequence =
+            (0..32).map(|_| first.sample(&logits, &[]).unwrap()).collect::<Vec<_>>();
+        let second_sequence =
+            (0..32).map(|_| second.sample(&logits, &[]).unwrap()).collect::<Vec<_>>();
+        assert_eq!(first_sequence, second_sequence);
+        assert!(first_sequence.iter().all(|token| matches!(*token, 1 | 3)));
+    }
+
+    #[test]
+    fn domain_constructor_and_membership_properties_are_exact() {
+        assert!(SelectableTokenDomain::entire_model_vocabulary(0, 0, hash(1), hash(2)).is_err());
+        assert!(SelectableTokenDomain::entire_model_vocabulary(4, 3, hash(1), hash(2)).is_err());
+        assert!(
+            SelectableTokenDomain::contiguous_tokenizer_prefix(4, 0, hash(1), hash(2)).is_err()
+        );
+        assert!(
+            SelectableTokenDomain::contiguous_tokenizer_prefix(4, 4, hash(1), hash(2)).is_err()
+        );
+        assert!(
+            SelectableTokenDomain::contiguous_tokenizer_prefix(4, 5, hash(1), hash(2)).is_err()
+        );
+        assert!(
+            SelectableTokenDomain::entire_model_vocabulary(
+                MAX_VOCABULARY_SIZE.saturating_add(1),
+                MAX_VOCABULARY_SIZE.saturating_add(1),
+                hash(1),
+                hash(2)
+            )
+            .is_err()
+        );
+
+        for model_count in 2_u32..128 {
+            let all = entire_domain(model_count);
+            assert_eq!(all.kind(), SelectableTokenDomainKind::EntireModelVocabulary);
+            assert!((0..model_count).all(|token| all.contains(token)));
+            assert!(!all.contains(model_count));
+            for prefix_count in 1..model_count {
+                let prefix = prefix_domain(model_count, prefix_count);
+                assert_eq!(prefix.kind(), SelectableTokenDomainKind::ContiguousTokenizerPrefix);
+                for token in 0..model_count {
+                    assert_eq!(prefix.contains(token), token < prefix_count);
+                }
+            }
+        }
     }
 }
