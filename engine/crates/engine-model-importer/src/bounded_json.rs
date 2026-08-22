@@ -1,4 +1,10 @@
 //! Small non-recursive JSON cursor for closed offline source profiles.
+//!
+//! This is deliberately a canonical subset rather than a general JSON parser.
+//! Numbers reject negative zero and redundant leading integer zeroes even where
+//! a general JSON implementation could accept the value. Exponent digits use
+//! standard JSON grammar because the exact pinned Qwen configuration spells its
+//! epsilon as `1e-06`; outer source-identity checks still fix its exact bytes.
 
 use personalai_engine_types::{EngineError, MAX_REQUEST_BYTES};
 
@@ -258,9 +264,7 @@ fn validate_number_grammar(text: &str) -> Result<(), EngineError> {
         while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
             cursor += 1;
         }
-        if cursor == exponent_start
-            || (cursor - exponent_start > 1 && bytes[exponent_start] == b'0')
-        {
+        if cursor == exponent_start {
             return Err(corrupt("source JSON number exponent is noncanonical"));
         }
     }
@@ -310,12 +314,12 @@ mod tests {
     #[test]
     fn cursor_rejects_noncanonical_json_number_forms() {
         for invalid in
-            ["01", "-01", "00", "-0", "-0.0", "+1", ".1", "1.", "1e", "1e+", "1e01", "1+2", "--1"]
+            ["01", "-01", "00", "-0", "-0.0", "+1", ".1", "1.", "1e", "1e+", "1+2", "--1"]
         {
             let mut cursor = JsonCursor::new(invalid.as_bytes()).unwrap();
             assert!(cursor.f64().is_err(), "accepted {invalid}");
         }
-        for valid in ["0", "1", "-1", "0.1", "-0.1", "1e0", "1E+2", "1e-2"] {
+        for valid in ["0", "1", "-1", "0.1", "-0.1", "1e0", "1E+2", "1e-2", "1e-06"] {
             let mut cursor = JsonCursor::new(valid.as_bytes()).unwrap();
             assert!(cursor.f64().is_ok(), "rejected {valid}");
             assert!(cursor.finish().is_ok(), "left trailing data for {valid}");

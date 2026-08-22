@@ -109,6 +109,18 @@ impl Qwen25TokenizerDescriptor {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn pinned_test_descriptor() -> Qwen25TokenizerDescriptor {
+    Qwen25TokenizerDescriptor {
+        source_sha256: Sha256Digest::from_hex(QWEN25_TOKENIZER_SHA256)
+            .expect("pinned tokenizer digest must remain valid"),
+        bpe_vocabulary_size: QWEN25_BPE_VOCABULARY_SIZE,
+        defined_token_count: QWEN25_DEFINED_TOKEN_COUNT,
+        model_vocabulary_size: QWEN25_MODEL_VOCABULARY_SIZE,
+        merge_count: QWEN25_MERGE_COUNT,
+    }
+}
+
 /// Parses and validates the exact pinned Qwen2.5 tokenizer source graph.
 pub fn inspect(bytes: &[u8]) -> Result<Qwen25TokenizerDescriptor, EngineError> {
     if bytes.len() != QWEN25_TOKENIZER_BYTES

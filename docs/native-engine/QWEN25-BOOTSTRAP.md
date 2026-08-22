@@ -41,18 +41,38 @@ runtime plus independent conformance vectors is required before packaging.
 
 ## Package boundary
 
-The current `PAIDIR01` version 1.0 manifest names only the original no-bias
-decoder. Qwen source mapping must not be mislabeled under that architecture.
-Package emission therefore returns `NotImplemented` until reviewed PAIDIR 1.1
-and scalar Qwen execution are integrated. Registry V2 remains closed and
-unchanged; none of these source files are approved, activated, or loadable.
+`PAIDIR01` v1.1 and the scalar Qwen correctness scaffold now exist without
+changing v1.0. That does not activate the source profile: v1.1 deliberately
+requires engine 0.2.0 while the current engine is 0.1.0, the exact tokenizer
+converter/runtime remains absent, Registry V2 remains legacy-only, and the
+full profile exceeds the scalar oracle ceiling without a qualified optimized
+backend. Package emission therefore still returns `NotImplemented`; none of
+these source files are approved, signed, activated, or loadable.
 Every public package/import entry performs this unsupported-target check before
 path inspection, source reads, shard parsing, tensor conversion, or allocation.
 
-Exact local validation of the three pinned config identities and the shared
-7,031,645-byte tokenizer was performed during implementation. This is parser
-evidence only, not model qualification, tokenizer numerical conformance,
-license approval, package signing, or production activation.
+Before any future emission activation, the import path must additionally
+preflight the exact descriptor count, direct-child filename, and byte length
+from filesystem metadata before any generic source read or source-sized
+allocation. The SHA-256 must then be computed from the same securely opened,
+descriptor-bound bytes; path-based verification followed by a second reopen is
+not sufficient. Exact tensor descriptor count/name/length validation must also
+complete before tensor payload conversion or destination allocation.
+
+The three exact config files are compact committed fixtures. A reproducible
+content-free diagnostic for an operator-held tokenizer is available as:
+
+```text
+cargo run -p personalai-engine-model-importer --example verify_qwen25_sources -- CONFIG_JSON TOKENIZER_JSON
+```
+
+Exact local validation of the shared 7,031,645-byte tokenizer was performed
+during implementation; the file itself is intentionally not committed. This is
+parser evidence only, not model qualification, tokenizer numerical
+conformance, license approval, package signing, or production activation. The
+closed JSON cursor uses a deliberately stricter numeric subset: negative zero
+and leading integer zeroes are rejected, while standard exponent grammar is
+retained because the pinned config spells epsilon as `1e-06`.
 
 The three multi-gigabyte tensor files are intentionally not repository test
 fixtures. Synthetic tests cover exact name/length/hash precedence and verify

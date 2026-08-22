@@ -62,15 +62,18 @@ AIPQ format with those declared F32 exclusions. AIPQ8/AIPQ4 mixing is rejected.
 Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
 
-The current importer and Model Foundry registry compatibility string remain
-legacy-only. They cannot create or approve a Qwen2.5 v1.1 artifact. A future
-offline Foundry slice must explicitly map the pinned Qwen safetensors names,
-pair with a reviewed first-party tokenizer revision that implements the exact
-fixed Qwen NFC/regex/ByteLevel and no-implicit-BOS semantics without executing
-arbitrary `tokenizer.json` graphs or chat templates, emit the exact v1.1
-inventory, independently qualify numeric vectors, and issue a new signed
-registry decision. AIPTok v1 cannot be relabeled as that tokenizer. The
-production engine does not infer or manufacture any of those supply-chain
+The importer now contains a disabled transition slice that pins the three
+Qwen2.5 config identities, shared tokenizer identity and closed graph, exact
+single-file tensor identities, canonical tensor names/shapes, Q/K/V biases, and
+tied output. It still emits only the legacy profile; the Model Foundry Registry
+V2 compatibility string remains legacy-only, so neither component can create
+or approve a Qwen2.5 v1.1 artifact. Activation requires a reviewed first-party
+tokenizer revision implementing the exact fixed Qwen NFC/regex/ByteLevel and
+no-implicit-BOS semantics without arbitrary tokenizer graphs or chat templates,
+exact descriptor preflight bound to the securely opened source, v1.1 emission,
+independent numeric vectors, engine 0.2, a qualified optimized backend, and a
+new signed registry decision. AIPTok v1 cannot be relabeled as that tokenizer.
+The production engine does not infer or manufacture any of those supply-chain
 decisions.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:

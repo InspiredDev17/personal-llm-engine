@@ -120,12 +120,15 @@ The import and production components are intentionally separate:
    that canonicalize beneath an owner-selected quarantine. It refuses URLs,
    quarantine escapes, pickle/executable formats, unknown tensor names,
    missing/extra/duplicate tensors, unsupported dtypes, non-finite values, and
-   any architecture mapping other than `llama-safetensors-v1`. Standard Qwen
-   tokenizer/config conversion is not present in this repository. Shard input
-   order cannot affect the output: unique source filenames are sorted, the
-   complete architecture inventory is validated globally, and F32, F16, or
-   BF16 source storage is converted explicitly into finite F32 values before an
-   explicit `reference-f32`, `balanced-q8`, or `compact-q4` profile is applied.
+   unapproved architecture mappings. A disabled `qwen2.5-safetensors-v1`
+   transition profile pins three exact configurations, one closed tokenizer
+   graph/identity, exact single-file identities, and the Qwen tensor
+   names/shapes, but it fails before source I/O and cannot emit a package until
+   the remaining tokenizer/version/registry/backend activation gates close.
+   Shard input order cannot affect the output: unique source filenames are
+   sorted, the complete architecture inventory is validated globally, and F32,
+   F16, or BF16 source storage is converted explicitly into finite F32 values
+   before an explicit `reference-f32`, `balanced-q8`, or `compact-q4` profile is applied.
    Only reviewed rank-two weights are quantized.
 2. The importer writes a staging directory and atomically installs
    `<model-id>.paimodel`. Replacement requires a bounded explicit audit note;
@@ -175,9 +178,11 @@ kernels.
 
 This is engine-private package/runtime support, not a production model
 approval. The offline importer still produces only the legacy Llama mapping,
-the Model Foundry registry V2 compatibility profile still names manifest v1.0,
-and no standard Qwen tokenizer-to-AIPTok converter or signed Qwen package exists
-here. The current service returns the earlier typed future-engine rejection;
+although it now contains the fail-closed Qwen source inspection/mapping
+transition. The Model Foundry registry V2 compatibility profile still names
+manifest v1.0, and no exact Qwen tokenizer converter or signed Qwen package
+exists here. The current service returns the earlier typed future-engine
+rejection;
 after an eventual runtime revision bump it still returns
 `UnsupportedTokenizer` instead of applying AIPTok v1 semantics incorrectly.
 Model Foundry, the tokenizer runtime, and a qualified optimized backend must add

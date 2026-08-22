@@ -6,8 +6,6 @@ use personalai_engine_types::{EngineError, ModelPackageHash, Sha256Digest};
 
 /// Source configuration format identifier.
 pub const QWEN25_CONFIG_JSON_SOURCE_FORMAT: &str = "qwen2.5-config-json-v1";
-/// Trusted engine architecture selected by this closed source profile.
-pub const QWEN25_DECODER_ARCHITECTURE_ID: &str = "qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1";
 /// Exact byte length shared by the three reviewed model tensor sources.
 pub const QWEN25_MODEL_SAFETENSORS_BYTES: u64 = 3_087_467_144;
 
@@ -334,6 +332,48 @@ fn corrupt(detail: impl AsRef<str>) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INSTRUCT_CONFIG: &[u8] =
+        include_bytes!("../tests/fixtures/qwen25-1.5b-instruct-config.json");
+    const MATH_CONFIG: &[u8] =
+        include_bytes!("../tests/fixtures/qwen25-math-1.5b-instruct-config.json");
+    const CODER_CONFIG: &[u8] =
+        include_bytes!("../tests/fixtures/qwen25-coder-1.5b-instruct-config.json");
+
+    #[test]
+    fn all_three_exact_compact_configuration_fixtures_validate() {
+        let cases = [
+            (
+                INSTRUCT_CONFIG,
+                Qwen25ConfigProfile::Instruct,
+                32_768,
+                1_000_000.0_f32,
+                GENERAL_MODEL_SHA256,
+            ),
+            (
+                MATH_CONFIG,
+                Qwen25ConfigProfile::MathInstruct,
+                4_096,
+                10_000.0_f32,
+                MATH_MODEL_SHA256,
+            ),
+            (
+                CODER_CONFIG,
+                Qwen25ConfigProfile::CoderInstruct,
+                32_768,
+                1_000_000.0_f32,
+                CODER_MODEL_SHA256,
+            ),
+        ];
+        for (fixture, profile, context, theta, model_digest) in cases {
+            let parsed = Qwen25Config::parse(fixture).expect("pinned config must validate");
+            assert_eq!(parsed.profile(), profile);
+            assert_eq!(parsed.context_limit(), context);
+            assert_eq!(parsed.rope_theta().to_bits(), theta.to_bits());
+            assert_eq!(parsed.model_source_bytes(), QWEN25_MODEL_SAFETENSORS_BYTES);
+            assert_eq!(parsed.model_source_sha256().to_string(), model_digest);
+        }
+    }
 
     #[test]
     fn unpinned_configuration_and_unknown_fields_fail_closed() {
