@@ -24,14 +24,29 @@ pub struct HostBuffer {
 
 impl HostBuffer {
     fn allocate(pool: &MemoryPool, bytes: usize, owner: MemoryOwner) -> Result<Self, EngineError> {
+        Self::allocate_preserving(pool, bytes, owner, 0)
+    }
+
+    /// Allocates initialized host memory while preserving pool headroom.
+    ///
+    /// The final allocation is an exact-length boxed slice. Any temporary
+    /// spare capacity reported by the fallible vector allocator is also
+    /// admitted under the same headroom rule before initialization, then
+    /// released after conversion to exact-length storage.
+    pub fn allocate_preserving(
+        pool: &MemoryPool,
+        bytes: usize,
+        owner: MemoryOwner,
+        preserved_headroom_bytes: u64,
+    ) -> Result<Self, EngineError> {
         let bytes_u64 = u64::try_from(bytes)
             .map_err(|_| EngineError::resource_exhaustion("host buffer length overflows"))?;
-        let mut reservation = pool.reserve_for(bytes_u64, owner)?;
+        let mut reservation =
+            pool.reserve_for_preserving(bytes_u64, preserved_headroom_bytes, owner)?;
         let mut allocation = Vec::new();
         allocation
             .try_reserve_exact(bytes)
             .map_err(|_| EngineError::resource_exhaustion("host buffer allocation failed"))?;
-        allocation.resize(bytes, 0);
         let spare = allocation.capacity().checked_sub(bytes).ok_or_else(|| {
             EngineError::internal_invariant("host buffer capacity is below initialized length")
         })?;
@@ -39,8 +54,13 @@ impl HostBuffer {
             EngineError::resource_exhaustion("host buffer spare capacity overflows")
         })?;
         if spare_u64 != 0 {
-            pool.grow_reservation(&mut reservation, spare_u64)?;
+            pool.grow_reservation_preserving(
+                &mut reservation,
+                spare_u64,
+                preserved_headroom_bytes,
+            )?;
         }
+        allocation.resize(bytes, 0);
         let bytes = allocation.into_boxed_slice();
         if spare_u64 != 0 {
             pool.shrink_reservation(&mut reservation, spare_u64)?;
@@ -616,6 +636,27 @@ mod tests {
         assert_eq!(resources.statistics().unwrap().reserved_bytes(), 32);
         resources.release_all().unwrap();
         assert_eq!(resources.statistics().unwrap().reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn host_buffer_preserves_headroom_accounts_exact_storage_and_releases() {
+        let pool = MemoryPool::new(256).unwrap();
+        let existing = pool.reserve(32).unwrap();
+        let owner = MemoryOwner::ModelState(ModelId::new("headroom-fixture").unwrap());
+        let buffer = HostBuffer::allocate_preserving(&pool, 48, owner.clone(), 128).unwrap();
+
+        assert_eq!(buffer.as_slice(), &[0; 48]);
+        assert_eq!(buffer.reserved_bytes(), 48);
+        let statistics = pool.statistics().unwrap();
+        assert_eq!(statistics.reserved_bytes(), 80);
+        assert_eq!(statistics.bytes_for(&owner), 48);
+
+        drop(buffer);
+        let statistics = pool.statistics().unwrap();
+        assert_eq!(statistics.reserved_bytes(), 32);
+        assert_eq!(statistics.bytes_for(&owner), 0);
+        drop(existing);
+        assert_eq!(pool.used_bytes().unwrap(), 0);
     }
 
     #[test]

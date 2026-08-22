@@ -807,6 +807,7 @@ fn internal_crate_dependencies_match_the_approved_dag() {
         (
             "engine-placement",
             &[
+                "personalai-engine-crypto",
                 "personalai-engine-loader",
                 "personalai-engine-memory",
                 "personalai-engine-model-format",
@@ -958,20 +959,35 @@ fn placement_authority_remains_internal_to_the_trusted_runtime() {
     let root = engine_root();
     let protocol_manifest = fs::read_to_string(root.join("crates/engine-protocol/Cargo.toml"))
         .expect("protocol manifest");
-    let protocol_source = fs::read_to_string(root.join("crates/engine-protocol/src/lib.rs"))
-        .expect("protocol source");
+    let protocol_sources = collect_files(&root.join("crates/engine-protocol/src"), "rs");
 
     assert!(
         !protocol_manifest.contains("personalai-engine-placement"),
         "the wire protocol must not depend on internal physical placement mechanics"
     );
-    for prohibited in
-        ["ExecutionPlacementPlan", "WeightResidencyMode", "byte_offset", "package_path"]
-    {
-        assert!(
-            !protocol_source.contains(prohibited),
-            "the client protocol must not accept internal placement authority {prohibited:?}"
-        );
+    for prohibited in [
+        "ExecutionPlacementPlan",
+        "WeightResidencyMode",
+        "SparseExpertExecutionPlan",
+        "SparseExpertId",
+        "SparseExpertSelection",
+        "expert_id",
+        "expert_ids",
+        "expert_offset",
+        "expert_offsets",
+        "router_selection",
+        "router_scores",
+        "byte_offset",
+        "package_path",
+    ] {
+        for source in &protocol_sources {
+            let contents = fs::read_to_string(source).expect("protocol source must be readable");
+            assert!(
+                !contents.contains(prohibited),
+                "the client protocol must not accept internal placement authority {prohibited:?}: {}",
+                source.display()
+            );
+        }
     }
 }
 
