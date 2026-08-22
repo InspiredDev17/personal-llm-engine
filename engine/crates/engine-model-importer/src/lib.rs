@@ -6,9 +6,23 @@
 //! execution capability.
 
 mod aiptok_metadata;
+mod bounded_json;
+mod qwen25_config_json;
+mod qwen25_tokenizer_json;
 mod safetensors;
 
 pub use aiptok_metadata::{AIPTOK_METADATA_SOURCE_FORMAT, convert as convert_aiptok_metadata};
+pub use qwen25_config_json::{
+    QWEN25_CONFIG_JSON_SOURCE_FORMAT, QWEN25_DECODER_ARCHITECTURE_ID,
+    QWEN25_MODEL_SAFETENSORS_BYTES, Qwen25Config, Qwen25ConfigProfile,
+};
+pub use qwen25_tokenizer_json::{
+    QWEN25_ADDED_TOKEN_COUNT, QWEN25_BOS_TOKEN_ID, QWEN25_BPE_VOCABULARY_SIZE,
+    QWEN25_DEFINED_TOKEN_COUNT, QWEN25_EOS_TOKEN_ID, QWEN25_MERGE_COUNT,
+    QWEN25_MODEL_VOCABULARY_SIZE, QWEN25_TOKENIZER_BYTES, QWEN25_TOKENIZER_JSON_SOURCE_FORMAT,
+    QWEN25_TOKENIZER_SHA256, Qwen25TokenizerDescriptor, convert as convert_qwen25_tokenizer_json,
+    inspect as inspect_qwen25_tokenizer_json,
+};
 
 pub use safetensors::{
     MAX_SAFETENSORS_HEADER_BYTES, MAX_SOURCE_TENSOR_NAME_BYTES, ParsedSafetensors, SafeTensorRecord,
@@ -16,7 +30,7 @@ pub use safetensors::{
 
 use ed25519_dalek::{Signer, SigningKey};
 use personalai_engine_crypto::{
-    directory_package_signature_message, hash_package, hash_signed_content,
+    directory_package_signature_message, hash_package, hash_sha256, hash_signed_content,
 };
 use personalai_engine_memory::MemoryPool;
 use personalai_engine_model_format::{
@@ -29,7 +43,7 @@ use personalai_engine_tensor::{bf16_bits_to_f32, f16_bits_to_f32};
 use personalai_engine_tokenizer::{FirstPartyBpeTokenizer, Tokenizer};
 use personalai_engine_types::{
     ContextLimit, DType, EngineError, MAX_MODEL_PACKAGE_BYTES, ModelId, ModelPackageHash,
-    SignerKeyId, TensorShape,
+    Sha256Digest, SignerKeyId, TensorShape,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -41,6 +55,8 @@ use zeroize::Zeroize;
 
 /// Exact supported source-name mapping.
 pub const LLAMA_SAFETENSORS_MAPPING_V1: &str = "llama-safetensors-v1";
+/// Exact Qwen2.5 source-name mapping, including required Q/K/V projection biases.
+pub const QWEN25_SAFETENSORS_MAPPING_V1: &str = "qwen2.5-safetensors-v1";
 /// Maximum provenance document length.
 pub const MAX_PROVENANCE_BYTES: usize = 1024 * 1024;
 /// Package shard alignment used by the initial importer.
@@ -83,6 +99,8 @@ impl<'a> SafetensorsSource<'a> {
 pub enum SourceMapping {
     /// Explicit Llama-family safetensors names mapped to the fixed decoder.
     LlamaSafetensorsV1,
+    /// Pinned Qwen2.5 names mapped to the reviewed bias-and-tied decoder profile.
+    Qwen25SafetensorsV1,
 }
 
 impl SourceMapping {
@@ -90,6 +108,7 @@ impl SourceMapping {
     pub fn parse(value: &str) -> Result<Self, EngineError> {
         match value {
             LLAMA_SAFETENSORS_MAPPING_V1 => Ok(Self::LlamaSafetensorsV1),
+            QWEN25_SAFETENSORS_MAPPING_V1 => Ok(Self::Qwen25SafetensorsV1),
             _ => Err(EngineError::invalid_input("source tensor mapping is unsupported")),
         }
     }
@@ -98,6 +117,7 @@ impl SourceMapping {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LlamaSafetensorsV1 => LLAMA_SAFETENSORS_MAPPING_V1,
+            Self::Qwen25SafetensorsV1 => QWEN25_SAFETENSORS_MAPPING_V1,
         }
     }
 }
@@ -120,6 +140,15 @@ pub struct ImportSpec {
     source_label: String,
     license_id: String,
     quantization_profile: QuantizationProfile,
+    qwen25_config: Option<Qwen25Config>,
+    pinned_source: Option<PinnedSourceIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PinnedSourceIdentity {
+    name: &'static str,
+    byte_length: u64,
+    sha256: Sha256Digest,
 }
 
 impl ImportSpec {
@@ -142,6 +171,11 @@ impl ImportSpec {
         license_id: impl Into<String>,
         quantization_profile: QuantizationProfile,
     ) -> Result<Self, EngineError> {
+        if mapping != SourceMapping::LlamaSafetensorsV1 {
+            return Err(EngineError::invalid_input(
+                "Qwen2.5 imports require pinned configuration and tokenizer sources",
+            ));
+        }
         let source_label = source_label.into();
         let license_id = license_id.into();
         validate_provenance_text(&source_label, 256)?;
@@ -177,7 +211,66 @@ impl ImportSpec {
             source_label,
             license_id,
             quantization_profile,
+            qwen25_config: None,
+            pinned_source: None,
         })
+    }
+
+    /// Creates the exact Qwen2.5 1.5B source profile from pinned local data.
+    pub fn new_qwen25_1_5b(
+        model_id: ModelId,
+        config_json: &[u8],
+        tokenizer_json: &[u8],
+        source_label: impl Into<String>,
+        license_id: impl Into<String>,
+        quantization_profile: QuantizationProfile,
+    ) -> Result<Self, EngineError> {
+        let config = Qwen25Config::parse(config_json)?;
+        let tokenizer = inspect_qwen25_tokenizer_json(tokenizer_json)?;
+        if tokenizer.model_vocabulary_size() != config.vocabulary_size()
+            || tokenizer.unknown_token().is_some()
+            || tokenizer.inserts_bos()
+        {
+            return Err(corrupt("Qwen2.5 tokenizer/configuration semantics differ"));
+        }
+        let mut spec = Self::new(
+            model_id,
+            SourceMapping::LlamaSafetensorsV1,
+            ContextLimit::new(config.context_limit())?,
+            config.vocabulary_size(),
+            config.hidden_dimension(),
+            config.layer_count(),
+            config.attention_head_count(),
+            config.kv_head_count(),
+            config.feed_forward_dimension(),
+            config.rope_theta(),
+            1.0,
+            true,
+            source_label,
+            license_id,
+            quantization_profile,
+        )?;
+        spec.mapping = SourceMapping::Qwen25SafetensorsV1;
+        spec.qwen25_config = Some(config);
+        spec.pinned_source = Some(PinnedSourceIdentity {
+            name: "model.safetensors",
+            byte_length: config.model_source_bytes(),
+            sha256: config.model_source_sha256(),
+        });
+        Ok(spec)
+    }
+
+    /// Returns exact pinned Qwen2.5 configuration evidence when applicable.
+    pub const fn qwen25_config(&self) -> Option<Qwen25Config> {
+        self.qwen25_config
+    }
+
+    /// Returns the reviewed Qwen source byte length and SHA-256 identity.
+    pub const fn qwen25_model_source_identity(&self) -> Option<(u64, Sha256Digest)> {
+        match &self.pinned_source {
+            Some(identity) => Some((identity.byte_length, identity.sha256)),
+            None => None,
+        }
     }
 
     /// Returns the destination model ID.
@@ -284,19 +377,22 @@ pub fn build_package(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
-    let result = build_package_inner(
-        spec,
-        source_name,
-        source_bytes,
-        TokenizerSourceEvidence {
-            name: "embedded-tokenizer.aiptok",
-            bytes: tokenizer_bytes,
-            format: "aiptok-byte-level-bpe-v1",
-        },
-        tokenizer_bytes,
-        signer_key_id,
-        signing_seed,
-    );
+    let result = (|| {
+        ensure_package_target_supported(spec)?;
+        build_package_inner(
+            spec,
+            source_name,
+            source_bytes,
+            TokenizerSourceEvidence {
+                name: "embedded-tokenizer.aiptok",
+                bytes: tokenizer_bytes,
+                format: "aiptok-byte-level-bpe-v1",
+            },
+            tokenizer_bytes,
+            signer_key_id,
+            signing_seed,
+        )
+    })();
     signing_seed.zeroize();
     result
 }
@@ -313,18 +409,21 @@ pub fn build_package_sharded(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
-    let result = build_package_sharded_inner(
-        spec,
-        sources,
-        TokenizerSourceEvidence {
-            name: "embedded-tokenizer.aiptok",
-            bytes: tokenizer_bytes,
-            format: "aiptok-byte-level-bpe-v1",
-        },
-        tokenizer_bytes,
-        signer_key_id,
-        signing_seed,
-    );
+    let result = (|| {
+        ensure_package_target_supported(spec)?;
+        build_package_sharded_inner(
+            spec,
+            sources,
+            TokenizerSourceEvidence {
+                name: "embedded-tokenizer.aiptok",
+                bytes: tokenizer_bytes,
+                format: "aiptok-byte-level-bpe-v1",
+            },
+            tokenizer_bytes,
+            signer_key_id,
+            signing_seed,
+        )
+    })();
     signing_seed.zeroize();
     result
 }
@@ -338,6 +437,7 @@ fn build_package_inner(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
+    validate_pinned_source_identity(spec, source_name, source_bytes)?;
     let source = SafetensorsSource::new(source_name, source_bytes)?;
     let built = build_shards(spec, &[source])?;
     let provenance = provenance(
@@ -368,6 +468,13 @@ fn build_package_sharded_inner(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
+    if spec.mapping == SourceMapping::Qwen25SafetensorsV1 {
+        let source = sources
+            .first()
+            .filter(|_| sources.len() == 1)
+            .ok_or_else(|| corrupt("Qwen2.5 requires exactly one pinned source shard"))?;
+        validate_pinned_source_identity(spec, source.name(), source.bytes())?;
+    }
     let ordered = validate_and_order_sources(sources)?;
     let built = build_shards(spec, &ordered)?;
     let provenance = sharded_provenance(
@@ -398,6 +505,7 @@ fn finish_package(
     signer_key_id: SignerKeyId,
     signing_seed: &mut [u8; 32],
 ) -> Result<ImportedPackage, EngineError> {
+    ensure_package_target_supported(spec)?;
     let tokenizer_pool = MemoryPool::new(128 * 1024 * 1024)?;
     let tokenizer = FirstPartyBpeTokenizer::parse(tokenizer_bytes, &tokenizer_pool)?;
     if tokenizer.spec().vocabulary_size() != spec.vocabulary_size {
@@ -496,6 +604,39 @@ fn finish_package(
     Ok(ImportedPackage { files, package_hash, signer_key_id, signer_public_key })
 }
 
+fn ensure_package_target_supported(spec: &ImportSpec) -> Result<(), EngineError> {
+    if spec.mapping == SourceMapping::Qwen25SafetensorsV1 {
+        Err(EngineError::not_implemented(
+            "Qwen2.5 package emission requires the reviewed PAIDIR 1.1 runtime and exact tokenizer implementation",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_pinned_source_identity(
+    spec: &ImportSpec,
+    source_name: &str,
+    source_bytes: &[u8],
+) -> Result<(), EngineError> {
+    if spec.mapping != SourceMapping::Qwen25SafetensorsV1 {
+        return Ok(());
+    }
+    let identity = spec
+        .pinned_source
+        .as_ref()
+        .ok_or_else(|| corrupt("Qwen2.5 pinned source identity is missing"))?;
+    let observed_length = u64::try_from(source_bytes.len())
+        .map_err(|_| EngineError::resource_exhaustion("source length is not representable"))?;
+    if source_name != identity.name || observed_length != identity.byte_length {
+        return Err(corrupt("Qwen2.5 source name or byte length differs from the pinned identity"));
+    }
+    if hash_sha256(source_bytes) != identity.sha256 {
+        return Err(corrupt("Qwen2.5 source SHA-256 differs from the pinned identity"));
+    }
+    Ok(())
+}
+
 /// Reads quarantined inputs, converts them, and installs a new local package.
 #[allow(clippy::too_many_arguments)]
 pub fn import_local(
@@ -509,6 +650,7 @@ pub fn import_local(
     force_audit_note: Option<&str>,
 ) -> Result<ImportReceipt, EngineError> {
     let result = (|| {
+        ensure_package_target_supported(spec)?;
         validate_local_path_text(source_path)?;
         validate_local_path_text(tokenizer_path)?;
         let source = read_quarantined_file(quarantine_root, source_path, MAX_MODEL_PACKAGE_BYTES)?;
@@ -562,6 +704,7 @@ pub fn import_local_sharded(
     force_audit_note: Option<&str>,
 ) -> Result<ImportReceipt, EngineError> {
     let result = (|| {
+        ensure_package_target_supported(spec)?;
         if source_paths.is_empty()
             || source_paths.len() > usize::try_from(MAX_DIRECTORY_SHARDS).unwrap_or(usize::MAX)
         {
@@ -805,6 +948,12 @@ fn expected_shapes(spec: &ImportSpec) -> Result<BTreeMap<String, TensorShape>, E
             expected
                 .insert(format!("{prefix}.{suffix}"), TensorShape::new([kv_dimension, hidden])?);
         }
+        if spec.mapping == SourceMapping::Qwen25SafetensorsV1 {
+            expected.insert(format!("{prefix}.q_proj.bias"), TensorShape::new([hidden])?);
+            for suffix in ["k_proj.bias", "v_proj.bias"] {
+                expected.insert(format!("{prefix}.{suffix}"), TensorShape::new([kv_dimension])?);
+            }
+        }
         for suffix in ["gate_proj.weight", "up_proj.weight"] {
             expected
                 .insert(format!("{prefix}.{suffix}"), TensorShape::new([intermediate, hidden])?);
@@ -824,7 +973,34 @@ fn canonical_name(
 ) -> Result<String, EngineError> {
     match mapping {
         SourceMapping::LlamaSafetensorsV1 => map_llama_name(source, layer_count),
+        SourceMapping::Qwen25SafetensorsV1 => map_qwen25_name(source, layer_count),
     }
+}
+
+fn map_qwen25_name(source: &str, layer_count: u32) -> Result<String, EngineError> {
+    let canonical = map_llama_name(source, layer_count);
+    if canonical.is_ok() {
+        return canonical;
+    }
+    let rest = source
+        .strip_prefix("model.layers.")
+        .ok_or_else(|| corrupt("Qwen2.5 tensor name has no approved canonical mapping"))?;
+    let (layer_text, suffix) =
+        rest.split_once('.').ok_or_else(|| corrupt("Qwen2.5 layer tensor name is malformed"))?;
+    if layer_text.len() > 1 && layer_text.starts_with('0') {
+        return Err(corrupt("Qwen2.5 layer index has ambiguous leading zeroes"));
+    }
+    let layer: u32 = layer_text.parse().map_err(|_| corrupt("Qwen2.5 layer index is invalid"))?;
+    if layer >= layer_count {
+        return Err(corrupt("Qwen2.5 layer index exceeds configured architecture"));
+    }
+    let suffix = match suffix {
+        "self_attn.q_proj.bias" => "q_proj.bias",
+        "self_attn.k_proj.bias" => "k_proj.bias",
+        "self_attn.v_proj.bias" => "v_proj.bias",
+        _ => return Err(corrupt("Qwen2.5 tensor name has no approved canonical mapping")),
+    };
+    Ok(format!("layers.{layer:03}.{suffix}"))
 }
 
 fn map_llama_name(source: &str, layer_count: u32) -> Result<String, EngineError> {
@@ -1486,6 +1662,135 @@ mod tests {
             profile,
         )
         .expect("spec must validate")
+    }
+
+    #[test]
+    fn qwen25_mapping_is_closed_bias_aware_tied_and_not_emitted_as_manifest_v1() {
+        assert_eq!(
+            SourceMapping::parse(QWEN25_SAFETENSORS_MAPPING_V1).unwrap(),
+            SourceMapping::Qwen25SafetensorsV1
+        );
+        assert_eq!(
+            canonical_name(
+                SourceMapping::Qwen25SafetensorsV1,
+                "model.layers.0.self_attn.q_proj.bias",
+                2,
+            )
+            .unwrap(),
+            "layers.000.q_proj.bias"
+        );
+        assert!(
+            canonical_name(
+                SourceMapping::Qwen25SafetensorsV1,
+                "model.layers.2.self_attn.k_proj.bias",
+                2,
+            )
+            .is_err()
+        );
+
+        let mut qwen = spec();
+        qwen.mapping = SourceMapping::Qwen25SafetensorsV1;
+        qwen.tied_output = true;
+        let shapes = expected_shapes(&qwen).unwrap();
+        assert_eq!(shapes["layers.000.q_proj.bias"].dimensions(), &[4]);
+        assert_eq!(shapes["layers.000.k_proj.bias"].dimensions(), &[2]);
+        assert!(!shapes.contains_key("output.weight"));
+
+        let mut seed = [7_u8; 32];
+        let result = finish_package(
+            &qwen,
+            vec![vec![0; 4]],
+            Vec::new(),
+            b"{}\n".to_vec(),
+            b"invalid-tokenizer",
+            SignerKeyId::from_bytes([1; 16]).unwrap(),
+            &mut seed,
+        );
+        assert!(matches!(result, Err(EngineError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn qwen25_public_emission_gates_precede_invalid_sources_and_zeroize_seeds() {
+        let mut qwen = spec();
+        qwen.mapping = SourceMapping::Qwen25SafetensorsV1;
+        qwen.tied_output = true;
+
+        let mut seed = [9_u8; 32];
+        let result = build_package(
+            &qwen,
+            "not-model.bin",
+            &[],
+            &[],
+            SignerKeyId::from_bytes([1; 16]).unwrap(),
+            &mut seed,
+        );
+        assert!(matches!(result, Err(EngineError::NotImplemented(_))));
+        assert_eq!(seed, [0; 32]);
+
+        let mut seed = [9_u8; 32];
+        let result = build_package_sharded(
+            &qwen,
+            &[],
+            &[],
+            SignerKeyId::from_bytes([1; 16]).unwrap(),
+            &mut seed,
+        );
+        assert!(matches!(result, Err(EngineError::NotImplemented(_))));
+        assert_eq!(seed, [0; 32]);
+
+        let root = temporary_root("qwen-early-emission-gate");
+        fs::create_dir(&root).unwrap();
+        let oversized = root.join("model.safetensors");
+        File::create(&oversized)
+            .and_then(|file| file.set_len(MAX_MODEL_PACKAGE_BYTES + 1))
+            .expect("sparse oversized source fixture");
+
+        let mut seed = [9_u8; 32];
+        let result = import_local(
+            &root,
+            &oversized,
+            &root.join("missing-tokenizer.json"),
+            &root.join("missing-output"),
+            &qwen,
+            SignerKeyId::from_bytes([1; 16]).unwrap(),
+            &mut seed,
+            None,
+        );
+        assert!(matches!(result, Err(EngineError::NotImplemented(_))));
+        assert_eq!(seed, [0; 32]);
+
+        let mut seed = [9_u8; 32];
+        let result = import_local_sharded(
+            &root,
+            &[],
+            &root.join("missing-tokenizer.json"),
+            &root.join("missing-output"),
+            &qwen,
+            SignerKeyId::from_bytes([1; 16]).unwrap(),
+            &mut seed,
+            None,
+        );
+        assert!(matches!(result, Err(EngineError::NotImplemented(_))));
+        assert_eq!(seed, [0; 32]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qwen25_source_identity_is_checked_before_safetensors_parsing() {
+        let exact = b"synthetic-pinned-source";
+        let mut qwen = spec();
+        qwen.mapping = SourceMapping::Qwen25SafetensorsV1;
+        qwen.pinned_source = Some(PinnedSourceIdentity {
+            name: "model.safetensors",
+            byte_length: u64::try_from(exact.len()).unwrap(),
+            sha256: hash_sha256(exact),
+        });
+        assert!(validate_pinned_source_identity(&qwen, "model.safetensors", exact).is_ok());
+        assert!(validate_pinned_source_identity(&qwen, "other.safetensors", exact).is_err());
+        assert!(validate_pinned_source_identity(&qwen, "model.safetensors", b"short").is_err());
+        let mut changed = exact.to_vec();
+        changed[0] ^= 1;
+        assert!(validate_pinned_source_identity(&qwen, "model.safetensors", &changed).is_err());
     }
 
     fn source_and_tokenizer() -> (Vec<u8>, Vec<u8>) {
