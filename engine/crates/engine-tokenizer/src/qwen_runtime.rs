@@ -33,9 +33,45 @@ enum GeneralClass {
 /// absent until its exact Unicode-16 data is dependency-reviewed.
 trait TrustedQwen25Unicode16: Send + Sync {
     fn unicode_version(&self) -> (u8, u8, u8);
-    fn normalize_nfc(&self, input: &str, output: &mut String) -> Result<(), EngineError>;
+    fn normalize_nfc(
+        &self,
+        input: &str,
+        output: &mut BoundedNormalizedText,
+    ) -> Result<(), EngineError>;
     fn general_class(&self, scalar: char) -> GeneralClass;
     fn contraction_ascii_fold(&self, scalar: char) -> Option<u8>;
+}
+
+struct BoundedNormalizedText {
+    value: String,
+    maximum_bytes: usize,
+}
+
+impl BoundedNormalizedText {
+    fn new(maximum_bytes: usize) -> Result<Self, EngineError> {
+        let mut value = String::new();
+        value.try_reserve_exact(maximum_bytes).map_err(|_| {
+            EngineError::resource_exhaustion("Qwen normalization allocation failed")
+        })?;
+        Ok(Self { value, maximum_bytes })
+    }
+
+    fn push_str(&mut self, value: &str) -> Result<(), EngineError> {
+        let new_length = self.value.len().checked_add(value.len()).ok_or_else(|| {
+            EngineError::resource_exhaustion("Qwen normalized input length overflows")
+        })?;
+        if new_length > self.maximum_bytes {
+            return Err(EngineError::resource_exhaustion(
+                "Qwen normalized input exceeds the tokenizer limit",
+            ));
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,20 +511,14 @@ impl Qwen25RuntimeCore {
             ));
         }
         self.validate_special_policy(policy)?;
+        let normalized_limit = maximum_input.min(MAX_REQUEST_BYTES);
         let _normalization =
-            self.tables.pool.reserve(u64::try_from(maximum_input).map_err(|_| {
+            self.tables.pool.reserve(u64::try_from(normalized_limit).map_err(|_| {
                 EngineError::resource_exhaustion("Qwen normalization bound is not representable")
             })?)?;
-        let mut normalized = String::new();
-        normalized.try_reserve_exact(maximum_input).map_err(|_| {
-            EngineError::resource_exhaustion("Qwen normalization allocation failed")
-        })?;
-        profile.normalize_nfc(input, &mut normalized)?;
-        if normalized.len() > maximum_input || normalized.len() > MAX_REQUEST_BYTES {
-            return Err(EngineError::resource_exhaustion(
-                "Qwen normalized input exceeds the tokenizer limit",
-            ));
-        }
+        let mut normalized_storage = BoundedNormalizedText::new(normalized_limit)?;
+        profile.normalize_nfc(input, &mut normalized_storage)?;
+        let normalized = normalized_storage.as_str();
         let token_capacity = normalized.len().min(
             usize::try_from(self.tables.descriptor.maximum_produced_tokens()).unwrap_or(usize::MAX),
         );
@@ -506,7 +536,7 @@ impl Qwen25RuntimeCore {
             .try_reserve_exact(token_capacity)
             .map_err(|_| EngineError::resource_exhaustion("Qwen token output allocation failed"))?;
         if matches!(policy, SpecialTokenPolicy::TreatAsOrdinaryBytes) {
-            self.append_pretokenized(&normalized, profile, &mut output)?;
+            self.append_pretokenized(normalized, profile, &mut output)?;
             return Ok(output);
         }
         let mut segment_start = 0_usize;
@@ -722,20 +752,25 @@ mod tests {
 
     struct WrongUnicodeVersion;
 
+    struct ExpandingUnicode16;
+
     impl TrustedQwen25Unicode16 for SyntheticUnicode16 {
         fn unicode_version(&self) -> (u8, u8, u8) {
             REQUIRED_UNICODE_VERSION
         }
 
-        fn normalize_nfc(&self, input: &str, output: &mut String) -> Result<(), EngineError> {
+        fn normalize_nfc(
+            &self,
+            input: &str,
+            output: &mut BoundedNormalizedText,
+        ) -> Result<(), EngineError> {
             let normalized = match input {
                 "Cafe\u{0301}" => "Café",
                 "\u{1100}\u{1161}" => "가",
                 "a\u{1ACF}\u{0315}\u{0300}\u{05AE}b" => "a\u{1ACF}\u{05AE}\u{0300}\u{0315}b",
                 _ => input,
             };
-            output.push_str(normalized);
-            Ok(())
+            output.push_str(normalized)
         }
 
         fn general_class(&self, scalar: char) -> GeneralClass {
@@ -772,9 +807,34 @@ mod tests {
             (17, 0, 0)
         }
 
-        fn normalize_nfc(&self, input: &str, output: &mut String) -> Result<(), EngineError> {
-            output.push_str(input);
-            Ok(())
+        fn normalize_nfc(
+            &self,
+            input: &str,
+            output: &mut BoundedNormalizedText,
+        ) -> Result<(), EngineError> {
+            output.push_str(input)
+        }
+
+        fn general_class(&self, _: char) -> GeneralClass {
+            GeneralClass::Other
+        }
+
+        fn contraction_ascii_fold(&self, _: char) -> Option<u8> {
+            None
+        }
+    }
+
+    impl TrustedQwen25Unicode16 for ExpandingUnicode16 {
+        fn unicode_version(&self) -> (u8, u8, u8) {
+            REQUIRED_UNICODE_VERSION
+        }
+
+        fn normalize_nfc(
+            &self,
+            _: &str,
+            output: &mut BoundedNormalizedText,
+        ) -> Result<(), EngineError> {
+            output.push_str("expanded")
         }
 
         fn general_class(&self, _: char) -> GeneralClass {
@@ -843,9 +903,11 @@ mod tests {
     fn chunks(input: &str) -> Vec<String> {
         let pool = MemoryPool::new(1 << 20).expect("pool validates");
         let profile = SyntheticUnicode16;
-        let mut normalized = String::new();
+        let mut normalized = BoundedNormalizedText::new(input.len().saturating_mul(4).max(1))
+            .expect("synthetic normalization buffer validates");
         profile.normalize_nfc(input, &mut normalized).expect("synthetic NFC vector works");
-        let scanned = scan_pretokens(&normalized, &profile, &pool).expect("scanner works");
+        let normalized = normalized.as_str();
+        let scanned = scan_pretokens(normalized, &profile, &pool).expect("scanner works");
         scanned.ranges.into_iter().map(|range| normalized[range].to_owned()).collect()
     }
 
@@ -987,6 +1049,18 @@ mod tests {
             core.encode("a", SpecialTokenPolicy::Reject, &WrongUnicodeVersion),
             Err(EngineError::UnsupportedTokenizer(_))
         ));
+    }
+
+    #[test]
+    fn normalization_cannot_grow_beyond_reserved_output() {
+        let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
+        let core = Qwen25RuntimeCore::load(&fixture(4, 4096), &pool).expect("tables load");
+        let baseline = pool.used_bytes().expect("metrics work");
+        assert!(matches!(
+            core.encode("a", SpecialTokenPolicy::Reject, &ExpandingUnicode16),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert_eq!(pool.used_bytes().expect("metrics work"), baseline);
     }
 
     #[test]
