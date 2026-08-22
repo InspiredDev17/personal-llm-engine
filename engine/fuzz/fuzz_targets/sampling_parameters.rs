@@ -2,9 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use personalai_engine_memory::MemoryPool;
-use personalai_engine_sampling::{Sampler, SamplingConfig};
+use personalai_engine_sampling::{Sampler, SamplingConfig, SelectableTokenDomain};
 use personalai_engine_tensor::{Tensor, TensorShape};
-use personalai_engine_types::RequestId;
+use personalai_engine_types::{ModelPackageHash, RequestId};
 
 const MAX_CAMPAIGN_BYTES: usize = 4096;
 const MAX_FUZZ_VOCABULARY: usize = 128;
@@ -43,6 +43,37 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let Ok(tensor) = Tensor::from_f32_values(shape, &logits, &pool) else { return };
-    let mut sampler = Sampler::new(config, RequestId::new(1).expect("fixed request ID"), &pool);
+    let Ok(vocabulary_u32) = u32::try_from(vocabulary) else { return };
+    let model_hash = ModelPackageHash::from_sha384_bytes([1; 48]);
+    let tokenizer_hash = ModelPackageHash::from_sha384_bytes([2; 48]);
+    let selectable = 1_usize
+        .saturating_add(usize::from(data.get(26).copied().unwrap_or(0)) % vocabulary);
+    let domain = if selectable == vocabulary {
+        SelectableTokenDomain::entire_model_vocabulary(
+            vocabulary_u32,
+            vocabulary_u32,
+            model_hash,
+            tokenizer_hash,
+        )
+    } else {
+        let Ok(selectable_u32) = u32::try_from(selectable) else { return };
+        SelectableTokenDomain::contiguous_tokenizer_prefix(
+            vocabulary_u32,
+            selectable_u32,
+            model_hash,
+            tokenizer_hash,
+        )
+    };
+    let Ok(domain) = domain else {
+        return;
+    };
+    let Ok(mut sampler) = Sampler::new(
+        config,
+        domain,
+        RequestId::new(1).expect("fixed request ID"),
+        &pool,
+    ) else {
+        return;
+    };
     let _result = sampler.sample(&tensor, &[]);
 });

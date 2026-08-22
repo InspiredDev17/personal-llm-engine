@@ -21,13 +21,16 @@ non-empty prefill and exactly-one-token decode, writes K/V through
 `ContiguousKvCache`, and publishes a token position only after every layer is
 complete. Package data cannot select operations or kernels.
 
-Sampling is first-party and uses this fixed order: token allow/deny constraints,
-repetition penalty, temperature, top-k, min-p, then top-p. Temperature zero is
-exact greedy decoding with token-ID tie breaking. Stochastic selection uses a
-documented xorshift64* generator for reproducibility only; it is not
-cryptographic. NaN and positive infinity are errors, negative infinity is an
+Sampling is first-party and uses this fixed order: the immutable
+tokenizer-defined domain, token allow/deny constraints, repetition penalty,
+temperature, top-k, min-p, then top-p. Temperature zero is exact greedy
+decoding with token-ID tie breaking. Stochastic selection uses a documented
+xorshift64* generator for reproducibility only; it is not cryptographic. NaN
+and positive infinity are errors on selectable rows, negative infinity is an
 explicitly excluded candidate, and empty or non-finite distributions fail.
-Parameters are validated rather than corrected.
+Non-selectable rows are never read into the probability pipeline. Parameters
+are validated rather than corrected. ADR-0034 defines the domain identity and
+authority boundary.
 
 The rich in-process lifecycle distinguishes acceptance, tokenization, prefill,
 token output, stopping, completion, cancellation, resource limits, model

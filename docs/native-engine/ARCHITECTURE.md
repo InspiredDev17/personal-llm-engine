@@ -35,7 +35,7 @@ Green authority.
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
 | `engine-transformer` | closed legacy decoder execution plus Qwen2.5 tiny scalar correctness scaffolding, exact tensor inventories, resident CPU path and bounded scalar streamed path |
-| `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
+| `engine-sampling` | model/tokenizer-bound selectable token domains plus bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding, bounded canonical Runtime-v3 documents, and the fixed-binary internal Knowledge 1.1 cache adapter |
 | `engine-server` | service composition, protected UDS, owner-selected CPU/Metal runtime, reusable cache lifecycle, and the bounded inference-runtime-v3 semantic reservation lifecycle |
@@ -447,10 +447,16 @@ internal lifecycle covers request acceptance, tokenization, prefill, generated
 tokens, stops, completion, cancellation, limits, model errors, and backend
 errors without changing the authenticated Go wire contract. The owner CLI can
 run this complete path for a registered signed package with explicit sampling
-and resource limits. Separate reference drivers provide both an exact
-batch and continuous admission. The batch accepts an exact configured number of
-connections no greater than the scheduler active limit or the separate
-64-connection ceiling,
+and resource limits. Loaded CPU and Metal models privately retain an immutable
+selectable-token domain bound to the verified package and tokenizer hashes.
+Sampling intersects request filters with that domain before reading candidate
+logits, so callers can narrow but cannot expand the tokenizer-defined ID set.
+Current AIPTok v1 packages retain exact all-vocabulary behavior; the disabled
+Qwen bootstrap can use its reserved-tail representation only after its exact
+tokenizer runtime is implemented and admitted. Separate reference drivers
+provide both an exact batch and continuous admission. The batch accepts an
+exact configured number of connections no greater than the scheduler active
+limit or the separate 64-connection ceiling,
 authenticates and durably replay-checks each stream, then drives their cursors
 through the coordinator with per-stream signing, ordinals, 256 KiB bounded-stack
 cancellation watchers, separate 256 KiB bounded-stack output writers, fixed

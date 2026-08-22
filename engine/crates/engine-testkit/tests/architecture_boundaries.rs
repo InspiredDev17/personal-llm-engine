@@ -722,6 +722,29 @@ fn placement_authority_remains_internal_to_the_trusted_runtime() {
 }
 
 #[test]
+fn selectable_token_domain_is_not_client_protocol_authority() {
+    let root = engine_root();
+    let protocol_root = root.join("crates/engine-protocol");
+    let protocol_manifest =
+        fs::read_to_string(protocol_root.join("Cargo.toml")).expect("protocol manifest");
+    assert!(
+        !protocol_manifest.contains("personalai-engine-sampling"),
+        "the client protocol must not construct sampling-domain authority"
+    );
+    for source in collect_files(&protocol_root.join("src"), "rs") {
+        let contents = fs::read_to_string(&source).expect("protocol source must be readable");
+        for prohibited in ["SelectableTokenDomain", "selectable_token_count", "reserved_token_tail"]
+        {
+            assert!(
+                !contents.contains(prohibited),
+                "client protocol source must not expose trusted token-domain field {prohibited:?}: {}",
+                source.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn crate_manifests_cannot_add_native_links_or_weaken_workspace_lints() {
     let crates = engine_root().join("crates");
     for manifest_path in collect_files(&crates, "Cargo.toml") {
