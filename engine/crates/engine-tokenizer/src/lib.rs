@@ -2,10 +2,16 @@
 //!
 //! AIPTok v1 preserves input bytes exactly and remains the only executable
 //! profile. The separate AIPTok v2/Qwen2.5 wire parser validates a fixed,
-//! data-only byte-level BPE profile but deliberately cannot construct a runtime
-//! tokenizer until the exact NFC and Unicode-category implementation is
-//! dependency-reviewed and independently qualified.
+//! data-only byte-level BPE profile. A private, non-constructible runtime core
+//! implements its fixed scanner/BPE/decode mechanics behind an explicit trusted
+//! Unicode-16 interface. The public factory remains fail-closed until that
+//! Unicode implementation is dependency-reviewed and independently qualified.
 
+#[allow(
+    dead_code,
+    reason = "the reviewed Qwen runtime core remains private until its Unicode-16 adapter is admitted"
+)]
+mod qwen_runtime;
 mod qwen_v2;
 
 pub use qwen_v2::{

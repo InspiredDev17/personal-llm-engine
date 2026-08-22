@@ -56,9 +56,11 @@ implementation. They do not fetch remote code, inspect model data, or ship as a
 runtime model capability. Any version, feature, source, or package-set change
 requires renewal of this record and the automated exact-allowlist test.
 
-The four Unicode entries are admitted supply-chain inputs only. Runtime source
-does not call them in this revision, so Qwen2.5 tokenization and execution remain
-explicitly unsupported. Their resolved graph is
+The four Unicode entries are admitted supply-chain inputs only. The private
+scanner/BPE/decode core adds no package to this inventory, is not publicly
+constructible, and does not yet call the admitted Unicode primitives. Qwen2.5
+tokenization and execution therefore remain explicitly unsupported. Their
+resolved graph is
 `engine-tokenizer -> unicode-normalization 0.1.24 -> tinyvec 1.12.0 ->
 tinyvec_macros 0.1.1` plus the independent
 `engine-tokenizer -> unicode-general-category 1.1.0` edge. Only

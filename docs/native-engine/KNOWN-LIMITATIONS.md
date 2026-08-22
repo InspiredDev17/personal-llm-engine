@@ -25,9 +25,13 @@
   0.2.0 artifacts. The current 0.1.0 loader rejects them. Tiny configurations
   provide scalar math evidence only; the exact 1.5B position-zero estimate is
   1,543,712,768 operations and fails the 100,000,000-operation scalar ceiling
-  before model materialization. A bounded data-only `AIPTOK02` Qwen table
-  parser now exists, but exact NFC/category pre-tokenization,
-  encode/decode/incremental decode and importer conversion do not. Offline
+  before model materialization. A bounded `AIPTOK02` Qwen table parser and a
+  private fixed scanner/BPE/decode/incremental-decode core now exist. The core
+  has no public constructor and accepts Unicode behavior only through a private
+  trusted Unicode-16 interface. Reviewed NFC/category primitives are admitted
+  but are not yet wired into that interface; the exact contraction case-fold
+  boundary, tokenizer conversion and production token-ID replay remain absent.
+  Offline
   importer emission, the Model Foundry registry compatibility profile, an
   optimized backend, signed package, independent logits, and production
   qualification remain absent. ARM64 and Metal reject the identifier. A second

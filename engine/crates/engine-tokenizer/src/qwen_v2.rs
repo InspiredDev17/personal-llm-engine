@@ -1,10 +1,10 @@
 //! Bounded data-only AIPTok v2 parser foundation for the pinned Qwen2.5 profile.
 //!
 //! This module defines and validates the immutable tables needed by the exact
-//! Qwen2.5 byte-level BPE profile. It intentionally does not implement encode,
-//! decode, normalization, or pre-tokenization. The public tokenizer factory
-//! validates this format and then returns `UnsupportedTokenizer` until exact
-//! NFC and Unicode property semantics are independently qualified.
+//! Qwen2.5 byte-level BPE profile. A private runtime core consumes these tables,
+//! but the public tokenizer factory still validates this format and returns
+//! `UnsupportedTokenizer` until exact NFC and Unicode property semantics are
+//! independently qualified.
 
 use super::{
     MAX_BPE_MERGE_RULES, MAX_SPECIAL_TOKENS, MAX_TOKEN_PIECE_BYTES, MAX_VOCABULARY_SIZE,
@@ -12,7 +12,7 @@ use super::{
     write_u32_at, write_u32_push,
 };
 use personalai_engine_crypto::hash_package;
-use personalai_engine_memory::MemoryPool;
+use personalai_engine_memory::{MemoryPool, MemoryReservation};
 use personalai_engine_types::{
     EngineError, MAX_REQUEST_BYTES, MAX_TOKEN_COUNT, MAX_TOKENIZER_DATA_BYTES, ModelPackageHash,
 };
@@ -117,7 +117,7 @@ impl AipTokQwen25AddedRole {
         }
     }
 
-    const fn is_special(self) -> bool {
+    pub(super) const fn is_special(self) -> bool {
         !matches!(self, Self::Ordinary)
     }
 }
@@ -477,6 +477,25 @@ struct Header {
 struct Vocabulary {
     pieces: Vec<Box<[u8]>>,
     flags: Vec<u16>,
+    vocabulary: BTreeMap<Box<[u8]>, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Qwen25MergeRule {
+    pub(super) rank: u32,
+    pub(super) result: u32,
+}
+
+#[derive(Debug)]
+pub(super) struct Qwen25LoadedTables {
+    pub(super) descriptor: Qwen25AipTokDescriptor,
+    pub(super) pieces: Vec<Box<[u8]>>,
+    pub(super) vocabulary: BTreeMap<Box<[u8]>, u32>,
+    pub(super) merges: BTreeMap<(u32, u32), Qwen25MergeRule>,
+    pub(super) added_tokens: Vec<AipTokQwen25AddedToken>,
+    pub(super) byte_token_ids: [u32; BYTE_MAP_ENTRIES],
+    pub(super) pool: MemoryPool,
+    pub(super) _reservation: MemoryReservation,
 }
 
 /// Parses the fixed AIPTok v2/Qwen2.5 tables under an aggregate memory bound.
@@ -484,9 +503,23 @@ pub fn inspect_qwen25_aiptok(
     data: &[u8],
     pool: &MemoryPool,
 ) -> Result<Qwen25AipTokDescriptor, EngineError> {
+    Ok(load_qwen25_tables(data, pool)?.descriptor)
+}
+
+pub(super) fn load_qwen25_tables(
+    data: &[u8],
+    pool: &MemoryPool,
+) -> Result<Qwen25LoadedTables, EngineError> {
     let header = parse_header(data)?;
     let reservation_bytes = u64::try_from(data.len())
         .ok()
+        .and_then(|bytes| {
+            header
+                .merge_offset
+                .checked_sub(header.vocabulary_offset)
+                .and_then(|vocabulary_bytes| u64::try_from(vocabulary_bytes).ok())
+                .and_then(|vocabulary_copy| bytes.checked_add(vocabulary_copy))
+        })
         .and_then(|bytes| {
             u64::from(header.descriptor.defined_token_count)
                 .checked_mul(PERSISTENT_BYTES_PER_VOCABULARY_ENTRY)
@@ -498,24 +531,47 @@ pub fn inspect_qwen25_aiptok(
                 .and_then(|table| bytes.checked_add(table))
         })
         .ok_or_else(|| EngineError::resource_exhaustion("AIPTok v2 memory bound overflows"))?;
-    let _reservation = pool.reserve(reservation_bytes)?;
-    parse_data_with_header(data, &header)
+    let reservation = pool.reserve(reservation_bytes)?;
+    let parsed = parse_data_with_header(data, &header)?;
+    Ok(Qwen25LoadedTables {
+        descriptor: parsed.descriptor,
+        pieces: parsed.pieces,
+        vocabulary: parsed.vocabulary,
+        merges: parsed.merges,
+        added_tokens: parsed.added_tokens,
+        byte_token_ids: parsed.byte_token_ids,
+        pool: pool.clone(),
+        _reservation: reservation,
+    })
 }
 
 fn parse_data(data: &[u8]) -> Result<Qwen25AipTokDescriptor, EngineError> {
     let header = parse_header(data)?;
-    parse_data_with_header(data, &header)
+    Ok(parse_data_with_header(data, &header)?.descriptor)
 }
 
-fn parse_data_with_header(
-    data: &[u8],
-    header: &Header,
-) -> Result<Qwen25AipTokDescriptor, EngineError> {
+fn parse_data_with_header(data: &[u8], header: &Header) -> Result<ParsedTables, EngineError> {
     let vocabulary = parse_vocabulary(data, header)?;
-    parse_merges(data, header, &vocabulary)?;
-    parse_added_tokens(data, header, &vocabulary)?;
-    parse_byte_map(data, header, &vocabulary)?;
-    Ok(header.descriptor)
+    let merges = parse_merges(data, header, &vocabulary)?;
+    let added_tokens = parse_added_tokens(data, header, &vocabulary)?;
+    let byte_token_ids = parse_byte_map(data, header, &vocabulary)?;
+    Ok(ParsedTables {
+        descriptor: header.descriptor,
+        pieces: vocabulary.pieces,
+        vocabulary: vocabulary.vocabulary,
+        merges,
+        added_tokens,
+        byte_token_ids,
+    })
+}
+
+struct ParsedTables {
+    descriptor: Qwen25AipTokDescriptor,
+    pieces: Vec<Box<[u8]>>,
+    vocabulary: BTreeMap<Box<[u8]>, u32>,
+    merges: BTreeMap<(u32, u32), Qwen25MergeRule>,
+    added_tokens: Vec<AipTokQwen25AddedToken>,
+    byte_token_ids: [u32; BYTE_MAP_ENTRIES],
 }
 
 #[allow(
@@ -645,7 +701,7 @@ fn parse_vocabulary(data: &[u8], header: &Header) -> Result<Vocabulary, EngineEr
     let bpe_count = header.descriptor.bpe_vocabulary_size;
     let mut pieces = Vec::new();
     let mut flags = Vec::new();
-    let mut unique = BTreeSet::new();
+    let mut vocabulary = BTreeMap::new();
     pieces
         .try_reserve_exact(count)
         .map_err(|_| EngineError::resource_exhaustion("AIPTok v2 vocabulary allocation failed"))?;
@@ -683,7 +739,8 @@ fn parse_vocabulary(data: &[u8], header: &Header) -> Result<Vocabulary, EngineEr
                 return Err(corrupt("AIPTok v2 added-token text is not data-only text"));
             }
         }
-        if !unique.insert(piece) {
+        let owned_piece = piece.to_vec().into_boxed_slice();
+        if vocabulary.insert(owned_piece.clone(), token_id).is_some() {
             return Err(corrupt("AIPTok v2 vocabulary contains duplicate decoded bytes"));
         }
         if token_flags & VOCABULARY_FLAG_SPECIAL != 0 {
@@ -691,7 +748,7 @@ fn parse_vocabulary(data: &[u8], header: &Header) -> Result<Vocabulary, EngineEr
                 .checked_add(1)
                 .ok_or_else(|| corrupt("AIPTok v2 special count overflows"))?;
         }
-        pieces.push(piece.to_vec().into_boxed_slice());
+        pieces.push(owned_piece);
         flags.push(token_flags);
         actual_maximum = actual_maximum.max(length);
         cursor = end;
@@ -702,10 +759,14 @@ fn parse_vocabulary(data: &[u8], header: &Header) -> Result<Vocabulary, EngineEr
     {
         return Err(corrupt("AIPTok v2 vocabulary metadata is noncanonical"));
     }
-    Ok(Vocabulary { pieces, flags })
+    Ok(Vocabulary { pieces, flags, vocabulary })
 }
 
-fn parse_merges(data: &[u8], header: &Header, vocabulary: &Vocabulary) -> Result<(), EngineError> {
+fn parse_merges(
+    data: &[u8],
+    header: &Header,
+    vocabulary: &Vocabulary,
+) -> Result<BTreeMap<(u32, u32), Qwen25MergeRule>, EngineError> {
     let merge_bytes = u32_to_usize(header.descriptor.merge_count)?
         .checked_mul(MERGE_RECORD_BYTES)
         .ok_or_else(|| corrupt("AIPTok v2 merge table length overflows"))?;
@@ -713,7 +774,7 @@ fn parse_merges(data: &[u8], header: &Header, vocabulary: &Vocabulary) -> Result
         return Err(corrupt("AIPTok v2 merge table length is noncanonical"));
     }
     let mut cursor = header.merge_offset;
-    let mut pairs = BTreeSet::new();
+    let mut merges = BTreeMap::new();
     let mut results = BTreeSet::new();
     for expected_rank in 0..header.descriptor.merge_count {
         let rank = read_u32(data, cursor)?;
@@ -743,21 +804,23 @@ fn parse_merges(data: &[u8], header: &Header, vocabulary: &Vocabulary) -> Result
         {
             return Err(corrupt("AIPTok v2 merge result bytes are invalid"));
         }
-        if !pairs.insert((left, right)) || !results.insert(result) {
+        if merges.insert((left, right), Qwen25MergeRule { rank, result }).is_some()
+            || !results.insert(result)
+        {
             return Err(corrupt("AIPTok v2 merge pair or result is duplicated"));
         }
     }
     if (256..header.descriptor.bpe_vocabulary_size).any(|token| !results.contains(&token)) {
         return Err(corrupt("AIPTok v2 BPE token lacks one defining merge"));
     }
-    Ok(())
+    Ok(merges)
 }
 
 fn parse_added_tokens(
     data: &[u8],
     header: &Header,
     vocabulary: &Vocabulary,
-) -> Result<(), EngineError> {
+) -> Result<Vec<AipTokQwen25AddedToken>, EngineError> {
     let added_bytes = u32_to_usize(header.descriptor.added_token_count)?
         .checked_mul(ADDED_RECORD_BYTES)
         .ok_or_else(|| corrupt("AIPTok v2 added-token length overflows"))?;
@@ -766,6 +829,10 @@ fn parse_added_tokens(
     }
     let mut cursor = header.added_offset;
     let mut observed = Vec::new();
+    let mut added_tokens = Vec::new();
+    added_tokens
+        .try_reserve_exact(u32_to_usize(header.descriptor.added_token_count)?)
+        .map_err(|_| EngineError::resource_exhaustion("AIPTok v2 added-token allocation failed"))?;
     let mut bos_count = 0_u32;
     let mut eos_count = 0_u32;
     for index in 0..header.descriptor.added_token_count {
@@ -807,6 +874,7 @@ fn parse_added_tokens(
             AipTokQwen25AddedRole::Special | AipTokQwen25AddedRole::Ordinary => {}
         }
         observed.push((vocabulary.pieces[u32_to_usize(token)?].as_ref(), role));
+        added_tokens.push(AipTokQwen25AddedToken { token_id: token, role });
     }
     if bos_count != 1 || eos_count != 1 {
         return Err(corrupt("AIPTok v2 required added-token roles are missing or duplicated"));
@@ -819,15 +887,16 @@ fn parse_added_tokens(
             return Err(corrupt("AIPTok v2 added-token literals have a prefix collision"));
         }
     }
-    Ok(())
+    Ok(added_tokens)
 }
 
 fn parse_byte_map(
     data: &[u8],
     header: &Header,
     vocabulary: &Vocabulary,
-) -> Result<(), EngineError> {
+) -> Result<[u32; BYTE_MAP_ENTRIES], EngineError> {
     let mut observed = BTreeSet::new();
+    let mut byte_token_ids = [0_u32; BYTE_MAP_ENTRIES];
     let mut cursor = header.byte_map_offset;
     for byte in 0_u16..=255 {
         let token = read_u32(data, cursor)?;
@@ -840,11 +909,12 @@ fn parse_byte_map(
         if vocabulary.pieces[u32_to_usize(token)?].as_ref() != [expected_byte] {
             return Err(corrupt("AIPTok v2 byte-token map does not match decoded bytes"));
         }
+        byte_token_ids[usize::from(byte)] = token;
     }
     if cursor != data.len() {
         return Err(corrupt("AIPTok v2 byte-token map has trailing data"));
     }
-    Ok(())
+    Ok(byte_token_ids)
 }
 
 fn u32_to_usize(value: u32) -> Result<usize, EngineError> {

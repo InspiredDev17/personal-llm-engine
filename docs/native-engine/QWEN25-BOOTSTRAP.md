@@ -34,17 +34,22 @@ The shared pinned tokenizer is not representable by `PAIBPE01`:
   rows.
 
 The importer therefore performs bounded, non-recursive source inspection but
-emits no lossy AIPTok conversion. A separate `AIPTOK02` foundation now validates
+emits no lossy AIPTok conversion. A separate `AIPTOK02` foundation validates
 the closed data tables, byte map, merge graph, added-token roles, undefined
-model-vocabulary tail and hard limits. The runtime validates that format and
-then returns `UnsupportedTokenizer`: exact NFC, Unicode-category
-pre-tokenization, encode/decode/incremental decode and source conversion remain
-absent. Adding a general regex crate or pretending byte-only tokenization is
-equivalent is prohibited. Version-matched Unicode 16 normalization/category
-primitives are now approved and offline-vendored, but this admission does not
-invoke them or establish tokenizer parity. A bounded first-party runtime and
-independent conformance vectors are still required before packaging. See
-ADR-0035.
+model-vocabulary tail and hard limits. A private runtime core retains those
+immutable tables and implements the exact fixed scanner state logic,
+deterministic byte-map/BPE, added-token policy, decode and incremental decode.
+It cannot be constructed publicly. Version-matched Unicode 16 normalization
+and category primitives are approved and offline-vendored, but no runtime
+adapter invokes them yet and the exact contraction case-fold boundary remains
+to be qualified. The public factory therefore still validates and returns
+`UnsupportedTokenizer`. Adding a general regex crate or pretending byte-only
+tokenization is equivalent is prohibited. Exact source conversion and replay
+of independent production-table token-ID vectors are required before
+packaging. See ADR-0035 and ADR-0036.
+
+The independently derived activation vectors and their current evidence level
+are recorded in [QWEN25-TOKENIZER-VECTORS.md](QWEN25-TOKENIZER-VECTORS.md).
 
 The sampling runtime now has a separate immutable selectable-token-domain
 boundary. Deterministic tests model the exact Qwen counts and prove that IDs

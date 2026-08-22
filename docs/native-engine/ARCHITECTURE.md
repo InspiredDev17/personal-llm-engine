@@ -27,7 +27,7 @@ Green authority.
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
-| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed data-only `AIPTOK02` Qwen2.5 table parser; immutable v1 encode/decode/incremental decode remains the only runtime path |
+| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed `AIPTOK02` Qwen2.5 parser and private fixed scanner/BPE/decode core; reviewed Unicode-16 primitives are admitted but not wired through the missing trusted adapter, so immutable v1 remains the only publicly constructible runtime path |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 lifecycle semantics and Knowledge 1.2 exact prefix framing |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
@@ -364,7 +364,7 @@ closed. The source metadata SHA-384, filename, and format are signed through
 package provenance. There is no diagnostic mode that can emit an approved
 lossy package.
 
-`AIPTOK02` is a distinct, non-executable Qwen2.5 parser profile; it never
+`AIPTOK02` is a distinct, publicly non-executable Qwen2.5 profile; it never
 reinterprets v1. Its fixed 160-byte header declares the closed NFC,
 Unicode-property pre-tokenizer, GPT-2 byte-symbol decoder, no-unknown and
 no-implicit-BOS/EOS behavior identities. Contiguous vocabulary records,
@@ -373,9 +373,14 @@ offsets, declared limits, exact special roles, and a SHA-384 table hash are
 validated under aggregate memory accounting. For the pinned production counts,
 the parser also fixes all 22 added-token literals/roles and distinguishes
 151,665 defined token IDs from 151,936 model logits. Undefined tail IDs are
-always invalid. The public runtime validates this structure and then returns
-`UnsupportedTokenizer`; it provides no v2 encode, decode, incremental decode,
-normalization, or pre-tokenizer behavior. ADR-0035 records the activation gate.
+always invalid. A private core now retains these immutable tables and implements
+the fixed pre-tokenizer state machine, deterministic byte-map/BPE, explicit
+added/special-token policies, strict decode, and bounded incremental decode.
+Unicode NFC/category/case-fold behavior is an explicit trusted internal
+Unicode-16 interface with no production implementation in this revision. The
+public factory therefore still validates the structure and returns
+`UnsupportedTokenizer`; no service or importer path can construct the core.
+ADR-0035 records the format gate and ADR-0036 records this inert runtime slice.
 
 ## Local protocol and authentication
 

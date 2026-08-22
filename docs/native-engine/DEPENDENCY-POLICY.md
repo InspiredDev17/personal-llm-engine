@@ -65,17 +65,19 @@ distinct domain and Rust trust type. Release artifact files use the already
 reviewed `O_NOFOLLOW|O_CLOEXEC` constants; the ledger uses only safe
 standard-library create-new, synchronization, and rename operations.
 
-AIPTok v2's data-only Qwen2.5 parser needs exact Unicode NFC and General
-Category `L`/`N` semantics that Rust `std` does not provide. The reviewed,
+AIPTok v2's data-only Qwen2.5 parser and private fixed scanner/BPE/decode core
+need exact Unicode NFC and General Category `L`/`N` semantics that Rust `std`
+does not provide. The reviewed,
 Unicode-version-matched pair is therefore admitted as general-purpose Unicode
 infrastructure: `unicode-normalization 0.1.24` and
 `unicode-general-category 1.1.0` both declare Unicode 16.0.0 data. They do not
 implement a tokenizer, vocabulary, merge algorithm, regex, pre-tokenizer,
 decoder, chat template, model loader, or model-selected rule. Only
-`engine-tokenizer` may depend on them. This admission does not invoke either
-crate in runtime source, establish Qwen tokenizer parity, or activate Qwen
-packages; those changes require a separately reviewed first-party tokenizer
-slice with version-bound conformance vectors.
+`engine-tokenizer` may depend on them. The private runtime core does not yet
+invoke either crate and remains nonconstructible through public APIs. This
+admission therefore does not establish Qwen tokenizer parity or activate Qwen
+packages; a reviewed Unicode adapter and production-table conformance vectors
+remain required.
 
 Both direct crates have defaults disabled and no features selected. NFC's
 iterator API is available through `unicode-normalization`'s `no_std` + `alloc`
