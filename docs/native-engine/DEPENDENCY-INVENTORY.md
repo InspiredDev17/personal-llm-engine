@@ -11,6 +11,10 @@ loading, or GPU kernels.
 | `ed25519-dalek 3.0.0` | BSD-3-Clause | Direct strict Ed25519 verification and role-separated package/response/release signing; only the `zeroize` feature is enabled |
 | `zeroize 1.8.2` | Apache-2.0 OR MIT | Direct audited clearing of owner-provided response and offline release-signing seeds plus Ed25519 signing state; no derive feature |
 | `libc 0.2.189` | MIT OR Apache-2.0 | Direct Unix constants `O_NOFOLLOW`/`O_CLOEXEC` for safe package/replay/release opens, isolated checked `flock` for exclusive journal ownership, isolated `sigaction` install/restore for graceful shutdown, isolated read-only effective-user/peer-credential calls for UDS admission, and isolated `PROT_READ|MAP_PRIVATE`/`munmap` tensor-shard mapping; no executable mapping or dynamic link discovery |
+| `unicode-normalization 0.1.24` | MIT OR Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 NFC primitive admitted for a future separately reviewed AIPTok v2 runtime; defaults and all direct features are disabled because NFC iterators work through its `no_std` + `alloc` path, and this crate supplies no tokenizer graph, regex, model rule, I/O, or authority |
+| `unicode-general-category 1.1.0` | Apache-2.0 | Direct `engine-tokenizer`-only Unicode 16.0 General Category lookup admitted for future fixed `L`/`N` classification; defaults disabled, no features or dependency, and no model-selected classification |
+| `tinyvec 1.12.0` | Zlib OR Apache-2.0 OR MIT | Transitive safe bounded storage beneath Unicode normalization; only `alloc` plus its empty default feature resolve, with no optional serialization/schema/debug features |
+| `tinyvec_macros 0.1.1` | MIT OR Apache-2.0 OR Zlib | Transitive ordinary declarative macro support selected by `tinyvec/alloc`; not a proc macro and has no dependency or build script |
 | `digest 0.11.3` | MIT OR Apache-2.0 | SHA-2 trait/internal support |
 | `block-buffer 0.12.1` | MIT OR Apache-2.0 | SHA-2 fixed-block buffering |
 | `crypto-common 0.2.2` | MIT OR Apache-2.0 | RustCrypto shared types |
@@ -52,12 +56,32 @@ implementation. They do not fetch remote code, inspect model data, or ship as a
 runtime model capability. Any version, feature, source, or package-set change
 requires renewal of this record and the automated exact-allowlist test.
 
-The AIPTok v2 parser foundation changes no package in this inventory. Exact
-Qwen2.5 runtime tokenization needs NFC and Unicode General Category semantics
-that are absent from Rust `std`; potential narrow Unicode crates remain
-unapproved and outside `Cargo.toml`, `Cargo.lock`, the vendor tree, and release
-SBOM. Accordingly this revision parses only data tables and returns an explicit
-unsupported error before execution.
+The four Unicode entries are admitted supply-chain inputs only. Runtime source
+does not call them in this revision, so Qwen2.5 tokenization and execution remain
+explicitly unsupported. Their resolved graph is
+`engine-tokenizer -> unicode-normalization 0.1.24 -> tinyvec 1.12.0 ->
+tinyvec_macros 0.1.1` plus the independent
+`engine-tokenizer -> unicode-general-category 1.1.0` edge. Only
+`tinyvec/alloc`, the upstream-selected empty `tinyvec/default`, and
+`tinyvec/tinyvec_macros` are active; neither direct Unicode crate has an active
+feature.
+
+Both direct crates declare Unicode 16.0.0. The vendored normalization and
+category table SHA-256 values are respectively
+`69a0faad67afe03146d80ff5b2d889d1898cbfe8f7677a24f012148f6fd27348`
+and `9a06bcac89a552d169aec1411438ab948391a218cbfef8c71bf186cd39ec5268`.
+The normalization archive's unused executable `scripts/unicode.py` and the
+category archive's unused external generator `Makefile` were pruned; Cargo's
+retained-file maps were regenerated while keeping the registry archive hashes.
+No JavaScript source was present. `unicode-general-category/build.rs` is the
+only new build-time surface: it deterministically reads bundled `src/tables.rs`
+and writes `category.rs` only to `OUT_DIR`, without network, subprocess, native
+link, dynamic loading, or unsafe code. `unicode-normalization` has no build
+script; its reviewed `src/normalize.rs` Hangul boundary contains one unsafe
+function, four unsafe expressions/blocks, and five range-guarded unchecked
+scalar conversions. Both tinyvec crates forbid unsafe code. Full maintainer,
+license, archive checksum, advisory, removal, and review-date evidence is in
+[DEPENDENCY-POLICY.md](DEPENDENCY-POLICY.md).
 
 `zeroize 1.8.2` was reviewed on 2026-08-11 as a RustCrypto-maintained memory
 clearing primitive. It has no build script, network, filesystem, process,

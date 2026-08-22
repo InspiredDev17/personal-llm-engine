@@ -13,13 +13,12 @@ silently change already signed package semantics.
 
 Rust's standard library does not implement Unicode NFC or Unicode General
 Category `L`/`N`. A handwritten partial Unicode database or approximate regex
-would create false compatibility. The dependency review identified
-`unicode-normalization` and `unicode-general-category` as plausible narrow
-general-purpose building blocks, but their reviewed releases use different
-Unicode versions (17 and 16 respectively) and therefore are not an acceptable
-pair. Their sources are not in the locked offline vendor graph and no
-dependency approval or independent version-bound conformance evidence exists
-in this revision.
+would create false compatibility. A follow-up dependency review admitted the
+version-matched general-purpose pair `unicode-normalization 0.1.24` and
+`unicode-general-category 1.1.0`, both fixed to Unicode 16.0.0, into the locked
+offline vendor graph. Defaults and all direct features are disabled. This is a
+supply-chain admission only: runtime source does not call either crate in this
+revision, and independent Qwen tokenizer conformance has not been established.
 
 ## Decision
 
@@ -57,7 +56,8 @@ converter continues to emit no package.
 Execution and importer emission require all of the following in a later
 reviewed change:
 
-1. approved, locked, offline-vendored Unicode normalization/category support;
+1. use the approved, locked, offline-vendored Unicode 16
+   normalization/category primitives in a bounded first-party implementation;
 2. exact implementation of the pinned Qwen pre-tokenizer and GPT-2 byte-symbol
    mapping with no arbitrary regex or tokenizer graph;
 3. deterministic encode/decode/incremental-decode and explicit allowed-special
@@ -79,7 +79,9 @@ tokenizer equivalence, model quality, package approval, or production safety.
 - Frozen AIPTok v1 compatibility is preserved.
 - Malformed Qwen tokenizer tables can be tested and fuzzed without enabling
   incomplete inference.
-- No third-party tokenizer/runtime library, Unicode dependency, build script,
-  network feature, Python, or model-provided code is added.
+- No third-party tokenizer/runtime library, network feature, Python, or
+  model-provided code is added. The admitted Unicode primitives remain general
+  Unicode algorithms/data, not tokenizer implementations; their one reviewed
+  offline table build script cannot read model input.
 - Exact Qwen tokenization remains an explicit blocker rather than an
   approximate implementation hidden behind a success type.

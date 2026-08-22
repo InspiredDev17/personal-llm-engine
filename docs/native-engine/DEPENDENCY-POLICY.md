@@ -40,7 +40,8 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 ## Current allowlist
 
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
-`zeroize 1.8.2`, `libc 0.2.189`, and Sovereign AI Contracts commit
+`zeroize 1.8.2`, `libc 0.2.189`, `unicode-normalization 0.1.24`,
+`unicode-general-category 1.1.0`, and Sovereign AI Contracts commit
 `2c4a7a6afd5625e7def3afec26f18fedac343d11`, all with unnecessary default
 features disabled. The Contracts dependency enables only the minimal
 `runtime-v3` consumer profile; cognitive, tool, memory, security, and other
@@ -64,20 +65,72 @@ distinct domain and Rust trust type. Release artifact files use the already
 reviewed `O_NOFOLLOW|O_CLOEXEC` constants; the ledger uses only safe
 standard-library create-new, synchronization, and rename operations.
 
-AIPTok v2's data-only Qwen2.5 parser also adds no external dependency. Exact
-Qwen execution requires Unicode NFC and Unicode General Category `L`/`N`, which
-the Rust standard library does not provide. `unicode-normalization 0.1.25` and
-`unicode-general-category 1.1.0` were identified as possible narrow
-general-purpose components, not approved or added dependencies. They cannot be
-approved as that pair: the reviewed releases expose Unicode 17 and Unicode 16
-semantics respectively, so their combined boundary behavior is not one exact
-Unicode profile. Any future selection must use one consistent reviewed Unicode
-version, encode that version in AIPTok, and carry version-bound conformance
-vectors. Source, features, build behavior, Unicode-version semantics,
-transitive graph, licensing, offline vendor material and independent
-conformance evidence must be reviewed under this policy before activation.
-Handwritten partial normalization, an approximate regex, or use of an existing
-transitive proc-macro Unicode table as runtime authority is prohibited.
+AIPTok v2's data-only Qwen2.5 parser needs exact Unicode NFC and General
+Category `L`/`N` semantics that Rust `std` does not provide. The reviewed,
+Unicode-version-matched pair is therefore admitted as general-purpose Unicode
+infrastructure: `unicode-normalization 0.1.24` and
+`unicode-general-category 1.1.0` both declare Unicode 16.0.0 data. They do not
+implement a tokenizer, vocabulary, merge algorithm, regex, pre-tokenizer,
+decoder, chat template, model loader, or model-selected rule. Only
+`engine-tokenizer` may depend on them. This admission does not invoke either
+crate in runtime source, establish Qwen tokenizer parity, or activate Qwen
+packages; those changes require a separately reviewed first-party tokenizer
+slice with version-bound conformance vectors.
+
+Both direct crates have defaults disabled and no features selected. NFC's
+iterator API is available through `unicode-normalization`'s `no_std` + `alloc`
+path, so its empty `std` feature is intentionally not enabled. The former
+resolves `tinyvec 1.12.0` with `alloc` and its
+`tinyvec_macros 0.1.1` dependency; `tinyvec`'s activated `default` feature is
+empty. No optional serialization, schema, debugger, benchmark, or other
+`tinyvec` feature is enabled. The latter has no transitive dependency. All four
+registry versions and checksums are exact in `Cargo.lock`.
+
+Admission review on 2026-08-22 found:
+
+- `unicode-normalization 0.1.24` (published 2024-09-17; crates.io owners
+  `huonw`, `SimonSapin`, `Manishearth`, `kwantam`, and `sujayakar`) is
+  MIT OR Apache-2.0. Its archive SHA-256 is
+  `5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956`.
+  Direct defaults and all features are disabled. It has no build script,
+  native link, network, filesystem, process, or dynamic
+  loading surface at runtime. Its only unsafe code is the reviewed Hangul
+  decomposition/composition implementation in `src/normalize.rs`: one unsafe
+  function, four unsafe expressions/blocks, and five checked
+  `char::from_u32_unchecked` conversions guarded by documented Unicode scalar
+  range invariants. The unused executable Python table generator was pruned
+  from the vendored tree and removed from Cargo's retained-file checksum map;
+  the original archive checksum remains recorded.
+- `unicode-general-category 1.1.0` (published 2025-09-16; crates.io owners
+  `wezm` and the YesLogic developers team) is Apache-2.0. Its archive SHA-256 is
+  `0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f`.
+  Its deterministic Rust `build.rs` reads only the bundled Unicode table and
+  writes a compiled table under Cargo `OUT_DIR`; it has no dependency, unsafe,
+  network, subprocess, dynamic-loading, or native-link surface. Its unused
+  external table-generation Makefile was pruned. The reviewed build script
+  SHA-256 is
+  `a877183b60fdc9846063f7ed5a1dc23f8ef26e1ff4994bc4cfc7418ddb4ec48e`.
+- `tinyvec 1.12.0` (published 2026-07-10; crates.io owners `Lokathor` and the
+  rust-bus maintainers team) is Zlib OR Apache-2.0 OR MIT, forbids unsafe code,
+  has no build script/native link, and has archive SHA-256
+  `bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f`.
+  `tinyvec_macros 0.1.1` (published 2023-02-02; owner `Soveu`) is MIT OR
+  Apache-2.0 OR Zlib, is an ordinary macro library rather than a proc macro,
+  forbids unsafe code, has no build script/dependency/native link, and has
+  archive SHA-256
+  `1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20`.
+- `cargo audit --no-fetch` scanned this lock against 1,225 locally cached
+  advisories at database commit
+  `bf5c0d245a92671908518d7e765914d437954ed6` (2026-08-21) and reported no
+  vulnerability. This is cached advisory evidence, not a live registry audit.
+
+Removal is mechanical while runtime use remains absent: delete the two direct
+`engine-tokenizer` dependency entries, regenerate the exact lock/vendor/SBOM,
+and remove these four vendor directories. After tokenizer activation, removal
+also requires a reviewed first-party replacement that passes the same Unicode
+16 normalization/category vectors. Handwritten partial normalization, an
+approximate regex, or use of a proc-macro Unicode table as runtime authority is
+prohibited.
 
 The complete resolved graph, purpose, license, source, and attack-surface record
 is [DEPENDENCY-INVENTORY.md](DEPENDENCY-INVENTORY.md). `Cargo.lock` pins exact
@@ -120,8 +173,11 @@ inference data plane.
   Apple `metal`, `metallib`, `clang++`, and `ar` tools against repository-owned
   sources, writes only to `OUT_DIR`, embeds the result, and performs no network
   access. Architecture tests reject every additional workspace build script.
-  A transitive build script requires explicit inventory review; current curve
-  arithmetic build metadata is offline and locked.
+  A transitive build script requires explicit inventory review. Current curve
+  arithmetic build metadata is offline and locked. The only newly admitted
+  Unicode build script is `unicode-general-category 1.1.0/build.rs`; its exact
+  offline, bundled-table-to-`OUT_DIR` behavior and hash are recorded above and
+  enforced by architecture tests.
 - No runtime dynamic-library lookup by arbitrary/configured name.
 - `cpu-reference` is default; `arm64`, `metal`, and `cuda` are explicit and
   default-off.
@@ -136,6 +192,9 @@ inference data plane.
   unsafe-lint allowances everywhere else. Any further FFI/backend exception
   requires an isolated module, `deny(unsafe_op_in_unsafe_fn)`, written
   invariants, safe wrappers, platform tests, and separate approval.
+  Vendored `unicode-normalization 0.1.24` contains a separately reviewed
+  upstream Hangul-only unsafe boundary described above; it is not workspace
+  code, FFI, model-selected behavior, or authority to add another exception.
 
 ## Required checks
 

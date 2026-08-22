@@ -47,8 +47,12 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
         "subtle@2.6.1",
         "syn@2.0.119",
         "syn@3.0.3",
+        "tinyvec@1.12.0",
+        "tinyvec_macros@0.1.1",
         "typenum@1.20.1",
+        "unicode-general-category@1.1.0",
         "unicode-ident@1.0.24",
+        "unicode-normalization@0.1.24",
         "version_check@0.9.5",
         "zeroize@1.8.2",
         "zmij@1.0.23",
@@ -125,6 +129,152 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
             );
         }
     }
+}
+
+#[test]
+fn unicode_16_dependencies_are_exact_tokenizer_only_and_not_yet_runtime_authority() {
+    let root = engine_root();
+    let workspace_manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
+    for required in [
+        "unicode-general-category = { version = \"=1.1.0\", default-features = false }",
+        "unicode-normalization = { version = \"=0.1.24\", default-features = false }",
+    ] {
+        assert!(
+            workspace_manifest.contains(required),
+            "Unicode dependency declaration changed: {required}"
+        );
+    }
+
+    let crates = root.join("crates");
+    for manifest_path in collect_files(&crates, "Cargo.toml") {
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest must be readable");
+        let is_tokenizer = manifest_path == crates.join("engine-tokenizer/Cargo.toml");
+        for dependency in ["unicode-general-category", "unicode-normalization"] {
+            assert_eq!(
+                manifest.contains(&format!("{dependency}.workspace = true")),
+                is_tokenizer,
+                "only engine-tokenizer may directly consume {dependency}: {}",
+                manifest_path.display()
+            );
+        }
+    }
+
+    for crate_entry in fs::read_dir(&crates).expect("crate directory must be readable") {
+        let source_root = crate_entry.expect("crate entry").path().join("src");
+        for source_path in collect_files(&source_root, "rs") {
+            let source = fs::read_to_string(&source_path).expect("source must be readable");
+            for marker in ["unicode_general_category", "unicode_normalization"] {
+                assert!(
+                    !source.contains(marker),
+                    "dependency admission must not activate model-selected Unicode behavior yet: {}",
+                    source_path.display()
+                );
+            }
+        }
+    }
+
+    let fuzz_lock = fs::read_to_string(root.join("fuzz/Cargo.lock")).expect("fuzz lock must exist");
+    let tokenizer_package = fuzz_lock
+        .split("[[package]]")
+        .find(|package| {
+            lock_value(package, "name").is_some_and(|name| name == "personalai-engine-tokenizer")
+        })
+        .expect("fuzz lock must contain engine-tokenizer");
+    for dependency in ["\"unicode-general-category\"", "\"unicode-normalization\""] {
+        assert!(
+            tokenizer_package.contains(dependency),
+            "fuzz lock tokenizer edge omitted {dependency}"
+        );
+    }
+    for required in [
+        "name = \"tinyvec\"\nversion = \"1.12.0\"",
+        "name = \"tinyvec_macros\"\nversion = \"0.1.1\"",
+        "name = \"unicode-general-category\"\nversion = \"1.1.0\"",
+        "name = \"unicode-normalization\"\nversion = \"0.1.24\"",
+    ] {
+        assert!(fuzz_lock.contains(required), "fuzz lock omitted {required}");
+    }
+}
+
+#[test]
+fn reviewed_unicode_16_vendor_boundaries_remain_pinned() {
+    let vendor = engine_root().join("vendor");
+    let normalization = vendor.join("unicode-normalization-0.1.24");
+    let category = vendor.join("unicode-general-category-1.1.0");
+    let tinyvec = vendor.join("tinyvec-1.12.0");
+    let macros = vendor.join("tinyvec_macros-0.1.1");
+
+    let normalization_tables =
+        fs::read_to_string(normalization.join("src/tables.rs")).expect("NFC tables must exist");
+    assert!(normalization_tables.contains("UNICODE_VERSION: (u8, u8, u8) = (16, 0, 0)"));
+    let category_source =
+        fs::read_to_string(category.join("src/lib.rs")).expect("category source must exist");
+    assert!(category_source.contains("UNICODE_VERSION: (u64, u64, u64) = (16, 0, 0)"));
+
+    let normalize_source =
+        fs::read_to_string(normalization.join("src/normalize.rs")).expect("normalizer source");
+    assert_eq!(normalize_source.matches("#[allow(unsafe_code").count(), 3);
+    assert_eq!(normalize_source.matches("unsafe fn").count(), 1);
+    assert_eq!(normalize_source.matches("unsafe {").count(), 4);
+    assert_eq!(normalize_source.matches("from_u32_unchecked").count(), 5);
+    assert!(normalize_source.contains("is_hangul_syllable(c)"));
+
+    let normalization_manifest =
+        fs::read_to_string(normalization.join("Cargo.toml")).expect("normalizer manifest");
+    assert!(normalization_manifest.contains("default = [\"std\"]"));
+    assert!(normalization_manifest.contains("features = [\"alloc\"]"));
+    let tinyvec_manifest =
+        fs::read_to_string(tinyvec.join("Cargo.toml")).expect("tinyvec manifest");
+    assert!(tinyvec_manifest.contains("alloc = [\"tinyvec_macros\"]"));
+    assert!(tinyvec_manifest.contains("default = []"));
+
+    for safe_crate in [&tinyvec, &macros] {
+        let lib = fs::read_to_string(safe_crate.join("src/lib.rs")).expect("safe crate source");
+        assert!(lib.contains("#![forbid(unsafe_code)]"));
+        for source_path in collect_files(&safe_crate.join("src"), "rs") {
+            let source = fs::read_to_string(&source_path).expect("safe crate source");
+            assert!(!source.contains("unsafe {"));
+            assert!(!source.contains("unsafe fn"));
+        }
+    }
+
+    let build = fs::read_to_string(category.join("build.rs")).expect("reviewed build script");
+    for required in ["env::var(\"OUT_DIR\")", "compile_table()", "File::create(path)"] {
+        assert!(build.contains(required), "category build script drifted: {required}");
+    }
+    for prohibited in [
+        "std::process",
+        "Command::",
+        "std::net",
+        "TcpStream",
+        "UdpSocket",
+        "curl",
+        "wget",
+        "unsafe",
+    ] {
+        assert!(
+            !build.contains(prohibited),
+            "category build script gained prohibited capability {prohibited:?}"
+        );
+    }
+
+    assert!(!normalization.join("scripts/unicode.py").try_exists().expect("generator path"));
+    assert!(!category.join("Makefile").try_exists().expect("generator path"));
+    let normalization_checksums = fs::read_to_string(normalization.join(".cargo-checksum.json"))
+        .expect("normalizer checksum map");
+    assert!(!normalization_checksums.contains("scripts/unicode.py"));
+    assert!(
+        normalization_checksums
+            .contains("69a0faad67afe03146d80ff5b2d889d1898cbfe8f7677a24f012148f6fd27348")
+    );
+    let category_checksums =
+        fs::read_to_string(category.join(".cargo-checksum.json")).expect("category checksum map");
+    assert!(!category_checksums.contains("Makefile"));
+    assert!(
+        category_checksums
+            .contains("a877183b60fdc9846063f7ed5a1dc23f8ef26e1ff4994bc4cfc7418ddb4ec48e")
+    );
 }
 
 #[test]
@@ -456,7 +606,10 @@ fn vendored_release_graph_matches_lock_and_contains_no_prohibited_languages() {
     for path in collect_all_files(&vendor) {
         let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         assert!(
-            !matches!(extension, "py" | "pyi" | "sage" | "ts" | "tsx"),
+            !matches!(
+                extension,
+                "py" | "pyi" | "sage" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx"
+            ),
             "vendored release graph contains a prohibited language file: {}",
             path.display()
         );
@@ -515,7 +668,10 @@ fn workspace_contains_no_python_or_typescript() {
     for path in collect_all_files(repository) {
         let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         assert!(
-            !matches!(extension, "py" | "pyi" | "sage" | "ts" | "tsx"),
+            !matches!(
+                extension,
+                "py" | "pyi" | "sage" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx"
+            ),
             "prohibited language file found: {}",
             path.display()
         );

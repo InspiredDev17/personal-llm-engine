@@ -189,6 +189,9 @@ eventual runtime revision bump it still reaches the closed tokenizer gate.
 Exact NFC/category-aware pre-tokenization, encode/decode/incremental decode,
 conversion, independent vectors, Model Foundry admission, and a qualified
 optimized backend must be implemented and qualified before activation.
+The exact Unicode 16 normalization/category primitives are admitted to the
+offline graph but deliberately unused until that separately reviewed runtime
+and its conformance evidence exist.
 
 ## Trusted execution placement
 

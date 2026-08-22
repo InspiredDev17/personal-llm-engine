@@ -10,6 +10,8 @@ description = "First-party tokenizer contracts and bounded tokenizer metadata"
 personalai-engine-crypto.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-types.workspace = true
+unicode-general-category.workspace = true
+unicode-normalization.workspace = true
 
 [[bench]]
 name = "tokenizer"

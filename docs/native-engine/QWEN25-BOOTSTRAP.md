@@ -40,8 +40,11 @@ model-vocabulary tail and hard limits. The runtime validates that format and
 then returns `UnsupportedTokenizer`: exact NFC, Unicode-category
 pre-tokenization, encode/decode/incremental decode and source conversion remain
 absent. Adding a general regex crate or pretending byte-only tokenization is
-equivalent is prohibited. Approved offline-vendored Unicode support and
-independent conformance vectors are required before packaging. See ADR-0035.
+equivalent is prohibited. Version-matched Unicode 16 normalization/category
+primitives are now approved and offline-vendored, but this admission does not
+invoke them or establish tokenizer parity. A bounded first-party runtime and
+independent conformance vectors are still required before packaging. See
+ADR-0035.
 
 The sampling runtime now has a separate immutable selectable-token-domain
 boundary. Deterministic tests model the exact Qwen counts and prove that IDs

@@ -2,10 +2,10 @@ SPDXVersion: SPDX-2.3
 DataLicense: CC0-1.0
 SPDXID: SPDXRef-DOCUMENT
 DocumentName: personalai-native-engine-0.1.0
-DocumentNamespace: https://github.com/InspiredDev17/personal-llm-engine/spdx/native-engine/0.1.0/2026-08-21-runtime-v3-cag
+DocumentNamespace: https://github.com/InspiredDev17/personal-llm-engine/spdx/native-engine/0.1.0/2026-08-22-unicode16-admission
 Creator: Organization: InspiredDev17
 Creator: Tool: Cargo.lock plus reviewed dependency inventory
-Created: 2026-08-21T00:00:00Z
+Created: 2026-08-22T00:00:00Z
 
 PackageName: personalai-native-engine
 SPDXID: SPDXRef-Package-personalai-native-engine
@@ -249,6 +249,40 @@ PackageLicenseDeclared: MIT OR Apache-2.0
 PackageCopyrightText: NOASSERTION
 Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-typenum
 
+PackageName: tinyvec
+SPDXID: SPDXRef-Package-tinyvec
+PackageVersion: 1.12.0
+PackageDownloadLocation: https://crates.io/crates/tinyvec/1.12.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f
+PackageLicenseConcluded: Zlib OR Apache-2.0 OR MIT
+PackageLicenseDeclared: Zlib OR Apache-2.0 OR MIT
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-tinyvec
+
+PackageName: tinyvec_macros
+SPDXID: SPDXRef-Package-tinyvec-macros
+PackageVersion: 0.1.1
+PackageDownloadLocation: https://crates.io/crates/tinyvec_macros/0.1.1
+FilesAnalyzed: false
+PackageChecksum: SHA256: 1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20
+PackageLicenseConcluded: MIT OR Apache-2.0 OR Zlib
+PackageLicenseDeclared: MIT OR Apache-2.0 OR Zlib
+PackageCopyrightText: NOASSERTION
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-tinyvec-macros
+
+PackageName: unicode-general-category
+SPDXID: SPDXRef-Package-unicode-general-category
+PackageVersion: 1.1.0
+PackageDownloadLocation: https://crates.io/crates/unicode-general-category/1.1.0
+FilesAnalyzed: false
+PackageChecksum: SHA256: 0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f
+PackageLicenseConcluded: Apache-2.0
+PackageLicenseDeclared: Apache-2.0
+PackageCopyrightText: NOASSERTION
+PackageComment: Unicode 16.0 table compiler reads bundled data and writes only to OUT_DIR; unused external table-generation Makefile pruned while the original archive checksum remains recorded.
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-unicode-general-category
+
 PackageName: unicode-ident
 SPDXID: SPDXRef-Package-unicode-ident
 PackageVersion: 1.0.24
@@ -259,6 +293,18 @@ PackageLicenseConcluded: (MIT OR Apache-2.0) AND Unicode-3.0
 PackageLicenseDeclared: (MIT OR Apache-2.0) AND Unicode-3.0
 PackageCopyrightText: NOASSERTION
 Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-unicode-ident
+
+PackageName: unicode-normalization
+SPDXID: SPDXRef-Package-unicode-normalization
+PackageVersion: 0.1.24
+PackageDownloadLocation: https://crates.io/crates/unicode-normalization/0.1.24
+FilesAnalyzed: false
+PackageChecksum: SHA256: 5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956
+PackageLicenseConcluded: MIT OR Apache-2.0
+PackageLicenseDeclared: MIT OR Apache-2.0
+PackageCopyrightText: NOASSERTION
+PackageComment: Unicode 16.0 NFC primitive; unused executable Python table generator pruned while the original archive checksum remains recorded and Cargo file checksums cover retained files.
+Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-unicode-normalization
 
 PackageName: zeroize
 SPDXID: SPDXRef-Package-zeroize
