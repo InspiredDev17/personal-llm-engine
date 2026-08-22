@@ -301,7 +301,7 @@ impl Qwen25RuntimeCore {
         let tables = load_qwen25_tables(data, pool)?;
         if !tables.descriptor.matches_pinned_qwen25_1_5b_counts() {
             return Err(EngineError::unsupported_tokenizer(
-                "Qwen runtime construction requires the exact pinned tokenizer identity",
+                "Qwen runtime construction requires the pinned production cardinality profile",
             ));
         }
         Self::from_tables(tables)
@@ -324,6 +324,25 @@ impl Qwen25RuntimeCore {
         let index_reservation =
             (index_bytes != 0).then(|| tables.pool.reserve(index_bytes)).transpose()?;
         let mut added_by_first_byte: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        let mut bucket_counts = [0_usize; 256];
+        for added in &tables.added_tokens {
+            let token_index = usize::try_from(added.token_id).map_err(|_| {
+                EngineError::corrupt_model_package("Qwen added-token ID is not addressable")
+            })?;
+            let first_byte =
+                *tables.pieces.get(token_index).and_then(|piece| piece.first()).ok_or_else(
+                    || EngineError::corrupt_model_package("Qwen added-token literal is empty"),
+                )?;
+            let count = &mut bucket_counts[usize::from(first_byte)];
+            *count = count.checked_add(1).ok_or_else(|| {
+                EngineError::resource_exhaustion("Qwen added-token bucket count overflows")
+            })?;
+        }
+        for (bucket, count) in added_by_first_byte.iter_mut().zip(bucket_counts) {
+            bucket.try_reserve_exact(count).map_err(|_| {
+                EngineError::resource_exhaustion("Qwen added-token index allocation failed")
+            })?;
+        }
         for (index, added) in tables.added_tokens.iter().enumerate() {
             let token_index = usize::try_from(added.token_id).map_err(|_| {
                 EngineError::corrupt_model_package("Qwen added-token ID is not addressable")
@@ -332,9 +351,6 @@ impl Qwen25RuntimeCore {
                 *tables.pieces.get(token_index).and_then(|piece| piece.first()).ok_or_else(
                     || EngineError::corrupt_model_package("Qwen added-token literal is empty"),
                 )?;
-            added_by_first_byte[usize::from(first_byte)].try_reserve(1).map_err(|_| {
-                EngineError::resource_exhaustion("Qwen added-token index allocation failed")
-            })?;
             added_by_first_byte[usize::from(first_byte)].push(index);
         }
         Ok(Self { tables, added_by_first_byte, _added_index_reservation: index_reservation })
