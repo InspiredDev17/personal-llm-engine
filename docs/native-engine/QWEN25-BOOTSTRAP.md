@@ -8,8 +8,9 @@ embedding/output weights.
 
 Each configuration also binds one exact 3,087,467,144-byte
 `model.safetensors` SHA-256 identity. This is source identity, not Foundry
-approval, qualification, promotion, or package trust. Length is checked before
-hashing, and identity is checked before safetensors parsing.
+approval, qualification, promotion, or package trust. The operator-only
+preflight checks the descriptor length before allocation, parses only the
+bounded header, and then streams SHA-256 from the same open descriptor.
 
 | Profile | `model.safetensors` SHA-256 |
 | --- | --- |
@@ -74,19 +75,37 @@ these source files are approved, signed, activated, or loadable.
 Every public package/import entry performs this unsupported-target check before
 path inspection, source reads, shard parsing, tensor conversion, or allocation.
 
-Before any future emission activation, the import path must additionally
-preflight the exact descriptor count, direct-child filename, and byte length
-from filesystem metadata before any generic source read or source-sized
-allocation. The SHA-256 must then be computed from the same securely opened,
-descriptor-bound bytes; path-based verification followed by a second reopen is
-not sufficient. Exact tensor descriptor count/name/length validation must also
-complete before tensor payload conversion or destination allocation.
+The portable preflight now requires one absolute normalized owner-private
+ingress root, one safe direct-child artifact name, an owner-private `source/`
+directory, and exactly `config.json`, `tokenizer.json`, and
+`model.safetensors`. Directories and files must share the ingress owner and
+grant no group/other permission. Unix opens use `O_NOFOLLOW`, `O_CLOEXEC`, and
+`O_DIRECTORY` where applicable; root, artifact, and source directory
+descriptors remain open throughout inspection. File device, inode, length,
+mode, owner, and modification timestamp must agree before open, after open, and
+after reading, and the current path must still identify the opened object.
+
+Only the at-most-64-MiB safetensors JSON header is allocated. Its flat parser
+requires exactly 338 BF16 tensors, the reviewed Qwen names and shapes, checked
+contiguous non-overlapping ranges, and complete coverage of the declared file
+extent. It rejects gaps, overlap, truncation, trailing data, unsupported dtype,
+and arithmetic overflow. The 3,087,467,144-byte payload is never materialized;
+SHA-256 is streamed from the same descriptor after header validation. Output
+contains only bounded profile, digest, byte-count, header-count, tensor-count,
+and explicit preflight-only status fields.
+
+This diagnostic closes the source-inspection mechanics only. It returns no
+reusable file handle and does not convert or emit a package. A future emission
+path must retain or explicitly transfer ownership of the verified descriptor;
+it must not reopen the path and treat this earlier diagnostic as package trust.
+Owner/root compromise and mutable-filesystem attacks are fail-detect controls,
+not an immutable-storage guarantee.
 
 The three exact config files are compact committed fixtures. A reproducible
 content-free diagnostic for an operator-held tokenizer is available as:
 
 ```text
-cargo run -p personalai-engine-model-importer --example verify_qwen25_sources -- CONFIG_JSON TOKENIZER_JSON
+cargo run --locked -p personalai-engine-model-importer --example verify_qwen25_sources -- INGRESS_ROOT ARTIFACT_NAME
 ```
 
 Exact local validation of the shared 7,031,645-byte tokenizer was performed
@@ -98,7 +117,11 @@ and leading integer zeroes are rejected, while standard exponent grammar is
 retained because the pinned config spells epsilon as `1e-06`.
 
 The three multi-gigabyte tensor files are intentionally not repository test
-fixtures. Synthetic tests cover exact name/length/hash precedence and verify
-that malformed bytes cannot reach safetensors parsing. Full-file SHA-256 and
-inventory validation remains an operated source-acquisition gate once each
-download is complete; no incomplete local download is counted as evidence.
+fixtures. Synthetic tests cover exact inventory, header-only range validation,
+wrong length/hash, symlinks, path replacement, descriptor mutation, truncation,
+and overlap. On 2026-08-22 the operator diagnostic inspected all three local
+startup artifacts: each reported 3,087,467,144 bytes, a 38,528-byte header,
+338 BF16 tensors, the shared pinned tokenizer digest, and its profile-specific
+pinned model digest. That is local acquisition evidence only. It is not license
+acceptance, quarantine approval, Foundry qualification, package signing,
+runtime compatibility, numerical parity, performance, or activation evidence.

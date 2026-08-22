@@ -177,9 +177,12 @@ Model metadata cannot define operations, plugins, paths, executable code, or
 kernels.
 
 This is engine-private package/runtime support, not a production model
-approval. The offline importer still produces only the legacy Llama mapping,
-although it now contains the fail-closed Qwen source inspection/mapping
-transition. `engine-tokenizer` recognizes and fully validates a separate
+approval. The offline importer still produces only the legacy Llama mapping.
+Its fail-closed Qwen transition can securely preflight an exact owner-private
+source directory by retaining no-follow descriptors, allocating only the
+bounded safetensors header, validating the 338-tensor BF16 inventory, and
+streaming the pinned digest from the same model descriptor; it cannot emit or
+sign a Qwen package. `engine-tokenizer` recognizes and fully validates a separate
 data-only `AIPTOK02` table profile, but deliberately returns
 `UnsupportedTokenizer` rather than constructing an approximate Qwen runtime.
 The Model Foundry registry V2 compatibility profile still names manifest v1.0,

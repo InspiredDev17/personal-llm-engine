@@ -8,6 +8,8 @@
 mod aiptok_metadata;
 mod bounded_json;
 mod qwen25_config_json;
+#[cfg(unix)]
+mod qwen25_source_preflight;
 mod qwen25_tokenizer_json;
 mod safetensors;
 
@@ -16,6 +18,8 @@ pub use qwen25_config_json::{
     QWEN25_CONFIG_JSON_SOURCE_FORMAT, QWEN25_MODEL_SAFETENSORS_BYTES, Qwen25Config,
     Qwen25ConfigProfile,
 };
+#[cfg(unix)]
+pub use qwen25_source_preflight::{Qwen25SourcePreflightReport, preflight_qwen25_ingress};
 pub use qwen25_tokenizer_json::{
     QWEN25_ADDED_TOKEN_COUNT, QWEN25_BOS_TOKEN_ID, QWEN25_BPE_VOCABULARY_SIZE,
     QWEN25_DEFINED_TOKEN_COUNT, QWEN25_EOS_TOKEN_ID, QWEN25_MERGE_COUNT,
@@ -25,7 +29,8 @@ pub use qwen25_tokenizer_json::{
 };
 
 pub use safetensors::{
-    MAX_SAFETENSORS_HEADER_BYTES, MAX_SOURCE_TENSOR_NAME_BYTES, ParsedSafetensors, SafeTensorRecord,
+    MAX_SAFETENSORS_HEADER_BYTES, MAX_SOURCE_TENSOR_NAME_BYTES, ParsedSafetensors,
+    ParsedSafetensorsHeader, SafeTensorRecord,
 };
 
 use ed25519_dalek::{Signer, SigningKey};

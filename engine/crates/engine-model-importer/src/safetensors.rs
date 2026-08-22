@@ -21,6 +21,109 @@ pub struct SafeTensorRecord {
     data_range: Range<usize>,
 }
 
+/// Fully validated safetensors metadata independent of tensor payload bytes.
+///
+/// Offline preflight can construct this value from only the bounded JSON
+/// header plus the descriptor-reported file length. Tensor payload bytes are
+/// not allocated or exposed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSafetensorsHeader {
+    header_length: usize,
+    data_start: usize,
+    file_length: u64,
+    tensors: Vec<SafeTensorRecord>,
+}
+
+impl ParsedSafetensorsHeader {
+    /// Parses one exact bounded JSON header against its complete file length.
+    pub fn parse(header: &[u8], file_length: u64) -> Result<Self, EngineError> {
+        if !(10..=MAX_MODEL_PACKAGE_BYTES).contains(&file_length) {
+            return Err(EngineError::resource_exhaustion(
+                "safetensors file length is outside hard bounds",
+            ));
+        }
+        if !(2..=MAX_SAFETENSORS_HEADER_BYTES).contains(&header.len()) {
+            return Err(corrupt("safetensors header length is outside hard bounds"));
+        }
+        let file_length = usize::try_from(file_length)
+            .map_err(|_| EngineError::resource_exhaustion("safetensors file is not addressable"))?;
+        let data_start = 8_usize
+            .checked_add(header.len())
+            .ok_or_else(|| EngineError::resource_exhaustion("safetensors data offset overflows"))?;
+        if data_start > file_length {
+            return Err(corrupt("safetensors JSON header is truncated"));
+        }
+        let header_text = std::str::from_utf8(header)
+            .map_err(|_| corrupt("safetensors header is not valid UTF-8"))?;
+        let relative = HeaderParser::new(header_text).parse()?;
+        if relative.is_empty()
+            || relative.len() > usize::try_from(MAX_TENSOR_COUNT).unwrap_or(usize::MAX)
+        {
+            return Err(corrupt("safetensors tensor count is outside hard bounds"));
+        }
+        let mut tensors = Vec::new();
+        tensors.try_reserve_exact(relative.len()).map_err(|_| {
+            EngineError::resource_exhaustion("safetensors metadata allocation failed")
+        })?;
+        let mut previous_end = 0_usize;
+        for tensor in relative {
+            if tensor.start != previous_end || tensor.end <= tensor.start {
+                return Err(corrupt("safetensors tensor ranges are overlapping or noncanonical"));
+            }
+            let absolute_start = data_start
+                .checked_add(tensor.start)
+                .ok_or_else(|| EngineError::resource_exhaustion("tensor offset overflows"))?;
+            let absolute_end = data_start
+                .checked_add(tensor.end)
+                .ok_or_else(|| EngineError::resource_exhaustion("tensor end overflows"))?;
+            let expected = usize::try_from(tensor.shape.byte_len(tensor.dtype)?).map_err(|_| {
+                EngineError::resource_exhaustion("tensor length is not addressable")
+            })?;
+            if tensor.end - tensor.start != expected || absolute_end > file_length {
+                return Err(corrupt("safetensors tensor range is out of bounds or wrong length"));
+            }
+            previous_end = tensor.end;
+            tensors.push(SafeTensorRecord {
+                name: tensor.name,
+                dtype: tensor.dtype,
+                shape: tensor.shape,
+                data_range: absolute_start..absolute_end,
+            });
+        }
+        if data_start.checked_add(previous_end) != Some(file_length) {
+            return Err(corrupt("safetensors data has trailing or unindexed bytes"));
+        }
+        Ok(Self {
+            header_length: header.len(),
+            data_start,
+            file_length: u64::try_from(file_length).map_err(|_| {
+                EngineError::internal_invariant("validated safetensors length is not representable")
+            })?,
+            tensors,
+        })
+    }
+
+    /// Returns the exact JSON-header byte length.
+    pub const fn header_length(&self) -> usize {
+        self.header_length
+    }
+
+    /// Returns the absolute offset of the first tensor byte.
+    pub const fn data_start(&self) -> usize {
+        self.data_start
+    }
+
+    /// Returns the descriptor-bound complete file length.
+    pub const fn file_length(&self) -> u64 {
+        self.file_length
+    }
+
+    /// Returns every tensor in canonical source-offset order.
+    pub fn tensors(&self) -> &[SafeTensorRecord] {
+        &self.tensors
+    }
+}
+
 impl SafeTensorRecord {
     /// Returns the source tensor name.
     pub fn name(&self) -> &str {
@@ -56,9 +159,6 @@ impl<'a> ParsedSafetensors<'a> {
         if bytes.len() < 10 {
             return Err(corrupt("safetensors file is truncated"));
         }
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MODEL_PACKAGE_BYTES {
-            return Err(EngineError::resource_exhaustion("safetensors file exceeds hard limit"));
-        }
         let header_length = usize::try_from(u64::from_le_bytes(
             bytes[..8].try_into().map_err(|_| corrupt("safetensors header length is truncated"))?,
         ))
@@ -72,47 +172,9 @@ impl<'a> ParsedSafetensors<'a> {
         let header = bytes
             .get(8..data_start)
             .ok_or_else(|| corrupt("safetensors JSON header is truncated"))?;
-        let header_text = std::str::from_utf8(header)
-            .map_err(|_| corrupt("safetensors header is not valid UTF-8"))?;
-        let relative = HeaderParser::new(header_text).parse()?;
-        if relative.is_empty()
-            || relative.len() > usize::try_from(MAX_TENSOR_COUNT).unwrap_or(usize::MAX)
-        {
-            return Err(corrupt("safetensors tensor count is outside hard bounds"));
-        }
-        let mut tensors = Vec::new();
-        tensors.try_reserve_exact(relative.len()).map_err(|_| {
-            EngineError::resource_exhaustion("safetensors metadata allocation failed")
-        })?;
-        let mut previous_end = 0_usize;
-        for tensor in relative {
-            if tensor.start != previous_end || tensor.end <= tensor.start {
-                return Err(corrupt("safetensors tensor ranges are overlapping or noncanonical"));
-            }
-            let absolute_start = data_start
-                .checked_add(tensor.start)
-                .ok_or_else(|| EngineError::resource_exhaustion("tensor offset overflows"))?;
-            let absolute_end = data_start
-                .checked_add(tensor.end)
-                .ok_or_else(|| EngineError::resource_exhaustion("tensor end overflows"))?;
-            let expected = usize::try_from(tensor.shape.byte_len(tensor.dtype)?).map_err(|_| {
-                EngineError::resource_exhaustion("tensor length is not addressable")
-            })?;
-            if tensor.end - tensor.start != expected || absolute_end > bytes.len() {
-                return Err(corrupt("safetensors tensor range is out of bounds or wrong length"));
-            }
-            previous_end = tensor.end;
-            tensors.push(SafeTensorRecord {
-                name: tensor.name,
-                dtype: tensor.dtype,
-                shape: tensor.shape,
-                data_range: absolute_start..absolute_end,
-            });
-        }
-        if data_start.checked_add(previous_end) != Some(bytes.len()) {
-            return Err(corrupt("safetensors data has trailing or unindexed bytes"));
-        }
-        Ok(Self { bytes, tensors })
+        let parsed =
+            ParsedSafetensorsHeader::parse(header, u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
+        Ok(Self { bytes, tensors: parsed.tensors })
     }
 
     /// Returns every source tensor in canonical source-offset order.
@@ -158,13 +220,13 @@ impl<'a> HeaderParser<'a> {
         loop {
             let name = self.string(MAX_SOURCE_TENSOR_NAME_BYTES)?;
             self.expect(b':')?;
+            if !names.insert(name.clone()) {
+                return Err(corrupt("safetensors contains a duplicate header name"));
+            }
             if name == "__metadata__" {
                 self.metadata()?;
             } else {
                 validate_source_name(&name)?;
-                if !names.insert(name.clone()) {
-                    return Err(corrupt("safetensors contains a duplicate tensor name"));
-                }
                 tensors.push(self.tensor(name)?);
             }
             self.whitespace();
@@ -412,6 +474,7 @@ mod tests {
             r#"{"a":{"dtype":"F64","shape":[1],"data_offsets":[0,8]}}"#,
             r#"{"a":{"dtype":"F32","shape":[1,1,1,1,1,1,1,1,1],"data_offsets":[0,4]}}"#,
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[1,5]}}"#,
+            r#"{"__metadata__":{},"__metadata__":{}}"#,
         ] {
             assert!(ParsedSafetensors::parse(&fixture(header, &[0; 8])).is_err());
         }

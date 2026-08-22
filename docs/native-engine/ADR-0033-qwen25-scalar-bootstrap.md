@@ -70,18 +70,23 @@ split-half RoPE, bias execution, deterministic tiny two-layer grouped-query
 prefill/decode, cached-versus-full parity, and exact 1.5B scalar compute
 rejection before weight materialization.
 
-An offline transition slice now performs bounded inspection of the three pinned
-config identities, the shared exact tokenizer graph/identity, and the closed
-safetensors name/shape profile. It deliberately cannot emit a package or exact
-Qwen tokenizer. This decision still adds no chat-template execution, registry
-authority, model download, package approval, or production qualification.
+An offline transition slice now performs descriptor-bound inspection of the
+three pinned config identities, the shared exact tokenizer graph/identity, and
+the closed safetensors name/shape profile. It securely opens an exact
+owner-private direct-child source set, allocates only the bounded header,
+validates 338 BF16 tensor descriptors and complete non-overlapping ranges, and
+streams the profile-specific SHA-256 from the same open file. It deliberately
+cannot emit a package or exact Qwen tokenizer. This decision still adds no
+chat-template execution, registry authority, model download, package approval,
+or production qualification.
 Existing AIPTok remains the only runtime tokenizer. The current authenticated
 service first rejects v1.1 as requiring a future runtime; a second explicit
 tokenizer gate prevents a future compatible runtime from silently applying
 AIPTok's incompatible preserve-bytes/no-pretokenizer/BOS profile. Model Foundry
-must finish the exact offline tokenizer conversion and descriptor-bound tensor
-preflight, issue new signed provenance and registry artifacts, and produce
-independent real-model numeric vectors. A separately
+must finish the exact offline tokenizer conversion, connect future package
+emission to an owned verified descriptor rather than reopening a path, issue
+new signed provenance and registry artifacts, and produce independent
+real-model numeric vectors. A separately
 reviewed optimized backend must then demonstrate admission and parity without
 weakening the scalar oracle's bound. Licensing, signing-key custody, actual
 1.5B resource evidence, long-context checks, and Apple hardware qualification

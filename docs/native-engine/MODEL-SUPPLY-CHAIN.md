@@ -76,6 +76,15 @@ new signed registry decision. AIPTok v1 cannot be relabeled as that tokenizer.
 The production engine does not infer or manufacture any of those supply-chain
 decisions.
 
+The descriptor preflight mechanics are implemented as an operator-only,
+non-emitting diagnostic. They require one protected ingress root, exact
+direct-child source names, no symlinks, pinned length and SHA-256, and the exact
+338-tensor BF16 inventory. Only the bounded safetensors header is allocated;
+the full payload digest is streamed from the same descriptor. This evidence
+does not quarantine, approve, qualify, sign, promote, install, or activate the
+source. Future emission must consume an owned verified descriptor rather than
+reopening a path based on a previous diagnostic result.
+
 `AIPTOK02` is now reserved as a separate data-only Qwen2.5 table format. Its
 bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
 records, exact byte mapping, special roles, declared resource limits, table

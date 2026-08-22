@@ -46,6 +46,41 @@ pub fn hash_sha256(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(exact)
 }
 
+/// Computes SHA-256 over a stream while enforcing an exact byte ceiling.
+///
+/// This is the streaming counterpart to [`hash_sha256`]. It lets offline
+/// inspection bind a large local artifact to one already-open file descriptor
+/// without allocating the complete artifact in memory.
+pub fn hash_sha256_bounded_reader(
+    reader: &mut impl Read,
+    maximum_bytes: u64,
+) -> Result<(Sha256Digest, u64), EngineError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| EngineError::invalid_input("bounded SHA-256 input could not be read"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| {
+                EngineError::internal_invariant("bounded SHA-256 read length overflows")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("bounded SHA-256 length overflows"))?;
+        if total > maximum_bytes {
+            return Err(EngineError::resource_exhaustion("bounded SHA-256 input exceeds limit"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; Sha256Digest::BYTE_LEN];
+    bytes.copy_from_slice(&digest);
+    Ok((Sha256Digest::from_bytes(bytes), total))
+}
+
 /// Operator-configured Ed25519 verification key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedSigner {
@@ -719,6 +754,16 @@ mod tests {
         assert_eq!(digest, hash_signed_content(&bytes));
         assert_eq!(length, 40_000);
         assert!(hash_bounded_reader(&mut bytes.as_slice(), 39_999).is_err());
+    }
+
+    #[test]
+    fn bounded_sha256_stream_matches_slice_hash_and_rejects_excess() {
+        let bytes = vec![0xa5; 140_000];
+        let (digest, length) = hash_sha256_bounded_reader(&mut bytes.as_slice(), 140_000)
+            .expect("bounded SHA-256 succeeds");
+        assert_eq!(digest, hash_sha256(&bytes));
+        assert_eq!(length, 140_000);
+        assert!(hash_sha256_bounded_reader(&mut bytes.as_slice(), 139_999).is_err());
     }
 
     #[test]
