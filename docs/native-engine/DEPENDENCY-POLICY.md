@@ -73,11 +73,14 @@ infrastructure: `unicode-normalization 0.1.24` and
 `unicode-general-category 1.1.0` both declare Unicode 16.0.0 data. They do not
 implement a tokenizer, vocabulary, merge algorithm, regex, pre-tokenizer,
 decoder, chat template, model loader, or model-selected rule. Only
-`engine-tokenizer` may depend on them. The private runtime core does not yet
-invoke either crate and remains nonconstructible through public APIs. This
-admission therefore does not establish Qwen tokenizer parity or activate Qwen
-packages; a reviewed Unicode adapter and production-table conformance vectors
-remain required.
+`engine-tokenizer` may depend on them. A crate-private adapter now consumes the
+two version constants, streams NFC scalars into an engine-bounded output, and
+maps every General Category `L*`/`N*` value. The fixed contraction matcher uses
+an engine-owned Unicode-16 simple-fold table only for mappings that reach ASCII
+(ASCII case, U+017F LONG S, and U+212A KELVIN SIGN). The runtime core and
+adapter remain nonconstructible through public APIs. This does not establish
+Qwen tokenizer parity or activate Qwen packages; exact source conversion and
+production-table token-ID conformance remain required.
 
 Both direct crates have defaults disabled and no features selected. NFC's
 iterator API is available through `unicode-normalization`'s `no_std` + `alloc`

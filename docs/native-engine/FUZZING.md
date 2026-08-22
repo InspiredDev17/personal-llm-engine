@@ -43,8 +43,10 @@ The corpus generator is Rust-only and additionally produces valid directory
 manifest/tensor-record/F32-F16-BF16 safetensors/package-name seeds plus
 malformed boundary seeds. It retains the decoder package, executable v1
 tokenizer, data-only v2 tokenizer-table, and frame seeds. The v2 seed exercises
-only bounded format validation; encode/decode/incremental targets remain v1-only
-until ADR-0035's exact Unicode gate closes. The decoder seed is generated from
+only bounded format validation; encode/decode/incremental targets remain
+v1-only because the private Unicode adapter does not supply the absent exact
+production-table conversion and public activation gates in ADR-0035 through
+ADR-0037. The decoder seed is generated from
 the current two-layer
 grouped-query-attention fixture, so corpus verification catches stale fixture
 bytes:

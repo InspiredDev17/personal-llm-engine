@@ -41,14 +41,14 @@ the closed data tables, byte map, merge graph, added-token roles, undefined
 model-vocabulary tail and hard limits. A private runtime core retains those
 immutable tables and implements the exact fixed scanner state logic,
 deterministic byte-map/BPE, added-token policy, decode and incremental decode.
-It cannot be constructed publicly. Version-matched Unicode 16 normalization
-and category primitives are approved and offline-vendored, but no runtime
-adapter invokes them yet and the exact contraction case-fold boundary remains
-to be qualified. The public factory therefore still validates and returns
-`UnsupportedTokenizer`. Adding a general regex crate or pretending byte-only
-tokenization is equivalent is prohibited. Exact source conversion and replay
-of independent production-table token-ID vectors are required before
-packaging. See ADR-0035 and ADR-0036.
+It cannot be constructed publicly. A private adapter now checks the admitted
+normalization/category tables are both Unicode 16.0, streams NFC into an
+engine-bounded output, maps all General Category `L*`/`N*` values, and pins the
+finite default-simple-fold mappings that reach ASCII, including U+017F LONG S.
+The public factory still validates and returns `UnsupportedTokenizer`. Adding
+a general regex crate or pretending byte-only tokenization is equivalent is
+prohibited. Exact source conversion and replay of independent production-table
+token-ID vectors are required before packaging. See ADR-0035 through ADR-0037.
 
 The independently derived activation vectors and their current evidence level
 are recorded in [QWEN25-TOKENIZER-VECTORS.md](QWEN25-TOKENIZER-VECTORS.md).

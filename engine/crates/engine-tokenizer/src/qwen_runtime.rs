@@ -3,7 +3,9 @@
 //! This module is intentionally private. It implements deterministic fixed
 //! pre-tokenizer, BPE, added-token, and decoding mechanics over already parsed
 //! AIPTok v2 tables. The public tokenizer factory remains fail-closed until the
-//! admitted Unicode-16 primitives are wired through a reviewed adapter.
+//! admitted Unicode-16 primitives are wired through the private adapter below.
+//! Public construction remains disabled until exact source conversion and
+//! production-table token-ID replay are independently qualified.
 
 use super::qwen_v2::{
     AipTokQwen25AddedRole, Qwen25LoadedTables, Qwen25MergeRule, load_qwen25_tables,
@@ -15,6 +17,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::mem::size_of;
 use std::ops::Range;
+use unicode_general_category::{GeneralCategory, get_general_category};
+use unicode_normalization::UnicodeNormalization;
 
 const REQUIRED_UNICODE_VERSION: (u8, u8, u8) = (16, 0, 0);
 const SCANNER_BYTES_PER_SCALAR: u64 = 64;
@@ -29,9 +33,7 @@ enum GeneralClass {
 }
 
 /// Engine-internal Unicode authority. No package or client can implement or
-/// select this interface; the production implementation is intentionally
-/// absent until the admitted Unicode-16 primitives are safely adapted and
-/// independently qualified.
+/// select this interface.
 trait TrustedQwen25Unicode16: Send + Sync {
     fn unicode_version(&self) -> (u8, u8, u8);
     fn normalize_nfc(
@@ -41,6 +43,78 @@ trait TrustedQwen25Unicode16: Send + Sync {
     ) -> Result<(), EngineError>;
     fn general_class(&self, scalar: char) -> GeneralClass;
     fn contraction_ascii_fold(&self, scalar: char) -> Option<u8>;
+}
+
+/// Fixed engine-owned adapter over the separately admitted Unicode 16.0
+/// normalization and General Category tables.
+///
+/// The type remains private with the rest of the Qwen runtime core. It cannot
+/// be selected by a package or client and its existence does not make
+/// `AIPTOK02` publicly executable.
+#[derive(Debug, Clone, Copy)]
+struct Qwen25Unicode16Adapter;
+
+impl Qwen25Unicode16Adapter {
+    fn versions_match() -> bool {
+        let required_category_version = (
+            u64::from(REQUIRED_UNICODE_VERSION.0),
+            u64::from(REQUIRED_UNICODE_VERSION.1),
+            u64::from(REQUIRED_UNICODE_VERSION.2),
+        );
+        unicode_normalization::UNICODE_VERSION == REQUIRED_UNICODE_VERSION
+            && unicode_general_category::UNICODE_VERSION == required_category_version
+    }
+}
+
+impl TrustedQwen25Unicode16 for Qwen25Unicode16Adapter {
+    fn unicode_version(&self) -> (u8, u8, u8) {
+        if Self::versions_match() {
+            REQUIRED_UNICODE_VERSION
+        } else {
+            // A future dependency-data drift must fail the existing version
+            // check rather than silently changing token boundaries.
+            (0, 0, 0)
+        }
+    }
+
+    fn normalize_nfc(
+        &self,
+        input: &str,
+        output: &mut BoundedNormalizedText,
+    ) -> Result<(), EngineError> {
+        for scalar in input.nfc() {
+            let mut encoded = [0_u8; 4];
+            output.push_str(scalar.encode_utf8(&mut encoded))?;
+        }
+        Ok(())
+    }
+
+    fn general_class(&self, scalar: char) -> GeneralClass {
+        match get_general_category(scalar) {
+            GeneralCategory::LowercaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::UppercaseLetter => GeneralClass::Letter,
+            GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber => GeneralClass::Number,
+            _ => GeneralClass::Other,
+        }
+    }
+
+    fn contraction_ascii_fold(&self, scalar: char) -> Option<u8> {
+        match scalar {
+            'A'..='Z' => Some((scalar as u8) + (b'a' - b'A')),
+            'a'..='z' => Some(scalar as u8),
+            // Unicode 16.0 default simple case-fold equivalences that reach an
+            // ASCII scalar. LONG S matters to the pinned contraction suffix;
+            // KELVIN SIGN is retained so this finite mapping is complete.
+            '\u{017F}' => Some(b's'),
+            '\u{212A}' => Some(b'k'),
+            _ => None,
+        }
+    }
 }
 
 struct BoundedNormalizedText {
@@ -993,6 +1067,17 @@ mod tests {
         scanned.ranges.into_iter().map(|range| normalized[range].to_owned()).collect()
     }
 
+    fn unicode16_chunks(input: &str) -> Vec<String> {
+        let pool = MemoryPool::new(1 << 20).expect("pool validates");
+        let profile = Qwen25Unicode16Adapter;
+        let mut normalized = BoundedNormalizedText::new(input.len().saturating_mul(4).max(1))
+            .expect("Unicode-16 normalization buffer validates");
+        profile.normalize_nfc(input, &mut normalized).expect("Unicode-16 NFC works");
+        let normalized = normalized.as_str();
+        let scanned = scan_pretokens(normalized, &profile, &pool).expect("scanner works");
+        scanned.ranges.into_iter().map(|range| normalized[range].to_owned()).collect()
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -1028,6 +1113,105 @@ mod tests {
         );
         assert_eq!(SyntheticUnicode16.general_class('\u{088F}'), GeneralClass::Other);
         assert_eq!(SyntheticUnicode16.general_class('\u{11DE0}'), GeneralClass::Other);
+    }
+
+    #[test]
+    fn admitted_unicode_tables_are_exactly_version_16() {
+        assert_eq!(unicode_normalization::UNICODE_VERSION, REQUIRED_UNICODE_VERSION);
+        assert_eq!(unicode_general_category::UNICODE_VERSION, (16, 0, 0));
+        assert!(Qwen25Unicode16Adapter::versions_match());
+        assert_eq!(Qwen25Unicode16Adapter.unicode_version(), REQUIRED_UNICODE_VERSION);
+    }
+
+    #[test]
+    fn unicode16_adapter_performs_bounded_nfc_without_intermediate_output() {
+        let profile = Qwen25Unicode16Adapter;
+        for (source, expected) in [
+            ("Cafe\u{0301}", "Café"),
+            ("\u{1100}\u{1161}", "가"),
+            ("a\u{1ACF}\u{0315}\u{0300}\u{05AE}b", "a\u{1ACF}\u{05AE}\u{0300}\u{0315}b"),
+        ] {
+            let mut output = BoundedNormalizedText::new(expected.len())
+                .expect("exact normalization bound allocates");
+            profile.normalize_nfc(source, &mut output).expect("vector normalizes");
+            assert_eq!(output.as_str(), expected);
+        }
+
+        // U+0344 has a two-scalar canonical decomposition that remains
+        // decomposed in NFC. Its four output bytes cannot enter a two-byte
+        // buffer, proving growth is rejected scalar-by-scalar.
+        let mut bounded = BoundedNormalizedText::new("\u{0344}".len())
+            .expect("input-sized normalization bound allocates");
+        assert!(matches!(
+            profile.normalize_nfc("\u{0344}", &mut bounded),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert!(bounded.as_str().len() <= "\u{0344}".len());
+    }
+
+    #[test]
+    fn unicode16_adapter_maps_every_letter_and_number_general_category() {
+        let profile = Qwen25Unicode16Adapter;
+        for scalar in ['A', 'a', 'ǅ', 'ʰ', '中'] {
+            assert_eq!(profile.general_class(scalar), GeneralClass::Letter, "{scalar:?}");
+        }
+        for scalar in ['1', '١', 'Ⅷ', '½'] {
+            assert_eq!(profile.general_class(scalar), GeneralClass::Number, "{scalar:?}");
+        }
+        for scalar in ['\u{0301}', '_', ' ', '😀', '\0', '\u{E000}', '\u{088F}', '\u{11DE0}'] {
+            assert_eq!(profile.general_class(scalar), GeneralClass::Other, "{scalar:?}");
+        }
+
+        assert_eq!(get_general_category('A'), GeneralCategory::UppercaseLetter);
+        assert_eq!(get_general_category('a'), GeneralCategory::LowercaseLetter);
+        assert_eq!(get_general_category('ǅ'), GeneralCategory::TitlecaseLetter);
+        assert_eq!(get_general_category('ʰ'), GeneralCategory::ModifierLetter);
+        assert_eq!(get_general_category('中'), GeneralCategory::OtherLetter);
+        assert_eq!(get_general_category('1'), GeneralCategory::DecimalNumber);
+        assert_eq!(get_general_category('Ⅷ'), GeneralCategory::LetterNumber);
+        assert_eq!(get_general_category('½'), GeneralCategory::OtherNumber);
+        assert_eq!(profile.general_class('\u{1C89}'), GeneralClass::Letter);
+
+        for value in 0_u32..=0x10_FFFF {
+            let Some(scalar) = char::from_u32(value) else {
+                continue;
+            };
+            let expected = match get_general_category(scalar).abbreviation().as_bytes()[0] {
+                b'L' => GeneralClass::Letter,
+                b'N' => GeneralClass::Number,
+                _ => GeneralClass::Other,
+            };
+            assert_eq!(profile.general_class(scalar), expected, "U+{value:04X}");
+        }
+    }
+
+    #[test]
+    fn contraction_fold_is_a_closed_unicode16_simple_fold_to_ascii() {
+        let profile = Qwen25Unicode16Adapter;
+        for (scalar, folded) in [
+            ('S', b's'),
+            ('s', b's'),
+            ('T', b't'),
+            ('R', b'r'),
+            ('E', b'e'),
+            ('V', b'v'),
+            ('M', b'm'),
+            ('L', b'l'),
+            ('D', b'd'),
+            ('\u{017F}', b's'),
+            ('\u{212A}', b'k'),
+        ] {
+            assert_eq!(profile.contraction_ascii_fold(scalar), Some(folded), "{scalar:?}");
+        }
+        for scalar in ['ß', '\u{0130}', '\u{0131}', 'Σ', 'Ａ'] {
+            assert_eq!(profile.contraction_ascii_fold(scalar), None, "{scalar:?}");
+        }
+
+        assert_eq!(
+            unicode16_chunks("I'm WE'RE he'ſ"),
+            strings(&["I", "'m", " WE", "'RE", " he", "'ſ"])
+        );
+        assert_eq!(unicode16_chunks("he'ß"), strings(&["he", "'ß"]));
     }
 
     #[test]
@@ -1068,6 +1252,17 @@ mod tests {
         assert_eq!(tokens, vec![257, 257]);
         assert_ne!(tokens.first().copied(), Some(258));
         assert_eq!(core.decode(&tokens).expect("tokens decode"), "abcabc");
+    }
+
+    #[test]
+    fn private_unicode16_adapter_drives_normalized_runtime_mechanics() {
+        let (core, _) = core();
+        let decomposed = "Cafe\u{0301}";
+        let tokens = core
+            .encode(decomposed, SpecialTokenPolicy::Reject, &Qwen25Unicode16Adapter)
+            .expect("private Unicode-16 adapter encodes");
+        assert_eq!(core.decode(&tokens).expect("normalized tokens decode"), "Café");
+        assert_ne!(core.decode(&tokens).expect("decode is deterministic"), decomposed);
     }
 
     #[test]
@@ -1143,6 +1338,19 @@ mod tests {
         let baseline = pool.used_bytes().expect("metrics work");
         assert!(matches!(
             core.encode("a", SpecialTokenPolicy::Reject, &ExpandingUnicode16),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert_eq!(pool.used_bytes().expect("metrics work"), baseline);
+    }
+
+    #[test]
+    fn real_unicode16_nfc_growth_cannot_exceed_the_memory_reservation() {
+        let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
+        let core =
+            Qwen25RuntimeCore::load_test_fixture(&fixture(2, 4096), &pool).expect("tables load");
+        let baseline = pool.used_bytes().expect("metrics work");
+        assert!(matches!(
+            core.encode("\u{0344}", SpecialTokenPolicy::Reject, &Qwen25Unicode16Adapter),
             Err(EngineError::ResourceExhaustion(_))
         ));
         assert_eq!(pool.used_bytes().expect("metrics work"), baseline);

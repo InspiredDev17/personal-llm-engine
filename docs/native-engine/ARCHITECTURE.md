@@ -27,7 +27,7 @@ Green authority.
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
 | `engine-placement` | immutable verified-artifact placement plans, checked residency accounting and bounded layer staging/prefetch |
-| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed `AIPTOK02` Qwen2.5 parser and private fixed scanner/BPE/decode core; reviewed Unicode-16 primitives are admitted but not wired through the missing trusted adapter, so immutable v1 remains the only publicly constructible runtime path |
+| `engine-tokenizer` | executable first-party AIPTok Byte-Level BPE v1 plus a fail-closed `AIPTOK02` Qwen2.5 parser and private fixed scanner/BPE/decode core; its private adapter pins bounded NFC, all Unicode-16 `L*`/`N*` categories and the finite contraction fold, while immutable v1 remains the only publicly constructible runtime path pending exact conversion and production-table replay |
 | `engine-memory` | explicit-owner aggregate accounting, request scratch arenas, CPU device memory, admission calculations and pressure metrics |
 | `engine-knowledge-contract` | narrow pinned execution projection of experimental Sovereign Knowledge 1.1 lifecycle semantics and Knowledge 1.2 exact prefix framing |
 | `engine-tensor` | validated row-major metadata, owned/read-only/mutable storage, explicit strided views, and F32/F16/BF16 conversion tied to aggregate reservations |
@@ -191,10 +191,11 @@ The Model Foundry registry V2 compatibility profile still names manifest v1.0,
 and no exact Qwen tokenizer converter or signed Qwen package exists here. The
 current service returns the earlier typed future-engine rejection; after an
 eventual runtime revision bump it still reaches the closed tokenizer gate.
-The admitted Unicode 16 normalization/category primitives still need a trusted
-adapter and exact contraction rule. Source conversion, production-table token
-replay, Model Foundry admission, and a qualified optimized backend must be
-implemented and qualified before activation.
+The private Unicode-16 adapter is version-checked and bounded, including exact
+General Category families and the finite simple-fold mappings relevant to the
+fixed contraction expression. Source conversion, production-table token
+replay, Model Foundry admission, and a qualified optimized backend must still
+be implemented and qualified before activation.
 
 ## Trusted execution placement
 
@@ -379,11 +380,13 @@ the parser also fixes all 22 added-token literals/roles and distinguishes
 always invalid. A private core now retains these immutable tables and implements
 the fixed pre-tokenizer state machine, deterministic byte-map/BPE, explicit
 added/special-token policies, strict decode, and bounded incremental decode.
-Unicode NFC/category/case-fold behavior is an explicit trusted internal
-Unicode-16 interface with no production implementation in this revision. The
-public factory therefore still validates the structure and returns
-`UnsupportedTokenizer`; no service or importer path can construct the core.
-ADR-0035 records the format gate and ADR-0036 records this inert runtime slice.
+Unicode NFC/category/case-fold behavior enters only through an engine-owned
+private adapter that checks both Unicode-16 data versions, bounds NFC output,
+maps all `L*`/`N*` categories and pins the finite simple fold. The public
+factory still validates the structure and returns `UnsupportedTokenizer`; no
+service or importer path can construct the core. ADR-0035 records the format
+gate, ADR-0036 records the inert runtime, and ADR-0037 records the private
+Unicode adapter.
 
 ## Local protocol and authentication
 

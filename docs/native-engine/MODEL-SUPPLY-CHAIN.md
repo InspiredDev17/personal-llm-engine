@@ -91,9 +91,10 @@ bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
 records, exact byte mapping, special roles, declared resource limits, table
 hash, undefined logit tail, and the pinned 22-token suffix when production
 counts are present. The importer cannot emit it from `tokenizer.json`. A private
-scanner/BPE/decode runtime core remains unreachable from public construction;
-activation is fail-closed pending the Unicode adapter, exact conversion and
-production-table conformance gates in ADR-0035 and ADR-0036.
+scanner/BPE/decode runtime core and its version-checked bounded Unicode-16
+adapter remain unreachable from public construction; activation is fail-closed
+pending exact conversion and production-table conformance gates in ADR-0035
+through ADR-0037.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:
 its first step is estimated at 1,543,712,768 checked operations, including the

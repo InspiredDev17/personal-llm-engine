@@ -8,9 +8,10 @@ These are independently derived vectors for the pinned 7,031,645-byte
 They are activation targets, not evidence that the current public runtime can
 tokenize Qwen input. This revision executes the scanner-boundary vectors against
 trusted synthetic Unicode classifications and exercises BPE against compact
-first-party tables. It cannot replay the production token IDs until exact
-source conversion and the reviewed Unicode-16 adapter exist. The production
-table is not committed.
+first-party tables. A private adapter now replays the normalization, category,
+and contraction-boundary vectors against the admitted Unicode-16 data, but it
+cannot replay production token IDs until exact source conversion exists. The
+production table is not committed.
 
 | Input notation | Fixed scanner chunks | Expected token IDs |
 | --- | --- | --- |
@@ -58,5 +59,6 @@ The corresponding pinned-table ID target is:
 64, 157, 104, 237, 146, 106, 96549, 136, 243, 65
 ```
 
-This boundary must be replayed through the eventual production adapter before
-activation. A test-only synthetic adapter does not count as Unicode conformance.
+The private production adapter now replays this boundary before any activation.
+It remains nonconstructible outside its module and does not by itself establish
+the pinned production table or tokenizer parity.

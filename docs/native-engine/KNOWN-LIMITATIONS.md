@@ -28,9 +28,10 @@
   before model materialization. A bounded `AIPTOK02` Qwen table parser and a
   private fixed scanner/BPE/decode/incremental-decode core now exist. The core
   has no public constructor and accepts Unicode behavior only through a private
-  trusted Unicode-16 interface. Reviewed NFC/category primitives are admitted
-  but are not yet wired into that interface; the exact contraction case-fold
-  boundary, tokenizer conversion and production token-ID replay remain absent.
+  trusted Unicode-16 interface. A version-checked private adapter now supplies
+  bounded NFC, every `L*`/`N*` General Category, and the closed contraction
+  simple-fold mapping. Tokenizer conversion and production token-ID replay
+  remain absent.
   Offline
   importer emission, the Model Foundry registry compatibility profile, an
   optimized backend, signed package, independent logits, and production
