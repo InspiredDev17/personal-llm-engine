@@ -185,6 +185,9 @@ fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() 
         "unicode_normalization::UNICODE_VERSION == REQUIRED_UNICODE_VERSION",
         "unicode_general_category::UNICODE_VERSION == required_category_version",
         "const MAX_NFC_COMPATIBILITY_NONSTARTERS: usize = 30;",
+        "const MAX_NFC_CANONICAL_DECOMPOSITION_SCALARS: usize = 4;",
+        "const NFC_DECOMPOSITION_INLINE_SCALARS: usize = 64;",
+        "const NFC_RECOMPOSITION_INLINE_SCALARS: usize = 32;",
         "const NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES: u64 = 4 * 1024;",
         "input.chars().stream_safe().eq(input.chars())",
         ".reserve(normalization_reservation_bytes(normalized_limit)?)?;",
@@ -250,7 +253,7 @@ fn reviewed_unicode_16_vendor_boundaries_remain_pinned() {
 
     let decomposition_source =
         fs::read_to_string(normalization.join("src/decompose.rs")).expect("decomposer source");
-    assert!(decomposition_source.contains("buffer: TinyVec<[(u8, char); 32]>,"));
+    assert!(decomposition_source.contains("buffer: TinyVec<[(u8, char); 64]>,"));
     assert!(decomposition_source.contains("while cursor > 0"));
     assert!(decomposition_source.contains("pending.swap(cursor - 1, cursor)"));
     assert!(!decomposition_source.contains("sort_by_key"));
@@ -263,7 +266,7 @@ fn reviewed_unicode_16_vendor_boundaries_remain_pinned() {
     let normalization_checksums = fs::read_to_string(normalization.join(".cargo-checksum.json"))
         .expect("normalizer retained-file checksums must exist");
     for required in [
-        "\"src/decompose.rs\": \"e8b45213ea08474e807cec0a5c4a442f4fc3ed5d3b92f76806ca0df6d1a3f671\"",
+        "\"src/decompose.rs\": \"06599747369f758a907d828712bd81ec3d7607c3ed6050283b844ea6700c105c\"",
         "\"src/recompose.rs\": \"c1b489f6402b96d3b6b55d7ccd08a22d066fc66b7c14331cf579d4c2d10bb963\"",
     ] {
         assert!(

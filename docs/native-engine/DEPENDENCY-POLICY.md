@@ -85,14 +85,16 @@ production-table token-ID conformance remain required.
 The private adapter rejects input whose Unicode-16 NFKD stream-safe view would
 insert a CGJ after more than 30 consecutive nonstarters; it never forwards the
 inserted CGJ or transforms over-limit input. The vendored normalizer is locally
-hardened so both internal four-entry `TinyVec` buffers have 32 inline entries,
-and canonical pending marks use stable in-place insertion sort rather than an
-allocator-backed stable sort. Thus every admitted NFC run stays inline and has
-no sort allocation. A conservative fixed 4 KiB workspace charge remains held
-in the engine memory pool across NFC, separately from the bounded normalized
-output reservation. Architecture tests pin the reject-only precheck, buffer
-sizes, insertion-sort implementation, workspace charge, and retained-file
-hashes.
+hardened so the four-entry decomposition and recomposition `TinyVec` buffers
+have 64 and 32 inline entries respectively, and canonical pending marks use
+stable in-place insertion sort rather than an allocator-backed stable sort.
+The decomposition bound covers 30 pending nonstarters plus the complete
+four-scalar maximum Unicode-16 canonical decomposition. Thus every admitted
+NFC run stays inline and has no sort allocation. A conservative fixed 4 KiB
+workspace charge remains held in the engine memory pool across NFC, separately
+from the bounded normalized output reservation. Architecture tests pin the
+reject-only precheck, buffer sizes, insertion-sort implementation, workspace
+charge, and retained-file hashes.
 
 Both direct crates have defaults disabled and no features selected. NFC's
 iterator API is available through `unicode-normalization`'s `no_std` + `alloc`

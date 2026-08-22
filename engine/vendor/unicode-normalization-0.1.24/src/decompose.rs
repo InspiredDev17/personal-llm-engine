@@ -32,7 +32,7 @@ pub struct Decompositions<I> {
     // 2) "Ready" characters which are sorted and ready to emit on demand;
     // 3) A "pending" block which stills needs more characters for us to be able
     //    to sort in canonical order and is not safe to emit.
-    buffer: TinyVec<[(u8, char); 32]>,
+    buffer: TinyVec<[(u8, char); 64]>,
     ready: Range<usize>,
 }
 

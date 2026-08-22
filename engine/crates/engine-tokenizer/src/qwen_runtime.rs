@@ -27,10 +27,16 @@ const PENDING_UTF8_BYTES: u64 = 4;
 // allocation-free stream-safe iterator only as a reject-only precheck: it
 // never forwards an inserted CGJ or transforms input to satisfy the bound.
 const MAX_NFC_COMPATIBILITY_NONSTARTERS: usize = 30;
-// The locally audited normalization patch keeps 32 entries inline and replaces
-// stable sort with in-place insertion sort. This fixed charge conservatively
-// accounts for both iterator buffers and their bounded stack workspace while
-// the separate output reservation accounts for the normalized String.
+// Unicode 16's longest recursive canonical decomposition is four scalars. The
+// locally audited normalization patch therefore keeps 64 decomposition entries
+// and 32 recomposition entries inline: 30 pending nonstarters plus one complete
+// four-scalar source decomposition cannot spill. It also replaces stable sort
+// with in-place insertion sort. This fixed charge conservatively accounts for
+// both iterator buffers and their bounded stack workspace while the separate
+// output reservation accounts for the normalized String.
+const MAX_NFC_CANONICAL_DECOMPOSITION_SCALARS: usize = 4;
+const NFC_DECOMPOSITION_INLINE_SCALARS: usize = 64;
+const NFC_RECOMPOSITION_INLINE_SCALARS: usize = 32;
 const NFC_ITERATOR_AND_SORT_WORKSPACE_BYTES: u64 = 4 * 1024;
 const CONTRACTION_SUFFIXES: [&[u8]; 7] = [b"s", b"t", b"re", b"ve", b"m", b"ll", b"d"];
 
@@ -1154,11 +1160,29 @@ mod tests {
     #[test]
     fn fixed_normalization_charge_covers_the_pinned_bounded_iterators() {
         assert_eq!(MAX_NFC_COMPATIBILITY_NONSTARTERS, 30);
-        let inline_slots = 32_usize;
-        let tuple_buffer_bytes =
-            inline_slots.checked_mul(size_of::<(u8, char)>()).expect("test bound fits");
-        let scalar_buffer_bytes =
-            inline_slots.checked_mul(size_of::<char>()).expect("test bound fits");
+        let mut observed_maximum_decomposition = 0_usize;
+        for value in 0_u32..=0x10_FFFF {
+            let Some(scalar) = char::from_u32(value) else {
+                continue;
+            };
+            let mut decomposed_scalars = 0_usize;
+            unicode_normalization::char::decompose_canonical(scalar, |_| {
+                decomposed_scalars += 1;
+            });
+            observed_maximum_decomposition = observed_maximum_decomposition.max(decomposed_scalars);
+        }
+        assert_eq!(observed_maximum_decomposition, MAX_NFC_CANONICAL_DECOMPOSITION_SCALARS);
+        assert!(
+            NFC_DECOMPOSITION_INLINE_SCALARS
+                >= MAX_NFC_COMPATIBILITY_NONSTARTERS + observed_maximum_decomposition
+        );
+
+        let tuple_buffer_bytes = NFC_DECOMPOSITION_INLINE_SCALARS
+            .checked_mul(size_of::<(u8, char)>())
+            .expect("test bound fits");
+        let scalar_buffer_bytes = NFC_RECOMPOSITION_INLINE_SCALARS
+            .checked_mul(size_of::<char>())
+            .expect("test bound fits");
         let conservative_total = tuple_buffer_bytes
             .checked_add(scalar_buffer_bytes)
             .and_then(|bytes| bytes.checked_mul(4))
@@ -1186,6 +1210,22 @@ mod tests {
         let mut output = BoundedNormalizedText::new(expected.len()).expect("output allocates");
         profile.normalize_nfc(&admitted, &mut output).expect("thirty nonstarters pass");
         assert_eq!(output.as_str(), expected);
+
+        // U+1F82 has Unicode 16's maximum four-scalar recursive canonical
+        // decomposition. It may arrive while all 30 admitted nonstarters are
+        // still pending, so this vector exercises the complete 34-entry
+        // decomposition segment that motivated the 64-entry inline buffer.
+        let maximum_segment =
+            format!("a{}\u{1F82}", mark.repeat(MAX_NFC_COMPATIBILITY_NONSTARTERS));
+        validate_nfc_nonstarter_bound(&maximum_segment)
+            .expect("the decomposed starter begins a new stream-safe run");
+        let maximum_segment_expected = maximum_segment.nfc().collect::<String>();
+        let mut maximum_segment_output = BoundedNormalizedText::new(maximum_segment_expected.len())
+            .expect("maximum segment output allocates");
+        profile
+            .normalize_nfc(&maximum_segment, &mut maximum_segment_output)
+            .expect("complete maximum decomposition stays inline");
+        assert_eq!(maximum_segment_output.as_str(), maximum_segment_expected);
 
         let rejected = format!("a{}", mark.repeat(31));
         let mut untouched = BoundedNormalizedText::new(rejected.len()).expect("output allocates");

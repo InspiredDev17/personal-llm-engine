@@ -12,7 +12,7 @@
     "README.md": "5e6af58a3100ef18063422cb2fdf70afac62b5d60d828c6cde6344236d795be9",
     "benches/bench.rs": "2c756c3a084c2ffc740988373fbc01a0333f7e85692ef547cac5ac592bed3024",
     "src/__test_api.rs": "4ca9e8f342dee364d0ca82f80504051b9d7c88fb6726bbe2683898ed0b919dfa",
-    "src/decompose.rs": "e8b45213ea08474e807cec0a5c4a442f4fc3ed5d3b92f76806ca0df6d1a3f671",
+    "src/decompose.rs": "06599747369f758a907d828712bd81ec3d7607c3ed6050283b844ea6700c105c",
     "src/lib.rs": "ac4346617ee1f046a7d107ad50ecd928f96f5b1a25c45a1bc912a2d7b760c19f",
     "src/lookups.rs": "962f9909b32e02b8a2a05836135d9cd39bb1ce01f7c659de99cbd8a3a3c78574",
     "src/normalize.rs": "e6bb470ed410399f967b8eed63b161a93930520cf75f04a1d34b3d0aa458fbb6",

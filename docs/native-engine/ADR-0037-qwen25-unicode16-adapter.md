@@ -37,10 +37,12 @@ The adapter:
    before NFC. If Unicode-16 NFKD would exceed 30 consecutive nonstarters and
    insert U+034F CGJ, the engine rejects the request; it never forwards an
    inserted CGJ or transforms input to make it admissible;
-3. uses a reviewed local vendor patch that expands both normalization inline
-   buffers from 4 to 32 entries and replaces stable `sort_by_key` with stable
-   in-place insertion sort. Admitted input therefore cannot spill either
-   buffer or allocate sort scratch;
+3. uses a reviewed local vendor patch that expands the decomposition buffer
+   from 4 to 64 entries and the recomposition buffer from 4 to 32 entries, then
+   replaces stable `sort_by_key` with stable in-place insertion sort. The
+   64-entry bound covers 30 pending nonstarters plus Unicode 16's complete
+   maximum four-scalar canonical decomposition, so admitted input cannot spill
+   either buffer or allocate sort scratch;
 4. reserves a conservative fixed 4 KiB iterator/sort workspace through the
    engine memory pool for the lifetime of NFC, separately reserves the maximum
    normalized output, then appends each NFC scalar through
