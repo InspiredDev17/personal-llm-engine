@@ -623,6 +623,9 @@ mod tests {
 
     #[test]
     fn qwen_inventory_rejects_wrong_dtype_shape_and_trailing_extent() {
+        const ORIGINAL_SHAPE: &str = "[151936,1536]";
+        const WRONG_SHAPE: &str = "[1536,151936]";
+
         let header = exact_qwen_header();
         let mut wrong_dtype = String::from_utf8(header.clone()).expect("header is UTF-8");
         let dtype_start = wrong_dtype.find("\"BF16\"").expect("dtype must exist");
@@ -634,8 +637,6 @@ mod tests {
         assert!(validate_qwen25_tensor_inventory(&instruct_spec(), &parsed_dtype).is_err());
 
         let mut wrong_shape = String::from_utf8(header.clone()).expect("header is UTF-8");
-        const ORIGINAL_SHAPE: &str = "[151936,1536]";
-        const WRONG_SHAPE: &str = "[1536,151936]";
         assert_eq!(ORIGINAL_SHAPE.len(), WRONG_SHAPE.len());
         let shape_start = wrong_shape.find(ORIGINAL_SHAPE).expect("embedding shape must exist");
         wrong_shape.replace_range(shape_start..shape_start + ORIGINAL_SHAPE.len(), WRONG_SHAPE);
