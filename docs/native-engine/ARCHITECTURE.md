@@ -22,7 +22,7 @@ Green authority.
 | `engine-types` | bounded IDs, shapes, budgets, requests/events, errors and security-event types |
 | `engine-crypto` | SHA-384 and strict Ed25519 verification/domain separation |
 | `engine-release` | offline release-only signing, exact installed-artifact verification and monotonic rollback ledger |
-| `engine-model-format` | fixed directory-manifest, hash-catalog, signature-envelope and legacy test-fixture parsers |
+| `engine-model-format` | versioned fixed directory manifests, hash catalog, signature envelope and legacy test-fixture parsers |
 | `engine-quantization` | fixed AIPQ8/AIPQ4 validation, deterministic conversion, error measurement and safe scalar reference kernels |
 | `engine-model-importer` | offline quarantine-only safetensors conversion, provenance, deterministic package writing and signing |
 | `engine-loader` | production registered-ID directory resolution, secure local opens, signature/hash verification, read-only shard mapping and tensor materialization |
@@ -34,7 +34,7 @@ Green authority.
 | `engine-cpu-reference` | immutable allowlisted graph, deterministic plan, and checked scalar correctness-oracle operations |
 | `engine-arm64` | default-off optimized ARM64 graph backend, bounded worker pool, runtime dispatch, quantized kernels, and scalar-oracle fallback |
 | `engine-kv-cache` | contiguous multi-sequence KV storage, atomic token commits, lifecycle invalidation and admission metrics |
-| `engine-transformer` | fixed decoder configuration, tensor inventory, resident CPU path and bounded scalar streamed path |
+| `engine-transformer` | closed legacy decoder execution plus Qwen2.5 tiny scalar correctness scaffolding, exact tensor inventories, resident CPU path and bounded scalar streamed path |
 | `engine-sampling` | bounded deterministic greedy, temperature, top-k, top-p, min-p and repetition-penalty selection with a reproducible non-cryptographic PRNG |
 | `engine-scheduler` | bounded inference queue and sequence lifecycle |
 | `engine-protocol` | directional frames, signed request/cancel envelopes, signed event encoding, bounded canonical Runtime-v3 documents, and the fixed-binary internal Knowledge 1.1 cache adapter |
@@ -120,7 +120,8 @@ The import and production components are intentionally separate:
    that canonicalize beneath an owner-selected quarantine. It refuses URLs,
    quarantine escapes, pickle/executable formats, unknown tensor names,
    missing/extra/duplicate tensors, unsupported dtypes, non-finite values, and
-   any architecture mapping other than `llama-safetensors-v1`. Shard input
+   any architecture mapping other than `llama-safetensors-v1`. Standard Qwen
+   tokenizer/config conversion is not present in this repository. Shard input
    order cannot affect the output: unique source filenames are sorted, the
    complete architecture inventory is validated globally, and F32, F16, or
    BF16 source storage is converted explicitly into finite F32 values before an
@@ -151,10 +152,37 @@ The import and production components are intentionally separate:
    accepts source formats, an arbitrary path, or an unsigned package. The old
    flat package remains only as deterministic unit-test compatibility data.
 
-The supported architecture is `decoder-rms-rope-swiglu-gqa-v1`, a fixed causal decoder
-with architecture-owned RMSNorm, Q/K/V projections, RoPE, grouped attention,
-output projection, residual paths, SwiGLU MLP, final norm, and logits. Model
-metadata cannot define operations, plugins, paths, executable code, or kernels.
+Two version-bound architecture identifiers are parsed. Manifest v1.0 retains
+the original `decoder-rms-rope-swiglu-gqa-v1` semantics unchanged. Manifest
+v1.1 selects only `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1`: the same closed
+causal decoder operation set plus required Q/K/V projection biases, split-half
+Qwen rotary layout, explicit RMSNorm epsilon, and tied token-embedding/output
+weights. The Qwen2.5 v1.1 validator recognizes only the reviewed 1.5B bootstrap
+dimensions and either the 32,768-context/1,000,000-theta general/coder profile
+or the 4,096-context/10,000-theta math profile once the profile is activated.
+V1.1 requires engine 0.2.0, while the current runtime remains 0.1.0 and rejects
+it before activation. Tiny scalar configurations provide deterministic math
+evidence, but the exact 1.5B profile's 1,543,712,768-operation initial step
+exceeds the unchanged 100,000,000-operation scalar ceiling and is rejected
+before weights are materialized. The CPU service also applies this Qwen-only
+compute admission immediately after trusted configuration conversion and before
+future tokenizer allocation or tensor materialization; current version and
+tokenizer gates remain earlier, and the legacy load order is unchanged. ARM64
+and Metal reject this new architecture rather than invoking their legacy
+adjacent-pair RoPE kernels.
+Model metadata cannot define operations, plugins, paths, executable code, or
+kernels.
+
+This is engine-private package/runtime support, not a production model
+approval. The offline importer still produces only the legacy Llama mapping,
+the Model Foundry registry V2 compatibility profile still names manifest v1.0,
+and no standard Qwen tokenizer-to-AIPTok converter or signed Qwen package exists
+here. The current service returns the earlier typed future-engine rejection;
+after an eventual runtime revision bump it still returns
+`UnsupportedTokenizer` instead of applying AIPTok v1 semantics incorrectly.
+Model Foundry, the tokenizer runtime, and a qualified optimized backend must add
+and qualify those supply-chain/execution artifacts before the Qwen path can be
+activated.
 
 ## Trusted execution placement
 
@@ -186,6 +214,10 @@ streaming with ARM64 or Metal. Authenticated clients still provide only a
 registered `ModelId`; the wire exposes no physical plan or placement override.
 `HybridResident` returns an explicit unsupported error.
 
+The placement plan records the parsed package format revision, so a v1.1 Qwen
+artifact cannot be mislabeled as v1.0 after verification. Qwen's tied logical
+output aliases the signed embedding range for streamed execution but is counted
+only once for fully resident execution, matching its materialization behavior.
 Quantization is orthogonal and stays bound to the signed artifact. Apple CPU
 and Metal placement use unified-memory topology rather than fabricated
 host-versus-VRAM capacity. Backend ownership remains logically explicit. A

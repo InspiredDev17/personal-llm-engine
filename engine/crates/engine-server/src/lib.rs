@@ -125,7 +125,10 @@ use personalai_engine_transformer::Arm64Backend;
 pub use personalai_engine_transformer::MetalBackend;
 use personalai_engine_transformer::{BackendStatus, backend_status};
 #[cfg(feature = "cpu-reference")]
-use personalai_engine_transformer::{CpuDecoderModel, CpuDecoderSession, TransformerConfig};
+use personalai_engine_transformer::{
+    CpuDecoderModel, CpuDecoderSession, QWEN2_DECODER_ARCHITECTURE_ID, TransformerConfig,
+    TransformerPlan,
+};
 #[cfg(all(feature = "cpu-reference", feature = "metal", target_os = "macos"))]
 use personalai_engine_transformer::{MetalDecoderModel, MetalDecoderSession};
 use personalai_engine_types::{
@@ -4907,8 +4910,10 @@ impl EngineService {
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
+            validate_service_tokenizer_semantics(verified.manifest().architecture_id().as_str())?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
+            validate_qwen_scalar_service_admission(&config, budget)?;
             let tokenizer =
                 Arc::<dyn Tokenizer>::from(build_tokenizer(verified.tokenizer_bytes(), &pool)?);
             if tokenizer.spec().vocabulary_size() != config.vocabulary_size() {
@@ -5006,6 +5011,7 @@ impl EngineService {
     ) -> Result<LoadedCpuModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result: Result<LoadedCpuModel, EngineError> = (|| {
+            validate_service_tokenizer_semantics(verified.manifest().architecture_id().as_str())?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -5070,6 +5076,7 @@ impl EngineService {
     ) -> Result<LoadedMetalModel, EngineError> {
         let verified = self.registry.load_registered_directory(model_id, budget, events)?;
         let result = (|| {
+            validate_service_tokenizer_semantics(verified.manifest().architecture_id().as_str())?;
             let pool = MemoryPool::from_budget(budget)?;
             let config = TransformerConfig::from_directory_manifest(verified.manifest())?;
             let tokenizer =
@@ -5313,6 +5320,27 @@ fn validate_absolute_normal_path(path: &Path, label: &str) -> Result<(), EngineE
     Ok(())
 }
 
+#[cfg(feature = "cpu-reference")]
+fn validate_service_tokenizer_semantics(architecture: &str) -> Result<(), EngineError> {
+    if architecture == QWEN2_DECODER_ARCHITECTURE_ID {
+        return Err(EngineError::unsupported_tokenizer(
+            "Qwen2.5 prompt tokenization is not implemented by AIPTok v1",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cpu-reference")]
+fn validate_qwen_scalar_service_admission(
+    config: &TransformerConfig,
+    budget: &ResourceBudget,
+) -> Result<(), EngineError> {
+    if config.architecture_id().as_str() == QWEN2_DECODER_ARCHITECTURE_ID {
+        TransformerPlan::new(config.clone(), budget)?.require_executable_architecture()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5336,6 +5364,65 @@ mod tests {
         ArchitectureId, ContextLimit, DType, ModelHashAlgorithm, ResourceBudget, Sha256Digest,
         SignerKeyId,
     };
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn qwen25_service_fails_closed_until_exact_tokenizer_semantics_exist() {
+        assert!(matches!(
+            validate_service_tokenizer_semantics(QWEN2_DECODER_ARCHITECTURE_ID),
+            Err(EngineError::UnsupportedTokenizer(_))
+        ));
+        validate_service_tokenizer_semantics(
+            personalai_engine_transformer::FIRST_PARTY_DECODER_ARCHITECTURE_ID,
+        )
+        .expect("legacy AIPTok service profile must remain available");
+    }
+
+    #[cfg(feature = "cpu-reference")]
+    #[test]
+    fn qwen25_service_compute_admission_precedes_future_tensor_materialization() {
+        let budget = ResourceBudget::new(4_u64 << 30, 2_u64 << 30, 1)
+            .expect("bounded service budget must validate");
+        let qwen = TransformerConfig::new_decoder(
+            ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID)
+                .expect("Qwen architecture ID must validate"),
+            28,
+            1_536,
+            12,
+            2,
+            151_936,
+            ContextLimit::new(32_768).expect("Qwen context must validate"),
+            DType::F32,
+            8_960,
+            1.0e-6,
+            1_000_000.0,
+        )
+        .expect("reviewed Qwen profile must validate structurally");
+        let rejection = validate_qwen_scalar_service_admission(&qwen, &budget)
+            .expect_err("exact Qwen 1.5B profile must exceed scalar compute admission");
+        let EngineError::ResourceExhaustion(detail) = rejection else {
+            panic!("Qwen service admission returned the wrong error category");
+        };
+        assert_eq!(detail.reason(), Some("CPU decoder step exceeds the reference compute bound"));
+
+        let legacy = TransformerConfig::new_decoder(
+            ArchitectureId::new(personalai_engine_transformer::FIRST_PARTY_DECODER_ARCHITECTURE_ID)
+                .expect("legacy architecture ID must validate"),
+            1,
+            4,
+            1,
+            1,
+            8,
+            ContextLimit::new(8).expect("legacy context must validate"),
+            DType::F32,
+            8,
+            1.0e-5,
+            10_000.0,
+        )
+        .expect("legacy fixture must validate");
+        validate_qwen_scalar_service_admission(&legacy, &budget)
+            .expect("Qwen admission hook must not alter the legacy load path");
+    }
 
     fn cache_scope(project: &str) -> CacheAuthorizationScope {
         CacheAuthorizationScope::new(

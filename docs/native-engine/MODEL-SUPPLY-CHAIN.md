@@ -35,10 +35,17 @@ Executables, scripts, dynamic libraries, object files, bytecode, shell/Python/
 JavaScript modules, WASM, device kernels, and executable templates therefore
 cannot be present in an admitted package.
 
-`manifest.aipm` uses an eight-byte magic, fixed version and endian marker,
+`manifest.aipm` uses an eight-byte magic, explicit version and endian marker,
 fixed 512-byte header, fixed 64-byte shard records, and fixed 192-byte tensor
-records. It declares only the reviewed
-`decoder-rms-rope-swiglu-gqa-v1` architecture. Records carry canonical tensor
+records. Version 1.0 declares only the reviewed
+`decoder-rms-rope-swiglu-gqa-v1` architecture. Engine-private version 1.1
+declares only `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1`, binds the formerly
+reserved header word to an explicit RMSNorm epsilon, and requires tied output
+plus unscaled positions. V1.1 requires future engine 0.2.0; the current 0.1.0
+production loader verifies its signature and manifest framing, then rejects it
+before activation. The architecture validator narrows v1.1 to the reviewed
+Qwen2.5 1.5B bootstrap dimensions and exact general/coder or math
+context/theta pairs. Records carry canonical tensor
 name, dtype, rank/dimensions, shard index, byte range, alignment,
 quantization declaration, and SHA-384 content hash. Parser rules include exact
 length, reserved-zero fields, checked arithmetic, bounded strings/counts/rank/
@@ -54,6 +61,23 @@ normalization vectors remain F32. A package-wide profile may mix only its exact
 AIPQ format with those declared F32 exclusions. AIPQ8/AIPQ4 mixing is rejected.
 Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
+
+The current importer and Model Foundry registry compatibility string remain
+legacy-only. They cannot create or approve a Qwen2.5 v1.1 artifact. A future
+offline Foundry slice must explicitly map the pinned Qwen safetensors names,
+pair with a reviewed first-party tokenizer revision that implements the exact
+fixed Qwen NFC/regex/ByteLevel and no-implicit-BOS semantics without executing
+arbitrary `tokenizer.json` graphs or chat templates, emit the exact v1.1
+inventory, independently qualify numeric vectors, and issue a new signed
+registry decision. AIPTok v1 cannot be relabeled as that tokenizer. The
+production engine does not infer or manufacture any of those supply-chain
+decisions.
+
+The exact 1.5B profile is also outside the scalar oracle's compute admission:
+its first step is estimated at 1,543,712,768 checked operations, including the
+Q/K/V bias additions, versus the fixed 100,000,000-operation ceiling. A future
+registry decision therefore requires a separately qualified optimized backend;
+package validity alone can never override compute admission.
 
 ## Cryptographic profile
 

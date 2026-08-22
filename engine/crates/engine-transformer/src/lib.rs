@@ -23,7 +23,9 @@ pub use personalai_engine_metal::{MetalKvCache, MetalKvCacheMetrics, MetalKvSequ
 use personalai_engine_kv_cache::{
     KvCachePlan, MAX_HEAD_DIMENSION, MAX_KV_HEAD_COUNT, MAX_LAYER_COUNT,
 };
-use personalai_engine_model_format::{DirectoryManifest, ModelManifest};
+use personalai_engine_model_format::{
+    DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID, DirectoryManifest, ModelManifest,
+};
 use personalai_engine_types::{
     ArchitectureId, BackendId, ContextLimit, DType, EngineError, MAX_VOCABULARY_SIZE,
     ResourceBudget,
@@ -42,6 +44,12 @@ pub const MAX_HIDDEN_DIMENSION: u32 = 1_048_576;
 pub const MAX_INTERMEDIATE_DIMENSION: u32 = 4_194_304;
 /// Exact first-party decoder architecture implemented by the CPU reference path.
 pub const FIRST_PARTY_DECODER_ARCHITECTURE_ID: &str = "decoder-rms-rope-swiglu-gqa-v1";
+/// Exact Qwen2.5-compatible scalar correctness scaffold.
+///
+/// The reviewed 1.5B configurations exceed the CPU reference compute ceiling
+/// and therefore remain non-executable until a separately qualified backend
+/// and admission policy exist.
+pub const QWEN2_DECODER_ARCHITECTURE_ID: &str = DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID;
 /// ARM64 feature/backend identifier.
 pub const ARM64_BACKEND_ID: &str = "arm64";
 /// Apple Metal feature/backend identifier.
@@ -153,7 +161,7 @@ impl TransformerConfig {
             manifest.context_limit(),
             DType::F32,
             manifest.feed_forward_dimension(),
-            1.0e-5,
+            manifest.rms_norm_epsilon(),
             manifest.rope_theta(),
         )
     }
@@ -359,6 +367,11 @@ impl TransformerConfig {
     /// redefine operations.
     #[cfg(feature = "cpu-reference")]
     pub fn reference_block_graph(&self, position: u32) -> Result<InferenceGraph, EngineError> {
+        if self.architecture_id.as_str() != FIRST_PARTY_DECODER_ARCHITECTURE_ID {
+            return Err(EngineError::not_implemented(
+                "generic reference block graph does not encode Qwen2.5 projection biases",
+            ));
+        }
         if position >= self.context_limit.get() {
             return Err(EngineError::invalid_input(
                 "reference graph position exceeds context limit",
@@ -487,15 +500,17 @@ impl TransformerPlan {
         &self.kv_cache
     }
 
-    /// Confirms that this exact architecture has a compiled implementation.
+    /// Confirms that this exact architecture has a compiled, admitted initial
+    /// execution step under the current reference-runtime compute ceiling.
     pub fn require_executable_architecture(&self) -> Result<(), EngineError> {
-        if cfg!(feature = "cpu-reference")
-            && self.config.architecture_id().as_str() == FIRST_PARTY_DECODER_ARCHITECTURE_ID
-        {
-            Ok(())
-        } else {
-            Err(EngineError::unsupported_architecture(self.config.architecture_id().clone()))
+        #[cfg(feature = "cpu-reference")]
+        if matches!(
+            self.config.architecture_id().as_str(),
+            FIRST_PARTY_DECODER_ARCHITECTURE_ID | QWEN2_DECODER_ARCHITECTURE_ID
+        ) {
+            return cpu_decoder::validate_scalar_step_compute(&self.config, 0);
         }
+        Err(EngineError::unsupported_architecture(self.config.architecture_id().clone()))
     }
 }
 

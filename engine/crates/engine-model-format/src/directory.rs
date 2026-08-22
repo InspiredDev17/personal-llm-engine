@@ -8,10 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Exact architecture implemented by the first production package profile.
 pub const DIRECTORY_DECODER_ARCHITECTURE_ID: &str = "decoder-rms-rope-swiglu-gqa-v1";
+/// Exact Qwen2.5 decoder profile with scalar correctness scaffolding.
+pub const DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID: &str =
+    "qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1";
 /// Directory-manifest magic.
 pub const DIRECTORY_MANIFEST_MAGIC: [u8; 8] = *b"PAIDIR01";
-/// Directory-manifest version.
+/// Original directory-manifest version for the legacy decoder profile.
 pub const DIRECTORY_MANIFEST_VERSION: (u16, u16) = (1, 0);
+/// Directory-manifest version for the closed Qwen2.5 decoder profile.
+pub const DIRECTORY_QWEN2_MANIFEST_VERSION: (u16, u16) = (1, 1);
+/// Minimum engine revision eligible to activate the Qwen2.5 manifest profile.
+///
+/// The current production runtime remains 0.1.0. Keeping this profile at a
+/// future revision makes v1.1 packages unambiguously non-activatable until the
+/// tokenizer, registry, backend, and release gates are completed together.
+pub const DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION: (u16, u16, u16) = (0, 2, 0);
 /// Fixed directory-manifest header length.
 pub const DIRECTORY_MANIFEST_HEADER_BYTES: usize = 512;
 /// Fixed shard-record length.
@@ -40,6 +51,7 @@ pub const AIPQ_REQUIRED_ALIGNMENT: u32 = 64;
 const ENDIAN_MARKER: u32 = 0x0102_0304;
 const FLAG_TIED_OUTPUT: u32 = 1;
 const KNOWN_FLAGS: u32 = FLAG_TIED_OUTPUT;
+const LEGACY_RMS_NORM_EPSILON: f32 = 1.0e-5;
 
 /// Closed quantization declaration for directory package version one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +284,7 @@ impl DirectoryTensorRecord {
 /// Parsed, fully validated directory-package manifest.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirectoryManifest {
+    format_version: (u16, u16),
     model_id: ModelId,
     architecture_id: ArchitectureId,
     required_engine_version: (u16, u16, u16),
@@ -282,6 +295,7 @@ pub struct DirectoryManifest {
     attention_head_count: u32,
     kv_head_count: u32,
     feed_forward_dimension: u32,
+    rms_norm_epsilon: f32,
     rope_theta: f32,
     rope_scaling: f32,
     storage_dtype: DType,
@@ -307,8 +321,8 @@ impl DirectoryManifest {
         if bytes[..8] != DIRECTORY_MANIFEST_MAGIC {
             return Err(corrupt("directory manifest magic is invalid"));
         }
-        if read_u16(bytes, 8)? != DIRECTORY_MANIFEST_VERSION.0
-            || read_u16(bytes, 10)? != DIRECTORY_MANIFEST_VERSION.1
+        let format_version = (read_u16(bytes, 8)?, read_u16(bytes, 10)?);
+        if !matches!(format_version, DIRECTORY_MANIFEST_VERSION | DIRECTORY_QWEN2_MANIFEST_VERSION)
         {
             return Err(corrupt("directory manifest version is unsupported"));
         }
@@ -348,11 +362,18 @@ impl DirectoryManifest {
         let feed_forward_dimension = read_nonzero_u32(bytes, 72, "feed-forward dimension")?;
         let rope_theta = f32::from_bits(read_u32(bytes, 76)?);
         let rope_scaling = f32::from_bits(read_u32(bytes, 80)?);
-        if read_u32(bytes, 84)? != 0 {
-            return Err(EngineError::not_implemented(
-                "directory manifest optional section is unsupported",
-            ));
-        }
+        let rms_norm_epsilon = match format_version {
+            DIRECTORY_MANIFEST_VERSION => {
+                if read_u32(bytes, 84)? != 0 {
+                    return Err(EngineError::not_implemented(
+                        "directory manifest optional section is unsupported",
+                    ));
+                }
+                LEGACY_RMS_NORM_EPSILON
+            }
+            DIRECTORY_QWEN2_MANIFEST_VERSION => f32::from_bits(read_u32(bytes, 84)?),
+            _ => return Err(corrupt("directory manifest version is unsupported")),
+        };
         let declared_length = read_u64(bytes, 88)?;
         if declared_length != usize_to_u64(bytes.len())? {
             return Err(corrupt("directory manifest length or trailing data is invalid"));
@@ -366,7 +387,10 @@ impl DirectoryManifest {
         if vocabulary_size == 0 || vocabulary_size > MAX_VOCABULARY_SIZE {
             return Err(corrupt("directory manifest vocabulary is outside hard bounds"));
         }
-        if !rope_theta.is_finite()
+        if !rms_norm_epsilon.is_finite()
+            || rms_norm_epsilon <= 0.0
+            || rms_norm_epsilon > 1.0
+            || !rope_theta.is_finite()
             || rope_theta <= 1.0
             || !rope_scaling.is_finite()
             || rope_scaling <= 0.0
@@ -380,8 +404,35 @@ impl DirectoryManifest {
         let architecture = parse_padded_text(bytes, 144, 64, architecture_length, "architecture")?;
         let architecture_id = ArchitectureId::new(architecture)
             .map_err(|_| corrupt("directory manifest architecture identifier is invalid"))?;
-        if architecture_id.as_str() != DIRECTORY_DECODER_ARCHITECTURE_ID {
+        let expected_architecture = match format_version {
+            DIRECTORY_MANIFEST_VERSION => DIRECTORY_DECODER_ARCHITECTURE_ID,
+            DIRECTORY_QWEN2_MANIFEST_VERSION => DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID,
+            _ => return Err(corrupt("directory manifest version is unsupported")),
+        };
+        if architecture_id.as_str() != expected_architecture {
+            if matches!(
+                architecture_id.as_str(),
+                DIRECTORY_DECODER_ARCHITECTURE_ID | DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
+            ) {
+                return Err(corrupt(
+                    "directory manifest architecture and format version are inconsistent",
+                ));
+            }
             return Err(EngineError::unsupported_architecture(architecture_id));
+        }
+        if format_version == DIRECTORY_QWEN2_MANIFEST_VERSION
+            && (flags & FLAG_TIED_OUTPUT == 0 || rope_scaling.to_bits() != 1.0_f32.to_bits())
+        {
+            return Err(corrupt(
+                "Qwen2.5 manifest requires tied output and unscaled rotary positions",
+            ));
+        }
+        if format_version == DIRECTORY_QWEN2_MANIFEST_VERSION
+            && required_engine_version < DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION
+        {
+            return Err(corrupt(
+                "Qwen2.5 manifest declares an engine version predating the profile",
+            ));
         }
         let model_id_text = parse_padded_text(bytes, 208, 128, model_id_length, "model ID")?;
         let model_id = ModelId::new(model_id_text)
@@ -438,6 +489,7 @@ impl DirectoryManifest {
         validate_quantization_profile(storage_dtype, quantization, &tensors)?;
 
         Ok(Self {
+            format_version,
             model_id,
             architecture_id,
             required_engine_version,
@@ -448,6 +500,7 @@ impl DirectoryManifest {
             attention_head_count,
             kv_head_count,
             feed_forward_dimension,
+            rms_norm_epsilon,
             rope_theta,
             rope_scaling,
             storage_dtype,
@@ -462,6 +515,11 @@ impl DirectoryManifest {
     /// Encodes the canonical manifest exactly.
     pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
         DirectoryManifestBuilder::from_manifest(self).build_bytes()
+    }
+
+    /// Returns the exact directory-manifest format revision.
+    pub const fn format_version(&self) -> (u16, u16) {
+        self.format_version
     }
 
     /// Returns the package model identifier.
@@ -512,6 +570,11 @@ impl DirectoryManifest {
     /// Returns the feed-forward intermediate dimension.
     pub const fn feed_forward_dimension(&self) -> u32 {
         self.feed_forward_dimension
+    }
+
+    /// Returns the architecture-bound RMS normalization epsilon.
+    pub const fn rms_norm_epsilon(&self) -> f32 {
+        self.rms_norm_epsilon
     }
 
     /// Returns the rotary base theta.
@@ -581,12 +644,12 @@ impl DirectoryManifestBuilder {
         tied_output: bool,
         tokenizer_hash: ModelPackageHash,
         shards: Vec<DirectoryShardRecord>,
-        mut tensors: Vec<DirectoryTensorRecord>,
+        tensors: Vec<DirectoryTensorRecord>,
     ) -> Result<Self, EngineError> {
-        tensors.sort_by(|left, right| left.name().cmp(right.name()));
-        let manifest = DirectoryManifest {
+        Self::new_profile(
+            DIRECTORY_MANIFEST_VERSION,
+            DIRECTORY_DECODER_ARCHITECTURE_ID,
             model_id,
-            architecture_id: ArchitectureId::new(DIRECTORY_DECODER_ARCHITECTURE_ID)?,
             required_engine_version,
             context_limit,
             vocabulary_size,
@@ -595,6 +658,103 @@ impl DirectoryManifestBuilder {
             attention_head_count,
             kv_head_count,
             feed_forward_dimension,
+            LEGACY_RMS_NORM_EPSILON,
+            rope_theta,
+            rope_scaling,
+            storage_dtype,
+            quantization,
+            tied_output,
+            tokenizer_hash,
+            shards,
+            tensors,
+        )
+    }
+
+    /// Creates a versioned manifest for the closed Qwen2.5 scalar profile.
+    ///
+    /// The architecture fixes split-half rotary positions, Q/K/V projection
+    /// biases, and tied token-embedding/output weights. Source conversion
+    /// remains an offline Model Foundry responsibility.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_qwen2(
+        model_id: ModelId,
+        required_engine_version: (u16, u16, u16),
+        context_limit: ContextLimit,
+        vocabulary_size: u32,
+        hidden_dimension: u32,
+        layer_count: u32,
+        attention_head_count: u32,
+        kv_head_count: u32,
+        feed_forward_dimension: u32,
+        rms_norm_epsilon: f32,
+        rope_theta: f32,
+        storage_dtype: DType,
+        quantization: Quantization,
+        tokenizer_hash: ModelPackageHash,
+        shards: Vec<DirectoryShardRecord>,
+        tensors: Vec<DirectoryTensorRecord>,
+    ) -> Result<Self, EngineError> {
+        Self::new_profile(
+            DIRECTORY_QWEN2_MANIFEST_VERSION,
+            DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID,
+            model_id,
+            required_engine_version,
+            context_limit,
+            vocabulary_size,
+            hidden_dimension,
+            layer_count,
+            attention_head_count,
+            kv_head_count,
+            feed_forward_dimension,
+            rms_norm_epsilon,
+            rope_theta,
+            1.0,
+            storage_dtype,
+            quantization,
+            true,
+            tokenizer_hash,
+            shards,
+            tensors,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_profile(
+        format_version: (u16, u16),
+        architecture_id: &str,
+        model_id: ModelId,
+        required_engine_version: (u16, u16, u16),
+        context_limit: ContextLimit,
+        vocabulary_size: u32,
+        hidden_dimension: u32,
+        layer_count: u32,
+        attention_head_count: u32,
+        kv_head_count: u32,
+        feed_forward_dimension: u32,
+        rms_norm_epsilon: f32,
+        rope_theta: f32,
+        rope_scaling: f32,
+        storage_dtype: DType,
+        quantization: Quantization,
+        tied_output: bool,
+        tokenizer_hash: ModelPackageHash,
+        shards: Vec<DirectoryShardRecord>,
+        mut tensors: Vec<DirectoryTensorRecord>,
+    ) -> Result<Self, EngineError> {
+        tensors.sort_by(|left, right| left.name().cmp(right.name()));
+        let manifest = DirectoryManifest {
+            format_version,
+            model_id,
+            architecture_id: ArchitectureId::new(architecture_id)?,
+            required_engine_version,
+            context_limit,
+            vocabulary_size,
+            hidden_dimension,
+            layer_count,
+            attention_head_count,
+            kv_head_count,
+            feed_forward_dimension,
+            rms_norm_epsilon,
             rope_theta,
             rope_scaling,
             storage_dtype,
@@ -627,8 +787,8 @@ impl DirectoryManifestBuilder {
         let length = manifest_length(shard_count, tensor_count)?;
         let mut bytes = zeroed(length)?;
         bytes[..8].copy_from_slice(&DIRECTORY_MANIFEST_MAGIC);
-        write_u16(&mut bytes, 8, DIRECTORY_MANIFEST_VERSION.0)?;
-        write_u16(&mut bytes, 10, DIRECTORY_MANIFEST_VERSION.1)?;
+        write_u16(&mut bytes, 8, self.manifest.format_version.0)?;
+        write_u16(&mut bytes, 10, self.manifest.format_version.1)?;
         write_u32(&mut bytes, 12, ENDIAN_MARKER)?;
         write_u32(&mut bytes, 16, usize_to_u32(DIRECTORY_MANIFEST_HEADER_BYTES)?)?;
         write_u32(&mut bytes, 20, u32::from(self.manifest.tied_output))?;
@@ -660,6 +820,9 @@ impl DirectoryManifestBuilder {
         write_u32(&mut bytes, 72, self.manifest.feed_forward_dimension)?;
         write_u32(&mut bytes, 76, self.manifest.rope_theta.to_bits())?;
         write_u32(&mut bytes, 80, self.manifest.rope_scaling.to_bits())?;
+        if self.manifest.format_version == DIRECTORY_QWEN2_MANIFEST_VERSION {
+            write_u32(&mut bytes, 84, self.manifest.rms_norm_epsilon.to_bits())?;
+        }
         write_u64(&mut bytes, 88, usize_to_u64(length)?)?;
         bytes[96..144].copy_from_slice(self.manifest.tokenizer_hash.as_bytes());
         write_padded_text(&mut bytes, 144, 64, self.manifest.architecture_id.as_str())?;
@@ -1050,12 +1213,91 @@ mod tests {
         .clone()
     }
 
+    fn qwen2_fixture() -> DirectoryManifest {
+        let tensor = DirectoryTensorRecord::new(
+            "token_embedding.weight",
+            DType::F32,
+            TensorShape::new([4, 4]).expect("shape must validate"),
+            0,
+            0,
+            64,
+            64,
+            Quantization::None,
+            hash(3),
+        )
+        .expect("tensor must validate");
+        DirectoryManifestBuilder::new_qwen2(
+            ModelId::new("synthetic-qwen2").expect("model ID must validate"),
+            DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION,
+            ContextLimit::new(128).expect("context must validate"),
+            256,
+            4,
+            1,
+            1,
+            1,
+            8,
+            1.0e-6,
+            1_000_000.0,
+            DType::F32,
+            Quantization::None,
+            hash(1),
+            vec![DirectoryShardRecord::new(0, 64, hash(2)).expect("shard must validate")],
+            vec![tensor],
+        )
+        .expect("Qwen2.5 builder must validate")
+        .manifest()
+        .clone()
+    }
+
     #[test]
     fn directory_manifest_round_trip_is_canonical() {
         let manifest = fixture();
         let encoded = manifest.encode().expect("manifest must encode");
         assert_eq!(DirectoryManifest::parse(&encoded).expect("manifest must parse"), manifest);
         assert_eq!(manifest.encode().expect("repeat must encode"), encoded);
+        assert_eq!(manifest.format_version(), DIRECTORY_MANIFEST_VERSION);
+        assert_eq!(read_u32(&encoded, 84).expect("reserved field must read"), 0);
+        assert_eq!(manifest.rms_norm_epsilon().to_bits(), LEGACY_RMS_NORM_EPSILON.to_bits());
+    }
+
+    #[test]
+    fn qwen2_manifest_profile_is_versioned_and_fail_closed() {
+        let manifest = qwen2_fixture();
+        let encoded = manifest.encode().expect("Qwen2.5 manifest must encode");
+        assert_eq!(manifest.format_version(), DIRECTORY_QWEN2_MANIFEST_VERSION);
+        assert_eq!(manifest.architecture_id().as_str(), DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID);
+        assert!(manifest.tied_output());
+        assert_eq!(manifest.rms_norm_epsilon().to_bits(), 1.0e-6_f32.to_bits());
+        assert_eq!(manifest.rope_scaling().to_bits(), 1.0_f32.to_bits());
+        assert_eq!(
+            DirectoryManifest::parse(&encoded).expect("Qwen2.5 manifest must parse"),
+            manifest
+        );
+
+        let mut legacy_version = encoded.clone();
+        legacy_version[8..10].copy_from_slice(&DIRECTORY_MANIFEST_VERSION.0.to_le_bytes());
+        legacy_version[10..12].copy_from_slice(&DIRECTORY_MANIFEST_VERSION.1.to_le_bytes());
+        assert!(DirectoryManifest::parse(&legacy_version).is_err());
+
+        let mut untied = encoded.clone();
+        untied[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(DirectoryManifest::parse(&untied).is_err());
+
+        let mut predating_engine = encoded.clone();
+        predating_engine[24..26].copy_from_slice(&0_u16.to_le_bytes());
+        predating_engine[26..28].copy_from_slice(&1_u16.to_le_bytes());
+        predating_engine[28..30].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(DirectoryManifest::parse(&predating_engine).is_err());
+
+        let mut scaled = encoded.clone();
+        scaled[80..84].copy_from_slice(&2.0_f32.to_bits().to_le_bytes());
+        assert!(DirectoryManifest::parse(&scaled).is_err());
+
+        for invalid_epsilon in [0.0_f32, f32::NAN, f32::INFINITY] {
+            let mut invalid = encoded.clone();
+            invalid[84..88].copy_from_slice(&invalid_epsilon.to_bits().to_le_bytes());
+            assert!(DirectoryManifest::parse(&invalid).is_err());
+        }
     }
 
     #[test]

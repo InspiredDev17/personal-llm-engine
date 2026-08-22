@@ -506,4 +506,15 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn registry_v2_remains_closed_to_the_legacy_package_profile() {
+        let fixture = std::str::from_utf8(positive()).expect("fixture must be UTF-8");
+        let qwen = fixture.replace(
+            DIRECTORY_ENGINE_COMPATIBILITY,
+            "directory-paimodel-v1.1+qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1+aiptok01+f32-cpu-reference",
+        );
+        assert_ne!(qwen.as_bytes(), positive());
+        assert!(SignedModelRegistryEntryV2::parse(qwen.as_bytes()).is_err());
+    }
 }

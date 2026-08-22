@@ -1,6 +1,9 @@
 //! Safe scalar implementation of the exact first-party decoder architecture.
 
-use crate::{FIRST_PARTY_DECODER_ARCHITECTURE_ID, TransformerConfig, TransformerPlan};
+use crate::{
+    FIRST_PARTY_DECODER_ARCHITECTURE_ID, QWEN2_DECODER_ARCHITECTURE_ID, TransformerConfig,
+    TransformerPlan,
+};
 #[cfg(feature = "arm64")]
 use personalai_engine_arm64::Arm64Backend;
 use personalai_engine_cpu_reference::MAX_CPU_REFERENCE_OPERATIONS;
@@ -28,7 +31,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const WEIGHTS_PER_LAYER: usize = 9;
+const QWEN2_WEIGHTS_PER_LAYER: usize = 12;
 const GLOBAL_WEIGHT_COUNT: usize = 3;
+const QWEN2_GLOBAL_WEIGHT_COUNT: usize = 2;
 
 /// Fully validated, aggregate-accounted CPU decoder model.
 ///
@@ -113,13 +118,17 @@ impl CpuDecoderModel {
         pool: &MemoryPool,
         backend: DecoderCpuBackend,
     ) -> Result<Self, EngineError> {
-        validate_model_configuration(&config)?;
+        validate_model_configuration(&config, &backend)?;
         let layer_count = usize::try_from(config.layer_count()).map_err(|_| {
             EngineError::corrupt_model_package("decoder layer count is not addressable")
         })?;
+        let weights_per_layer =
+            if is_qwen2(&config) { QWEN2_WEIGHTS_PER_LAYER } else { WEIGHTS_PER_LAYER };
+        let global_weight_count =
+            if is_qwen2(&config) { QWEN2_GLOBAL_WEIGHT_COUNT } else { GLOBAL_WEIGHT_COUNT };
         let expected_count = layer_count
-            .checked_mul(WEIGHTS_PER_LAYER)
-            .and_then(|count| count.checked_add(GLOBAL_WEIGHT_COUNT))
+            .checked_mul(weights_per_layer)
+            .and_then(|count| count.checked_add(global_weight_count))
             .ok_or_else(|| EngineError::corrupt_model_package("decoder weight count overflows"))?;
         if weights.len() != expected_count {
             return Err(EngineError::corrupt_model_package(
@@ -139,7 +148,7 @@ impl CpuDecoderModel {
         plan: Arc<ExecutionPlacementPlan>,
         pool: &MemoryPool,
     ) -> Result<Self, EngineError> {
-        validate_model_configuration(&config)?;
+        validate_model_configuration(&config, &DecoderCpuBackend::Scalar)?;
         plan.verify_package_binding(&package)
             .map_err(personalai_engine_placement::PlacementError::into_engine_error)?;
         if plan.mode() != WeightResidencyMode::LayerStreamed
@@ -429,7 +438,7 @@ impl CpuDecoderSession {
             self.model.inner.config.rms_norm_epsilon(),
         )?;
         let logits = self.linear(
-            required_weight(weights, "output.weight")?,
+            output_weight(weights, &self.model.inner.config)?,
             &normalized,
             usize_from_u32(self.model.inner.config.vocabulary_size())?,
             hidden,
@@ -626,12 +635,26 @@ impl CpuDecoderSession {
             kv_dimension,
             hidden,
         )?;
-        let value = self.linear(
+        let mut value = self.linear(
             required_weight(weights, &format!("{prefix}.v_proj.weight"))?,
             &attention_input,
             kv_dimension,
             hidden,
         )?;
+        if is_qwen2(&self.model.inner.config) {
+            add_tensor_in_place(
+                &mut query,
+                required_weight(weights, &format!("{prefix}.q_proj.bias"))?,
+            )?;
+            add_tensor_in_place(
+                &mut key,
+                required_weight(weights, &format!("{prefix}.k_proj.bias"))?,
+            )?;
+            add_tensor_in_place(
+                &mut value,
+                required_weight(weights, &format!("{prefix}.v_proj.bias"))?,
+            )?;
+        }
         self.apply_rope(
             &mut query,
             self.model.inner.config.attention_head_count(),
@@ -908,7 +931,11 @@ impl CpuDecoderSession {
             values.copy_from_slice(&tensor_f32_values(&output)?);
             return Ok(());
         }
-        apply_rope(values, head_count, head_dimension, position, theta)
+        if is_qwen2(&self.model.inner.config) {
+            apply_qwen2_rope(values, head_count, head_dimension, position, theta)
+        } else {
+            apply_rope(values, head_count, head_dimension, position, theta)
+        }
     }
 
     #[cfg_attr(
@@ -959,14 +986,33 @@ impl Drop for CpuDecoderSession {
     }
 }
 
-fn validate_model_configuration(config: &TransformerConfig) -> Result<(), EngineError> {
-    if config.architecture_id().as_str() != FIRST_PARTY_DECODER_ARCHITECTURE_ID {
+fn validate_model_configuration(
+    config: &TransformerConfig,
+    backend: &DecoderCpuBackend,
+) -> Result<(), EngineError> {
+    if !matches!(
+        config.architecture_id().as_str(),
+        FIRST_PARTY_DECODER_ARCHITECTURE_ID | QWEN2_DECODER_ARCHITECTURE_ID
+    ) {
         return Err(EngineError::unsupported_architecture(config.architecture_id().clone()));
+    }
+    if is_qwen2(config) && !matches!(backend, DecoderCpuBackend::Scalar) {
+        return Err(EngineError::not_implemented(
+            "Qwen2.5 semantics are scaffolded only by the scalar CPU reference backend",
+        ));
+    }
+    if config.head_dimension() % 2 != 0 {
+        return Err(EngineError::corrupt_model_package(
+            "decoder rotary head dimension must be even",
+        ));
     }
     if config.cache_dtype() != DType::F32 {
         return Err(EngineError::not_implemented(
             "CPU decoder currently supports only f32 model and cache tensors",
         ));
+    }
+    if matches!(backend, DecoderCpuBackend::Scalar) {
+        validate_scalar_step_compute(config, 0)?;
     }
     Ok(())
 }
@@ -978,6 +1024,16 @@ fn required_weight<'a>(
     weights
         .get(name)
         .ok_or_else(|| EngineError::internal_invariant("validated decoder weight is missing"))
+}
+
+fn output_weight<'a>(
+    weights: &'a BTreeMap<String, Tensor>,
+    config: &TransformerConfig,
+) -> Result<&'a Tensor, EngineError> {
+    required_weight(
+        weights,
+        if is_qwen2(config) { "token_embedding.weight" } else { "output.weight" },
+    )
 }
 
 fn stage_weight<'a>(
@@ -1009,7 +1065,9 @@ fn validate_weights(
         .ok_or_else(|| EngineError::corrupt_model_package("KV weight dimension overflows"))?;
     validate_weight(weights, "token_embedding.weight", &[vocabulary, hidden], pool)?;
     validate_weight(weights, "final_norm.weight", &[hidden], pool)?;
-    validate_weight(weights, "output.weight", &[vocabulary, hidden], pool)?;
+    if !is_qwen2(config) {
+        validate_weight(weights, "output.weight", &[vocabulary, hidden], pool)?;
+    }
     for layer in 0..config.layer_count() {
         let prefix = format!("layers.{layer:03}");
         for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
@@ -1018,6 +1076,12 @@ fn validate_weights(
         validate_weight(weights, &format!("{prefix}.q_proj.weight"), &[hidden, hidden], pool)?;
         for suffix in ["k_proj.weight", "v_proj.weight"] {
             validate_weight(weights, &format!("{prefix}.{suffix}"), &[kv_dimension, hidden], pool)?;
+        }
+        if is_qwen2(config) {
+            validate_weight(weights, &format!("{prefix}.q_proj.bias"), &[hidden], pool)?;
+            for suffix in ["k_proj.bias", "v_proj.bias"] {
+                validate_weight(weights, &format!("{prefix}.{suffix}"), &[kv_dimension], pool)?;
+            }
         }
         validate_weight(weights, &format!("{prefix}.o_proj.weight"), &[hidden, hidden], pool)?;
         for suffix in ["gate_proj.weight", "up_proj.weight"] {
@@ -1031,6 +1095,10 @@ fn validate_weights(
         )?;
     }
     Ok(())
+}
+
+fn is_qwen2(config: &TransformerConfig) -> bool {
+    config.architecture_id().as_str() == QWEN2_DECODER_ARCHITECTURE_ID
 }
 
 fn validate_weight(
@@ -1159,6 +1227,55 @@ fn apply_rope(
     Ok(())
 }
 
+fn apply_qwen2_rope(
+    values: &mut [f32],
+    head_count: u32,
+    head_dimension: u32,
+    position: u32,
+    theta: f32,
+) -> Result<(), EngineError> {
+    if head_dimension % 2 != 0 {
+        return Err(EngineError::unsupported_architecture(
+            personalai_engine_types::ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID)?,
+        ));
+    }
+    let heads = usize_from_u32(head_count)?;
+    let dimension = usize_from_u32(head_dimension)?;
+    let expected = heads
+        .checked_mul(dimension)
+        .ok_or_else(|| EngineError::resource_exhaustion("Qwen2.5 RoPE length overflows"))?;
+    if values.len() != expected {
+        return Err(EngineError::internal_invariant(
+            "Qwen2.5 RoPE tensor length differs from its declared heads",
+        ));
+    }
+    let half = dimension / 2;
+    for head in 0..heads {
+        let base = head
+            .checked_mul(dimension)
+            .ok_or_else(|| EngineError::internal_invariant("Qwen2.5 RoPE head offset overflows"))?;
+        for pair in 0..half {
+            let doubled = pair
+                .checked_mul(2)
+                .ok_or_else(|| EngineError::internal_invariant("Qwen2.5 RoPE pair overflows"))?;
+            let exponent = f64::from(u32_from_usize(doubled)?) / f64::from(head_dimension);
+            let angle = f64::from(position) / f64::from(theta).powf(exponent);
+            let (sine, cosine) = angle.sin_cos();
+            let first_index = base
+                .checked_add(pair)
+                .ok_or_else(|| EngineError::internal_invariant("Qwen2.5 RoPE index overflows"))?;
+            let second_index = first_index
+                .checked_add(half)
+                .ok_or_else(|| EngineError::internal_invariant("Qwen2.5 RoPE index overflows"))?;
+            let first = f64::from(finite(values[first_index])?);
+            let second = f64::from(finite(values[second_index])?);
+            values[first_index] = f32_from_f64(first * cosine - second * sine)?;
+            values[second_index] = f32_from_f64(first * sine + second * cosine)?;
+        }
+    }
+    Ok(())
+}
+
 fn softmax(values: &mut [f32]) -> Result<(), EngineError> {
     let maximum = values
         .iter()
@@ -1201,6 +1318,19 @@ fn add_in_place(left: &mut [f32], right: &[f32]) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn add_tensor_in_place(left: &mut [f32], right: &Tensor) -> Result<(), EngineError> {
+    let count = usize::try_from(right.shape().element_count()).map_err(|_| {
+        EngineError::resource_exhaustion("decoder bias tensor length is not addressable")
+    })?;
+    if left.len() != count {
+        return Err(EngineError::internal_invariant("decoder bias dimensions differ"));
+    }
+    for (index, left_value) in left.iter_mut().enumerate() {
+        *left_value = finite(*left_value + finite(right.f32_value(index)?)?)?;
+    }
+    Ok(())
+}
+
 fn finite(value: f32) -> Result<f32, EngineError> {
     if value.is_finite() {
         Ok(value)
@@ -1238,12 +1368,37 @@ fn tensor_f32_values(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
     Ok(values)
 }
 
-fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<(), EngineError> {
+pub(crate) fn validate_scalar_step_compute(
+    config: &TransformerConfig,
+    position: u32,
+) -> Result<(), EngineError> {
+    let total = scalar_step_operation_count(config, position)?;
+    if total > MAX_CPU_REFERENCE_OPERATIONS {
+        return Err(EngineError::resource_exhaustion(
+            "CPU decoder step exceeds the reference compute bound",
+        ));
+    }
+    Ok(())
+}
+
+fn scalar_step_operation_count(
+    config: &TransformerConfig,
+    position: u32,
+) -> Result<u64, EngineError> {
     let hidden = u64::from(config.hidden_dimension());
     let intermediate = u64::from(config.intermediate_dimension());
     let kv_dimension = u64::from(config.kv_head_count())
         .checked_mul(u64::from(config.head_dimension()))
         .ok_or_else(|| EngineError::resource_exhaustion("KV operation dimension overflows"))?;
+    let projection_bias = if is_qwen2(config) {
+        hidden
+            .checked_add(kv_dimension.checked_mul(2).ok_or_else(|| {
+                EngineError::resource_exhaustion("bias operation bound overflows")
+            })?)
+            .ok_or_else(|| EngineError::resource_exhaustion("bias operation bound overflows"))?
+    } else {
+        0
+    };
     let linear = hidden
         .checked_mul(hidden)
         .and_then(|value| value.checked_mul(2))
@@ -1259,6 +1414,7 @@ fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<()
                 .and_then(|part| part.checked_mul(3))
                 .and_then(|part| value.checked_add(part))
         })
+        .and_then(|value| value.checked_add(projection_bias))
         .ok_or_else(|| EngineError::resource_exhaustion("linear operation bound overflows"))?;
     let sequence = u64::from(position)
         .checked_add(1)
@@ -1278,12 +1434,11 @@ fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<()
                 || EngineError::resource_exhaustion("logit operation bound overflows"),
             )?)
             .ok_or_else(|| EngineError::resource_exhaustion("decoder operation bound overflows"))?;
-    if total > MAX_CPU_REFERENCE_OPERATIONS {
-        return Err(EngineError::resource_exhaustion(
-            "CPU decoder step exceeds the reference compute bound",
-        ));
-    }
-    Ok(())
+    Ok(total)
+}
+
+fn check_operation_count(config: &TransformerConfig, position: u32) -> Result<(), EngineError> {
+    validate_scalar_step_compute(config, position)
 }
 
 fn workspace_bytes(config: &TransformerConfig, position: u32) -> Result<u64, EngineError> {
@@ -1529,6 +1684,158 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn qwen2_scalar_prefill_and_decode_are_deterministic() {
+        let first_pool = MemoryPool::new(2 << 20).expect("first pool must validate");
+        let second_pool = MemoryPool::new(2 << 20).expect("second pool must validate");
+        let first =
+            CpuDecoderModel::new(qwen2_config(), qwen2_weights(&first_pool, true), &first_pool)
+                .expect("Qwen2.5 scalar model must construct");
+        let second =
+            CpuDecoderModel::new(qwen2_config(), qwen2_weights(&second_pool, true), &second_pool)
+                .expect("repeat Qwen2.5 scalar model must construct");
+        let budget = ResourceBudget::new(2 << 20, 1 << 18, 2).expect("budget must validate");
+        let mut first_session = first
+            .start_session(&budget, RequestId::new(21).unwrap(), SequenceId::new(21).unwrap())
+            .expect("first session must construct");
+        let mut second_session = second
+            .start_session(&budget, RequestId::new(22).unwrap(), SequenceId::new(22).unwrap())
+            .expect("second session must construct");
+
+        let first_prefill = first_session.prefill(&[1, 2, 3]).expect("prefill must execute");
+        let second_prefill = second_session.prefill(&[1, 2, 3]).expect("prefill must repeat");
+        let first_decode = first_session.decode(4).expect("decode must execute");
+        let second_decode = second_session.decode(4).expect("decode must repeat");
+        for index in 0..8 {
+            assert_eq!(
+                first_prefill.f32_value(index).unwrap().to_bits(),
+                second_prefill.f32_value(index).unwrap().to_bits()
+            );
+            assert_eq!(
+                first_decode.f32_value(index).unwrap().to_bits(),
+                second_decode.f32_value(index).unwrap().to_bits()
+            );
+        }
+
+        let third_pool = MemoryPool::new(2 << 20).expect("third pool must validate");
+        let third =
+            CpuDecoderModel::new(qwen2_config(), qwen2_weights(&third_pool, true), &third_pool)
+                .expect("third Qwen2.5 scalar model must construct");
+        let mut full = third
+            .start_session(&budget, RequestId::new(23).unwrap(), SequenceId::new(23).unwrap())
+            .expect("full session must construct");
+        let full_logits = full.prefill(&[1, 2, 3, 4]).expect("full prefill must execute");
+        for index in 0..8 {
+            assert!(
+                (first_decode.f32_value(index).unwrap() - full_logits.f32_value(index).unwrap())
+                    .abs()
+                    <= 1.0e-6
+            );
+        }
+    }
+
+    #[test]
+    fn qwen25_15b_profile_fails_before_scalar_weight_materialization() {
+        let config = qwen25_15b_config();
+        assert_eq!(
+            scalar_step_operation_count(&config, 0).expect("operation estimate must fit"),
+            1_543_712_768
+        );
+        assert!(matches!(
+            validate_scalar_step_compute(&config, 0),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        let budget = ResourceBudget::new(4_u64 << 30, 2_u64 << 30, 1)
+            .expect("planning budget must validate");
+        let plan = TransformerPlan::new(config.clone(), &budget)
+            .expect("structural Qwen plan must validate");
+        assert!(matches!(
+            plan.require_executable_architecture(),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+
+        let pool = MemoryPool::new(1 << 20).expect("small pool must validate");
+        assert!(matches!(
+            CpuDecoderModel::new(config, BTreeMap::new(), &pool),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert_eq!(pool.used_bytes().expect("pool metrics must read"), 0);
+    }
+
+    #[test]
+    fn qwen2_projection_biases_are_executed() {
+        let biased_pool = MemoryPool::new(2 << 20).expect("biased pool must validate");
+        let zero_pool = MemoryPool::new(2 << 20).expect("zero pool must validate");
+        let biased =
+            CpuDecoderModel::new(qwen2_config(), qwen2_weights(&biased_pool, true), &biased_pool)
+                .expect("biased Qwen2.5 model must construct");
+        let zero =
+            CpuDecoderModel::new(qwen2_config(), qwen2_weights(&zero_pool, false), &zero_pool)
+                .expect("zero-bias Qwen2.5 model must construct");
+        let budget = ResourceBudget::new(2 << 20, 1 << 18, 1).expect("budget must validate");
+        let mut biased_session = biased
+            .start_session(&budget, RequestId::new(24).unwrap(), SequenceId::new(24).unwrap())
+            .expect("biased session must construct");
+        let mut zero_session = zero
+            .start_session(&budget, RequestId::new(25).unwrap(), SequenceId::new(25).unwrap())
+            .expect("zero session must construct");
+        let biased_logits = biased_session.prefill(&[1, 2]).expect("biased prefill must execute");
+        let zero_logits = zero_session.prefill(&[1, 2]).expect("zero prefill must execute");
+        assert!((0..8).any(|index| {
+            biased_logits.f32_value(index).unwrap().to_bits()
+                != zero_logits.f32_value(index).unwrap().to_bits()
+        }));
+    }
+
+    #[test]
+    fn qwen2_tensor_inventory_and_tied_output_fail_closed() {
+        let missing_pool = MemoryPool::new(2 << 20).expect("missing pool must validate");
+        let mut missing = qwen2_weights(&missing_pool, true);
+        missing.remove("layers.001.k_proj.bias");
+        assert!(matches!(
+            CpuDecoderModel::new(qwen2_config(), missing, &missing_pool),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+
+        let wrong_pool = MemoryPool::new(2 << 20).expect("wrong pool must validate");
+        let mut wrong_shape = qwen2_weights(&wrong_pool, true);
+        insert(&mut wrong_shape, "layers.000.v_proj.bias", [3], &[0.0; 3], &wrong_pool);
+        assert!(matches!(
+            CpuDecoderModel::new(qwen2_config(), wrong_shape, &wrong_pool),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+
+        let untied_pool = MemoryPool::new(2 << 20).expect("untied pool must validate");
+        let mut untied = qwen2_weights(&untied_pool, true);
+        insert(&mut untied, "output.weight", [8, 4], &repeated(32, 0.009), &untied_pool);
+        assert!(matches!(
+            CpuDecoderModel::new(qwen2_config(), untied, &untied_pool),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+    }
+
+    #[test]
+    fn qwen2_split_half_rope_is_distinct_and_validates_length() {
+        let mut qwen = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut legacy = qwen;
+        apply_qwen2_rope(&mut qwen, 1, 4, 1, 10_000.0).expect("Qwen2.5 RoPE must execute");
+        apply_rope(&mut legacy, 1, 4, 1, 10_000.0).expect("legacy RoPE must execute");
+        let (sin_zero, cos_zero) = 1.0_f64.sin_cos();
+        let (sin_one, cos_one) = 0.01_f64.sin_cos();
+        let expected = [
+            f32_from_f64(cos_zero - 3.0 * sin_zero).unwrap(),
+            f32_from_f64(2.0 * cos_one - 4.0 * sin_one).unwrap(),
+            f32_from_f64(sin_zero + 3.0 * cos_zero).unwrap(),
+            f32_from_f64(2.0 * sin_one + 4.0 * cos_one).unwrap(),
+        ];
+        for index in 0..4 {
+            assert!((qwen[index] - expected[index]).abs() <= 1.0e-6);
+        }
+        assert_ne!(qwen.map(f32::to_bits), legacy.map(f32::to_bits));
+        assert!(apply_qwen2_rope(&mut [0.0; 3], 1, 4, 0, 10_000.0).is_err());
+        assert!(apply_qwen2_rope(&mut [0.0; 3], 1, 3, 0, 10_000.0).is_err());
+    }
+
     #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
     #[test]
     fn complete_arm64_decoder_matches_scalar_and_cached_execution() {
@@ -1583,6 +1890,42 @@ mod tests {
             10_000.0,
         )
         .expect("tiny config must validate")
+    }
+
+    fn qwen2_config() -> TransformerConfig {
+        TransformerConfig::new_decoder(
+            ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID)
+                .expect("Qwen2.5 architecture ID must validate"),
+            2,
+            4,
+            2,
+            1,
+            8,
+            ContextLimit::new(8).expect("context must validate"),
+            DType::F32,
+            8,
+            1.0e-6,
+            1_000_000.0,
+        )
+        .expect("Qwen2.5 config must validate")
+    }
+
+    fn qwen25_15b_config() -> TransformerConfig {
+        TransformerConfig::new_decoder(
+            ArchitectureId::new(QWEN2_DECODER_ARCHITECTURE_ID)
+                .expect("Qwen2.5 architecture ID must validate"),
+            28,
+            1_536,
+            12,
+            2,
+            151_936,
+            ContextLimit::new(32_768).expect("context must validate"),
+            DType::F32,
+            8_960,
+            1.0e-6,
+            1_000_000.0,
+        )
+        .expect("Qwen2.5 1.5B config must validate structurally")
     }
 
     #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
@@ -1662,6 +2005,73 @@ mod tests {
         insert(&mut weights, "layers.000.gate_proj.weight", [8, 4], &repeated(32, 0.02), pool);
         insert(&mut weights, "layers.000.up_proj.weight", [8, 4], &repeated(32, 0.01), pool);
         insert(&mut weights, "layers.000.down_proj.weight", [4, 8], &repeated(32, 0.01), pool);
+        weights
+    }
+
+    fn qwen2_weights(pool: &MemoryPool, nonzero_biases: bool) -> BTreeMap<String, Tensor> {
+        let mut weights = BTreeMap::new();
+        let embeddings = repeated(32, 0.007);
+        insert(&mut weights, "token_embedding.weight", [8, 4], &embeddings, pool);
+        insert(&mut weights, "final_norm.weight", [4], &[1.0, 0.9, 1.1, 1.05], pool);
+        for layer in 0_u16..2 {
+            let prefix = format!("layers.{layer:03}");
+            insert(
+                &mut weights,
+                &format!("{prefix}.attn_norm.weight"),
+                [4],
+                &[1.0, 1.1, 0.9, 1.05],
+                pool,
+            );
+            insert(&mut weights, &format!("{prefix}.q_proj.weight"), [4, 4], &identity(4), pool);
+            for suffix in ["k_proj.weight", "v_proj.weight"] {
+                insert(
+                    &mut weights,
+                    &format!("{prefix}.{suffix}"),
+                    [2, 4],
+                    &repeated(8, 0.011 + f32::from(layer) * 0.001),
+                    pool,
+                );
+            }
+            let q_bias = if nonzero_biases {
+                [0.1 + f32::from(layer) * 0.01, -0.2, 0.05, 0.3]
+            } else {
+                [0.0; 4]
+            };
+            let kv_bias = if nonzero_biases { [0.17, -0.09] } else { [0.0; 2] };
+            insert(&mut weights, &format!("{prefix}.q_proj.bias"), [4], &q_bias, pool);
+            insert(&mut weights, &format!("{prefix}.k_proj.bias"), [2], &kv_bias, pool);
+            insert(
+                &mut weights,
+                &format!("{prefix}.v_proj.bias"),
+                [2],
+                &[kv_bias[1], kv_bias[0]],
+                pool,
+            );
+            insert(&mut weights, &format!("{prefix}.o_proj.weight"), [4, 4], &identity(4), pool);
+            insert(
+                &mut weights,
+                &format!("{prefix}.ffn_norm.weight"),
+                [4],
+                &[0.95, 1.0, 1.05, 1.1],
+                pool,
+            );
+            for suffix in ["gate_proj.weight", "up_proj.weight"] {
+                insert(
+                    &mut weights,
+                    &format!("{prefix}.{suffix}"),
+                    [8, 4],
+                    &repeated(32, 0.004 + f32::from(layer) * 0.0005),
+                    pool,
+                );
+            }
+            insert(
+                &mut weights,
+                &format!("{prefix}.down_proj.weight"),
+                [4, 8],
+                &repeated(32, 0.003 + f32::from(layer) * 0.0005),
+                pool,
+            );
+        }
         weights
     }
 

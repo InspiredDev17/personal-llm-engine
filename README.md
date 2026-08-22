@@ -16,7 +16,8 @@ no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
 tokenization, canonical aggregate-accounted tensors with explicit F16/BF16
 storage conversion, deterministic first-party AIPQ8/AIPQ4 package profiles and
-scalar quantized reference kernels, an immutable architecture-owned graph, one fixed decoder architecture,
+scalar quantized reference kernels, an immutable architecture-owned graph,
+a closed legacy decoder and Qwen2.5 scalar correctness scaffolding,
 scalar CPU reference
 inference, contiguous sequence-owned KV state, deterministic greedy and seeded
 temperature/top-k/top-p/min-p/repetition-penalty sampling, a bounded scheduler,
@@ -44,7 +45,16 @@ Go repository contains the corresponding `NATIVE_ENGINE` provider adapter; it
 has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
-signed synthetic model. It is not yet a useful production model. A default-off
+signed legacy synthetic model and direct deterministic tiny Qwen2.5 scalar
+fixtures. It is not yet a useful production model. The Qwen2.5 manifest v1.1
+mechanics target future engine revision 0.2.0, while this runtime remains
+0.1.0 and rejects every v1.1 package. Moreover, the exact 1.5B profile requires
+1,543,712,768 estimated scalar operations at its first position and is rejected
+by the unchanged 100,000,000-operation reference ceiling before model
+construction. Foundry import, exact tokenizer conversion, registry promotion,
+a qualified optimized backend, a signed real package, and production evidence
+remain absent. Even after a future runtime-version activation, the authenticated
+service retains a separate fail-closed tokenizer gate. A default-off
 ARM64 graph backend provides bounded Advanced SIMD graph kernels with
 scalar-oracle differential tests. The default-off Metal backend now completes
 the signed synthetic decoder and owner-selected UDS service path, while its

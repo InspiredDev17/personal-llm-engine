@@ -6,8 +6,8 @@ use personalai_engine_crypto::{
 };
 use personalai_engine_memory::{MemoryOwner, MemoryPool, MemoryReservation};
 use personalai_engine_model_format::{
-    DIRECTORY_DECODER_ARCHITECTURE_ID, DirectoryManifest, DirectoryTensorRecord, HashCatalog,
-    PackageFileKind, Quantization, SignatureEnvelope,
+    DIRECTORY_DECODER_ARCHITECTURE_ID, DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID, DirectoryManifest,
+    DirectoryTensorRecord, HashCatalog, PackageFileKind, Quantization, SignatureEnvelope,
 };
 use personalai_engine_quantization::QuantizedTensor;
 use personalai_engine_tensor::Tensor;
@@ -26,6 +26,17 @@ const SIGNATURE_FILE: &str = "signature.ed25519";
 const MAX_HASH_CATALOG_BYTES: u64 = 256 * 1024;
 const MAX_PROVENANCE_BYTES: u64 = 1024 * 1024;
 const CURRENT_ENGINE_VERSION: (u16, u16, u16) = (0, 1, 0);
+const QWEN25_15B_VOCABULARY: u32 = 151_936;
+const QWEN25_15B_HIDDEN: u32 = 1_536;
+const QWEN25_15B_LAYERS: u32 = 28;
+const QWEN25_15B_ATTENTION_HEADS: u32 = 12;
+const QWEN25_15B_KV_HEADS: u32 = 2;
+const QWEN25_15B_FEED_FORWARD: u32 = 8_960;
+const QWEN25_RMS_EPSILON: f32 = 1.0e-6;
+const QWEN25_STANDARD_CONTEXT: u32 = 32_768;
+const QWEN25_STANDARD_ROPE_THETA: f32 = 1_000_000.0;
+const QWEN25_MATH_CONTEXT: u32 = 4_096;
+const QWEN25_MATH_ROPE_THETA: f32 = 10_000.0;
 
 /// Mandatory typed event destination for production package validation.
 pub trait DirectorySecurityEventSink {
@@ -185,7 +196,9 @@ impl VerifiedDirectoryPackage {
                 ));
             }
         }
-        if self.manifest.tied_output() {
+        if self.manifest.tied_output()
+            && self.manifest.architecture_id().as_str() == DIRECTORY_DECODER_ARCHITECTURE_ID
+        {
             let embedding = self
                 .manifest
                 .tensors()
@@ -668,8 +681,20 @@ fn open_direct_file(
 }
 
 fn validate_architecture(manifest: &DirectoryManifest) -> Result<(), EngineError> {
-    if manifest.architecture_id().as_str() != DIRECTORY_DECODER_ARCHITECTURE_ID {
+    let architecture = manifest.architecture_id().as_str();
+    if !matches!(
+        architecture,
+        DIRECTORY_DECODER_ARCHITECTURE_ID | DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
+    ) {
         return Err(EngineError::unsupported_architecture(manifest.architecture_id().clone()));
+    }
+    if architecture == DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
+        && (!manifest.tied_output() || manifest.rope_scaling().to_bits() != 1.0_f32.to_bits())
+    {
+        return Err(corrupt("Qwen2.5 package requires tied output and unscaled rotary positions"));
+    }
+    if architecture == DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID {
+        validate_qwen25_15b_profile(manifest)?;
     }
     if !matches!(manifest.storage_dtype(), DType::F32 | DType::F16 | DType::BFloat16)
         || manifest.tensors().iter().any(|tensor| tensor.dtype() != manifest.storage_dtype())
@@ -686,6 +711,30 @@ fn validate_architecture(manifest: &DirectoryManifest) -> Result<(), EngineError
         || expected.iter().any(|(name, shape)| observed.get(name.as_str()) != Some(&shape))
     {
         return Err(corrupt("directory tensor inventory or shape is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_qwen25_15b_profile(manifest: &DirectoryManifest) -> Result<(), EngineError> {
+    let dimensions_match = manifest.vocabulary_size() == QWEN25_15B_VOCABULARY
+        && manifest.hidden_dimension() == QWEN25_15B_HIDDEN
+        && manifest.layer_count() == QWEN25_15B_LAYERS
+        && manifest.attention_head_count() == QWEN25_15B_ATTENTION_HEADS
+        && manifest.kv_head_count() == QWEN25_15B_KV_HEADS
+        && manifest.feed_forward_dimension() == QWEN25_15B_FEED_FORWARD
+        && manifest.rms_norm_epsilon().to_bits() == QWEN25_RMS_EPSILON.to_bits();
+    let rope_profile_matches = matches!(
+        (manifest.context_limit().get(), manifest.rope_theta().to_bits()),
+        (QWEN25_STANDARD_CONTEXT, bits)
+            if bits == QWEN25_STANDARD_ROPE_THETA.to_bits()
+    ) || matches!(
+        (manifest.context_limit().get(), manifest.rope_theta().to_bits()),
+        (QWEN25_MATH_CONTEXT, bits) if bits == QWEN25_MATH_ROPE_THETA.to_bits()
+    );
+    if !dimensions_match || !rope_profile_matches {
+        return Err(corrupt(
+            "Qwen2.5 package configuration is outside the reviewed 1.5B bootstrap profiles",
+        ));
     }
     Ok(())
 }
@@ -720,6 +769,12 @@ fn expected_shapes(
         }
         for suffix in ["k_proj.weight", "v_proj.weight"] {
             expected.insert(format!("{prefix}.{suffix}"), TensorShape::new([kv, hidden])?);
+        }
+        if manifest.architecture_id().as_str() == DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID {
+            expected.insert(format!("{prefix}.q_proj.bias"), TensorShape::new([hidden])?);
+            for suffix in ["k_proj.bias", "v_proj.bias"] {
+                expected.insert(format!("{prefix}.{suffix}"), TensorShape::new([kv])?);
+            }
         }
         for suffix in ["gate_proj.weight", "up_proj.weight"] {
             expected
@@ -815,4 +870,141 @@ fn usize_to_u64(value: usize) -> Result<u64, EngineError> {
 
 fn corrupt(detail: impl AsRef<str>) -> EngineError {
     EngineError::corrupt_model_package(detail)
+}
+
+#[cfg(test)]
+mod qwen25_tests {
+    use super::*;
+    use personalai_engine_model_format::{
+        DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION, DirectoryManifestBuilder, DirectoryShardRecord,
+        DirectoryTensorRecord,
+    };
+    use personalai_engine_types::{ContextLimit, ModelPackageHash};
+
+    fn hash(byte: u8) -> ModelPackageHash {
+        ModelPackageHash::from_sha384_bytes([byte; ModelPackageHash::BYTE_LEN])
+    }
+
+    fn record(name: String, shape: TensorShape, offset: &mut u64) -> DirectoryTensorRecord {
+        let byte_length =
+            shape.element_count().checked_mul(4).expect("fixture byte length must fit");
+        let tensor = DirectoryTensorRecord::new(
+            name,
+            DType::F32,
+            shape,
+            0,
+            *offset,
+            byte_length,
+            64,
+            Quantization::None,
+            hash(3),
+        )
+        .expect("fixture tensor must validate");
+        *offset = offset.checked_add(byte_length).expect("fixture offset must fit");
+        tensor
+    }
+
+    fn qwen25_manifest(omitted: Option<&str>, context: u32, rope_theta: f32) -> DirectoryManifest {
+        let hidden = u64::from(QWEN25_15B_HIDDEN);
+        let vocabulary = u64::from(QWEN25_15B_VOCABULARY);
+        let intermediate = u64::from(QWEN25_15B_FEED_FORWARD);
+        let kv = u64::from(QWEN25_15B_KV_HEADS) * (hidden / u64::from(QWEN25_15B_ATTENTION_HEADS));
+        let mut specifications = vec![
+            ("token_embedding.weight".to_owned(), TensorShape::new([vocabulary, hidden]).unwrap()),
+            ("final_norm.weight".to_owned(), TensorShape::new([hidden]).unwrap()),
+        ];
+        for layer in 0..QWEN25_15B_LAYERS {
+            let prefix = format!("layers.{layer:03}");
+            for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+                specifications
+                    .push((format!("{prefix}.{suffix}"), TensorShape::new([hidden]).unwrap()));
+            }
+            for suffix in ["q_proj.weight", "o_proj.weight"] {
+                specifications.push((
+                    format!("{prefix}.{suffix}"),
+                    TensorShape::new([hidden, hidden]).unwrap(),
+                ));
+            }
+            for suffix in ["k_proj.weight", "v_proj.weight"] {
+                specifications
+                    .push((format!("{prefix}.{suffix}"), TensorShape::new([kv, hidden]).unwrap()));
+            }
+            specifications
+                .push((format!("{prefix}.q_proj.bias"), TensorShape::new([hidden]).unwrap()));
+            for suffix in ["k_proj.bias", "v_proj.bias"] {
+                specifications
+                    .push((format!("{prefix}.{suffix}"), TensorShape::new([kv]).unwrap()));
+            }
+            for suffix in ["gate_proj.weight", "up_proj.weight"] {
+                specifications.push((
+                    format!("{prefix}.{suffix}"),
+                    TensorShape::new([intermediate, hidden]).unwrap(),
+                ));
+            }
+            specifications.push((
+                format!("{prefix}.down_proj.weight"),
+                TensorShape::new([hidden, intermediate]).unwrap(),
+            ));
+        }
+        specifications.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut offset = 0_u64;
+        let tensors = specifications
+            .into_iter()
+            .filter(|(name, _)| omitted != Some(name.as_str()))
+            .map(|(name, shape)| record(name, shape, &mut offset))
+            .collect();
+        DirectoryManifestBuilder::new_qwen2(
+            ModelId::new("qwen25-bootstrap-fixture").unwrap(),
+            DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION,
+            ContextLimit::new(context).unwrap(),
+            QWEN25_15B_VOCABULARY,
+            QWEN25_15B_HIDDEN,
+            QWEN25_15B_LAYERS,
+            QWEN25_15B_ATTENTION_HEADS,
+            QWEN25_15B_KV_HEADS,
+            QWEN25_15B_FEED_FORWARD,
+            QWEN25_RMS_EPSILON,
+            rope_theta,
+            DType::F32,
+            Quantization::None,
+            hash(1),
+            vec![DirectoryShardRecord::new(0, offset, hash(2)).unwrap()],
+            tensors,
+        )
+        .expect("Qwen2.5 manifest must validate")
+        .manifest()
+        .clone()
+    }
+
+    #[test]
+    fn reviewed_qwen25_profiles_have_exact_bias_inventory() {
+        let general = qwen25_manifest(None, QWEN25_STANDARD_CONTEXT, QWEN25_STANDARD_ROPE_THETA);
+        validate_architecture(&general).expect("standard Qwen2.5 profile must validate");
+        let math = qwen25_manifest(None, QWEN25_MATH_CONTEXT, QWEN25_MATH_ROPE_THETA);
+        validate_architecture(&math).expect("math Qwen2.5 profile must validate");
+
+        let expected = expected_shapes(&general).expect("expected inventory must derive");
+        assert!(expected.contains_key("layers.000.q_proj.bias"));
+        assert!(expected.contains_key("layers.027.k_proj.bias"));
+        assert!(expected.contains_key("layers.027.v_proj.bias"));
+        assert!(!expected.contains_key("output.weight"));
+
+        let missing = qwen25_manifest(
+            Some("layers.013.v_proj.bias"),
+            QWEN25_STANDARD_CONTEXT,
+            QWEN25_STANDARD_ROPE_THETA,
+        );
+        assert!(matches!(
+            validate_architecture(&missing),
+            Err(EngineError::CorruptModelPackage(_))
+        ));
+    }
+
+    #[test]
+    fn unreviewed_qwen25_configuration_fails_closed() {
+        let context = qwen25_manifest(None, 8_192, QWEN25_STANDARD_ROPE_THETA);
+        assert!(validate_architecture(&context).is_err());
+        let theta = qwen25_manifest(None, QWEN25_STANDARD_CONTEXT, 10_000.0);
+        assert!(validate_architecture(&theta).is_err());
+    }
 }

@@ -19,7 +19,18 @@
 
 ## Models and numerical evidence
 
-- Only `decoder-rms-rope-swiglu-gqa-v1` is accepted.
+- Manifest v1.0 accepts `decoder-rms-rope-swiglu-gqa-v1`. Engine-private
+  manifest v1.1 parses the exact
+  `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1` 1.5B bootstrap profiles as future
+  0.2.0 artifacts. The current 0.1.0 loader rejects them. Tiny configurations
+  provide scalar math evidence only; the exact 1.5B position-zero estimate is
+  1,543,712,768 operations and fails the 100,000,000-operation scalar ceiling
+  before model materialization. The offline importer, standard tokenizer
+  conversion, Model Foundry registry compatibility profile, optimized backend,
+  signed package, independent logits, and production qualification remain
+  absent. ARM64 and Metal reject the identifier. A second authenticated-service
+  tokenizer gate prevents AIPTok v1 from being mislabeled after any future
+  engine-version activation.
 - Only synthetic signed tiny packages are qualified. No production model,
   license/provenance review, tokenizer conformance corpus, long-context quality,
   or generated-output acceptance evidence exists.

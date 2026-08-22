@@ -1449,14 +1449,17 @@ mod tests {
         ModelRegistry, RegistrationMode, RegistrySelectionV2, VerifiedDirectoryPackage,
     };
     use personalai_engine_model_format::{
-        DIRECTORY_MANIFEST_HEADER_BYTES, DirectoryManifest, ParsedModelPackage,
+        DIRECTORY_MANIFEST_HEADER_BYTES, DIRECTORY_QWEN2_MANIFEST_VERSION,
+        DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION, DirectoryManifest, DirectoryManifestBuilder,
+        ParsedModelPackage,
     };
     use personalai_engine_placement::{PlacementPolicy, WeightResidencyMode};
     use personalai_engine_scheduler::SchedulerLimits;
     use personalai_engine_server::{EngineService, ServiceConfig};
     use personalai_engine_testkit::DecoderPackageFixtureBuilder;
     use personalai_engine_types::{
-        GenerationEvent, GenerationRequest, RequestId, ResourceBudget, SecurityEvent, SequenceId,
+        GenerationEvent, GenerationRequest, ModelPackageRejection, RequestId, ResourceBudget,
+        SecurityEvent, SequenceId,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2017,6 +2020,45 @@ mod tests {
         }
     }
 
+    fn resign_as_bounded_qwen_v11(
+        package: &ImportedPackage,
+        signer_key_id: SignerKeyId,
+        signing_seed: [u8; 32],
+    ) -> ImportedPackage {
+        let legacy = DirectoryManifest::parse(
+            package.files.get("manifest.aipm").expect("manifest must exist"),
+        )
+        .expect("legacy manifest must parse");
+        let qwen = DirectoryManifestBuilder::new_qwen2(
+            legacy.model_id().clone(),
+            DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION,
+            legacy.context_limit(),
+            legacy.vocabulary_size(),
+            legacy.hidden_dimension(),
+            legacy.layer_count(),
+            legacy.attention_head_count(),
+            legacy.kv_head_count(),
+            legacy.feed_forward_dimension(),
+            1.0e-6,
+            1_000_000.0,
+            legacy.storage_dtype(),
+            legacy.quantization(),
+            legacy.tokenizer_hash(),
+            legacy.shards().to_vec(),
+            legacy.tensors().to_vec(),
+        )
+        .expect("bounded Qwen v1.1 manifest must build")
+        .build_bytes()
+        .expect("bounded Qwen v1.1 manifest must encode");
+        assert_eq!(qwen.len(), package.files["manifest.aipm"].len());
+        resign_manifest(
+            package,
+            |manifest| manifest.copy_from_slice(&qwen),
+            signer_key_id,
+            signing_seed,
+        )
+    }
+
     fn external_name(canonical: &str) -> String {
         match canonical {
             "token_embedding.weight" => "model.embed_tokens.weight".to_owned(),
@@ -2123,6 +2165,100 @@ mod tests {
                 "tokenizer.aiptok",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_qwen_v11_is_rejected_by_current_loader_and_service_identity() {
+        let root = temporary_root("qwen-v11-future-runtime");
+        let store = root.join("models");
+        let runtime = root.join("runtime");
+        let package_path = store.join("synthetic-import.paimodel");
+        for directory in [&root, &store, &runtime] {
+            fs::create_dir(directory).expect("fixture directory must create");
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("fixture directory mode must set");
+        }
+        create_private_directory(&package_path).expect("package directory must create");
+
+        let (source, tokenizer) = source_and_tokenizer();
+        let key_id = SignerKeyId::from_bytes([0x53; 16]).expect("key ID must validate");
+        let signing_seed = [0x54; 32];
+        let mut seed = signing_seed;
+        let legacy =
+            build_package(&spec(), "model.safetensors", &source, &tokenizer, key_id, &mut seed)
+                .expect("legacy source fixture must build");
+        let package = resign_as_bounded_qwen_v11(&legacy, key_id, signing_seed);
+        let manifest = DirectoryManifest::parse(
+            package.files().get("manifest.aipm").expect("manifest must exist"),
+        )
+        .expect("signed v1.1 manifest must parse");
+        assert_eq!(manifest.format_version(), DIRECTORY_QWEN2_MANIFEST_VERSION);
+        assert_eq!(manifest.required_engine_version(), DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION);
+        write_package_files(&package_path, &package).expect("package must write and seal");
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o500))
+            .expect("model store must seal");
+
+        let trusted = TrustedSigner::active(key_id, package.signer_public_key())
+            .expect("trusted signer must validate");
+        let budget = ResourceBudget::new(1 << 30, 1 << 28, 1).expect("budget must validate");
+        let mut registry = ModelRegistry::new(&store).expect("registry must construct");
+        registry
+            .register(
+                spec().model_id().clone(),
+                "synthetic-import.paimodel",
+                package.package_hash(),
+                trusted.clone(),
+            )
+            .expect("signed package must register");
+        let mut loader_events = Vec::new();
+        assert!(matches!(
+            registry.load_registered_directory(spec().model_id(), &budget, &mut |event| {
+                loader_events.push(event);
+            }),
+            Err(EngineError::NotImplemented(_))
+        ));
+        assert_eq!(
+            loader_events,
+            vec![SecurityEvent::ModelPackageRejected {
+                model_id: spec().model_id().clone(),
+                reason: ModelPackageRejection::Corrupt,
+            }]
+        );
+
+        let config = ServiceConfig::new(&store, &runtime, runtime.join("engine.sock"))
+            .expect("service config must validate");
+        let mut service = EngineService::new(
+            config,
+            SchedulerLimits::new(8, 1, 1 << 20).expect("scheduler limits must validate"),
+        )
+        .expect("service must construct");
+        service
+            .register_configured_model(
+                spec().model_id().clone(),
+                "synthetic-import.paimodel",
+                package.package_hash(),
+                trusted,
+            )
+            .expect("service package must register");
+        let mut service_events = Vec::new();
+        assert!(matches!(
+            service.load_registered_cpu_model(spec().model_id(), &budget, &mut |event| {
+                service_events.push(event);
+            }),
+            Err(EngineError::NotImplemented(_))
+        ));
+        assert_eq!(
+            service_events,
+            vec![SecurityEvent::ModelPackageRejected {
+                model_id: spec().model_id().clone(),
+                reason: ModelPackageRejection::Corrupt,
+            }]
+        );
+
+        drop(service);
+        drop(registry);
+        remove_sealed_store(&root, &store, &package_path);
     }
 
     #[cfg(unix)]

@@ -9,7 +9,7 @@ use personalai_engine_loader::{
 };
 use personalai_engine_memory::MemoryPool;
 use personalai_engine_model_format::{
-    DIRECTORY_MANIFEST_VERSION, DirectoryTensorRecord, Quantization,
+    DIRECTORY_DECODER_ARCHITECTURE_ID, DirectoryManifest, DirectoryTensorRecord, Quantization,
 };
 use personalai_engine_types::{
     ArchitectureId, BackendId, DType, EngineError, MAX_RESOURCE_MEMORY_BYTES, ModelId,
@@ -423,7 +423,7 @@ impl ExecutionPlacementPlan {
             model_id: package.registration().model_id().clone(),
             artifact_id: package.registration().registry_artifact_id().map(str::to_owned),
             package_digest: *package.registration().expected_hash(),
-            package_format_version: DIRECTORY_MANIFEST_VERSION,
+            package_format_version: manifest.format_version(),
             architecture_id: manifest.architecture_id().clone(),
             backend_id: capabilities.backend_id.clone(),
             quantization: manifest.quantization(),
@@ -579,9 +579,7 @@ fn measure_verified_package(
         manifest_metadata_bytes,
         "immutable package overhead",
     )?;
-    let complete_execution_bytes = stages.iter().try_fold(0_u64, |total, stage| {
-        checked_add(total, stage.execution_bytes, "complete execution weights")
-    })?;
+    let complete_execution_bytes = resident_execution_bytes(manifest)?;
     let largest_source_snapshot = manifest
         .tensors()
         .iter()
@@ -604,6 +602,34 @@ fn measure_verified_package(
         complete_execution_bytes,
         complete_materialized_bytes,
     })
+}
+
+fn resident_execution_bytes(manifest: &DirectoryManifest) -> Result<u64, PlacementError> {
+    let unique_source_bytes = manifest.tensors().iter().try_fold(0_u64, |total, record| {
+        checked_add(
+            total,
+            execution_bytes_from_record(record)?,
+            "complete unique execution weights",
+        )
+    })?;
+    if manifest.tied_output()
+        && manifest.architecture_id().as_str() == DIRECTORY_DECODER_ARCHITECTURE_ID
+    {
+        // The legacy resident materializer still creates a distinct output
+        // tensor for its tied source. Qwen2.5 consumes the embedding tensor
+        // directly and must not be charged for its streamed logical alias.
+        let embedding = manifest
+            .tensors()
+            .iter()
+            .find(|record| record.name() == "token_embedding.weight")
+            .ok_or_else(|| resource("tied resident output is missing its embedding source"))?;
+        return checked_add(
+            unique_source_bytes,
+            execution_bytes_from_record(embedding)?,
+            "legacy tied resident execution weights",
+        );
+    }
+    Ok(unique_source_bytes)
 }
 
 fn select_staging_requirement(
@@ -917,11 +943,7 @@ fn range_from_record(
     record: &DirectoryTensorRecord,
     logical_name: &str,
 ) -> Result<PlacementTensorRange, PlacementError> {
-    let execution_bytes = record
-        .shape()
-        .element_count()
-        .checked_mul(4)
-        .ok_or_else(|| resource("placement execution tensor bytes overflow"))?;
+    let execution_bytes = execution_bytes_from_record(record)?;
     Ok(PlacementTensorRange {
         logical_name: logical_name.to_owned(),
         source_name: record.name().to_owned(),
@@ -934,6 +956,14 @@ fn range_from_record(
         content_hash: record.content_hash(),
         execution_bytes,
     })
+}
+
+fn execution_bytes_from_record(record: &DirectoryTensorRecord) -> Result<u64, PlacementError> {
+    record
+        .shape()
+        .element_count()
+        .checked_mul(4)
+        .ok_or_else(|| resource("placement execution tensor bytes overflow"))
 }
 
 fn required_streaming_staging(
@@ -1076,7 +1106,11 @@ fn resource(reason: &'static str) -> PlacementError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personalai_engine_types::TensorShape;
+    use personalai_engine_model_format::{
+        DIRECTORY_QWEN2_MANIFEST_VERSION, DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION,
+        DirectoryManifestBuilder, DirectoryShardRecord,
+    };
+    use personalai_engine_types::{ContextLimit, TensorShape};
     use std::sync::Mutex;
 
     fn hash(byte: u8) -> ModelPackageHash {
@@ -1145,6 +1179,50 @@ mod tests {
         assert_eq!(stages[3].tensors()[1].source_name(), "token_embedding.weight");
         assert_eq!(required_streaming_staging(&stages, 1).unwrap(), 736);
         assert_eq!(required_streaming_staging(&stages, 0).unwrap(), 440);
+    }
+
+    #[test]
+    fn qwen_v11_resident_accounting_counts_tied_source_once_but_streams_alias() {
+        const EMBEDDING_ELEMENTS: u64 = 151_936 * 1_536;
+        const EMBEDDING_BYTES: u64 = EMBEDDING_ELEMENTS * 4;
+        let records = vec![
+            record("token_embedding.weight", EMBEDDING_ELEMENTS, 0),
+            record("layers.000.q_proj.weight", 7, EMBEDDING_BYTES),
+            record("final_norm.weight", 2, EMBEDDING_BYTES + 28),
+        ];
+        let manifest = DirectoryManifestBuilder::new_qwen2(
+            ModelId::new("qwen-placement-fixture").unwrap(),
+            DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION,
+            ContextLimit::new(8).unwrap(),
+            151_936,
+            1_536,
+            1,
+            12,
+            2,
+            8_960,
+            1.0e-6,
+            1_000_000.0,
+            DType::F32,
+            Quantization::None,
+            hash(1),
+            vec![DirectoryShardRecord::new(0, EMBEDDING_BYTES + 36, hash(2)).unwrap()],
+            records,
+        )
+        .unwrap()
+        .manifest()
+        .clone();
+        assert_eq!(manifest.format_version(), DIRECTORY_QWEN2_MANIFEST_VERSION);
+
+        let stages = derive_stages(manifest.tensors(), manifest.layer_count(), true).unwrap();
+        let output = stages.last().expect("output stage must exist");
+        assert_eq!(output.tensors()[1].logical_name(), "output.weight");
+        assert_eq!(output.tensors()[1].source_name(), "token_embedding.weight");
+        assert_eq!(EMBEDDING_BYTES, 933_494_784);
+        assert_eq!(resident_execution_bytes(&manifest).unwrap(), EMBEDDING_BYTES + 36);
+        assert_eq!(
+            stages.iter().map(PlacementStage::execution_bytes).sum::<u64>(),
+            EMBEDDING_BYTES.checked_mul(2).and_then(|bytes| bytes.checked_add(36)).unwrap()
+        );
     }
 
     #[test]
