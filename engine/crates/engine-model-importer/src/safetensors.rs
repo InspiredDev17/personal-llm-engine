@@ -4,7 +4,6 @@ use personalai_engine_types::{
     DType, EngineError, MAX_DIMENSION_SIZE, MAX_MODEL_PACKAGE_BYTES, MAX_TENSOR_COUNT,
     MAX_TENSOR_RANK, TensorShape,
 };
-use std::collections::BTreeSet;
 use std::ops::Range;
 
 /// Largest accepted safetensors JSON header: 64 MiB.
@@ -37,6 +36,27 @@ pub struct ParsedSafetensorsHeader {
 impl ParsedSafetensorsHeader {
     /// Parses one exact bounded JSON header against its complete file length.
     pub fn parse(header: &[u8], file_length: u64) -> Result<Self, EngineError> {
+        Self::parse_with_tensor_limit(
+            header,
+            file_length,
+            usize::try_from(MAX_TENSOR_COUNT).unwrap_or(usize::MAX),
+        )
+    }
+
+    /// Parses while enforcing a caller-narrowed tensor-count ceiling during
+    /// header decoding, before retaining any entry beyond that ceiling.
+    pub(crate) fn parse_with_tensor_limit(
+        header: &[u8],
+        file_length: u64,
+        maximum_tensor_count: usize,
+    ) -> Result<Self, EngineError> {
+        if maximum_tensor_count == 0
+            || maximum_tensor_count > usize::try_from(MAX_TENSOR_COUNT).unwrap_or(usize::MAX)
+        {
+            return Err(EngineError::invalid_input(
+                "safetensors parser tensor ceiling is outside hard bounds",
+            ));
+        }
         if !(10..=MAX_MODEL_PACKAGE_BYTES).contains(&file_length) {
             return Err(EngineError::resource_exhaustion(
                 "safetensors file length is outside hard bounds",
@@ -55,10 +75,8 @@ impl ParsedSafetensorsHeader {
         }
         let header_text = std::str::from_utf8(header)
             .map_err(|_| corrupt("safetensors header is not valid UTF-8"))?;
-        let relative = HeaderParser::new(header_text).parse()?;
-        if relative.is_empty()
-            || relative.len() > usize::try_from(MAX_TENSOR_COUNT).unwrap_or(usize::MAX)
-        {
+        let relative = HeaderParser::new(header_text, maximum_tensor_count).parse()?;
+        if relative.is_empty() {
             return Err(corrupt("safetensors tensor count is outside hard bounds"));
         }
         let mut tensors = Vec::new();
@@ -202,17 +220,18 @@ struct RelativeTensor {
 struct HeaderParser<'a> {
     bytes: &'a [u8],
     cursor: usize,
+    maximum_tensor_count: usize,
 }
 
 impl<'a> HeaderParser<'a> {
-    const fn new(text: &'a str) -> Self {
-        Self { bytes: text.as_bytes(), cursor: 0 }
+    const fn new(text: &'a str, maximum_tensor_count: usize) -> Self {
+        Self { bytes: text.as_bytes(), cursor: 0, maximum_tensor_count }
     }
 
     fn parse(mut self) -> Result<Vec<RelativeTensor>, EngineError> {
         self.expect(b'{')?;
         let mut tensors = Vec::new();
-        let mut names = BTreeSet::new();
+        let mut metadata_seen = false;
         self.whitespace();
         if self.consume(b'}') {
             return Ok(tensors);
@@ -220,14 +239,22 @@ impl<'a> HeaderParser<'a> {
         loop {
             let name = self.string(MAX_SOURCE_TENSOR_NAME_BYTES)?;
             self.expect(b':')?;
-            if !names.insert(name.clone()) {
-                return Err(corrupt("safetensors contains a duplicate header name"));
-            }
             if name == "__metadata__" {
+                if metadata_seen {
+                    return Err(corrupt("safetensors contains a duplicate header name"));
+                }
+                metadata_seen = true;
                 self.metadata()?;
             } else {
+                if tensors.len() >= self.maximum_tensor_count {
+                    return Err(corrupt("safetensors tensor count is outside hard bounds"));
+                }
                 validate_source_name(&name)?;
-                tensors.push(self.tensor(name)?);
+                let tensor = self.tensor(name)?;
+                tensors.try_reserve(1).map_err(|_| {
+                    EngineError::resource_exhaustion("safetensors parser tensor allocation failed")
+                })?;
+                tensors.push(tensor);
             }
             self.whitespace();
             if self.consume(b'}') {
@@ -238,6 +265,10 @@ impl<'a> HeaderParser<'a> {
         self.whitespace();
         if self.cursor != self.bytes.len() {
             return Err(corrupt("safetensors header contains trailing JSON"));
+        }
+        tensors.sort_by(|left, right| left.name.cmp(&right.name));
+        if tensors.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return Err(corrupt("safetensors contains a duplicate header name"));
         }
         tensors.sort_by_key(|tensor| tensor.start);
         Ok(tensors)
@@ -481,5 +512,21 @@ mod tests {
         let mut invalid = fixture("{}", &[]);
         invalid[8] = 0xff;
         assert!(ParsedSafetensors::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn parser_enforces_narrow_tensor_ceiling_before_retaining_extra_entries() {
+        let header = concat!(
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},",
+            "\"b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}"
+        );
+        let file_length = 8_u64
+            .checked_add(u64::try_from(header.len()).expect("header length fits"))
+            .and_then(|length| length.checked_add(8))
+            .expect("fixture length fits");
+        assert!(
+            ParsedSafetensorsHeader::parse_with_tensor_limit(header.as_bytes(), file_length, 1,)
+                .is_err()
+        );
     }
 }

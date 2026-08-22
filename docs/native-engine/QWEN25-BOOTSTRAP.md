@@ -9,8 +9,9 @@ embedding/output weights.
 Each configuration also binds one exact 3,087,467,144-byte
 `model.safetensors` SHA-256 identity. This is source identity, not Foundry
 approval, qualification, promotion, or package trust. The operator-only
-preflight checks the descriptor length before allocation, parses only the
-bounded header, and then streams SHA-256 from the same open descriptor.
+preflight checks the descriptor length, authenticates the complete file by
+streaming SHA-256 from the same open descriptor, and only then parses its
+bounded header.
 
 | Profile | `model.safetensors` SHA-256 |
 | --- | --- |
@@ -87,12 +88,14 @@ descriptors remain open throughout inspection. File device, inode, length,
 mode, owner, and modification timestamp must agree before open, after open, and
 after reading, and the current path must still identify the opened object.
 
-Only the at-most-64-MiB safetensors JSON header is allocated. Its flat parser
-requires exactly 338 BF16 tensors, the reviewed Qwen names and shapes, checked
+Only after complete-file identity authentication is the at-most-64-MiB
+safetensors JSON header allocated. Its flat parser enforces the 338-entry
+ceiling while decoding, then requires exactly 338 BF16 tensors, the reviewed
+Qwen names and shapes, checked
 contiguous non-overlapping ranges, and complete coverage of the declared file
 extent. It rejects gaps, overlap, truncation, trailing data, unsupported dtype,
 and arithmetic overflow. The 3,087,467,144-byte payload is never materialized;
-SHA-256 is streamed from the same descriptor after header validation. Output
+SHA-256 is streamed from the same descriptor before header validation. Output
 contains only bounded profile, digest, byte-count, header-count, tensor-count,
 and explicit preflight-only status fields.
 

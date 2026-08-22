@@ -79,9 +79,10 @@ decisions.
 The descriptor preflight mechanics are implemented as an operator-only,
 non-emitting diagnostic. They require one protected ingress root, exact
 direct-child source names, no symlinks, pinned length and SHA-256, and the exact
-338-tensor BF16 inventory. Only the bounded safetensors header is allocated;
-the full payload digest is streamed from the same descriptor. This evidence
-does not quarantine, approve, qualify, sign, promote, install, or activate the
+338-tensor BF16 inventory. The full payload digest is streamed and authenticated
+from the retained descriptor before the bounded safetensors header is allocated
+and parsed. This evidence does not quarantine, approve, qualify, sign, promote,
+install, or activate the
 source. Future emission must consume an owned verified descriptor rather than
 reopening a path based on a previous diagnostic result.
 
@@ -89,9 +90,10 @@ reopening a path based on a previous diagnostic result.
 bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
 records, exact byte mapping, special roles, declared resource limits, table
 hash, undefined logit tail, and the pinned 22-token suffix when production
-counts are present. It is not an executable tokenizer and the importer cannot
-emit it from `tokenizer.json`. Runtime construction remains fail-closed pending
-the exact Unicode and conformance gates in ADR-0035.
+counts are present. The importer cannot emit it from `tokenizer.json`. A private
+scanner/BPE/decode runtime core remains unreachable from public construction;
+activation is fail-closed pending the Unicode adapter, exact conversion and
+production-table conformance gates in ADR-0035 and ADR-0036.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:
 its first step is estimated at 1,543,712,768 checked operations, including the

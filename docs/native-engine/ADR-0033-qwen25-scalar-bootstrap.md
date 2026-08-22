@@ -73,10 +73,11 @@ rejection before weight materialization.
 An offline transition slice now performs descriptor-bound inspection of the
 three pinned config identities, the shared exact tokenizer graph/identity, and
 the closed safetensors name/shape profile. It securely opens an exact
-owner-private direct-child source set, allocates only the bounded header,
-validates 338 BF16 tensor descriptors and complete non-overlapping ranges, and
-streams the profile-specific SHA-256 from the same open file. It deliberately
-cannot emit a package or exact Qwen tokenizer. This decision still adds no
+owner-private direct-child source set, streams and authenticates the profile-
+specific SHA-256 from the retained descriptor, and only then allocates the
+bounded header and validates 338 BF16 tensor descriptors and complete
+non-overlapping ranges. It deliberately cannot emit a package or exact Qwen
+tokenizer. This decision still adds no
 chat-template execution, registry authority, model download, package approval,
 or production qualification.
 Existing AIPTok remains the only runtime tokenizer. The current authenticated

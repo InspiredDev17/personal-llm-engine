@@ -179,22 +179,22 @@ kernels.
 This is engine-private package/runtime support, not a production model
 approval. The offline importer still produces only the legacy Llama mapping.
 Its fail-closed Qwen transition can securely preflight an exact owner-private
-source directory by retaining no-follow descriptors, allocating only the
-bounded safetensors header, validating the 338-tensor BF16 inventory, and
-streaming the pinned digest from the same model descriptor; it cannot emit or
-sign a Qwen package. `engine-tokenizer` recognizes and fully validates a separate
-data-only `AIPTOK02` table profile, but deliberately returns
-`UnsupportedTokenizer` rather than constructing an approximate Qwen runtime.
+source directory by retaining no-follow descriptors, streaming and
+authenticating the pinned digest from the model descriptor, and only then
+allocating its bounded safetensors header and validating the 338-tensor BF16
+inventory; it cannot emit or sign a Qwen package. `engine-tokenizer` recognizes
+and fully validates a separate data-only `AIPTOK02` table profile. A private
+fixed scanner/BPE/decode core exists, but the public factory deliberately
+returns `UnsupportedTokenizer` rather than constructing an approximate Qwen
+runtime.
 The Model Foundry registry V2 compatibility profile still names manifest v1.0,
 and no exact Qwen tokenizer converter or signed Qwen package exists here. The
 current service returns the earlier typed future-engine rejection; after an
 eventual runtime revision bump it still reaches the closed tokenizer gate.
-Exact NFC/category-aware pre-tokenization, encode/decode/incremental decode,
-conversion, independent vectors, Model Foundry admission, and a qualified
-optimized backend must be implemented and qualified before activation.
-The exact Unicode 16 normalization/category primitives are admitted to the
-offline graph but deliberately unused until that separately reviewed runtime
-and its conformance evidence exist.
+The admitted Unicode 16 normalization/category primitives still need a trusted
+adapter and exact contraction rule. Source conversion, production-table token
+replay, Model Foundry admission, and a qualified optimized backend must be
+implemented and qualified before activation.
 
 ## Trusted execution placement
 

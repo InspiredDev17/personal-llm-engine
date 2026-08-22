@@ -25,6 +25,7 @@ const TOKENIZER_NAME: &str = "tokenizer.json";
 const MODEL_NAME: &str = "model.safetensors";
 const SOURCE_DIRECTORY_NAME: &str = "source";
 const MAX_ARTIFACT_NAME_BYTES: usize = 160;
+const QWEN25_TENSOR_COUNT: usize = 338;
 
 /// Content-free evidence from one successful pinned Qwen2.5 source preflight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,10 +142,13 @@ pub fn preflight_qwen25_ingress(
         &[expected_model_bytes],
         "model tensor",
     )?;
-    let metadata = read_safetensors_header(&mut model_file, expected_model_bytes)?;
+    let (observed_model_sha256, metadata) = authenticate_and_parse_model_source(
+        &mut model_file,
+        expected_model_bytes,
+        expected_model_sha256,
+    )?;
     validate_qwen25_tensor_inventory(&spec, &metadata)?;
-    let observed_model_sha256 =
-        verify_streamed_sha256(&mut model_file, expected_model_bytes, expected_model_sha256)?;
+    model_file.verify_unchanged()?;
     source_guard.verify_current()?;
     artifact_guard.verify_current()?;
     root_guard.verify_current()?;
@@ -162,6 +166,17 @@ pub fn preflight_qwen25_ingress(
             EngineError::internal_invariant("safetensors tensor count is not representable")
         })?,
     })
+}
+
+fn authenticate_and_parse_model_source(
+    source: &mut PinnedSourceFile,
+    expected_bytes: u64,
+    expected_sha256: Sha256Digest,
+) -> Result<(Sha256Digest, ParsedSafetensorsHeader), EngineError> {
+    let observed_sha256 = verify_streamed_sha256(source, expected_bytes, expected_sha256)?;
+    let metadata = read_safetensors_header(source, expected_bytes)?;
+    source.verify_unchanged()?;
+    Ok((observed_sha256, metadata))
 }
 
 fn verify_streamed_sha256(
@@ -212,7 +227,7 @@ fn read_safetensors_header(
         .file
         .read_exact(&mut header)
         .map_err(|_| corrupt("safetensors JSON header is truncated"))?;
-    ParsedSafetensorsHeader::parse(&header, file_length)
+    ParsedSafetensorsHeader::parse_with_tensor_limit(&header, file_length, QWEN25_TENSOR_COUNT)
 }
 
 fn validate_qwen25_tensor_inventory(
@@ -223,7 +238,7 @@ fn validate_qwen25_tensor_inventory(
         return Err(corrupt("Qwen2.5 model tensor file length differs"));
     }
     let expected = expected_shapes(spec)?;
-    if metadata.tensors().len() != expected.len() || expected.len() != 338 {
+    if metadata.tensors().len() != expected.len() || expected.len() != QWEN25_TENSOR_COUNT {
         return Err(corrupt("Qwen2.5 tensor count differs from the reviewed inventory"));
     }
     let mut seen = BTreeSet::new();
@@ -609,13 +624,26 @@ mod tests {
     #[test]
     fn qwen_inventory_rejects_wrong_dtype_shape_and_trailing_extent() {
         let header = exact_qwen_header();
-        let mut wrong_dtype = header.clone();
-        let location =
-            wrong_dtype.windows(4).position(|window| window == b"BF16").expect("dtype must exist");
-        wrong_dtype[location..location + 4].copy_from_slice(b"F16 ");
-        assert!(
-            ParsedSafetensorsHeader::parse(&wrong_dtype, QWEN25_MODEL_SAFETENSORS_BYTES).is_err()
-        );
+        let mut wrong_dtype = String::from_utf8(header.clone()).expect("header is UTF-8");
+        let dtype_start = wrong_dtype.find("\"BF16\"").expect("dtype must exist");
+        wrong_dtype.replace_range(dtype_start..dtype_start + 6, "\"F16\"");
+        wrong_dtype.push(' ');
+        let parsed_dtype =
+            ParsedSafetensorsHeader::parse(wrong_dtype.as_bytes(), QWEN25_MODEL_SAFETENSORS_BYTES)
+                .expect("F16 is structurally supported");
+        assert!(validate_qwen25_tensor_inventory(&instruct_spec(), &parsed_dtype).is_err());
+
+        let mut wrong_shape = String::from_utf8(header.clone()).expect("header is UTF-8");
+        const ORIGINAL_SHAPE: &str = "[151936,1536]";
+        const WRONG_SHAPE: &str = "[1536,151936]";
+        assert_eq!(ORIGINAL_SHAPE.len(), WRONG_SHAPE.len());
+        let shape_start = wrong_shape.find(ORIGINAL_SHAPE).expect("embedding shape must exist");
+        wrong_shape.replace_range(shape_start..shape_start + ORIGINAL_SHAPE.len(), WRONG_SHAPE);
+        let parsed_shape =
+            ParsedSafetensorsHeader::parse(wrong_shape.as_bytes(), QWEN25_MODEL_SAFETENSORS_BYTES)
+                .expect("same-element-count shape is structurally valid");
+        assert!(validate_qwen25_tensor_inventory(&instruct_spec(), &parsed_shape).is_err());
+
         assert!(
             ParsedSafetensorsHeader::parse(&header, QWEN25_MODEL_SAFETENSORS_BYTES + 1).is_err()
         );
@@ -642,6 +670,30 @@ mod tests {
             expected
         );
         assert!(verify_streamed_sha256(&mut pinned, 5, hash_sha256(b"other")).is_err());
+        fs::remove_dir_all(root).expect("temporary tree must remove");
+    }
+
+    #[test]
+    fn model_hash_authentication_precedes_header_parsing() {
+        let root = private_temp("hash-before-header");
+        let path = root.join("model.safetensors");
+        let mut malformed = Vec::from(64_u64.to_le_bytes());
+        malformed.extend_from_slice(b"{}");
+        private_file(&path, &malformed);
+        let uid = fs::metadata(&root).expect("root metadata").uid();
+        let length = u64::try_from(malformed.len()).expect("fixture length fits");
+        let mut pinned =
+            PinnedSourceFile::open(&path, uid, &[length], "test").expect("source securely opens");
+
+        let wrong_hash_error =
+            authenticate_and_parse_model_source(&mut pinned, length, hash_sha256(b"different"))
+                .expect_err("wrong hash must fail before malformed header parsing");
+        assert!(wrong_hash_error.to_string().contains("SHA-256 differs"));
+
+        let header_error =
+            authenticate_and_parse_model_source(&mut pinned, length, hash_sha256(&malformed))
+                .expect_err("authenticated malformed header must then fail parsing");
+        assert!(header_error.to_string().contains("header"));
         fs::remove_dir_all(root).expect("temporary tree must remove");
     }
 
