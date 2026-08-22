@@ -4,12 +4,13 @@
 //! profile. The separate AIPTok v2/Qwen2.5 wire parser validates a fixed,
 //! data-only byte-level BPE profile. A private, non-constructible runtime core
 //! implements its fixed scanner/BPE/decode mechanics behind an explicit trusted
-//! Unicode-16 interface. The public factory remains fail-closed until that
-//! Unicode implementation is dependency-reviewed and independently qualified.
+//! Unicode-16 interface. Unicode primitives are admitted but not wired through
+//! that interface; the public factory remains fail-closed until the adapter and
+//! production tables are independently qualified.
 
 #[allow(
     dead_code,
-    reason = "the reviewed Qwen runtime core remains private until its Unicode-16 adapter is admitted"
+    reason = "the reviewed Qwen runtime core remains private until its Unicode-16 adapter is implemented and qualified"
 )]
 mod qwen_runtime;
 mod qwen_v2;

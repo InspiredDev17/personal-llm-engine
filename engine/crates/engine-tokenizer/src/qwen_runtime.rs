@@ -2,8 +2,8 @@
 //!
 //! This module is intentionally private. It implements deterministic fixed
 //! pre-tokenizer, BPE, added-token, and decoding mechanics over already parsed
-//! AIPTok v2 tables. The public tokenizer factory remains fail-closed until an
-//! audited Unicode-16 NFC/category adapter supplies the trusted interface.
+//! AIPTok v2 tables. The public tokenizer factory remains fail-closed until the
+//! admitted Unicode-16 primitives are wired through a reviewed adapter.
 
 use super::qwen_v2::{
     AipTokQwen25AddedRole, Qwen25LoadedTables, Qwen25MergeRule, load_qwen25_tables,
@@ -30,7 +30,8 @@ enum GeneralClass {
 
 /// Engine-internal Unicode authority. No package or client can implement or
 /// select this interface; the production implementation is intentionally
-/// absent until its exact Unicode-16 data is dependency-reviewed.
+/// absent until the admitted Unicode-16 primitives are safely adapted and
+/// independently qualified.
 trait TrustedQwen25Unicode16: Send + Sync {
     fn unicode_version(&self) -> (u8, u8, u8);
     fn normalize_nfc(
@@ -291,11 +292,52 @@ struct BpeNode {
 #[derive(Debug)]
 struct Qwen25RuntimeCore {
     tables: Qwen25LoadedTables,
+    added_by_first_byte: [Vec<usize>; 256],
+    _added_index_reservation: Option<MemoryReservation>,
 }
 
 impl Qwen25RuntimeCore {
     fn load(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
-        Ok(Self { tables: load_qwen25_tables(data, pool)? })
+        let tables = load_qwen25_tables(data, pool)?;
+        if !tables.descriptor.matches_pinned_qwen25_1_5b_counts() {
+            return Err(EngineError::unsupported_tokenizer(
+                "Qwen runtime construction requires the exact pinned tokenizer identity",
+            ));
+        }
+        Self::from_tables(tables)
+    }
+
+    #[cfg(test)]
+    fn load_test_fixture(data: &[u8], pool: &MemoryPool) -> Result<Self, EngineError> {
+        Self::from_tables(load_qwen25_tables(data, pool)?)
+    }
+
+    fn from_tables(tables: Qwen25LoadedTables) -> Result<Self, EngineError> {
+        let index_bytes = tables
+            .added_tokens
+            .len()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                EngineError::resource_exhaustion("Qwen added-token index bound overflows")
+            })?;
+        let index_reservation =
+            (index_bytes != 0).then(|| tables.pool.reserve(index_bytes)).transpose()?;
+        let mut added_by_first_byte: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        for (index, added) in tables.added_tokens.iter().enumerate() {
+            let token_index = usize::try_from(added.token_id).map_err(|_| {
+                EngineError::corrupt_model_package("Qwen added-token ID is not addressable")
+            })?;
+            let first_byte =
+                *tables.pieces.get(token_index).and_then(|piece| piece.first()).ok_or_else(
+                    || EngineError::corrupt_model_package("Qwen added-token literal is empty"),
+                )?;
+            added_by_first_byte[usize::from(first_byte)].try_reserve(1).map_err(|_| {
+                EngineError::resource_exhaustion("Qwen added-token index allocation failed")
+            })?;
+            added_by_first_byte[usize::from(first_byte)].push(index);
+        }
+        Ok(Self { tables, added_by_first_byte, _added_index_reservation: index_reservation })
     }
 
     fn token_index(&self, token: u32) -> Result<usize, EngineError> {
@@ -472,7 +514,9 @@ impl Qwen25RuntimeCore {
     }
 
     fn matching_added(&self, input: &[u8]) -> Option<(u32, AipTokQwen25AddedRole, usize)> {
-        self.tables.added_tokens.iter().find_map(|added| {
+        let candidates = self.added_by_first_byte.get(usize::from(*input.first()?))?;
+        candidates.iter().find_map(|index| {
+            let added = self.tables.added_tokens.get(*index)?;
             let piece = self.tables.pieces.get(usize::try_from(added.token_id).ok()?)?;
             input.starts_with(piece).then_some((added.token_id, added.role, piece.len()))
         })
@@ -644,6 +688,7 @@ struct Qwen25IncrementalDecoder<'a> {
     pending: Vec<u8>,
     decoded_tokens: usize,
     decoded_bytes: usize,
+    failed: bool,
     _pending_reservation: MemoryReservation,
 }
 
@@ -654,12 +699,18 @@ impl<'a> Qwen25IncrementalDecoder<'a> {
             pending: Vec::with_capacity(usize::try_from(PENDING_UTF8_BYTES).unwrap_or(4)),
             decoded_tokens: 0,
             decoded_bytes: 0,
+            failed: false,
             _pending_reservation: core.tables.pool.reserve(PENDING_UTF8_BYTES)?,
         })
     }
 
     fn push(&mut self, token: u32) -> Result<String, EngineError> {
-        self.decoded_tokens = self
+        if self.failed {
+            return Err(EngineError::invalid_input(
+                "Qwen incremental decoder is terminal after malformed UTF-8",
+            ));
+        }
+        let next_decoded_tokens = self
             .decoded_tokens
             .checked_add(1)
             .filter(|count| {
@@ -672,10 +723,11 @@ impl<'a> Qwen25IncrementalDecoder<'a> {
                 EngineError::resource_exhaustion("Qwen stream exceeds its token limit")
             })?;
         if self.core.is_special_token(token)? {
+            self.decoded_tokens = next_decoded_tokens;
             return Ok(String::new());
         }
         let piece = self.core.token_piece(token)?;
-        self.decoded_bytes = self
+        let next_decoded_bytes = self
             .decoded_bytes
             .checked_add(piece.len())
             .filter(|bytes| *bytes <= MAX_REQUEST_BYTES)
@@ -695,6 +747,8 @@ impl<'a> Qwen25IncrementalDecoder<'a> {
         match std::str::from_utf8(&combined) {
             Ok(text) => {
                 self.pending.clear();
+                self.decoded_tokens = next_decoded_tokens;
+                self.decoded_bytes = next_decoded_bytes;
                 Ok(text.to_owned())
             }
             Err(error) if error.error_len().is_none() => {
@@ -706,14 +760,18 @@ impl<'a> Qwen25IncrementalDecoder<'a> {
                 self.pending.extend_from_slice(&combined[valid..]);
                 if self.pending.len() > usize::try_from(PENDING_UTF8_BYTES).unwrap_or(4) {
                     self.pending.clear();
+                    self.failed = true;
                     return Err(EngineError::invalid_input(
                         "Qwen generated token ends with an oversized UTF-8 suffix",
                     ));
                 }
+                self.decoded_tokens = next_decoded_tokens;
+                self.decoded_bytes = next_decoded_bytes;
                 Ok(output)
             }
             Err(_) => {
                 self.pending.clear();
+                self.failed = true;
                 Err(EngineError::invalid_input(
                     "Qwen generated token bytes contain malformed UTF-8",
                 ))
@@ -728,7 +786,11 @@ impl<'a> Qwen25IncrementalDecoder<'a> {
     }
 
     fn finish(self) -> Result<(), EngineError> {
-        if self.pending.is_empty() {
+        if self.failed {
+            Err(EngineError::invalid_input(
+                "Qwen incremental decoder is terminal after malformed UTF-8",
+            ))
+        } else if self.pending.is_empty() {
             Ok(())
         } else {
             Err(EngineError::invalid_input(
@@ -798,7 +860,11 @@ mod tests {
         }
 
         fn contraction_ascii_fold(&self, scalar: char) -> Option<u8> {
-            scalar.is_ascii_alphabetic().then(|| scalar.to_ascii_lowercase() as u8)
+            if scalar == '\u{017F}' {
+                Some(b's')
+            } else {
+                scalar.is_ascii_alphabetic().then(|| scalar.to_ascii_lowercase() as u8)
+            }
         }
     }
 
@@ -895,8 +961,8 @@ mod tests {
 
     fn core() -> (Qwen25RuntimeCore, MemoryPool) {
         let pool = MemoryPool::new(64 * 1024 * 1024).expect("pool validates");
-        let core =
-            Qwen25RuntimeCore::load(&fixture(4096, 4096), &pool).expect("runtime tables must load");
+        let core = Qwen25RuntimeCore::load_test_fixture(&fixture(4096, 4096), &pool)
+            .expect("runtime tables must load");
         (core, pool)
     }
 
@@ -919,6 +985,7 @@ mod tests {
     fn independent_chunk_vectors_cover_priority_categories_and_whitespace() {
         assert_eq!(chunks("Hello world"), strings(&["Hello", " world"]));
         assert_eq!(chunks("I'm WE'RE he'd"), strings(&["I", "'m", " WE", "'RE", " he", "'d"]));
+        assert_eq!(chunks("'ſfoo"), strings(&["'ſ", "foo"]));
         assert_eq!(chunks("abc123Ⅷ½"), strings(&["abc", "1", "2", "3", "Ⅷ", "½"]));
         assert_eq!(chunks("Hello, world!!!\n"), strings(&["Hello", ",", " world", "!!!\n"]));
         assert_eq!(chunks("A\r\nB\n\n"), strings(&["A", "\r\n", "B", "\n\n"]));
@@ -1042,7 +1109,8 @@ mod tests {
         assert!(core.decode_bytes(&[262]).is_err());
         assert!(core.encode(&"a".repeat(4097), SpecialTokenPolicy::Reject, &profile).is_err());
         let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
-        let limited = Qwen25RuntimeCore::load(&fixture(4096, 1), &pool).expect("tables load");
+        let limited =
+            Qwen25RuntimeCore::load_test_fixture(&fixture(4096, 1), &pool).expect("tables load");
         assert!(limited.encode("def", SpecialTokenPolicy::Reject, &profile).is_err());
 
         assert!(matches!(
@@ -1054,7 +1122,8 @@ mod tests {
     #[test]
     fn normalization_cannot_grow_beyond_reserved_output() {
         let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
-        let core = Qwen25RuntimeCore::load(&fixture(4, 4096), &pool).expect("tables load");
+        let core =
+            Qwen25RuntimeCore::load_test_fixture(&fixture(4, 4096), &pool).expect("tables load");
         let baseline = pool.used_bytes().expect("metrics work");
         assert!(matches!(
             core.encode("a", SpecialTokenPolicy::Reject, &ExpandingUnicode16),
@@ -1085,11 +1154,25 @@ mod tests {
         assert!(incomplete.finish().is_err());
 
         let pool = MemoryPool::new(16 * 1024 * 1024).expect("pool validates");
-        let limited = Qwen25RuntimeCore::load(&fixture(4096, 1), &pool).expect("tables load");
+        let limited =
+            Qwen25RuntimeCore::load_test_fixture(&fixture(4096, 1), &pool).expect("tables load");
         let mut limited_decoder =
             Qwen25IncrementalDecoder::new(&limited).expect("decoder allocates");
         assert_eq!(limited_decoder.push(259).expect("one special is in bounds"), "");
         assert!(limited_decoder.push(259).is_err());
+
+        let mut validation_decoder =
+            Qwen25IncrementalDecoder::new(&core).expect("decoder allocates");
+        assert!(validation_decoder.push(262).is_err());
+        let ascii_a = core.tables.byte_token_ids[usize::from(b'a')];
+        assert_eq!(validation_decoder.push(ascii_a).expect("rejected ID changes no state"), "a");
+
+        let mut malformed_decoder =
+            Qwen25IncrementalDecoder::new(&core).expect("decoder allocates");
+        let malformed = core.tables.byte_token_ids[usize::from(0xFF_u8)];
+        assert!(malformed_decoder.push(malformed).is_err());
+        assert!(malformed_decoder.push(ascii_a).is_err());
+        assert!(malformed_decoder.finish().is_err());
     }
 
     #[test]

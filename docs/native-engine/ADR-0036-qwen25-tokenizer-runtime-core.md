@@ -52,15 +52,19 @@ the diagnostic ordinary-byte policy bypasses added-token recognition. Ordinary
 added tokens remain decodable data, while BOS/EOS/control roles are skipped by
 normal decoding.
 
-Persistent table copies, scanner work, normalization/output bounds, BPE work,
-and incremental UTF-8 suffix state use the existing memory pool. Input, output,
-token-piece, table-count and hard request ceilings remain checked. The runtime
-does not allocate from a model-controlled size without prior validation.
+Persistent table copies, scanner work, bounded normalization output, BPE work,
+the first-byte added-token index, and incremental UTF-8 suffix state use the
+existing memory pool. Executable construction accepts only the exact pinned
+production cardinalities; compact structural tables remain test-only. Input,
+output, token-piece, table-count and hard request ceilings remain checked. A
+malformed incremental UTF-8 stream terminalizes its decoder, while a rejected
+token ID changes no decoder state.
 
 ## Evidence and remaining activation gate
 
 Deterministic tests cover the independently derived fixed scanner boundaries
-for contractions, Unicode letter/number categories, punctuation/newlines,
+for contractions including U+017F LONG S folding, Unicode letter/number
+categories, punctuation/newlines,
 trailing whitespace, NUL, mixed scripts, NBSP and ZWSP. Synthetic trusted-input
 fixtures cover the reviewed Unicode-16 normalization ordering, decomposed Latin
 and Jamo composition, and the Unicode-version boundary scalars U+088F and
