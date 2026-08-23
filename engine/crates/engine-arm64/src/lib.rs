@@ -34,6 +34,15 @@ pub const MATMUL_ROW_TILE: usize = 2;
 pub const MATMUL_COLUMN_TILE: usize = 4;
 /// Fixed logical value count in one canonical AIPQ v1 block.
 const AIPQ_V1_BLOCK_VALUES: usize = 32;
+/// Exact work ceiling for the reviewed Qwen2.5 1.5B tied output projection.
+///
+/// This does not widen the generic matrix-vector or scalar-reference bounds.
+/// Only the engine-owned `LogitProjection` operation may use this ceiling.
+const MAX_ARM64_LOGIT_PROJECTION_OPERATIONS: u64 = 233_373_696;
+/// Fixed output-row quantum between cooperative cancellation polls.
+const LOGIT_PROJECTION_ROW_CHUNK: usize = 64;
+/// Fixed stack staging used while reading one contiguous F32 weight row.
+const LOGIT_PROJECTION_COLUMN_CHUNK: usize = 256;
 
 /// Trusted execution policy selected by local engine configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,14 +347,12 @@ impl Arm64Backend {
         if columns < MIN_VECTOR_ELEMENTS as u64 {
             return self.scalar.matrix_vector(matrix, vector, pool);
         }
-        let operations = rows_u64.checked_mul(columns).ok_or_else(|| {
-            EngineError::resource_exhaustion("ARM64 matrix-vector work count overflows")
-        })?;
-        if operations > MAX_CPU_REFERENCE_OPERATIONS {
-            return Err(EngineError::resource_exhaustion(
-                "ARM64 matrix-vector exceeds its work ceiling",
-            ));
-        }
+        validate_matrix_vector_work(
+            rows_u64,
+            columns,
+            MAX_CPU_REFERENCE_OPERATIONS,
+            "ARM64 matrix-vector exceeds its work ceiling",
+        )?;
         let rows = usize::try_from(rows_u64)
             .map_err(|_| EngineError::resource_exhaustion("ARM64 row count is not addressable"))?;
         let columns = usize::try_from(columns).map_err(|_| {
@@ -366,6 +373,109 @@ impl Arm64Backend {
             require_finite(*destination)?;
         }
         MutableTensor::from_f32_values(TensorShape::new([rows_u64])?, output.as_slice(), pool)
+    }
+
+    /// Executes the engine-owned hidden-to-vocabulary projection with bounded
+    /// scratch and cooperative cancellation.
+    ///
+    /// The separate ceiling is the exact work required by the already-reviewed
+    /// Qwen2.5 1.5B tied embedding/output shape. Generic matrix-vector and
+    /// scalar-reference operations retain their existing lower ceiling.
+    pub fn logit_projection_cancellable(
+        &self,
+        matrix: &Tensor,
+        vector: &Tensor,
+        pool: &MemoryPool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Tensor, EngineError> {
+        require_contiguous_f32_with_limit(
+            matrix,
+            pool,
+            MAX_ARM64_LOGIT_PROJECTION_OPERATIONS,
+            "ARM64 logit projection exceeds its exact work ceiling",
+        )?;
+        require_contiguous_f32(vector, pool)?;
+        if matrix.shape().rank() != 2 || vector.shape().rank() != 1 {
+            return Err(EngineError::invalid_input("ARM64 logit projection ranks are invalid"));
+        }
+        let rows_u64 = matrix.shape().dimensions()[0];
+        let columns_u64 = matrix.shape().dimensions()[1];
+        if vector.shape().dimensions()[0] != columns_u64 {
+            return Err(EngineError::invalid_input("ARM64 logit projection dimensions differ"));
+        }
+        validate_matrix_vector_work(
+            rows_u64,
+            columns_u64,
+            MAX_ARM64_LOGIT_PROJECTION_OPERATIONS,
+            "ARM64 logit projection exceeds its exact work ceiling",
+        )?;
+        if columns_u64 < MIN_VECTOR_ELEMENTS as u64 {
+            if cancelled() {
+                return Err(EngineError::cancellation(None));
+            }
+            return self.scalar.logit_projection(matrix, vector, pool);
+        }
+        let rows = addressable(rows_u64, "ARM64 logit row count is not addressable")?;
+        let columns = addressable(columns_u64, "ARM64 logit width is not addressable")?;
+        let staging = self.staging_pool(pool);
+        let vector = f32_values(vector, &staging)?;
+        let mut output = StagedF32::zeros(rows, &staging)?;
+        let mut weights = [0.0_f32; LOGIT_PROJECTION_COLUMN_CHUNK];
+        for first_row in (0..rows).step_by(LOGIT_PROJECTION_ROW_CHUNK) {
+            if cancelled() {
+                return Err(EngineError::cancellation(None));
+            }
+            let row_end = first_row
+                .checked_add(LOGIT_PROJECTION_ROW_CHUNK)
+                .ok_or_else(|| EngineError::resource_exhaustion("ARM64 logit row chunk overflows"))?
+                .min(rows);
+            for (row, destination) in
+                output.as_mut_slice()[first_row..row_end].iter_mut().enumerate()
+            {
+                let row = first_row.checked_add(row).ok_or_else(|| {
+                    EngineError::resource_exhaustion("ARM64 logit row index overflows")
+                })?;
+                let row_start = row.checked_mul(columns).ok_or_else(|| {
+                    EngineError::resource_exhaustion("ARM64 logit row offset overflows")
+                })?;
+                let mut accumulator = 0.0_f64;
+                for first_column in (0..columns).step_by(LOGIT_PROJECTION_COLUMN_CHUNK) {
+                    if cancelled() {
+                        return Err(EngineError::cancellation(None));
+                    }
+                    let width = (columns - first_column).min(LOGIT_PROJECTION_COLUMN_CHUNK);
+                    let input_end = first_column.checked_add(width).ok_or_else(|| {
+                        EngineError::resource_exhaustion("ARM64 logit input range overflows")
+                    })?;
+                    for (offset, weight) in weights.iter_mut().take(width).enumerate() {
+                        let index = row_start
+                            .checked_add(first_column)
+                            .and_then(|index| index.checked_add(offset))
+                            .ok_or_else(|| {
+                                EngineError::resource_exhaustion(
+                                    "ARM64 logit weight index overflows",
+                                )
+                            })?;
+                        *weight = require_finite(matrix.f32_value(index)?)?;
+                    }
+                    let partial = accelerated_dot(
+                        &weights[..width],
+                        &vector.as_slice()[first_column..input_end],
+                    )?;
+                    accumulator += f64::from(require_finite(partial)?);
+                    if !accumulator.is_finite() {
+                        return Err(EngineError::backend_failure(
+                            "ARM64 logit projection accumulator is non-finite",
+                        ));
+                    }
+                }
+                *destination = f32_from_f64(accumulator)?;
+            }
+        }
+        if cancelled() {
+            return Err(EngineError::cancellation(None));
+        }
+        checked_tensor(rows, output.as_slice(), TensorShape::new([rows_u64])?, pool)
     }
 
     fn matrix_matrix(
@@ -707,8 +817,11 @@ impl Arm64Backend {
             (Operation::ScalarMultiply(scalar), [input]) => {
                 self.scalar_multiply(input, *scalar, pool)
             }
-            (Operation::MatrixVector | Operation::LogitProjection, [matrix, vector]) => {
-                self.matrix_vector(matrix, vector, pool)
+            (Operation::MatrixVector, [matrix, vector]) => self.matrix_vector(matrix, vector, pool),
+            (Operation::LogitProjection, [matrix, vector]) => {
+                self.logit_projection_cancellable(matrix, vector, pool, &|| {
+                    cancellation.is_cancelled()
+                })
             }
             (Operation::MatrixMatrix, [left, right]) => {
                 self.matrix_matrix(left, right, pool, cancellation)
@@ -854,6 +967,20 @@ impl Backend for Arm64Backend {
 }
 
 fn require_contiguous_f32(tensor: &Tensor, pool: &MemoryPool) -> Result<(), EngineError> {
+    require_contiguous_f32_with_limit(
+        tensor,
+        pool,
+        MAX_CPU_REFERENCE_OPERATIONS,
+        "ARM64 operation exceeds its work ceiling",
+    )
+}
+
+fn require_contiguous_f32_with_limit(
+    tensor: &Tensor,
+    pool: &MemoryPool,
+    maximum_elements: u64,
+    limit_reason: &'static str,
+) -> Result<(), EngineError> {
     if tensor.dtype() != DType::F32 || !tensor.metadata().layout().is_contiguous() {
         return Err(EngineError::invalid_input(
             "ARM64 acceleration requires a contiguous F32 tensor",
@@ -862,10 +989,25 @@ fn require_contiguous_f32(tensor: &Tensor, pool: &MemoryPool) -> Result<(), Engi
     if !tensor.accounted_by(pool) {
         return Err(EngineError::invalid_input("ARM64 tensor belongs to a different memory pool"));
     }
-    if tensor.shape().element_count() > MAX_CPU_REFERENCE_OPERATIONS {
-        return Err(EngineError::resource_exhaustion("ARM64 operation exceeds its work ceiling"));
+    if tensor.shape().element_count() > maximum_elements {
+        return Err(EngineError::resource_exhaustion(limit_reason));
     }
     Ok(())
+}
+
+fn validate_matrix_vector_work(
+    rows: u64,
+    columns: u64,
+    maximum_operations: u64,
+    limit_reason: &'static str,
+) -> Result<u64, EngineError> {
+    let operations = rows.checked_mul(columns).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 matrix-vector work count overflows")
+    })?;
+    if operations > maximum_operations {
+        return Err(EngineError::resource_exhaustion(limit_reason));
+    }
+    Ok(operations)
 }
 
 fn same_contiguous_f32(
@@ -1477,6 +1619,8 @@ mod tests {
     };
     #[cfg(target_arch = "aarch64")]
     use std::collections::BTreeMap;
+    #[cfg(target_arch = "aarch64")]
+    use std::sync::atomic::AtomicUsize;
 
     #[cfg(target_arch = "aarch64")]
     fn tensor(pool: &MemoryPool, shape: impl IntoIterator<Item = u64>, data: &[f32]) -> Tensor {
@@ -1495,6 +1639,71 @@ mod tests {
                 "index {index}: {actual} != {expected}, tolerance {tolerance}"
             );
         }
+    }
+
+    #[test]
+    fn logit_projection_work_ceiling_is_exact_and_does_not_widen_matrix_vector() {
+        assert_eq!(
+            validate_matrix_vector_work(
+                151_936,
+                1_536,
+                MAX_ARM64_LOGIT_PROJECTION_OPERATIONS,
+                "fixture logit limit",
+            )
+            .expect("the exact reviewed Qwen projection must fit"),
+            MAX_ARM64_LOGIT_PROJECTION_OPERATIONS,
+        );
+        assert!(matches!(
+            validate_matrix_vector_work(
+                151_937,
+                1_536,
+                MAX_ARM64_LOGIT_PROJECTION_OPERATIONS,
+                "fixture logit limit",
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert!(matches!(
+            validate_matrix_vector_work(
+                MAX_CPU_REFERENCE_OPERATIONS + 1,
+                1,
+                MAX_CPU_REFERENCE_OPERATIONS,
+                "fixture generic limit",
+            ),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+        assert!(matches!(
+            validate_matrix_vector_work(u64::MAX, 2, u64::MAX, "fixture overflow"),
+            Err(EngineError::ResourceExhaustion(_))
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn logit_projection_matches_scalar_and_cancels_with_bounded_scratch() {
+        let pool = MemoryPool::new(1 << 20).unwrap();
+        let backend = Arm64Backend::new().unwrap();
+        let matrix_values =
+            (0_i16..40).map(|value| f32::from(value % 13) / 13.0 - 0.4).collect::<Vec<_>>();
+        let matrix = tensor(&pool, [5, 8], &matrix_values);
+        let vector = tensor(&pool, [8], &[0.5, -1.0, 0.25, 2.0, -0.75, 1.5, 0.125, -0.5]);
+        let actual = backend
+            .execute_operation(&Operation::LogitProjection, &[&matrix, &vector], &pool)
+            .unwrap();
+        let expected = backend.scalar.logit_projection(&matrix, &vector, &pool).unwrap();
+        assert_close(&actual, &expected, 2.0e-6, 2.0e-6);
+
+        let cancel_rows = LOGIT_PROJECTION_ROW_CHUNK * 2 + 1;
+        let cancel_matrix =
+            tensor(&pool, [u64::try_from(cancel_rows).unwrap(), 8], &vec![0.25; cancel_rows * 8]);
+        let baseline = pool.used_bytes().unwrap();
+        let polls = AtomicUsize::new(0);
+        let cancelled = || polls.fetch_add(1, Ordering::AcqRel) > LOGIT_PROJECTION_ROW_CHUNK;
+        assert!(matches!(
+            backend.logit_projection_cancellable(&cancel_matrix, &vector, &pool, &cancelled,),
+            Err(EngineError::Cancellation(_))
+        ));
+        assert!(polls.load(Ordering::Acquire) > LOGIT_PROJECTION_ROW_CHUNK);
+        assert_eq!(pool.used_bytes().unwrap(), baseline);
     }
 
     #[cfg(target_arch = "aarch64")]

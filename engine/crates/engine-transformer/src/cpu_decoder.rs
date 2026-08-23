@@ -29,6 +29,7 @@ use personalai_engine_types::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 const WEIGHTS_PER_LAYER: usize = 9;
 const QWEN2_WEIGHTS_PER_LAYER: usize = 12;
@@ -410,6 +411,15 @@ impl CpuDecoderSession {
 
     /// Executes one token and returns finite next-token logits.
     pub fn forward_token(&mut self, token: u32) -> Result<Tensor, EngineError> {
+        self.forward_token_resident(token, &AtomicBool::new(false))
+    }
+
+    fn forward_token_resident(
+        &mut self,
+        token: u32,
+        cancellation: &dyn PlacementCancellationProbe,
+    ) -> Result<Tensor, EngineError> {
+        check_decoder_cancelled(cancellation)?;
         let weights = self.model.resident_weights()?;
         if token >= self.model.inner.config.vocabulary_size() {
             return Err(EngineError::invalid_input("input token is outside the model vocabulary"));
@@ -434,19 +444,23 @@ impl CpuDecoderSession {
 
         let mut writer = self.model.inner.cache.begin_token(self.handle)?;
         for layer in 0..self.model.inner.config.layer_count() {
+            check_decoder_cancelled(cancellation)?;
             self.forward_layer(layer, &mut writer, &mut state, weights)?;
         }
+        check_decoder_cancelled(cancellation)?;
         let normalized = self.rms_norm(
             &state,
             required_weight(weights, "final_norm.weight")?,
             self.model.inner.config.rms_norm_epsilon(),
         )?;
-        let logits = self.linear(
+        let logits = self.output_projection(
             output_weight(weights, &self.model.inner.config)?,
             &normalized,
             usize_from_u32(self.model.inner.config.vocabulary_size())?,
             hidden,
+            cancellation,
         )?;
+        check_decoder_cancelled(cancellation)?;
         let output = Tensor::from_f32_values(
             TensorShape::new([u64::from(self.model.inner.config.vocabulary_size())])?,
             &logits,
@@ -562,11 +576,12 @@ impl CpuDecoderSession {
                         stage_weight(stage, loaded.tensors(), "final_norm.weight")?,
                         self.model.inner.config.rms_norm_epsilon(),
                     )?;
-                    logits = Some(self.linear(
+                    logits = Some(self.output_projection(
                         stage_weight(stage, loaded.tensors(), "output.weight")?,
                         &normalized,
                         usize_from_u32(self.model.inner.config.vocabulary_size())?,
                         hidden,
+                        cancellation,
                     )?);
                     Ok(())
                 }
@@ -605,7 +620,7 @@ impl CpuDecoderSession {
         if streamed {
             self.forward_token_streamed(token, cancellation, &NoPlacementFaults, events)
         } else {
-            self.forward_token(token)
+            self.forward_token_resident(token, cancellation)
         }
     }
 
@@ -883,6 +898,45 @@ impl CpuDecoderSession {
             return tensor_f32_values(&output);
         }
         linear(weight, input, output_dimension, input_dimension)
+    }
+
+    fn output_projection(
+        &self,
+        weight: &Tensor,
+        input: &[f32],
+        output_dimension: usize,
+        input_dimension: usize,
+        cancellation: &dyn PlacementCancellationProbe,
+    ) -> Result<Vec<f32>, EngineError> {
+        #[cfg(feature = "arm64")]
+        if let DecoderCpuBackend::Arm64(backend) = &self.model.inner.backend {
+            if is_qwen2(&self.model.inner.config) {
+                if input.len() != input_dimension {
+                    return Err(EngineError::internal_invariant(
+                        "logit projection input dimension differs",
+                    ));
+                }
+                let input_tensor = Tensor::from_f32_values(
+                    TensorShape::new([input_dimension as u64])?,
+                    input,
+                    &self.scratch_pool,
+                )?;
+                let output = backend.logit_projection_cancellable(
+                    weight,
+                    &input_tensor,
+                    &self.scratch_pool,
+                    &|| cancellation.is_cancelled(),
+                )?;
+                if output.shape().dimensions() != [output_dimension as u64] {
+                    return Err(EngineError::internal_invariant(
+                        "ARM64 logit projection output shape differs",
+                    ));
+                }
+                return tensor_f32_values(&output);
+            }
+        }
+        let _ = cancellation;
+        self.linear(weight, input, output_dimension, input_dimension)
     }
 
     #[cfg_attr(
@@ -1371,6 +1425,12 @@ fn finite(value: f32) -> Result<f32, EngineError> {
     }
 }
 
+fn check_decoder_cancelled(
+    cancellation: &dyn PlacementCancellationProbe,
+) -> Result<(), EngineError> {
+    if cancellation.is_cancelled() { Err(EngineError::cancellation(None)) } else { Ok(()) }
+}
+
 fn f32_from_f64(value: f64) -> Result<f32, EngineError> {
     if !value.is_finite() || value > f64::from(f32::MAX) || value < f64::from(f32::MIN) {
         return Err(EngineError::backend_failure("CPU decoder accumulator is outside f32 range"));
@@ -1541,6 +1601,21 @@ mod tests {
         AttentionPositionSemantics, CacheRetentionPolicy, ReusableKvCacheLimits,
     };
     use personalai_engine_types::{ArchitectureId, ContextLimit, ModelPackageHash, Sha256Digest};
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    struct CancelAtPoll {
+        polls: AtomicUsize,
+        cancel_at: usize,
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    impl PlacementCancellationProbe for CancelAtPoll {
+        fn is_cancelled(&self) -> bool {
+            self.polls.fetch_add(1, Ordering::AcqRel) >= self.cancel_at
+        }
+    }
 
     fn reusable_binding(model: &CpuDecoderModel) -> CacheBinding {
         let model_id = ModelId::new("unregistered-test-model").unwrap();
@@ -1950,6 +2025,53 @@ mod tests {
             .expect("ARM64 preparation must not inherit the scalar oracle ceiling");
         validate_selected_backend_step_compute(&config, &arm64, config.context_limit().get() - 1)
             .expect("last admitted position must retain checked operation arithmetic");
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_arm64_final_projection_matches_scalar_and_cancellation_never_commits() {
+        let scalar_pool = MemoryPool::new(2 << 20).expect("scalar pool must validate");
+        let arm64_pool = MemoryPool::new(2 << 20).expect("ARM64 pool must validate");
+        let config = qwen2_config();
+        let scalar = CpuDecoderModel::new_registered(
+            ModelId::new("qwen-scalar-fixture").unwrap(),
+            config.clone(),
+            qwen2_weights(&scalar_pool, true),
+            &scalar_pool,
+        )
+        .expect("small Qwen scalar oracle must construct");
+        let arm64 = CpuDecoderModel::new_registered_arm64(
+            ModelId::new("qwen-arm64-fixture").unwrap(),
+            config,
+            qwen2_weights(&arm64_pool, true),
+            &arm64_pool,
+            Arm64Backend::new().expect("ARM64 backend must construct"),
+        )
+        .expect("small Qwen ARM64 model must construct");
+        let budget = ResourceBudget::new(2 << 20, 1 << 18, 1).unwrap();
+        let mut scalar_session = scalar
+            .start_session(&budget, RequestId::new(31).unwrap(), SequenceId::new(31).unwrap())
+            .unwrap();
+        let mut arm64_session = arm64
+            .start_session(&budget, RequestId::new(32).unwrap(), SequenceId::new(32).unwrap())
+            .unwrap();
+        let scalar_logits = scalar_session.forward_token(1).expect("scalar Qwen step must execute");
+        let arm64_logits = arm64_session.forward_token(1).expect("ARM64 Qwen step must execute");
+        assert_tensors_close(&scalar_logits, &arm64_logits, 2.0e-4, 2.0e-4);
+        drop(arm64_session);
+
+        let mut cancelled_session = arm64
+            .start_session(&budget, RequestId::new(33).unwrap(), SequenceId::new(33).unwrap())
+            .unwrap();
+        let cancellation = CancelAtPoll { polls: AtomicUsize::new(0), cancel_at: 5 };
+        let mut security_events = Vec::new();
+        let result = cancelled_session
+            .forward_token_selected(1, &cancellation, &mut |event| security_events.push(event));
+        assert!(matches!(result, Err(EngineError::Cancellation(_))));
+        assert!(cancellation.polls.load(Ordering::Acquire) >= 6);
+        assert_eq!(cancelled_session.token_count(), 0);
+        assert!(security_events.is_empty());
+        assert!(matches!(cancelled_session.forward_token(1), Err(EngineError::Cancellation(_))));
     }
 
     #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
