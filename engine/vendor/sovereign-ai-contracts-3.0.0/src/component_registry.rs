@@ -193,6 +193,13 @@ const COMPONENT_CONTRACT_REGISTRY: &[ComponentContractRegistryEntry] = &[
     ),
     entry(
         "1.1.0",
+        "cognitive",
+        "schemas/cognitive/v1/cognitive-1.1.0.schema.json",
+        &["personal_ai_platform"],
+        &["model_foundry", "personal_ai_platform"],
+    ),
+    entry(
+        "1.1.0",
         "common",
         "schemas/common/v1/common-1.1.0.schema.json",
         ALL_COMPONENTS,

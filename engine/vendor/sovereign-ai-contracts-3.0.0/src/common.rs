@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-/// Recursively orders every JSON object by its lexical key representation.
+/// Recursively orders every JSON object by its lexical key representation and
+/// normalizes integral floating-point numbers to the canonical integer form.
 ///
 /// This is the common canonical object-ordering rule shared by the full
 /// document normalizer and the minimal Runtime V3 encoder. Array order remains
@@ -23,7 +24,44 @@ pub(crate) fn sort_json_value(value: Value) -> Value {
             )
         }
         Value::Array(values) => Value::Array(values.into_iter().map(sort_json_value).collect()),
+        Value::Number(number) if number.is_f64() => {
+            let value = number
+                .as_f64()
+                .expect("a serde_json f64 number must remain representable as f64");
+            if value == 0.0 {
+                Value::Number(0.into())
+            } else if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 {
+                let integer = format!("{value:.0}");
+                Value::Number(
+                    integer
+                        .parse()
+                        .expect("a bounded integral f64 must parse as a JSON number"),
+                )
+            } else {
+                Value::Number(number)
+            }
+        }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod canonical_json_tests {
+    use super::sort_json_value;
+    use serde_json::json;
+
+    #[test]
+    fn integral_generation_floats_use_canonical_integer_form() {
+        let sorted = sort_json_value(json!({
+            "top_p": 1.0,
+            "temperature": 0.0,
+            "negative_zero": -0.0,
+            "fractional": 0.25,
+        }));
+        assert_eq!(
+            serde_json::to_string(&sorted).expect("encode canonical JSON"),
+            r#"{"fractional":0.25,"negative_zero":0,"temperature":0,"top_p":1}"#
+        );
     }
 }
 

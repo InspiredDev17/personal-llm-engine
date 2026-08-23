@@ -1386,6 +1386,22 @@ mod tests {
             encode_inference_execution_request_v3,
         );
         assert_canonical_fixture(
+            "inference-v3-execution-request-integral-generation.json",
+            include_bytes!(
+                "../../fixtures/v1/valid/inference-v3-execution-request-integral-generation.json"
+            ),
+            decode_inference_execution_request_v3,
+            encode_inference_execution_request_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-execution-request-negative-zero-generation.json",
+            include_bytes!(
+                "../../fixtures/v1/valid/inference-v3-execution-request-negative-zero-generation.json"
+            ),
+            decode_inference_execution_request_v3,
+            encode_inference_execution_request_v3,
+        );
+        assert_canonical_fixture(
             "inference-v3-execution-result.json",
             include_bytes!("../../fixtures/v1/valid/inference-v3-execution-result.json"),
             decode_inference_execution_result_v3,

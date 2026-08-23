@@ -11,7 +11,7 @@ Sovereign-AI-Contracts commit
 `2eaa6c23e6334df9b1309dcb28a0a8d15ebb5356` first defined the canonical CAG cache
 lifecycle at version 1.1.0 and exact static-prefix acquisition at version
 1.2.0. The engine's current Contracts pin is
-`346b04f5899facce34fe89ea3292d139bcb7de05`, whose narrow `models-v2`
+`af62132e46fc641e7dd74eb3e21eabb6d40947c7`, whose narrow `models-v2`
 feature and required `runtime-v3` dependency intentionally exclude Knowledge lifecycle
 and control-plane modules. The engine already used authenticated fixed binary
 service kinds 27 through 33. Enabling the Contracts Rust `full` feature would

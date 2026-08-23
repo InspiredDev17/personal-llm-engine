@@ -4,9 +4,9 @@ offline = true
 [source.crates-io]
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=346b04f5899facce34fe89ea3292d139bcb7de05"]
+[source."git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=af62132e46fc641e7dd74eb3e21eabb6d40947c7"]
 git = "https://github.com/InspiredDev17/Sovereign-AI-Contracts.git"
-rev = "346b04f5899facce34fe89ea3292d139bcb7de05"
+rev = "af62132e46fc641e7dd74eb3e21eabb6d40947c7"
 replace-with = "vendored-sources"
 
 [source.vendored-sources]

@@ -27,7 +27,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Exact Contracts source for Models 2.0 and runtime-v3 identity.
-pub const MODELS_V2_CONTRACT_COMMIT: &str = "346b04f5899facce34fe89ea3292d139bcb7de05";
+pub const MODELS_V2_CONTRACT_COMMIT: &str = "af62132e46fc641e7dd74eb3e21eabb6d40947c7";
 /// Maximum exact canonical descriptor bytes.
 pub const MAX_MODELS_V2_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 /// Exact canonical package profile identifier.

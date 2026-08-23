@@ -3,7 +3,7 @@
 - Status: Accepted; authenticated development execution implemented, production execution and recovery pending
 - Date: 2026-08-14
 - Contract: Sovereign-AI-Contracts `inference/runtime v3.0.0`
-- Current consumer pin: `346b04f5899facce34fe89ea3292d139bcb7de05`
+- Current consumer pin: `af62132e46fc641e7dd74eb3e21eabb6d40947c7`
 
 ## Context
 

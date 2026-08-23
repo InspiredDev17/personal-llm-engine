@@ -217,6 +217,20 @@ pub fn public_type_registry() -> Vec<PublicTypeRegistryEntry> {
         ),
     ]);
     registry.extend(vec![
+        entry_version::<crate::cognitive_taxonomy::CognitiveCapabilityId>(
+            crate::cognitive_taxonomy::COGNITIVE_CAPABILITY_TAXONOMY_CONTRACT_VERSION,
+            "cognitive",
+            "CognitiveCapabilityId",
+            "cognitive/v1/cognitive-1.1.0.schema.json",
+            "CognitiveCapabilityID",
+        ),
+        entry_version::<crate::cognitive_taxonomy::CognitiveCapabilityTaxonomy>(
+            crate::cognitive_taxonomy::COGNITIVE_CAPABILITY_TAXONOMY_CONTRACT_VERSION,
+            "cognitive",
+            "CognitiveCapabilityTaxonomy",
+            "cognitive/v1/cognitive-1.1.0.schema.json",
+            "CognitiveCapabilityTaxonomy",
+        ),
         entry_version::<crate::cognitive::CapabilityRequirement>(
             "1.0.0",
             "cognitive",

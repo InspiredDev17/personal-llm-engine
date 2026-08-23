@@ -7,6 +7,8 @@
 pub mod audit;
 #[cfg(feature = "full")]
 pub mod cognitive;
+#[cfg(feature = "full")]
+pub mod cognitive_taxonomy;
 #[cfg(feature = "runtime-v3")]
 pub mod common;
 #[cfg(feature = "full")]

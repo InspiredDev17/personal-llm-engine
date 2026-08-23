@@ -5,6 +5,7 @@
 
 use crate::audit::AuditEvent;
 use crate::cognitive::{CognitiveExecutionRequest, CognitiveExecutionResult, CognitivePlan};
+use crate::cognitive_taxonomy::CognitiveCapabilityTaxonomy;
 use crate::inference::{CancellationRequest, EngineHealth, GenerationEvent, InferenceRequest};
 use crate::inference_runtime_v2::{
     InferenceExecutionRequest, InferenceExecutionResult, InferenceReservationDecision,
@@ -299,6 +300,11 @@ const DOCUMENT_REGISTRY: &[DocumentRegistryEntry] = &[
     },
     DocumentRegistryEntry {
         contract_version: "1.1.0",
+        kind: "cognitive.capability_taxonomy",
+        schema: "cognitive/v1/cognitive-1.1.0.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "1.1.0",
         kind: "contract.version_offer",
         schema: "common/v1/common-1.1.0.schema.json",
     },
@@ -573,6 +579,9 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
         return normalize_knowledge_v1(kind, value);
     }
     match (contract_version, kind) {
+        ("1.1.0", "cognitive.capability_taxonomy") => {
+            normalize::<CognitiveCapabilityTaxonomy>(value)
+        }
         ("1.0.0", "cognitive.plan") => normalize::<CognitivePlan>(value),
         ("1.0.0", "cognitive.execution_request") => normalize::<CognitiveExecutionRequest>(value),
         ("1.0.0", "cognitive.execution_result") => normalize::<CognitiveExecutionResult>(value),

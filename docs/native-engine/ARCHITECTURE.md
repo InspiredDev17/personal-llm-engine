@@ -49,7 +49,7 @@ call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no thi
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
-commit `346b04f5899facce34fe89ea3292d139bcb7de05`. It does not define or parse a
+commit `af62132e46fc641e7dd74eb3e21eabb6d40947c7`. It does not define or parse a
 second wire format. A strict bounded adapter consumes only canonical v3
 documents decoded by the pinned Contracts implementation, maps them into the
 engine state machine, revalidates engine-owned identity before reservation and

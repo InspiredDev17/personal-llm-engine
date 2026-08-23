@@ -1032,6 +1032,17 @@ mod tests {
     }
 
     #[test]
+    fn integral_generation_parameters_use_canonical_contract_bytes() {
+        let reservation = reservation();
+        let execution = execution(&reservation);
+        let encoded = encode_inference_execution_request_v3(&execution).expect("encode execution");
+        let text = std::str::from_utf8(&encoded).expect("canonical Runtime V3 JSON is UTF-8");
+        assert!(text.contains(r#""temperature":0,"top_p":1"#));
+        assert!(!text.contains(r#""temperature":0.0"#));
+        assert!(!text.contains(r#""top_p":1.0"#));
+    }
+
+    #[test]
     fn exact_reservation_replay_and_single_execution_are_enforced() {
         let (adapter, authority) = adapter();
         let reservation = reservation();
