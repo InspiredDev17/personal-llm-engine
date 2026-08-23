@@ -1,7 +1,8 @@
 //! Production-only admission for signed directory-backed `.paimodel` packages.
 
 use crate::{
-    ModelRegistry, RegisteredModel, RegistrationMode, qwen_registry_v3::descriptor_member,
+    ModelRegistry, RegisteredModel, RegistrationMode,
+    qwen_registry_v3::{descriptor_member, sha384_hex},
     read_only_map::ReadOnlyFileMap,
 };
 use personalai_engine_crypto::{
@@ -598,7 +599,7 @@ fn inspect_readiness_metadata_inner(
     let provenance_entry = required_entry(&catalog, "provenance.json")?;
     ensure_entry_budget(total_bytes, provenance_entry.byte_length(), budget)?;
     let provenance = read_catalog_file(registration.package_path(), provenance_entry)?;
-    validate_provenance(&provenance)?;
+    validate_provenance(&provenance, &registration)?;
     let provenance_hash = hash_package(&provenance);
     validate_models_v2_member(&registration, "provenance", provenance_hash, provenance.len())?;
     if let Some(binding) = registration.registry_binding() {
@@ -801,7 +802,7 @@ fn load_inner(
     let provenance_entry = required_entry(&catalog, "provenance.json")?;
     ensure_entry_budget(total_bytes, provenance_entry.byte_length(), budget)?;
     let provenance = read_catalog_file(registration.package_path(), provenance_entry)?;
-    validate_provenance(&provenance)?;
+    validate_provenance(&provenance, &registration)?;
     validate_models_v2_member(
         &registration,
         "provenance",
@@ -1114,12 +1115,21 @@ fn validate_models_v2_member(
     let member = descriptor_member(binding.descriptor(), member_id)?;
     let observed_bytes = u64::try_from(observed_bytes)
         .map_err(|_| EngineError::resource_exhaustion("package member length exceeds u64"))?;
-    if member.content.digest != observed_hash.to_string() || member.size_bytes != observed_bytes {
+    if !models_v2_digest_matches(&member.content.digest, observed_hash)
+        || member.size_bytes != observed_bytes
+    {
         return Err(EngineError::authentication_failure(
             "PAIDIR01 member differs from the canonical Models 2.0 descriptor",
         ));
     }
     Ok(())
+}
+
+fn models_v2_digest_matches(
+    canonical_digest: &str,
+    observed_hash: personalai_engine_types::ModelPackageHash,
+) -> bool {
+    canonical_digest == sha384_hex(observed_hash)
 }
 
 fn validate_models_v2_manifest(
@@ -1145,7 +1155,10 @@ fn validate_models_v2_manifest(
     if manifest.architecture_id().as_str() != DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
         || descriptor.architecture.architecture_id != manifest.architecture_id().as_str()
         || descriptor.architecture.context_limit != manifest.context_limit().get()
-        || descriptor.tokenizer.content.digest != manifest.tokenizer_hash().to_string()
+        || !models_v2_digest_matches(
+            &descriptor.tokenizer.content.digest,
+            manifest.tokenizer_hash(),
+        )
         || descriptor.tensor_inventory.tensor_count
             != u32::try_from(manifest.tensors().len()).map_err(|_| {
                 EngineError::resource_exhaustion("manifest tensor count exceeds u32")
@@ -1282,7 +1295,10 @@ fn check_cancelled(cancellation: &dyn DirectoryLoadCancellationProbe) -> Result<
     if cancellation.is_cancelled() { Err(EngineError::cancellation(None)) } else { Ok(()) }
 }
 
-fn validate_provenance(bytes: &[u8]) -> Result<(), EngineError> {
+fn validate_provenance(bytes: &[u8], registration: &RegisteredModel) -> Result<(), EngineError> {
+    if registration.mode() == RegistrationMode::ExperimentalQwenRegistryV3 {
+        return validate_models_v2_provenance(bytes);
+    }
     if bytes.is_empty()
         || bytes.len() > usize::try_from(MAX_PROVENANCE_BYTES).unwrap_or(usize::MAX)
         || bytes.first() != Some(&b'{')
@@ -1296,6 +1312,32 @@ fn validate_provenance(bytes: &[u8]) -> Result<(), EngineError> {
         .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
     {
         return Err(corrupt("provenance contains prohibited control data"));
+    }
+    Ok(())
+}
+
+fn validate_models_v2_provenance(bytes: &[u8]) -> Result<(), EngineError> {
+    if bytes.is_empty()
+        || bytes.len() > usize::try_from(MAX_PROVENANCE_BYTES).unwrap_or(usize::MAX)
+        || bytes.first() != Some(&b'{')
+        || bytes.last() != Some(&b'}')
+    {
+        return Err(corrupt("Models 2.0 provenance document is not canonical"));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| corrupt("Models 2.0 provenance is invalid UTF-8"))?;
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(corrupt("Models 2.0 provenance contains prohibited control data"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| corrupt("Models 2.0 provenance is invalid JSON"))?;
+    let canonical = crate::canonical_json::to_vec(value)
+        .map_err(|_| EngineError::internal_invariant("provenance serialization failed"))?;
+    if canonical != bytes {
+        return Err(corrupt("Models 2.0 provenance document is not canonical"));
     }
     Ok(())
 }
@@ -1699,5 +1741,23 @@ mod qwen25_tests {
         assert!(validate_architecture(&context).is_err());
         let theta = qwen25_manifest(None, QWEN25_STANDARD_CONTEXT, 10_000.0);
         assert!(validate_architecture(&theta).is_err());
+    }
+
+    #[test]
+    fn models_v2_digests_are_unprefixed_while_internal_hashes_are_algorithm_tagged() {
+        let observed = hash(0xab);
+        let canonical = "ab".repeat(ModelPackageHash::BYTE_LEN);
+        assert!(models_v2_digest_matches(&canonical, observed));
+        assert_ne!(canonical, observed.to_string());
+        assert!(!models_v2_digest_matches(&"cd".repeat(ModelPackageHash::BYTE_LEN), observed));
+    }
+
+    #[test]
+    fn provenance_requires_recursive_canonical_json_without_a_trailing_newline() {
+        let canonical = br#"{"a":{"c":2,"d":1},"b":[1,2]}"#;
+        validate_models_v2_provenance(canonical).expect("canonical provenance");
+        assert!(validate_models_v2_provenance(br#"{"b":[1,2],"a":{"c":2,"d":1}}"#).is_err());
+        assert!(validate_models_v2_provenance(b"{\"a\":1}\n").is_err());
+        assert!(validate_models_v2_provenance(br#"{"a":1,"a":1}"#).is_err());
     }
 }

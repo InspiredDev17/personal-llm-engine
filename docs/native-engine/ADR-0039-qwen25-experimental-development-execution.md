@@ -8,7 +8,7 @@ unavailable.
 PAIDIR01 v1.1 and `AIPTOK02` require engine 0.2.0, but the frozen Model Foundry
 Registry V2 profile describes only the legacy v1.0 architecture. Mutating V2
 would break its signed meaning. Sovereign AI Contracts commit
-`dd3e18496b669a8aa28f822ca85e0299c16c9b99` supplies the canonical Models 2.0
+`346b04f5899facce34fe89ea3292d139bcb7de05` supplies the canonical Models 2.0
 execution-package descriptor but does not manufacture qualification or owner
 activation.
 

@@ -1,9 +1,31 @@
 use crate::error::{ContractError, Result, Validate};
 use crate::CONTRACT_VERSION;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+
+/// Recursively orders every JSON object by its lexical key representation.
+///
+/// This is the common canonical object-ordering rule shared by the full
+/// document normalizer and the minimal Runtime V3 encoder. Array order remains
+/// semantically significant and is preserved.
+pub(crate) fn sort_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries: Vec<(String, Value)> = object.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_json_value(value)))
+                    .collect::<Map<String, Value>>(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(sort_json_value).collect()),
+        other => other,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ContractVersion;

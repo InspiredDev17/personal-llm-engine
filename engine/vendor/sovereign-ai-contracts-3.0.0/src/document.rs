@@ -765,20 +765,7 @@ where
 }
 
 pub(crate) fn sort_value(value: Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut entries: Vec<(String, Value)> = object.into_iter().collect();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, sort_value(value)))
-                    .collect(),
-            )
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(sort_value).collect()),
-        other => other,
-    }
+    crate::common::sort_json_value(value)
 }
 
 pub(crate) fn parse_strict_value(source: &[u8]) -> Result<Value> {

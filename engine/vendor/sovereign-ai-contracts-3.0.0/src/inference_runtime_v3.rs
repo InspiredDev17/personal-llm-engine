@@ -36,7 +36,10 @@ fn decode_runtime_v3<T: DeserializeOwned + Validate>(source: &[u8]) -> Result<T>
 
 fn encode_runtime_v3<T: Serialize + Validate>(value: &T) -> Result<Vec<u8>> {
     value.validate()?;
-    Ok(serde_json::to_vec(value)?)
+    let encoded = serde_json::to_value(value)?;
+    Ok(serde_json::to_vec(&crate::common::sort_json_value(
+        encoded,
+    ))?)
 }
 
 macro_rules! runtime_v3_codec {
@@ -1176,12 +1179,34 @@ fn validate_lower_hex_v3(field: &'static str, value: &str, length: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_inference_reservation_request_v3, encode_inference_reservation_request_v3,
+        decode_inference_execution_request_v3, decode_inference_execution_result_v3,
+        decode_inference_reservation_decision_v3, decode_inference_reservation_release_v3,
+        decode_inference_reservation_request_v3, decode_runtime_availability_v3,
+        decode_runtime_cancellation_request_v3, encode_inference_execution_request_v3,
+        encode_inference_execution_result_v3, encode_inference_reservation_decision_v3,
+        encode_inference_reservation_release_v3, encode_inference_reservation_request_v3,
+        encode_runtime_availability_v3, encode_runtime_cancellation_request_v3,
         runtime_v3_timestamp_from_unix_millis, InferenceExecutionRequestV3,
         InferenceExecutionResultV3, InferenceReservationDecisionV3, InferenceReservationReleaseV3,
         InferenceReservationRequestV3, RuntimeAvailabilityV3, RuntimeCancellationRequestV3,
     };
-    use crate::{identity::ModelId, Validate};
+    use crate::{identity::ModelId, Result, Validate};
+
+    fn assert_canonical_fixture<T>(
+        path: &str,
+        source: &[u8],
+        decode: fn(&[u8]) -> Result<T>,
+        encode: fn(&T) -> Result<Vec<u8>>,
+    ) {
+        let value = decode(source).expect("decode shared Runtime V3 fixture");
+        let actual = encode(&value).expect("encode canonical Runtime V3 fixture");
+        let prefix = format!("v1/valid/{path}\t");
+        let expected = include_str!("../../fixtures/canonical.jsonl")
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("canonical fixture entry is missing for {path}"));
+        assert_eq!(actual, expected.as_bytes(), "canonical bytes for {path}");
+    }
 
     #[test]
     fn shared_valid_fixtures_decode() {
@@ -1332,5 +1357,53 @@ mod tests {
             1,
         );
         assert!(decode_inference_reservation_request_v3(duplicated.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn every_runtime_v3_encoder_matches_shared_go_canonical_fixtures() {
+        assert_canonical_fixture(
+            "inference-v3-runtime-availability.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-runtime-availability.json"),
+            decode_runtime_availability_v3,
+            encode_runtime_availability_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-reservation-request.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-reservation-request.json"),
+            decode_inference_reservation_request_v3,
+            encode_inference_reservation_request_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-reservation-decision.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-reservation-decision.json"),
+            decode_inference_reservation_decision_v3,
+            encode_inference_reservation_decision_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-execution-request.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-execution-request.json"),
+            decode_inference_execution_request_v3,
+            encode_inference_execution_request_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-execution-result.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-execution-result.json"),
+            decode_inference_execution_result_v3,
+            encode_inference_execution_result_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-reservation-release.json",
+            include_bytes!("../../fixtures/v1/valid/inference-v3-reservation-release.json"),
+            decode_inference_reservation_release_v3,
+            encode_inference_reservation_release_v3,
+        );
+        assert_canonical_fixture(
+            "inference-v3-runtime-cancellation-request.json",
+            include_bytes!(
+                "../../fixtures/v1/valid/inference-v3-runtime-cancellation-request.json"
+            ),
+            decode_runtime_cancellation_request_v3,
+            encode_runtime_cancellation_request_v3,
+        );
     }
 }

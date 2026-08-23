@@ -85,7 +85,7 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
             if name == "sovereign-ai-contracts" {
                 assert_eq!(
                     source,
-                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=dd3e18496b669a8aa28f822ca85e0299c16c9b99#dd3e18496b669a8aa28f822ca85e0299c16c9b99",
+                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=346b04f5899facce34fe89ea3292d139bcb7de05#346b04f5899facce34fe89ea3292d139bcb7de05",
                     "canonical runtime/models contract dependency must use its exact reviewed commit"
                 );
                 assert!(
@@ -111,7 +111,7 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
         fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
     assert!(
         workspace_manifest.contains(
-            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"dd3e18496b669a8aa28f822ca85e0299c16c9b99\", default-features = false, features = [\"models-v2\"] }"
+            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"346b04f5899facce34fe89ea3292d139bcb7de05\", default-features = false, features = [\"models-v2\"] }"
         ),
         "canonical contracts must remain exact-commit pinned with only models-v2 and its runtime-v3 dependency enabled"
     );
@@ -834,7 +834,7 @@ fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
             );
         } else {
             assert!(
-                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@dd3e18496b669a8aa28f822ca85e0299c16c9b99"),
+                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@346b04f5899facce34fe89ea3292d139bcb7de05"),
                 "SPDX document omits the exact canonical contract commit"
             );
         }
@@ -1462,7 +1462,7 @@ fn locked_external_packages(lock: &str) -> BTreeSet<String> {
                 lock_value(package, "checksum").is_some()
                     || (name == "sovereign-ai-contracts"
                         && source
-                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=dd3e18496b669a8aa28f822ca85e0299c16c9b99#dd3e18496b669a8aa28f822ca85e0299c16c9b99"),
+                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=346b04f5899facce34fe89ea3292d139bcb7de05#346b04f5899facce34fe89ea3292d139bcb7de05"),
                 "external dependency must have a locked checksum or exact reviewed commit: {name}"
             );
             format!("{name}@{version}")

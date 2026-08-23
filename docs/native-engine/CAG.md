@@ -99,7 +99,7 @@ positive canonical decimal frames with at most ten length digits, its stricter r
 and the ordered-prefix digest before tokenization.
 
 The engine pins Contracts commit
-`dd3e18496b669a8aa28f822ca85e0299c16c9b99` and intentionally compiles only its narrow
+`346b04f5899facce34fe89ea3292d139bcb7de05` and intentionally compiles only its narrow
 `models-v2` feature and required `runtime-v3` dependency. That feature boundary excludes Knowledge
 lifecycle and control-plane modules by design. CAG therefore remains a reviewed internal binary
 projection of the Knowledge 1.1/1.2 execution facts rather than a second canonical JSON consumer.

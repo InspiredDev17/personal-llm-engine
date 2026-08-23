@@ -5,6 +5,7 @@
 //! decision. Registry-backed paths are derived only after strict verification;
 //! request data never supplies paths, hashes, or trust identities.
 
+mod canonical_json;
 #[cfg(unix)]
 mod directory_loader;
 mod qwen_registry_v3;

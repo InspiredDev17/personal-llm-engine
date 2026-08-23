@@ -42,7 +42,7 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 `zeroize 1.8.2`, `libc 0.2.189`, `unicode-normalization 0.1.24`,
 `unicode-general-category 1.1.0`, and Sovereign AI Contracts commit
-`dd3e18496b669a8aa28f822ca85e0299c16c9b99`, all with unnecessary default
+`346b04f5899facce34fe89ea3292d139bcb7de05`, all with unnecessary default
 features disabled. The Contracts dependency enables only the narrow
 `models-v2` consumer profile and its runtime-v3 dependency; cognitive, tool, memory, security, and other
 control-plane authority modules are excluded from the compiled engine graph.

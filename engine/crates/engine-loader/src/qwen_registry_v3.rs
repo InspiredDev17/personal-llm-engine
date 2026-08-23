@@ -4,6 +4,7 @@
 //! identity comes from Sovereign Models 2.0, while package bytes remain
 //! authenticated by the independent PAIDIR01 catalog signature.
 
+use crate::canonical_json;
 use personalai_engine_crypto::{
     TrustedSigner, hash_package, hash_signed_content, verify_model_foundry_qwen_registry_signature,
 };
@@ -26,7 +27,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Exact Contracts source for Models 2.0 and runtime-v3 identity.
-pub const MODELS_V2_CONTRACT_COMMIT: &str = "dd3e18496b669a8aa28f822ca85e0299c16c9b99";
+pub const MODELS_V2_CONTRACT_COMMIT: &str = "346b04f5899facce34fe89ea3292d139bcb7de05";
 /// Maximum exact canonical descriptor bytes.
 pub const MAX_MODELS_V2_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 /// Exact canonical package profile identifier.
@@ -293,7 +294,10 @@ fn decode_qwen_models_v2_descriptor(
     descriptor.validate().map_err(|_| {
         EngineError::corrupt_model_package("Models 2.0 descriptor validation failed")
     })?;
-    let canonical = serde_json::to_vec(&descriptor).map_err(|_| {
+    let value = serde_json::to_value(&descriptor).map_err(|_| {
+        EngineError::internal_invariant("Models 2.0 descriptor serialization failed")
+    })?;
+    let canonical = canonical_json::to_vec(value).map_err(|_| {
         EngineError::internal_invariant("Models 2.0 descriptor serialization failed")
     })?;
     if canonical != bytes {
@@ -365,7 +369,7 @@ fn validate_qwen_models_v2_profile(
     Ok(())
 }
 
-fn sha384_hex(digest: ModelPackageHash) -> String {
+pub(crate) fn sha384_hex(digest: ModelPackageHash) -> String {
     lowercase_hex(digest.as_bytes())
 }
 
@@ -632,7 +636,7 @@ mod tests {
 
     #[test]
     fn signed_registry_and_canonical_descriptor_bind_exact_package() {
-        let descriptor = serde_json::to_vec(&descriptor()).unwrap();
+        let descriptor = canonical_descriptor(&descriptor());
         let descriptor_hash = hash_package(&descriptor);
         let (registry_key, registry_trust) = trusted(7, 0x71);
         let (_, package_trust) = trusted(8, 0x72);
@@ -657,7 +661,7 @@ mod tests {
     #[test]
     fn descriptor_or_runtime_substitution_fails_closed() {
         let original = descriptor();
-        let descriptor = serde_json::to_vec(&original).unwrap();
+        let descriptor = canonical_descriptor(&original);
         let descriptor_hash = hash_package(&descriptor);
         let (registry_key, registry_trust) = trusted(9, 0x73);
         let (_, package_trust) = trusted(10, 0x74);
@@ -672,12 +676,8 @@ mod tests {
         let mut changed = original;
         changed.runtime_identity.backend_instance_id = "backend.arm64.other.dev1".to_owned();
         assert!(
-            verify_qwen_registry_selection_v3(
-                &bytes,
-                &serde_json::to_vec(&changed).unwrap(),
-                &selection,
-            )
-            .is_err()
+            verify_qwen_registry_selection_v3(&bytes, &canonical_descriptor(&changed), &selection,)
+                .is_err()
         );
         assert!(
             verify_qwen_registry_selection_v3(
@@ -687,5 +687,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn descriptor_requires_recursively_sorted_canonical_json() {
+        let descriptor = descriptor();
+        let canonical = canonical_descriptor(&descriptor);
+        let struct_order = serde_json::to_vec(&descriptor).expect("encode descriptor");
+
+        assert_ne!(struct_order, canonical);
+        decode_qwen_models_v2_descriptor(&canonical).expect("canonical descriptor validates");
+        assert!(decode_qwen_models_v2_descriptor(&struct_order).is_err());
+    }
+
+    fn canonical_descriptor(descriptor: &ExecutionPackageDescriptor) -> Vec<u8> {
+        let value = serde_json::to_value(descriptor).expect("serialize descriptor");
+        canonical_json::to_vec(value).expect("encode canonical descriptor")
     }
 }
