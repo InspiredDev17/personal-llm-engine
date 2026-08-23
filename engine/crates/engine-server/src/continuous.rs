@@ -13,7 +13,7 @@ use super::{
     record_runtime_error_parts, retain_security_event, service_response_frame,
     terminal_connection_result, watch_generation_cancellation, write_queued_events,
 };
-use crate::transport::InboundWatchEvent;
+use crate::transport::{InboundWatchEvent, TryAcceptOutcome};
 use personalai_engine_protocol::{RuntimeV3Document, ServiceRequestBody, ServiceResponseBody};
 use personalai_engine_types::SignerKeyId;
 use personalai_engine_types::{ResourceBudget, SecurityEvent};
@@ -314,17 +314,22 @@ impl ContinuousState<'_> {
     fn accept_ready(&mut self, listener: &UnixFrameListener) -> Result<bool, EngineError> {
         let mut accepted = false;
         while self.owned_connections() < self.maximum_connections {
-            let connection = match listener.try_accept() {
-                Ok(Some(connection)) => connection,
-                Ok(None) => break,
-                Err(EngineError::AuthenticationFailure(_)) => {
+            let connection = match listener.try_accept_isolated()? {
+                TryAcceptOutcome::Accepted(connection) => connection,
+                TryAcceptOutcome::Pending => break,
+                TryAcceptOutcome::Rejected(EngineError::AuthenticationFailure(_)) => {
                     accepted = true;
                     increment(&mut self.summary.accepted_connections, "accepted connection count")?;
                     increment(&mut self.summary.failed_connections, "failed connection count")?;
                     self.record_peer_authentication_failure()?;
                     continue;
                 }
-                Err(error) => return Err(error),
+                TryAcceptOutcome::Rejected(_error) => {
+                    accepted = true;
+                    increment(&mut self.summary.accepted_connections, "accepted connection count")?;
+                    increment(&mut self.summary.failed_connections, "failed connection count")?;
+                    continue;
+                }
             };
             accepted = true;
             increment(&mut self.summary.accepted_connections, "accepted connection count")?;

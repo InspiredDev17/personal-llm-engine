@@ -75,6 +75,18 @@ pub struct UnixFrameListener {
     policy: UnixSocketPolicy,
 }
 
+/// One nonblocking listener admission outcome. A stream that was accepted but
+/// disconnected before same-user verification or finite timeout setup is a
+/// connection-local rejection, not a listener failure.
+pub(crate) enum TryAcceptOutcome {
+    /// No connection is currently ready.
+    Pending,
+    /// One fully configured same-user connection is ready.
+    Accepted(UnixFrameConnection),
+    /// One accepted stream failed its connection-local setup.
+    Rejected(EngineError),
+}
+
 impl UnixFrameListener {
     /// Binds the configured socket only inside an existing owner-private runtime directory.
     pub fn bind(config: &ServiceConfig) -> Result<Self, EngineError> {
@@ -147,15 +159,30 @@ impl UnixFrameListener {
     ///
     /// The listener must have been placed in nonblocking mode by its owner.
     pub fn try_accept(&self) -> Result<Option<UnixFrameConnection>, EngineError> {
-        match self.listener.accept() {
-            Ok((stream, _address)) => {
-                self.verify_peer(&stream)?;
-                configure_stream(&stream, self.policy)?;
-                Ok(Some(UnixFrameConnection { stream }))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(_) => Err(EngineError::backend_failure("Unix socket accept failed")),
+        match self.try_accept_isolated()? {
+            TryAcceptOutcome::Pending => Ok(None),
+            TryAcceptOutcome::Accepted(connection) => Ok(Some(connection)),
+            TryAcceptOutcome::Rejected(error) => Err(error),
         }
+    }
+
+    /// Accepts one ready local connection while distinguishing a rejected
+    /// accepted stream from failure of the listener itself.
+    pub(crate) fn try_accept_isolated(&self) -> Result<TryAcceptOutcome, EngineError> {
+        let (stream, _address) = match self.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(TryAcceptOutcome::Pending);
+            }
+            Err(_) => return Err(EngineError::backend_failure("Unix socket accept failed")),
+        };
+        if let Err(error) = self.verify_peer(&stream) {
+            return Ok(TryAcceptOutcome::Rejected(error));
+        }
+        if let Err(error) = configure_stream(&stream, self.policy) {
+            return Ok(TryAcceptOutcome::Rejected(error));
+        }
+        Ok(TryAcceptOutcome::Accepted(UnixFrameConnection { stream }))
     }
 
     /// Returns the exact bound socket path.
@@ -432,6 +459,38 @@ mod tests {
         });
         assert!(matches!(listener.accept_once(), Err(EngineError::AuthenticationFailure(_))));
         client.join().expect("client must finish");
+        drop(listener);
+        assert!(!socket.exists());
+        fs::remove_dir(&directory).expect("temporary directory must remove");
+    }
+
+    #[test]
+    fn isolated_accept_keeps_connection_rejection_separate_from_listener_failure() {
+        let directory = temporary_directory();
+        fs::create_dir(&directory).expect("temporary runtime directory must create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions must set");
+        let socket = directory.join("engine.sock");
+        let config = ServiceConfig::new("/models", &directory, &socket)
+            .expect("temporary config must validate");
+        let mut listener = UnixFrameListener::bind(&config).expect("socket must bind");
+        listener.set_nonblocking(true).expect("listener must become nonblocking");
+        listener.reject_current_peer_for_test();
+
+        let rejected_client = UnixStream::connect(&socket).expect("rejected client must connect");
+        assert!(matches!(
+            listener.try_accept_isolated().expect("listener must remain healthy"),
+            TryAcceptOutcome::Rejected(EngineError::AuthenticationFailure(_))
+        ));
+        drop(rejected_client);
+
+        listener.allowed_peer_user_id = peer_credential::effective_user_id();
+        let accepted_client = UnixStream::connect(&socket).expect("accepted client must connect");
+        assert!(matches!(
+            listener.try_accept_isolated().expect("listener must remain reusable"),
+            TryAcceptOutcome::Accepted(_)
+        ));
+        drop(accepted_client);
         drop(listener);
         assert!(!socket.exists());
         fs::remove_dir(&directory).expect("temporary directory must remove");
