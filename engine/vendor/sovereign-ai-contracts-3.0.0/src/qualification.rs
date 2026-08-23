@@ -879,7 +879,25 @@ impl Validate for QualificationSignatureEnvelope {
         {
             return Err(field("must be canonical Ed25519 base64", "signature"));
         }
+        // Ed25519 signatures contain 64 bytes. Their final one-byte base64
+        // quantum has four unused low bits in the second data character; a
+        // canonical RFC 4648 encoding requires those bits to be zero.
+        let final_value = base64_value(self.signature.as_bytes()[85])?;
+        if final_value & 0x0f != 0 {
+            return Err(field("must be canonical Ed25519 base64", "signature"));
+        }
         Ok(())
+    }
+}
+
+fn base64_value(value: u8) -> Result<u8> {
+    match value {
+        b'A'..=b'Z' => Ok(value - b'A'),
+        b'a'..=b'z' => Ok(value - b'a' + 26),
+        b'0'..=b'9' => Ok(value - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(field("must be canonical Ed25519 base64", "signature")),
     }
 }
 
@@ -1010,5 +1028,13 @@ mod tests {
         let mut manifest = fixture();
         manifest.payload.anti_rollback_metadata.sequence = 2;
         assert!(manifest.payload.validate().is_err());
+    }
+
+    #[test]
+    fn signature_envelope_rejects_noncanonical_base64_pad_bits() {
+        let mut signature = fixture().signature_envelope;
+        assert_eq!(signature.signature.len(), 88);
+        signature.signature.replace_range(85..86, "B");
+        assert!(signature.validate().is_err());
     }
 }

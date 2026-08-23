@@ -7,6 +7,7 @@
 
 #[cfg(unix)]
 mod directory_loader;
+mod qwen_registry_v3;
 #[cfg(unix)]
 mod read_only_map;
 mod registry_v2;
@@ -15,6 +16,17 @@ mod registry_v2;
 pub use directory_loader::{
     DIRECTORY_LOADER_ENGINE_VERSION, DirectoryLoadCancellationProbe, DirectorySecurityEventSink,
     LoadedDirectoryTensors, VerifiedDirectoryPackage, VerifiedDirectoryReadinessMetadata,
+};
+#[cfg(unix)]
+use qwen_registry_v3::read_verified_qwen_registry_selection_v3;
+pub use qwen_registry_v3::{
+    MAX_MODELS_V2_DESCRIPTOR_BYTES, MODELS_V2_CONTRACT_COMMIT, QWEN_MODELS_V2_ARCHITECTURE_ID,
+    QWEN_MODELS_V2_MODEL_VOCABULARY, QWEN_MODELS_V2_PACKAGE_FORMAT_ID,
+    QWEN_MODELS_V2_PACKAGE_FORMAT_VERSION, QWEN_MODELS_V2_POSITION_SEMANTICS_ID,
+    QWEN_MODELS_V2_QUANTIZATION_PROFILE_ID, QWEN_MODELS_V2_SELECTABLE_TOKENS,
+    QWEN_MODELS_V2_TOKENIZER_FORMAT_ID, QWEN_MODELS_V2_TOKENIZER_FORMAT_VERSION,
+    QWEN_MODELS_V2_TOKENIZER_ID, QwenRegistrySelectionV3, VerifiedQwenRegistrySelectionV3,
+    verify_qwen_registry_selection_v3,
 };
 #[cfg(unix)]
 use registry_v2::read_verified_registry_selection_v2;
@@ -34,6 +46,8 @@ use personalai_engine_tensor::Tensor;
 #[cfg(test)]
 use personalai_engine_types::MAX_MODEL_PACKAGE_BYTES;
 use personalai_engine_types::{EngineError, ModelId, ModelPackageHash, ResourceBudget};
+use sovereign_ai_contracts::inference_runtime_v3::RuntimeIdentityV3;
+use sovereign_ai_contracts::models_v2::ExecutionPackageDescriptor;
 use std::collections::BTreeMap;
 #[cfg(all(unix, test))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -53,6 +67,8 @@ pub enum RegistrationMode {
     OwnerPinned,
     /// Exact signed Model Foundry V2 decision selected by owner configuration.
     ModelFoundryRegistryV2,
+    /// Development-only Qwen profile bound to a signed V3 decision and canonical Models 2.0.
+    ExperimentalQwenRegistryV3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +82,20 @@ pub(crate) struct RegistryBindingV2 {
     tensor_shard_hashes: Vec<ModelPackageHash>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwenRegistryBindingV3 {
+    descriptor: ExecutionPackageDescriptor,
+    descriptor_hash: ModelPackageHash,
+    registry_sequence: u64,
+    registry_entry_hash: ModelPackageHash,
+}
+
+impl QwenRegistryBindingV3 {
+    pub(crate) const fn descriptor(&self) -> &ExecutionPackageDescriptor {
+        &self.descriptor
+    }
+}
+
 /// One configuration-owned model package registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredModel {
@@ -75,6 +105,7 @@ pub struct RegisteredModel {
     trusted_signer: TrustedSigner,
     mode: RegistrationMode,
     registry_binding: Option<RegistryBindingV2>,
+    qwen_registry_binding: Option<QwenRegistryBindingV3>,
 }
 
 impl RegisteredModel {
@@ -109,21 +140,48 @@ impl RegisteredModel {
 
     /// Returns the signed lifecycle artifact ID for registry-backed admission.
     pub fn registry_artifact_id(&self) -> Option<&str> {
-        self.registry_binding.as_ref().map(|binding| binding.artifact_id.as_str())
+        self.registry_binding.as_ref().map(|binding| binding.artifact_id.as_str()).or_else(|| {
+            self.qwen_registry_binding
+                .as_ref()
+                .map(|binding| binding.descriptor.runtime_identity.artifact_id.as_str())
+        })
     }
 
     /// Returns the exact selected registry sequence for registry-backed admission.
     pub fn registry_sequence(&self) -> Option<u64> {
-        self.registry_binding.as_ref().map(|binding| binding.registry_sequence)
+        self.registry_binding.as_ref().map(|binding| binding.registry_sequence).or_else(|| {
+            self.qwen_registry_binding.as_ref().map(|binding| binding.registry_sequence)
+        })
     }
 
     /// Returns the exact selected registry-envelope identity.
     pub fn registry_entry_hash(&self) -> Option<ModelPackageHash> {
-        self.registry_binding.as_ref().map(|binding| binding.registry_entry_hash)
+        self.registry_binding.as_ref().map(|binding| binding.registry_entry_hash).or_else(|| {
+            self.qwen_registry_binding.as_ref().map(|binding| binding.registry_entry_hash)
+        })
+    }
+
+    /// Returns the canonical Models 2.0 descriptor for a V3 Qwen registration.
+    pub fn execution_package_descriptor(&self) -> Option<&ExecutionPackageDescriptor> {
+        self.qwen_registry_binding.as_ref().map(|binding| &binding.descriptor)
+    }
+
+    /// Returns exact descriptor SHA-384 for a V3 Qwen registration.
+    pub fn execution_package_descriptor_hash(&self) -> Option<ModelPackageHash> {
+        self.qwen_registry_binding.as_ref().map(|binding| binding.descriptor_hash)
+    }
+
+    /// Returns the canonical runtime identity for a V3 Qwen registration.
+    pub fn execution_runtime_identity(&self) -> Option<&RuntimeIdentityV3> {
+        self.execution_package_descriptor().map(|descriptor| &descriptor.runtime_identity)
     }
 
     pub(crate) const fn registry_binding(&self) -> Option<&RegistryBindingV2> {
         self.registry_binding.as_ref()
+    }
+
+    pub(crate) const fn qwen_registry_binding(&self) -> Option<&QwenRegistryBindingV3> {
+        self.qwen_registry_binding.as_ref()
     }
 }
 
@@ -172,6 +230,7 @@ impl ModelRegistry {
             trusted_signer,
             mode: RegistrationMode::OwnerPinned,
             registry_binding: None,
+            qwen_registry_binding: None,
         };
         self.registrations.insert(key, registration);
         Ok(())
@@ -217,6 +276,54 @@ impl ModelRegistry {
                 tokenizer_hash: entry.tokenizer_hash(),
                 provenance_hash: entry.provenance_hash(),
                 tensor_shard_hashes: entry.tensor_shard_hashes().to_vec(),
+            }),
+            qwen_registry_binding: None,
+        };
+        self.registrations.insert(key, registration);
+        Ok(())
+    }
+
+    /// Verifies and registers one development-only signed Qwen V3 decision.
+    ///
+    /// Registry and descriptor paths are derived from protected local state;
+    /// clients provide neither paths nor package identities. Registration is
+    /// evidence and package trust only. A separate explicit owner execution
+    /// gate remains mandatory and production activation is unavailable.
+    #[cfg(unix)]
+    pub fn register_qwen_registry_v3(
+        &mut self,
+        selection: &QwenRegistrySelectionV3,
+    ) -> Result<(), EngineError> {
+        if self.registrations.len() >= MAX_REGISTERED_MODELS {
+            return Err(EngineError::resource_exhaustion(
+                "local model registry reached its hard entry limit",
+            ));
+        }
+        let verified = read_verified_qwen_registry_selection_v3(&self.model_root, selection)?;
+        let descriptor = verified.descriptor();
+        let model_id = ModelId::new(descriptor.runtime_identity.provider_model_id.as_str())
+            .map_err(|_| {
+                EngineError::corrupt_model_package("Qwen descriptor model ID is invalid")
+            })?;
+        let key = model_id.as_str().to_owned();
+        if self.registrations.contains_key(&key) {
+            return Err(EngineError::invalid_input("model identifier is already registered"));
+        }
+        let artifact_id = descriptor.runtime_identity.artifact_id.as_str();
+        let package_name = format!("{}.{}", model_id.as_str(), MODEL_PACKAGE_EXTENSION);
+        let package_path = self.model_root.join(artifact_id).join(package_name);
+        let registration = RegisteredModel {
+            model_id,
+            package_path,
+            expected_hash: verified.package_catalog_hash(),
+            trusted_signer: verified.package_signer().clone(),
+            mode: RegistrationMode::ExperimentalQwenRegistryV3,
+            registry_binding: None,
+            qwen_registry_binding: Some(QwenRegistryBindingV3 {
+                descriptor: descriptor.clone(),
+                descriptor_hash: verified.descriptor_hash(),
+                registry_sequence: verified.registry_sequence(),
+                registry_entry_hash: verified.registry_entry_hash(),
             }),
         };
         self.registrations.insert(key, registration);

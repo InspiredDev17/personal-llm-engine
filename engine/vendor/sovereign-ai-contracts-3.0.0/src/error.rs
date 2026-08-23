@@ -4,9 +4,19 @@ use std::fmt::{Display, Formatter};
 /// but are not themselves a wire contract.
 #[derive(Debug)]
 pub enum ContractError {
-    InvalidField { field: &'static str, reason: String },
-    InvalidIdentifier { kind: &'static str, reason: String },
+    InvalidField {
+        field: &'static str,
+        reason: String,
+    },
+    InvalidIdentifier {
+        kind: &'static str,
+        reason: String,
+    },
     UnsupportedRequiredExtension(String),
+    /// An unsigned immutable lineage has reached its maximum revision.
+    RevisionTerminal {
+        revision: u64,
+    },
     Json(serde_json::Error),
     Io(std::io::Error),
     Frame(&'static str),
@@ -33,6 +43,9 @@ impl Display for ContractError {
             }
             Self::UnsupportedRequiredExtension(name) => {
                 write!(formatter, "unsupported required extension: {name}")
+            }
+            Self::RevisionTerminal { revision } => {
+                write!(formatter, "contract revision {revision} is terminal")
             }
             Self::Json(error) => Display::fmt(error, formatter),
             Self::Io(error) => Display::fmt(error, formatter),

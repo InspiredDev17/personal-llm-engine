@@ -50,6 +50,18 @@ never a compatibility signal.
 5. The engine copies the sealed prefix into a new sequence and continues prefill/decode at the
    cached token position. The sealed object is held through an immutable lease and is not mutated.
 
+Canonical Runtime-v3 execution uses the same one-shot target request ID. The
+continuous execution coordinator consumes that exact pending attachment before
+the worker starts; a wrong, expired, invalidated, or substituted attachment is a
+terminal failure and never silently becomes uncached generation. Cancellation,
+disconnect, or an unsent worker job terminalizes the reservation and removes
+request-local attachment state. For Qwen2.5 the static prefix remains the exact
+raw Memory Vault token sequence, while only the dynamic ChatML suffix permits
+the two engine-owned delimiter token IDs. Synthetic real-decoder tests compare
+that exact sequence with uncached `raw prefix + identical suffix` execution.
+Actual-package Qwen equivalence remains an opt-in operated gate and is not
+established by synthetic fixtures.
+
 The one-shot staged binding expires after 30 seconds if generation never consumes it. This bounds
 crash/disconnect residue without mutating or evicting the shared sealed cache object.
 
@@ -87,8 +99,8 @@ positive canonical decimal frames with at most ten length digits, its stricter r
 and the ordered-prefix digest before tokenization.
 
 The engine pins Contracts commit
-`2c4a7a6afd5625e7def3afec26f18fedac343d11` and intentionally compiles only its minimal
-`runtime-v3` feature. That feature boundary now builds independently and excludes Knowledge
+`dd3e18496b669a8aa28f822ca85e0299c16c9b99` and intentionally compiles only its narrow
+`models-v2` feature and required `runtime-v3` dependency. That feature boundary excludes Knowledge
 lifecycle and control-plane modules by design. CAG therefore remains a reviewed internal binary
 projection of the Knowledge 1.1/1.2 execution facts rather than a second canonical JSON consumer.
 Activating either experimental contract remains an explicit downstream decision.

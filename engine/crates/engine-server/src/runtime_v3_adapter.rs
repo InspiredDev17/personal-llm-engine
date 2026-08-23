@@ -63,9 +63,30 @@ struct AdapterState {
 pub struct AdmittedRuntimeExecution {
     request: InferenceExecutionRequestV3,
     identity: RuntimeIdentityBinding,
+    budget: RuntimeResourceCeiling,
     request_id: RequestId,
     task_id: TaskAuthorityId,
     reservation_id: ReservationId,
+}
+
+/// Immutable, non-consuming execution identity used to close local service
+/// gates before the reservation state machine is advanced to `Consumed`.
+/// Admission repeats every canonical and live-authority check immediately
+/// before consumption; this value is never execution authority by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeExecutionPreflight {
+    identity: RuntimeIdentityBinding,
+    reservation_id: ReservationId,
+}
+
+impl RuntimeExecutionPreflight {
+    pub(crate) const fn identity(&self) -> &RuntimeIdentityBinding {
+        &self.identity
+    }
+
+    pub(crate) const fn reservation_id(&self) -> &ReservationId {
+        &self.reservation_id
+    }
 }
 
 impl AdmittedRuntimeExecution {
@@ -77,6 +98,11 @@ impl AdmittedRuntimeExecution {
     /// Returns the exact engine-owned target revalidated before consumption.
     pub const fn identity(&self) -> &RuntimeIdentityBinding {
         &self.identity
+    }
+
+    /// Returns the exact accepted provider-neutral execution ceilings.
+    pub const fn resource_ceiling(&self) -> RuntimeResourceCeiling {
+        self.budget
     }
 
     /// Returns the engine request correlation identifier.
@@ -242,6 +268,20 @@ impl RuntimeV3ContractAdapter {
             EngineError::authentication_failure("runtime reservation decision does not exist")
         })?;
         contract_result(request.validate_against(&record.decision))?;
+        let budget = map_budget(record.decision.granted_budget.as_ref().ok_or_else(|| {
+            EngineError::authentication_failure(
+                "runtime execution has no accepted resource authority",
+            )
+        })?)?;
+        let requested_duration = deadline.checked_sub(created).ok_or_else(|| {
+            EngineError::invalid_field("deadline_at", "precedes execution creation")
+        })?;
+        if requested_duration > budget.maximum_execution_millis() {
+            return Err(EngineError::invalid_field(
+                "deadline_at",
+                "exceeds the accepted execution-duration ceiling",
+            ));
+        }
         let mapped_identity = map_identity(&request.identity)?;
         let mapped_request = map_request_id(request.request_id.as_str())?;
         let mapped_task = TaskAuthorityId::new(request.task_id.as_str())?;
@@ -280,10 +320,100 @@ impl RuntimeV3ContractAdapter {
         Ok(AdmittedRuntimeExecution {
             request,
             identity: mapped_identity,
+            budget,
             request_id: mapped_request,
             task_id: mapped_task,
             reservation_id,
         })
+    }
+
+    /// Strictly validates the immutable execution/reservation binding without
+    /// consuming admission. The service uses this only to prove model loading
+    /// and reserve a bounded worker-cancellation slot before calling
+    /// [`Self::admit_execution_document`], which repeats these checks and the
+    /// live engine-owned identity proof at the consumption boundary.
+    pub(crate) fn preflight_execution_document(
+        &self,
+        source: &[u8],
+        now_unix_millis: u64,
+    ) -> Result<RuntimeExecutionPreflight, EngineError> {
+        check_document_bound(source)?;
+        let request = contract_result(decode_inference_execution_request_v3(source))?;
+        let created = contract_result(request.created_unix_millis())?;
+        let deadline = contract_result(request.deadline_unix_millis())?;
+        if now_unix_millis < created || now_unix_millis >= deadline {
+            return Err(EngineError::invalid_field(
+                "deadline_at",
+                "execution is outside its authenticated time window",
+            ));
+        }
+
+        let reservation_id = ReservationId::new(request.reservation_id.clone())?;
+        let state = self.lock_state()?;
+        let record = state.records.get(&reservation_id).ok_or_else(|| {
+            EngineError::authentication_failure("runtime reservation decision does not exist")
+        })?;
+        contract_result(request.validate_against(&record.decision))?;
+        let budget = map_budget(record.decision.granted_budget.as_ref().ok_or_else(|| {
+            EngineError::authentication_failure(
+                "runtime execution has no accepted resource authority",
+            )
+        })?)?;
+        let requested_duration = deadline.checked_sub(created).ok_or_else(|| {
+            EngineError::invalid_field("deadline_at", "precedes execution creation")
+        })?;
+        if requested_duration > budget.maximum_execution_millis() {
+            return Err(EngineError::invalid_field(
+                "deadline_at",
+                "exceeds the accepted execution-duration ceiling",
+            ));
+        }
+        let identity = map_identity(&request.identity)?;
+        let request_id = map_request_id(request.request_id.as_str())?;
+        let task_id = TaskAuthorityId::new(request.task_id.as_str())?;
+        if identity != record.identity
+            || request_id != record.request_id
+            || task_id != record.task_id
+        {
+            return Err(EngineError::authentication_failure(
+                "runtime execution changed reserved identity or correlation",
+            ));
+        }
+        if let Some(existing) = record.execution_request.as_ref() {
+            if existing != &request {
+                return Err(EngineError::authentication_failure(
+                    "runtime execution replay changed immutable request content",
+                ));
+            }
+            return Err(EngineError::resource_exhaustion("runtime execution is already admitted"));
+        }
+        Ok(RuntimeExecutionPreflight { identity, reservation_id })
+    }
+
+    /// Reports whether an admitted execution received its exact correlated
+    /// cancellation. The caller remains responsible for propagating this into
+    /// the request-local backend cancellation probe.
+    pub fn execution_is_cancelled(
+        &self,
+        admitted: &AdmittedRuntimeExecution,
+    ) -> Result<bool, EngineError> {
+        let state = self.lock_state()?;
+        let record = state.records.get(&admitted.reservation_id).ok_or_else(|| {
+            EngineError::authentication_failure("runtime reservation decision does not exist")
+        })?;
+        if record.request_id != admitted.request_id
+            || record.task_id != admitted.task_id
+            || record.identity != admitted.identity
+            || record.execution_request.as_ref() != Some(&admitted.request)
+        {
+            return Err(EngineError::authentication_failure(
+                "runtime cancellation query changed admitted execution authority",
+            ));
+        }
+        Ok(matches!(
+            self.reservations.status(&record.reservation_id)?,
+            Some(ReservationStatus::Cancelled)
+        ))
     }
 
     /// Returns the original terminal response for an exact execution-request
@@ -647,12 +777,10 @@ fn enforce_result_budget(
         ));
     }
 
-    let mut has_memory = false;
     let mut has_wall_time = false;
     for usage in &result.resource_usage {
         match (&usage.resource, &usage.unit) {
             (RuntimeResourceV3::InferenceMemory, RuntimeResourceUnitV3::Bytes) => {
-                has_memory = true;
                 if usage.units > granted.maximum_inference_memory_bytes {
                     return Err(EngineError::resource_exhaustion(
                         "runtime result memory usage exceeds the accepted reservation",
@@ -684,10 +812,8 @@ fn enforce_result_budget(
             }
         }
     }
-    if !has_memory || !has_wall_time {
-        return Err(EngineError::invalid_input(
-            "runtime result must report inference memory and wall time",
-        ));
+    if !has_wall_time {
+        return Err(EngineError::invalid_input("runtime result must report measured wall time"));
     }
     Ok(())
 }
@@ -1035,6 +1161,34 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn terminal_result_does_not_require_an_unmeasured_memory_claim() {
+        let (adapter, authority) = adapter();
+        let reservation = reservation();
+        let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
+        let now = reservation.created_unix_millis().expect("created") + 1;
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
+        let execution = execution(&reservation);
+        let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
+        let admitted = adapter
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
+            .expect("admit");
+        let mut result = successful_result(&execution);
+        result.resource_usage.retain(|usage| usage.resource != RuntimeResourceV3::InferenceMemory);
+        adapter
+            .finalize_execution_result(
+                &admitted,
+                &result,
+                result.completed_unix_millis().expect("completed"),
+                &authority,
+            )
+            .expect("measured wall time is sufficient resource evidence");
     }
 
     #[test]

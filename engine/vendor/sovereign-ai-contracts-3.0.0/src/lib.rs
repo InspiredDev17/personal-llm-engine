@@ -34,6 +34,8 @@ pub mod inference_runtime_v3;
 #[cfg(feature = "full")]
 pub mod knowledge;
 #[cfg(feature = "full")]
+pub mod knowledge_invalidation_feed;
+#[cfg(feature = "full")]
 pub mod knowledge_lifecycle;
 #[cfg(feature = "full")]
 pub mod knowledge_prefix;
@@ -41,6 +43,8 @@ pub mod knowledge_prefix;
 pub mod memory;
 #[cfg(feature = "full")]
 pub mod models;
+#[cfg(feature = "models-v2")]
+pub mod models_v2;
 #[cfg(feature = "full")]
 pub mod negotiation;
 #[cfg(feature = "full")]
@@ -53,6 +57,8 @@ pub mod pairsev1;
 pub mod qualification;
 #[cfg(feature = "full")]
 pub mod qualification_v2;
+#[cfg(feature = "full")]
+pub mod qualification_v2_1;
 #[cfg(feature = "full")]
 pub mod security;
 #[cfg(feature = "full")]

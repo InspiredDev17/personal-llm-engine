@@ -49,7 +49,7 @@ call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no thi
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
-commit `2c4a7a6afd5625e7def3afec26f18fedac343d11`. It does not define or parse a
+commit `dd3e18496b669a8aa28f822ca85e0299c16c9b99`. It does not define or parse a
 second wire format. A strict bounded adapter consumes only canonical v3
 documents decoded by the pinned Contracts implementation, maps them into the
 engine state machine, revalidates engine-owned identity before reservation and
@@ -59,11 +59,15 @@ single consumption, cancellation, release, expiry, terminal identity, and
 resource ceilings. The existing signed, replay-journaled, same-user UDS service
 now carries bounded canonical availability, reservation, cancellation, release,
 and execution documents without assigning them authentication authority.
-Execution is fail-closed unless a backend is explicitly composed; the only
-host-independent implementation in this slice is a compile-time-gated
-deterministic development simulator. Production backend dispatch and durable
-recovery of accepted reservations remain incomplete, so this is not yet an
-operated v3 inference service.
+Execution revalidates the exact selected loaded model/package/backend and runs
+its bounded decoder cursor on a finite continuous-mode worker set. A separate
+authenticated connection can set the request-local cancellation flag while a
+decoder step is active; deadlines are resampled after each step before output is
+retained. The synchronous one-connection driver rejects execution because it
+cannot process a concurrent canonical cancel. A compile-time-gated deterministic
+simulator remains only for fault tests. Durable recovery of accepted
+reservations and operated qualified-package evidence remain incomplete, so this
+is not yet a production v3 inference service.
 
 Model unload has one shared fail-closed gate for both the authenticated service
 and the internal runtime API. It refuses unload while the scheduler owns the
@@ -87,6 +91,17 @@ record set is full, only already-terminal records whose original authority has
 expired are pruned. Active or still-valid replay state is never evicted. This
 retention is in-memory and does not replace the still-required durable accepted-
 reservation recovery gate.
+
+Runtime-v3 execution consumes an exact pending reusable-cache attachment only
+for the canonical request ID mapped to the native 128-bit request ID. A staged
+attachment is single-use. Missing, expired, invalidated, scope-mismatched, or
+model/runtime-mismatched cache state fails terminally; it never becomes an
+implicit uncached execution. For Qwen2.5, cache creation tokenizes the Memory
+Vault prefix bytes exactly and execution tokenizes only the ChatML dynamic
+suffix with the two engine-owned delimiter IDs allowlisted. Synthetic decoder
+tests prove equality against `raw static-prefix tokens + identical dynamic
+suffix`; an actual signed Qwen package run remains operated evidence, not a
+unit-test claim.
 
 ## Engine release trust flow
 
@@ -163,18 +178,16 @@ Qwen rotary layout, explicit RMSNorm epsilon, and tied token-embedding/output
 weights. The Qwen2.5 v1.1 validator recognizes only the reviewed 1.5B bootstrap
 dimensions and either the 32,768-context/1,000,000-theta general/coder profile
 or the 4,096-context/10,000-theta math profile once the profile is activated.
-V1.1 requires engine 0.2.0, while the current runtime remains 0.1.0 and rejects
-it before activation. Tiny scalar configurations provide deterministic math
-evidence, but the exact 1.5B profile's 1,543,712,768-operation initial step
-exceeds the unchanged 100,000,000-operation scalar ceiling and is rejected
-before weights are materialized. The CPU service also applies this Qwen-only
-compute admission immediately after trusted configuration conversion and before
-future tokenizer allocation or tensor materialization; current version and
-tokenizer gates remain earlier, and the legacy load order is unchanged. ARM64
-never invokes its legacy adjacent-pair RoPE kernel for this architecture: it
-uses the exact split-half scalar correctness operation. This is backend
-correctness scaffolding, not an activated or qualified Qwen service. Metal
-ordinary service remains unreachable behind the shared version/tokenizer gates.
+V1.1 is accepted only by engine 0.2.0 after a signed development registry V3
+record, canonical Models 2.0 descriptor, exact owner Runtime-v3 identity and a
+separate startup approval all agree. Registry V2 remains frozen. Tiny scalar
+configurations provide deterministic math evidence, but the exact 1.5B
+profile's 1,543,712,768-operation initial step exceeds the unchanged
+100,000,000-operation scalar ceiling. CPU-reference and Metal therefore remain
+ineligible. The default-off ARM64 path uses the exact split-half scalar
+correctness operation instead of its legacy adjacent-pair RoPE kernel and
+checks cancellation through package verification and tensor materialization.
+This is development execution plumbing, not production backend qualification.
 Model metadata cannot define operations, plugins, paths, executable code, or
 kernels.
 
@@ -190,23 +203,24 @@ does not install it into a package. `engine-tokenizer` recognizes
 and fully validates a separate data-only `AIPTOK02` table profile. A private
 fixed scanner/BPE/decode core exists behind a narrow constructor that requires
 and revalidates the complete tokenizer hash from a verified package. The
-ordinary factory deliberately returns `UnsupportedTokenizer` rather than
-activating Qwen service execution.
-The Model Foundry registry V2 compatibility profile still names manifest v1.0,
-and no signed Qwen package exists here. The
-current service returns the earlier typed future-engine rejection; after an
-eventual runtime revision bump it still reaches the closed tokenizer gate.
+ordinary factory deliberately returns `UnsupportedTokenizer`; only the exact
+Qwen V3 ARM64 path may construct it after package verification. Model Foundry
+registry V2 remains unchanged and legacy-only. Qwen V3 is a separately
+versioned transitional development record whose fixed status authorizes
+development execution only; its production activation field is necessarily
+false.
 The private Unicode-16 adapter is version-checked and bounded, including exact
 General Category families and the finite simple-fold mappings relevant to the
 fixed contraction expression. A feature-gated offline diagnostic now replays
 the complete pinned production token-ID corpus without exposing construction.
-Model Foundry admission, package emission, and a qualified optimized backend
-must still be implemented and qualified before activation.
+Model Foundry must still emit, sign and qualify a real development package and
+V3 record. A qualified optimized backend and independent numeric evidence
+remain mandatory before any production activation design.
 
 The loader also exposes a metadata-only inspection result for the owner-gated
 experimental readiness path. It authenticates the catalog, manifest,
 tokenizer, provenance and exact shard identities but does not hash shard
-contents, materialize tensors or bypass the current engine-version gate.
+contents or materialize tensors.
 `engine-server` may consume that unforgeable metadata only when its explicit
 startup policy is owner-approved; the default remains disabled and no CLI or
 wire-protocol field exists. The server then revalidates the package-bound Qwen
@@ -215,17 +229,16 @@ package, artifact, backend, backend-version, backend-instance and engine-instanc
 identities. The resulting content-free evidence type has no eligible state and
 retains explicit blockers for every uncompleted activation gate.
 
-On AArch64 builds only, a distinct startup-only policy may derive bounded
-ARM64 execution-preparation evidence from the same verified metadata. The
-preparation binds the exact selectable token domain and Runtime-v3 identities,
-checks complete per-sequence KV capacity against memory/KV/concurrency budgets,
-and observes cancellation between stages. Decoder session and per-token compute
-validation are backend-aware: scalar execution retains its fixed correctness
-ceiling, while ARM64 retains checked operation arithmetic without inheriting
-that scalar-only ceiling. The preparation has no executable state, is absent
-from client protocol and CLI surfaces, and does not bypass engine-version,
-ordinary tokenizer, Registry V2, tensor verification, qualification, or owner
-activation gates. Metal is not accepted by this preparation path.
+On AArch64 builds only, a distinct startup-only policy derives bounded ARM64
+execution preparation from the same verified metadata. The preparation binds
+the exact selectable token domain and Runtime-v3 identities, checks complete
+per-sequence KV capacity against memory/KV/concurrency budgets, and observes
+cancellation between stages. The experimental load composes that preparation
+only after the exact V3/Models 2.0 identity and the owner CLI's literal
+`owner-approved` decision agree. It then constructs the package-bound tokenizer
+and cooperatively verifies/materializes tensors. Client messages cannot enable
+the path, another model/backend cannot be substituted, and production
+activation remains unavailable. Metal is not accepted.
 
 Directory admission and tensor materialization now also expose loader-owned
 cooperative-cancellation APIs. They preserve the same registered-ID, signature,
@@ -234,7 +247,8 @@ load. SHA-384 verification and immutable snapshot copying poll at bounded 1 MiB
 chunks; BF16/F16 conversion polls while writing directly into its accounted F32
 destination, and AIPQ conversion polls per fixed block. Cancellation releases
 partial reservations and is not mislabeled as package corruption. These APIs
-do not make the v1.1 Qwen package executable under engine 0.1.0.
+make no package executable by themselves; the full development-only trust chain
+remains mandatory.
 
 ## Trusted execution placement
 

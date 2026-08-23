@@ -8,6 +8,7 @@
 mod directory;
 mod hash_catalog;
 mod registry;
+mod registry_v3;
 
 pub use directory::{
     AIPQ_BLOCK_VALUES, AIPQ_REQUIRED_ALIGNMENT, AIPQ_TENSOR_HEADER_BYTES, AIPQ4_BLOCK_BYTES,
@@ -26,6 +27,11 @@ pub use registry::{
     DIRECTORY_ENGINE_COMPATIBILITY, MODEL_REGISTRY_MAX_BYTES,
     MODEL_REGISTRY_MINIMUM_ENGINE_VERSION, MODEL_REGISTRY_SCHEMA_V2, ModelRegistryEntryV2,
     SignedModelRegistryEntryV2,
+};
+pub use registry_v3::{
+    QWEN_REGISTRY_DEVELOPMENT_STATUS, QWEN_REGISTRY_ENGINE_COMPATIBILITY,
+    QWEN_REGISTRY_MINIMUM_ENGINE_VERSION, QWEN_REGISTRY_SCHEMA_V3, QWEN_REGISTRY_V3_MAX_BYTES,
+    QwenRegistryEntryV3, SignedQwenRegistryEntryV3,
 };
 
 use personalai_engine_types::{

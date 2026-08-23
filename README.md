@@ -11,12 +11,13 @@ The workspace implements a signed directory-backed data-only `.paimodel`
 format, a Rust-only quarantine safetensors importer with deterministic
 multi-shard conversion, deterministic provenance,
 SHA-384 and strict Ed25519 admission, a configuration-only model registry,
-an explicit exact-owner-selected Model Foundry registry V2 admission mode,
+an explicit exact-owner-selected Model Foundry registry V2 admission mode and
+a separately signed development-only Qwen registry V3 adapter bound to
+canonical Sovereign Models 2.0 descriptors,
 no-follow direct-file opening, read-only non-executable shard mapping, strict
 AIPTok Byte-Level BPE v1 metadata conversion and bounded byte/UTF-8/incremental
 tokenization, plus exact pinned-source conversion into a separate `AIPTOK02`
-Qwen2.5 table format with a full-hash-bound trusted-loader constructor and a
-still-closed ordinary service factory,
+Qwen2.5 table format with a full-hash-bound trusted-loader constructor,
 canonical aggregate-accounted tensors with explicit F16/BF16
 storage conversion, deterministic first-party AIPQ8/AIPQ4 package profiles and
 scalar quantized reference kernels, an immutable architecture-owned graph,
@@ -37,9 +38,12 @@ an owner CLI, and a separate release-only signer/verifier with a monotonic
 installed-version ledger. The CLI also exposes an explicit one-shot `generate`
 command that admits a registered signed package by model ID and never accepts a
 URL or arbitrary package path. The CLI exposes the continuous driver only
-through an explicit bounded mode, requires an explicit owner-pinned or Model
-Foundry V2 registration mode, and translates owner-process `SIGINT`/`SIGTERM` into the existing
-stop-admit, cancel, and drain path. A normal real-socket test repeats eight
+through an explicit bounded mode, requires an explicit owner-pinned, frozen
+Model Foundry V2, or experimental Qwen V3 registration mode, and translates
+owner-process `SIGINT`/`SIGTERM` into the existing stop-admit, cancel, and drain
+path. Qwen V3 additionally requires the exact
+`--experimental-qwen-development-execution owner-approved` gate, ARM64, and a
+matching Runtime-v3 identity. A normal real-socket test repeats eight
 six-client restart cycles while one authenticated reader waits for five peers;
 a pinned weekly/manual workflow is configured to repeat that bounded test eight
 times once integrated onto the default branch. A separate pinned, read-only
@@ -50,28 +54,31 @@ has no HTTP or remote-network fallback.
 
 The executable CPU path is a correctness baseline tested with a deterministic
 signed legacy synthetic model and direct deterministic tiny Qwen2.5 scalar
-fixtures. It is not yet a useful production model. The Qwen2.5 manifest v1.1
-mechanics target future engine revision 0.2.0, while this runtime remains
-0.1.0 and rejects every v1.1 package. Moreover, the exact 1.5B profile requires
-1,543,712,768 estimated scalar operations at its first position and is rejected
-by the unchanged 100,000,000-operation reference ceiling before model
-construction. Foundry package emission, registry promotion,
-a qualified optimized backend, a signed real package, and production evidence
-remain absent. Even after a future runtime-version activation, the authenticated
-service retains a separate fail-closed tokenizer gate. A default-off
-ARM64 graph backend provides bounded Advanced SIMD graph kernels with
-scalar-oracle differential tests. The default-off Metal backend now completes
+fixtures. It is not yet a useful production model. Engine 0.2.0 accepts the
+exact Qwen2.5 PAIDIR01 v1.1 format only through a separately signed,
+anti-rollback development registry V3 record, an exact canonical Sovereign
+Models 2.0 descriptor, and an additional explicit owner startup approval.
+That experimental path is ARM64-only, cancellation-aware, package-bound to
+`AIPTOK02`, and remains default-off. Registry V2 is frozen and unchanged;
+CPU-reference and Metal cannot execute the Qwen profile. Production activation
+is structurally unavailable. Model Foundry must still produce a real signed
+development package/record and genuine qualification evidence before local
+inference can be claimed. The exact 1.5B profile also remains outside the
+100,000,000-operation scalar correctness ceiling. A default-off ARM64 graph
+backend provides bounded Advanced SIMD graph kernels with scalar-oracle
+differential tests. The default-off Metal backend now completes
 the signed synthetic decoder and owner-selected UDS service path, while its
 production-size canary remains gated. A legally approved real source
 model/package and independent numeric evidence, ARM64 service integration,
 CUDA, performance qualification, and
 production-size fuzz/soak evidence remain required before replacement of
-existing production runtimes. Ordinary service tokenizer support remains
-limited to AIPTok Byte-Level BPE v1. AIPTok v2 can be deterministically emitted
-only from the exact pinned Qwen2.5 source, replayed through a feature-gated
-content-free offline conformance diagnostic, and constructed only by the
-separate API that revalidates an authenticated package manifest's complete
-tokenizer hash. The generic factory still returns unsupported; SentencePiece,
+existing production runtimes. Ordinary CPU and Metal service tokenizer support
+remains limited to AIPTok Byte-Level BPE v1. AIPTok v2 can be deterministically
+exported to one fresh owner-private read-only file only from the exact pinned
+Qwen2.5 source, replayed through a feature-gated content-free offline
+conformance diagnostic, and constructed only by the Qwen V3 ARM64 path after
+revalidating an authenticated package manifest's complete tokenizer hash. The
+generic factory still returns unsupported; SentencePiece,
 Unigram, WordPiece, tiktoken, and arbitrary `tokenizer.json` graphs are not
 supported. The locked dependency
 graph is checked in under `engine/vendor`, Cargo is offline/source-replaced by
@@ -110,10 +117,13 @@ The default feature is the safe CPU reference backend. `arm64`, `metal`, and
   escalation fail closed;
 - runtime-v3 service composition is owner-enabled and model identities are
   owner-bound to registered package/backend state before signed availability or
-  reservation is exposed; canonical execution request/result transport is
-  implemented with an explicitly compiled and configured deterministic
-  development simulator, while production backend execution and restart
-  recovery of accepted reservations remain disabled release gates;
+  reservation is exposed; canonical execution invokes the exact selected loaded
+  model through a finite continuous-mode worker set, revalidates identity,
+  deadline, cancellation, and resource ceilings, and returns an exact signed
+  terminal result. The simulator remains only for explicit development fault
+  tests. Single-connection serving rejects execution because it cannot observe
+  concurrent canonical cancellation; durable accepted-reservation recovery
+  remains a release gate;
 - registry-backed admission verifies the exact owner-selected signed V2 entry
   before package access, derives the approved path from signed identities, and
   never chooses `latest` or falls back to owner-pinned registration;

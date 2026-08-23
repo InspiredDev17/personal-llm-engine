@@ -21,6 +21,9 @@ pub const DIRECTORY_MODEL_PACKAGE_SIGNATURE_DOMAIN_V1: &[u8] =
 /// Domain separator for Model Foundry registry V2 decisions.
 pub const MODEL_FOUNDRY_REGISTRY_SIGNATURE_DOMAIN_V2: &[u8] =
     b"PersonalAI.ModelRegistry.Entry.Signature.v2\0";
+/// Domain separator for the transitional development-only Qwen registry V3 profile.
+pub const MODEL_FOUNDRY_QWEN_REGISTRY_SIGNATURE_DOMAIN_V3: &[u8] =
+    b"PersonalAI.QwenRegistry.Entry.Signature.v3\0";
 /// Domain separator for Go control-plane request signatures.
 pub const CONTROL_PLANE_REQUEST_SIGNATURE_DOMAIN_V1: &[u8] =
     b"PersonalAI.ControlPlane.Request.Signature.v1\0";
@@ -469,6 +472,13 @@ pub fn model_foundry_registry_signature_message(
     domain_separated_message(MODEL_FOUNDRY_REGISTRY_SIGNATURE_DOMAIN_V2, entry_digest)
 }
 
+/// Builds the bounded message signed by transitional Qwen registry V3 tooling.
+pub fn model_foundry_qwen_registry_signature_message(
+    entry_digest: &[u8; ModelPackageHash::BYTE_LEN],
+) -> Result<Vec<u8>, EngineError> {
+    domain_separated_message(MODEL_FOUNDRY_QWEN_REGISTRY_SIGNATURE_DOMAIN_V3, entry_digest)
+}
+
 /// Builds the bounded message signed by the Go control plane.
 pub fn control_plane_signature_message(request_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
     let digest = hash_signed_content(request_bytes);
@@ -594,6 +604,33 @@ pub fn verify_model_foundry_registry_signature(
     verifying_key
         .verify_strict(&message, &signature)
         .map_err(|_| EngineError::signature_failure("model registry signature is invalid"))
+}
+
+/// Verifies one exact development-only Qwen registry V3 entry.
+pub fn verify_model_foundry_qwen_registry_signature(
+    signer: &TrustedSigner,
+    envelope_key_id: SignerKeyId,
+    entry_digest: &[u8; ModelPackageHash::BYTE_LEN],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("Qwen registry signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "Qwen registry signer does not match owner configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured Qwen registry key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured Qwen registry key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    let message = model_foundry_qwen_registry_signature_message(entry_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| EngineError::signature_failure("Qwen registry signature is invalid"))
 }
 
 /// Strictly verifies one authenticated Go control-plane request body.

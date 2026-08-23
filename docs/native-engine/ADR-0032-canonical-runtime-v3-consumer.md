@@ -20,8 +20,8 @@ blur the authority boundary even if those modules were unused.
 ## Decision
 
 The engine pins exact Contracts commit
-`2c4a7a6afd5625e7def3afec26f18fedac343d11` and compiles only its minimal
-`runtime-v3` feature. The resulting dependency graph contains common typed IDs,
+`dd3e18496b669a8aa28f822ca85e0299c16c9b99` and compiles only its narrow
+`models-v2` feature plus its `runtime-v3` dependency. The resulting dependency graph contains common typed IDs,
 generation data, and runtime-v3 documents only. Cognitive roles, qualification
 authority, tool authority, memory authority, security authority, and component
 administration are excluded.
@@ -56,9 +56,11 @@ valid Contracts data but unsupported by this native runtime profile.
 - Serde/JSON and the Contracts SHA-256 stack enlarge the reviewed offline graph;
   exact versions, sources, vendor contents, and SPDX entries are enforced.
 - Signed UDS admission and canonical execution dispatch are integration-tested
-  with synthetic packages, development keys, and a compile-time-gated fixed
-  output simulator. Production backend dispatch, control-plane operated proof,
-  and durable accepted-reservation recovery remain required before this is an
-  operated inference-runtime-v3 service.
+  with synthetic packages, development keys, the real bounded decoder cursor,
+  concurrent canonical cancellation, and a separately gated fault simulator.
+  Execution is available only through bounded continuous serving; synchronous
+  single-connection execution fails closed. Actual qualified-package
+  control-plane proof and durable accepted-reservation recovery remain required
+  before this is an operated inference-runtime-v3 service.
 - Production model, hardware, latency, throughput, resource-pressure, and soak
   evidence remain separate deployment gates.

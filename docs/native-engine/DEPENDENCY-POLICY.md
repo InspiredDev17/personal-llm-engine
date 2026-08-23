@@ -42,9 +42,9 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 `zeroize 1.8.2`, `libc 0.2.189`, `unicode-normalization 0.1.24`,
 `unicode-general-category 1.1.0`, and Sovereign AI Contracts commit
-`2c4a7a6afd5625e7def3afec26f18fedac343d11`, all with unnecessary default
-features disabled. The Contracts dependency enables only the minimal
-`runtime-v3` consumer profile; cognitive, tool, memory, security, and other
+`dd3e18496b669a8aa28f822ca85e0299c16c9b99`, all with unnecessary default
+features disabled. The Contracts dependency enables only the narrow
+`models-v2` consumer profile and its runtime-v3 dependency; cognitive, tool, memory, security, and other
 control-plane authority modules are excluded from the compiled engine graph.
 SHA-384 and strict Ed25519 are package/control-message/response/release integrity
 mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper
@@ -79,9 +79,11 @@ maps every General Category `L*`/`N*` value. The fixed contraction matcher uses
 an engine-owned Unicode-16 simple-fold table only for mappings that reach ASCII
 (ASCII case, U+017F LONG S, and U+212A KELVIN SIGN). The runtime core and
 adapter remain nonconstructible through ordinary public APIs. Exact pinned
-source conversion and fixed-corpus conformance now run only through a
-feature-gated offline diagnostic; that evidence does not activate Qwen
-packages or expose a tokenizer handle.
+source conversion and fixed-corpus conformance run only through a feature-gated
+offline diagnostic. The exporter writes one exact read-only artifact; it
+returns no tokenizer handle and grants no package trust. Only the separately
+signed, owner-approved, ARM64 development path can construct that tokenizer,
+and production activation remains unavailable.
 
 The private adapter rejects input whose Unicode-16 NFKD stream-safe view would
 insert a CGJ after more than 30 consecutive nonstarters; it never forwards the

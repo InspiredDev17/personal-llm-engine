@@ -26,7 +26,8 @@ readme = false
 
 [features]
 default = ["full"]
-full = ["runtime-v3"]
+full = ["models-v2"]
+models-v2 = ["runtime-v3"]
 runtime-v3 = [
     "dep:serde",
     "dep:serde_json",
@@ -76,6 +77,14 @@ path = "src/bin/fixture-normalize.rs"
 [[bin]]
 name = "type-registry"
 path = "src/bin/type-registry.rs"
+
+[[test]]
+name = "knowledge_invalidation_feed"
+path = "tests/knowledge_invalidation_feed.rs"
+
+[[test]]
+name = "qualification_v2_1"
+path = "tests/qualification_v2_1.rs"
 
 [[test]]
 name = "semantic_fixtures"

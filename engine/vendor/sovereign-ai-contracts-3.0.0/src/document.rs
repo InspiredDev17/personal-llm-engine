@@ -22,6 +22,10 @@ use crate::knowledge::{
     CagCacheQueryResult, DynamicRetrievalResult, KnowledgePlanRequest, KnowledgePlanResult,
     MemoryRevisionInvalidated, StaticKnowledgeBundle,
 };
+use crate::knowledge_invalidation_feed::{
+    KnowledgeInvalidationFeedRequest, KnowledgeInvalidationFeedResult,
+    KnowledgeInvalidationTombstone,
+};
 use crate::knowledge_lifecycle::{
     CagCacheAttachRequest, CagCacheAttachResult, CagCacheCreateRequest, CagCacheCreateResult,
     CagCacheDescribeRequest, CagCacheDescribeResult, CagCacheInvalidateRequest,
@@ -33,6 +37,7 @@ use crate::memory::{
     ApprovedMemoryWrite, MemoryCandidate, MemoryQuery, MemoryRecord, MemoryWriteProposal,
 };
 use crate::models::{ModelActivationRequest, ModelActivationState, ModelArtifactDescriptor};
+use crate::models_v2::ExecutionPackageDescriptor;
 use crate::negotiation::{
     ContractVersionOffer, ContractVersionSelection, VersionNegotiationTranscript,
 };
@@ -42,6 +47,7 @@ use crate::negotiation_v2::{
 use crate::nodes::{NodeActionRequest, NodeActionResult, NodeDescriptor};
 use crate::qualification::CognitiveQualificationManifest;
 use crate::qualification_v2::ModelCapabilityManifest;
+use crate::qualification_v2_1::ModelCapabilityManifestV21;
 use crate::security::{ContainmentRequest, ContainmentResult, SecurityDecision, SecurityEvent};
 use crate::tasks::{TaskEnvelope, TaskStatus};
 use crate::tools::{
@@ -387,6 +393,21 @@ const DOCUMENT_REGISTRY: &[DocumentRegistryEntry] = &[
         schema: "knowledge/v1/knowledge-1.2.0.schema.json",
     },
     DocumentRegistryEntry {
+        contract_version: "1.3.0",
+        kind: "knowledge.invalidation_feed_request",
+        schema: "knowledge/v1/knowledge-1.3.0.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "1.3.0",
+        kind: "knowledge.invalidation_feed_result",
+        schema: "knowledge/v1/knowledge-1.3.0.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "1.3.0",
+        kind: "knowledge.invalidation_tombstone",
+        schema: "knowledge/v1/knowledge-1.3.0.schema.json",
+    },
+    DocumentRegistryEntry {
         contract_version: "2.0.0",
         kind: "contract.production_version_offer",
         schema: "common/v2/common.schema.json",
@@ -438,8 +459,18 @@ const DOCUMENT_REGISTRY: &[DocumentRegistryEntry] = &[
     },
     DocumentRegistryEntry {
         contract_version: "2.0.0",
+        kind: "model.execution_package_descriptor",
+        schema: "models/v2/models.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "2.0.0",
         kind: "qualification.model_capability_manifest",
         schema: "qualification/v2/qualification.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "2.1.0",
+        kind: "qualification.model_capability_manifest",
+        schema: "qualification/v2/qualification-2.1.0.schema.json",
     },
     DocumentRegistryEntry {
         contract_version: "3.0.0",
@@ -533,18 +564,10 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
         return normalize_knowledge_lifecycle(kind, value);
     }
     if contract_version == "1.2.0" && kind.starts_with("knowledge.static_prefix_material_") {
-        return match kind {
-            "knowledge.static_prefix_material_request" => {
-                normalize::<StaticPrefixMaterialRequest>(value)
-            }
-            "knowledge.static_prefix_material_result" => {
-                normalize::<StaticPrefixMaterialResult>(value)
-            }
-            _ => Err(ContractError::field(
-                "kind",
-                "unsupported knowledge 1.2 kind",
-            )),
-        };
+        return normalize_knowledge_prefix(kind, value);
+    }
+    if contract_version == "1.3.0" && kind.starts_with("knowledge.invalidation_") {
+        return normalize_knowledge_invalidation_feed(kind, value);
     }
     if contract_version == "1.0.0" && kind.starts_with("knowledge.") {
         return normalize_knowledge_v1(kind, value);
@@ -564,6 +587,9 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
         }
         ("2.0.0", "qualification.model_capability_manifest") => {
             normalize::<ModelCapabilityManifest>(value)
+        }
+        ("2.1.0", "qualification.model_capability_manifest") => {
+            normalize::<ModelCapabilityManifestV21>(value)
         }
         ("3.0.0", "inference.runtime_availability") => normalize::<RuntimeAvailabilityV3>(value),
         ("3.0.0", "inference.reservation_request") => {
@@ -611,6 +637,9 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
         (_, "security.containment_request") => normalize::<ContainmentRequest>(value),
         (_, "security.containment_result") => normalize::<ContainmentResult>(value),
         (_, "model.artifact_descriptor") => normalize::<ModelArtifactDescriptor>(value),
+        ("2.0.0", "model.execution_package_descriptor") => {
+            normalize::<ExecutionPackageDescriptor>(value)
+        }
         (_, "model.activation_request") => normalize::<ModelActivationRequest>(value),
         (_, "model.activation_state") => normalize::<ModelActivationState>(value),
         (_, "qualification.cognitive_manifest") => {
@@ -626,6 +655,56 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
             "kind",
             format!("unsupported contract kind {kind:?}"),
         )),
+    }
+}
+
+fn normalize_knowledge_prefix(kind: &str, value: Value) -> Result<Value> {
+    match kind {
+        "knowledge.static_prefix_material_request" => {
+            normalize::<StaticPrefixMaterialRequest>(value)
+        }
+        "knowledge.static_prefix_material_result" => normalize::<StaticPrefixMaterialResult>(value),
+        _ => Err(ContractError::field(
+            "kind",
+            "unsupported knowledge 1.2 kind",
+        )),
+    }
+}
+
+fn normalize_knowledge_invalidation_feed(kind: &str, value: Value) -> Result<Value> {
+    reject_explicit_nulls(&value)?;
+    match kind {
+        "knowledge.invalidation_feed_request" => {
+            normalize::<KnowledgeInvalidationFeedRequest>(value)
+        }
+        "knowledge.invalidation_feed_result" => normalize::<KnowledgeInvalidationFeedResult>(value),
+        "knowledge.invalidation_tombstone" => normalize::<KnowledgeInvalidationTombstone>(value),
+        _ => Err(ContractError::field(
+            "kind",
+            "unsupported knowledge 1.3 kind",
+        )),
+    }
+}
+
+fn reject_explicit_nulls(value: &Value) -> Result<()> {
+    match value {
+        Value::Null => Err(ContractError::field(
+            "document",
+            "explicit null is forbidden",
+        )),
+        Value::Array(values) => {
+            for value in values {
+                reject_explicit_nulls(value)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                reject_explicit_nulls(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 

@@ -34,7 +34,7 @@ loading, or GPU kernels.
 | `unicode-ident 1.0.24` | (MIT OR Apache-2.0) AND Unicode-3.0 | Rust identifier parsing beneath proc macros |
 | `rustc_version 0.4.1` | MIT OR Apache-2.0 | Locked curve build-time compiler capability selection; no fetch |
 | `semver 1.0.28` | MIT OR Apache-2.0 | Version parsing for `rustc_version` |
-| `sovereign-ai-contracts 3.0.0` at `2c4a7a6afd5625e7def3afec26f18fedac343d11` | Apache-2.0 | Direct canonical provider-neutral runtime-v3 data contract; only the minimal `runtime-v3` feature is compiled, excluding cognitive/tool/memory/security authority modules |
+| `sovereign-ai-contracts 3.0.0` at `dd3e18496b669a8aa28f822ca85e0299c16c9b99` | Apache-2.0 | Direct canonical Models 2.0 package identity plus provider-neutral runtime-v3 identity; only the narrow `models-v2` feature and its runtime-v3 dependency are compiled, excluding cognitive/tool/memory/security authority modules |
 | `serde 1.0.229` | MIT OR Apache-2.0 | Strict bounded runtime-v3 document serialization support beneath the canonical contract |
 | `serde_core 1.0.229` | MIT OR Apache-2.0 | Serde core traits beneath the canonical contract |
 | `serde_derive 1.0.229` | MIT OR Apache-2.0 | Offline compile-time derivation for closed canonical contract documents |
@@ -62,8 +62,9 @@ inventory and cannot be selected or configured publicly. A narrow wrapper may
 construct only the pinned full-hash-bound tokenizer profile. The adapter invokes
 bounded NFC, stream-safe classification and General Category lookup. Exact
 pinned-source conversion and fixed-corpus replay are feature-gated offline
-diagnostics; ordinary Qwen2.5 service tokenization and execution remain
-explicitly unsupported.
+diagnostics. Qwen2.5 construction is confined to the separately signed,
+owner-approved, default-off ARM64 development path; CPU, Metal and production
+execution remain explicitly unsupported.
 Their resolved graph is
 `engine-tokenizer -> unicode-normalization 0.1.24 -> tinyvec 1.12.0 ->
 tinyvec_macros 0.1.1` plus the independent

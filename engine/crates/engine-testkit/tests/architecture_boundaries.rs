@@ -6,6 +6,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
+fn workspace_and_loader_release_identity_are_both_engine_0_2_0() {
+    let root = engine_root();
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+    assert!(
+        workspace.contains("[workspace.package]\nversion = \"0.2.0\""),
+        "the workspace release identity must remain 0.2.0"
+    );
+    let loader = fs::read_to_string(root.join("crates/engine-loader/src/directory_loader.rs"))
+        .expect("loader source");
+    assert!(
+        loader.contains("pub const DIRECTORY_LOADER_ENGINE_VERSION: (u16, u16, u16) = (0, 2, 0);"),
+        "the signed-package compatibility gate must match the workspace release"
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the complete exact external dependency and source allowlist is intentionally visible"
@@ -69,8 +85,8 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
             if name == "sovereign-ai-contracts" {
                 assert_eq!(
                     source,
-                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=2c4a7a6afd5625e7def3afec26f18fedac343d11#2c4a7a6afd5625e7def3afec26f18fedac343d11",
-                    "canonical runtime contract dependency must use its exact reviewed commit"
+                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=dd3e18496b669a8aa28f822ca85e0299c16c9b99#dd3e18496b669a8aa28f822ca85e0299c16c9b99",
+                    "canonical runtime/models contract dependency must use its exact reviewed commit"
                 );
                 assert!(
                     lock_value(package, "checksum").is_none(),
@@ -95,9 +111,9 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
         fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
     assert!(
         workspace_manifest.contains(
-            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"2c4a7a6afd5625e7def3afec26f18fedac343d11\", default-features = false, features = [\"runtime-v3\"] }"
+            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"dd3e18496b669a8aa28f822ca85e0299c16c9b99\", default-features = false, features = [\"models-v2\"] }"
         ),
-        "canonical contracts must remain exact-commit pinned with only runtime-v3 enabled"
+        "canonical contracts must remain exact-commit pinned with only models-v2 and its runtime-v3 dependency enabled"
     );
 
     let prohibited = [
@@ -227,10 +243,21 @@ fn unicode_16_dependencies_are_exact_and_confined_to_the_private_qwen_adapter() 
     let readiness = &server[readiness_start..readiness_end];
     assert!(readiness.contains("build_package_bound_qwen25_tokenizer("));
     assert!(readiness.contains("OwnerApprovedMetadataInspection"));
-    let outside_readiness = format!("{}{}", &server[..readiness_start], &server[readiness_end..]);
-    assert!(
-        !outside_readiness.contains("build_package_bound_qwen25_tokenizer("),
-        "package-bound Qwen construction escaped the owner-gated metadata readiness boundary"
+    let load_start = server
+        .find("pub fn load_registered_arm64_model_cancellable(")
+        .expect("explicit Qwen-capable ARM64 development load must exist");
+    let load_end = server[load_start..]
+        .find("    /// Opens one registered signed directory package for complete Metal execution")
+        .map(|offset| load_start + offset)
+        .expect("Qwen-capable ARM64 load must end before Metal loading");
+    let qwen_load = &server[load_start..load_end];
+    assert!(qwen_load.contains("validate_qwen_development_execution_binding("));
+    assert!(qwen_load.contains("build_package_bound_qwen25_tokenizer("));
+    assert!(qwen_load.contains("materialize_tensors_cancellable("));
+    assert_eq!(
+        server.matches("build_package_bound_qwen25_tokenizer(").count(),
+        2,
+        "package-bound Qwen construction must remain confined to readiness and exact ARM64 development load"
     );
 
     assert_qwen_diagnostic_feature_is_offline_importer_only(&crates);
@@ -420,8 +447,8 @@ fn fuzz_tooling_is_isolated_from_the_production_release_graph() {
         .collect::<BTreeSet<_>>();
     let expected = [
         "arbitrary@1.4.2",
-        "cc@1.4.2",
-        "find-msvc-tools@0.1.10",
+        "cc@1.4.4",
+        "find-msvc-tools@0.1.11",
         "getrandom@0.4.3",
         "jobserver@0.1.35",
         "libfuzzer-sys@0.4.13",
@@ -807,7 +834,7 @@ fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
             );
         } else {
             assert!(
-                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@2c4a7a6afd5625e7def3afec26f18fedac343d11"),
+                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@dd3e18496b669a8aa28f822ca85e0299c16c9b99"),
                 "SPDX document omits the exact canonical contract commit"
             );
         }
@@ -1103,6 +1130,19 @@ fn experimental_qwen_readiness_is_not_client_or_cli_activation_authority() {
             "ordinary CLI must not activate experimental Qwen readiness: {prohibited}"
         );
     }
+    assert!(cli.contains("--experimental-qwen-development-execution"));
+    assert!(cli.contains("text != \"owner-approved\""));
+    assert!(cli.contains("experimental-qwen-registry-v3"));
+
+    let registry = fs::read_to_string(root.join("crates/engine-model-format/src/registry_v3.rs"))
+        .expect("Qwen V3 registry source must be readable");
+    assert!(registry.contains(
+        "pub const fn development_execution_authorized(&self) -> bool {\n        true\n    }"
+    ));
+    assert!(
+        registry
+            .contains("pub const fn production_activation(&self) -> bool {\n        false\n    }")
+    );
 }
 
 #[test]
@@ -1422,7 +1462,7 @@ fn locked_external_packages(lock: &str) -> BTreeSet<String> {
                 lock_value(package, "checksum").is_some()
                     || (name == "sovereign-ai-contracts"
                         && source
-                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=2c4a7a6afd5625e7def3afec26f18fedac343d11#2c4a7a6afd5625e7def3afec26f18fedac343d11"),
+                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=dd3e18496b669a8aa28f822ca85e0299c16c9b99#dd3e18496b669a8aa28f822ca85e0299c16c9b99"),
                 "external dependency must have a locked checksum or exact reviewed commit: {name}"
             );
             format!("{name}@{version}")

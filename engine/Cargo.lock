@@ -177,7 +177,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "personalai-engine-arm64"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-cpu-reference",
  "personalai-engine-memory",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "personalai-engine-crypto",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-cpu-reference"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-memory",
  "personalai-engine-tensor",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "personalai-engine-types",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-knowledge-contract"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-types",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-kv-cache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-knowledge-contract",
@@ -240,8 +240,9 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "ed25519-dalek",
  "libc",
  "personalai-engine-crypto",
  "personalai-engine-memory",
@@ -250,18 +251,20 @@ dependencies = [
  "personalai-engine-tensor",
  "personalai-engine-testkit",
  "personalai-engine-types",
+ "serde_json",
+ "sovereign-ai-contracts",
 ]
 
 [[package]]
 name = "personalai-engine-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-types",
 ]
 
 [[package]]
 name = "personalai-engine-metal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-arm64",
  "personalai-engine-cpu-reference",
@@ -276,14 +279,14 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-model-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-types",
 ]
 
 [[package]]
 name = "personalai-engine-model-importer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -304,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-placement"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-loader",
@@ -318,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "personalai-engine-crypto",
@@ -328,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-quantization"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-memory",
  "personalai-engine-model-format",
@@ -338,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-release"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "personalai-engine-crypto",
@@ -348,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-sampling"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-memory",
  "personalai-engine-tensor",
@@ -357,14 +360,14 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-types",
 ]
 
 [[package]]
 name = "personalai-engine-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -389,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-tensor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-memory",
  "personalai-engine-types",
@@ -397,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "personalai-engine-cpu-reference",
@@ -410,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-tokenizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-crypto",
  "personalai-engine-memory",
@@ -423,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-transformer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "personalai-engine-arm64",
  "personalai-engine-cpu-reference",
@@ -444,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "personalai-engine-types"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "proc-macro2"
@@ -553,7 +556,7 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 [[package]]
 name = "sovereign-ai-contracts"
 version = "3.0.0"
-source = "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=2c4a7a6afd5625e7def3afec26f18fedac343d11#2c4a7a6afd5625e7def3afec26f18fedac343d11"
+source = "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=dd3e18496b669a8aa28f822ca85e0299c16c9b99#dd3e18496b669a8aa28f822ca85e0299c16c9b99"
 dependencies = [
  "serde",
  "serde_json",
@@ -589,12 +592,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typenum"
-version = "1.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
 name = "tinyvec"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -608,6 +605,12 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicode-general-category"

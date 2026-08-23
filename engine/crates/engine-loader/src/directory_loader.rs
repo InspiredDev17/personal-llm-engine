@@ -1,6 +1,9 @@
 //! Production-only admission for signed directory-backed `.paimodel` packages.
 
-use crate::{ModelRegistry, RegisteredModel, read_only_map::ReadOnlyFileMap};
+use crate::{
+    ModelRegistry, RegisteredModel, RegistrationMode, qwen_registry_v3::descriptor_member,
+    read_only_map::ReadOnlyFileMap,
+};
 use personalai_engine_crypto::{
     PackageHashAccumulator, hash_package, hash_signed_content, verify_directory_package_signature,
 };
@@ -33,7 +36,7 @@ const DIRECTORY_COPY_CHUNK_BYTES: usize = 1024 * 1024;
 /// Metadata readiness inspection reports this value but cannot override it.
 /// In particular, inspecting a future package never makes that package
 /// executable by the current service.
-pub const DIRECTORY_LOADER_ENGINE_VERSION: (u16, u16, u16) = (0, 1, 0);
+pub const DIRECTORY_LOADER_ENGINE_VERSION: (u16, u16, u16) = (0, 2, 0);
 const QWEN25_15B_VOCABULARY: u32 = 151_936;
 const QWEN25_15B_HIDDEN: u32 = 1_536;
 const QWEN25_15B_LAYERS: u32 = 28;
@@ -521,6 +524,12 @@ fn inspect_readiness_metadata_inner(
             "directory package identity does not match local configuration",
         ));
     }
+    validate_models_v2_member(
+        &registration,
+        "catalog",
+        hash_package(&catalog_bytes),
+        catalog_bytes.len(),
+    )?;
     let catalog = HashCatalog::parse(&catalog_bytes)?;
     let catalog_length = usize_to_u64(catalog_bytes.len())?;
     ensure_entry_budget(0, catalog_length, budget)?;
@@ -528,6 +537,12 @@ fn inspect_readiness_metadata_inner(
     let signature_bytes =
         read_direct_file(registration.package_path(), SIGNATURE_FILE, signature_maximum)?;
     let signature = SignatureEnvelope::parse(&signature_bytes)?;
+    validate_models_v2_member(
+        &registration,
+        "signature",
+        hash_package(&signature_bytes),
+        signature_bytes.len(),
+    )?;
     verify_directory_package_signature(
         registration.trusted_signer(),
         signature.key_id(),
@@ -549,6 +564,7 @@ fn inspect_readiness_metadata_inner(
         ));
     }
     validate_architecture(&manifest)?;
+    validate_models_v2_manifest(&registration, &manifest, &manifest_bytes)?;
     if let Some(binding) = registration.registry_binding() {
         if manifest.context_limit().get() != binding.context_capacity {
             return Err(EngineError::authentication_failure(
@@ -564,6 +580,12 @@ fn inspect_readiness_metadata_inner(
     if hash_package(&tokenizer) != manifest.tokenizer_hash() {
         return Err(corrupt("directory tokenizer hash differs from manifest"));
     }
+    validate_models_v2_member(
+        &registration,
+        "tokenizer",
+        hash_package(&tokenizer),
+        tokenizer.len(),
+    )?;
     if let Some(binding) = registration.registry_binding() {
         if manifest.tokenizer_hash() != binding.tokenizer_hash {
             return Err(EngineError::authentication_failure(
@@ -578,6 +600,7 @@ fn inspect_readiness_metadata_inner(
     let provenance = read_catalog_file(registration.package_path(), provenance_entry)?;
     validate_provenance(&provenance)?;
     let provenance_hash = hash_package(&provenance);
+    validate_models_v2_member(&registration, "provenance", provenance_hash, provenance.len())?;
     if let Some(binding) = registration.registry_binding() {
         if provenance_hash != binding.provenance_hash {
             return Err(EngineError::authentication_failure(
@@ -618,7 +641,16 @@ fn inspect_readiness_metadata_inner(
             return Err(corrupt("tensor shard length differs from signed metadata"));
         }
         drop(file);
+        validate_models_v2_member(
+            &registration,
+            &format!("tensor_shard.{:04}", shard.index()),
+            shard.content_hash(),
+            usize::try_from(shard.byte_length()).map_err(|_| {
+                EngineError::resource_exhaustion("tensor shard length is not addressable")
+            })?,
+        )?;
     }
+    validate_models_v2_total(&registration, total_bytes)?;
     if let Some(binding) = registration.registry_binding() {
         let mut observed = manifest
             .shards()
@@ -689,6 +721,12 @@ fn load_inner(
             "directory package identity does not match local configuration",
         ));
     }
+    validate_models_v2_member(
+        &registration,
+        "catalog",
+        hash_package(&catalog_bytes),
+        catalog_bytes.len(),
+    )?;
     let catalog = HashCatalog::parse(&catalog_bytes)?;
     let catalog_length = usize_to_u64(catalog_bytes.len())?;
     ensure_entry_budget(0, catalog_length, budget)?;
@@ -696,6 +734,12 @@ fn load_inner(
     let signature_bytes =
         read_direct_file(registration.package_path(), SIGNATURE_FILE, signature_maximum)?;
     let signature = SignatureEnvelope::parse(&signature_bytes)?;
+    validate_models_v2_member(
+        &registration,
+        "signature",
+        hash_package(&signature_bytes),
+        signature_bytes.len(),
+    )?;
     verify_directory_package_signature(
         registration.trusted_signer(),
         signature.key_id(),
@@ -724,6 +768,7 @@ fn load_inner(
     }
     check_cancelled(cancellation)?;
     validate_architecture(&manifest)?;
+    validate_models_v2_manifest(&registration, &manifest, &manifest_bytes)?;
     if let Some(binding) = registration.registry_binding() {
         if manifest.context_limit().get() != binding.context_capacity {
             return Err(EngineError::authentication_failure(
@@ -739,6 +784,12 @@ fn load_inner(
     if hash_package(&tokenizer) != manifest.tokenizer_hash() {
         return Err(corrupt("directory tokenizer hash differs from manifest"));
     }
+    validate_models_v2_member(
+        &registration,
+        "tokenizer",
+        hash_package(&tokenizer),
+        tokenizer.len(),
+    )?;
     if let Some(binding) = registration.registry_binding() {
         if manifest.tokenizer_hash() != binding.tokenizer_hash {
             return Err(EngineError::authentication_failure(
@@ -751,6 +802,12 @@ fn load_inner(
     ensure_entry_budget(total_bytes, provenance_entry.byte_length(), budget)?;
     let provenance = read_catalog_file(registration.package_path(), provenance_entry)?;
     validate_provenance(&provenance)?;
+    validate_models_v2_member(
+        &registration,
+        "provenance",
+        hash_package(&provenance),
+        provenance.len(),
+    )?;
     if let Some(binding) = registration.registry_binding() {
         if hash_package(&provenance) != binding.provenance_hash {
             return Err(EngineError::authentication_failure(
@@ -795,8 +852,17 @@ fn load_inner(
         if hash_package_cancellable(map.bytes(), cancellation)? != shard.content_hash() {
             return Err(EngineError::signature_failure("tensor shard hash verification failed"));
         }
+        validate_models_v2_member(
+            &registration,
+            &format!("tensor_shard.{:04}", shard.index()),
+            shard.content_hash(),
+            usize::try_from(shard.byte_length()).map_err(|_| {
+                EngineError::resource_exhaustion("tensor shard length is not addressable")
+            })?,
+        )?;
         shards.push(VerifiedShard { map, expected_hash: shard.content_hash() });
     }
+    validate_models_v2_total(&registration, total_bytes)?;
     if let Some(binding) = registration.registry_binding() {
         let mut observed = manifest
             .shards()
@@ -840,10 +906,10 @@ fn validate_registry_artifact_parent(
     registry: &ModelRegistry,
     registration: &RegisteredModel,
 ) -> Result<Option<fs::Metadata>, EngineError> {
-    let Some(binding) = registration.registry_binding() else {
+    let Some(artifact_id) = registration.registry_artifact_id() else {
         return Ok(None);
     };
-    let artifact = registry.model_root().join(&binding.artifact_id);
+    let artifact = registry.model_root().join(artifact_id);
     let expected_package = artifact.join(format!(
         "{}.{}",
         registration.model_id().as_str(),
@@ -1032,6 +1098,82 @@ fn validate_architecture(manifest: &DirectoryManifest) -> Result<(), EngineError
         || expected.iter().any(|(name, shape)| observed.get(name.as_str()) != Some(&shape))
     {
         return Err(corrupt("directory tensor inventory or shape is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_models_v2_member(
+    registration: &RegisteredModel,
+    member_id: &str,
+    observed_hash: personalai_engine_types::ModelPackageHash,
+    observed_bytes: usize,
+) -> Result<(), EngineError> {
+    let Some(binding) = registration.qwen_registry_binding() else {
+        return Ok(());
+    };
+    let member = descriptor_member(binding.descriptor(), member_id)?;
+    let observed_bytes = u64::try_from(observed_bytes)
+        .map_err(|_| EngineError::resource_exhaustion("package member length exceeds u64"))?;
+    if member.content.digest != observed_hash.to_string() || member.size_bytes != observed_bytes {
+        return Err(EngineError::authentication_failure(
+            "PAIDIR01 member differs from the canonical Models 2.0 descriptor",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_models_v2_manifest(
+    registration: &RegisteredModel,
+    manifest: &DirectoryManifest,
+    manifest_bytes: &[u8],
+) -> Result<(), EngineError> {
+    let is_qwen = manifest.architecture_id().as_str() == DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID;
+    if is_qwen && registration.mode() != RegistrationMode::ExperimentalQwenRegistryV3 {
+        return Err(EngineError::authentication_failure(
+            "Qwen package execution requires the separate signed V3/Models 2.0 binding",
+        ));
+    }
+    if !is_qwen && registration.mode() == RegistrationMode::ExperimentalQwenRegistryV3 {
+        return Err(EngineError::authentication_failure(
+            "Qwen V3 registration cannot authorize another architecture",
+        ));
+    }
+    let Some(binding) = registration.qwen_registry_binding() else {
+        return Ok(());
+    };
+    let descriptor = binding.descriptor();
+    if manifest.architecture_id().as_str() != DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
+        || descriptor.architecture.architecture_id != manifest.architecture_id().as_str()
+        || descriptor.architecture.context_limit != manifest.context_limit().get()
+        || descriptor.tokenizer.content.digest != manifest.tokenizer_hash().to_string()
+        || descriptor.tensor_inventory.tensor_count
+            != u32::try_from(manifest.tensors().len()).map_err(|_| {
+                EngineError::resource_exhaustion("manifest tensor count exceeds u32")
+            })?
+    {
+        return Err(EngineError::authentication_failure(
+            "PAIDIR01 manifest differs from the canonical Models 2.0 descriptor",
+        ));
+    }
+    validate_models_v2_member(
+        registration,
+        "manifest",
+        hash_package(manifest_bytes),
+        manifest_bytes.len(),
+    )
+}
+
+fn validate_models_v2_total(
+    registration: &RegisteredModel,
+    observed_bytes: u64,
+) -> Result<(), EngineError> {
+    let Some(binding) = registration.qwen_registry_binding() else {
+        return Ok(());
+    };
+    if binding.descriptor().package_size_bytes != observed_bytes {
+        return Err(EngineError::authentication_failure(
+            "PAIDIR01 byte total differs from the canonical Models 2.0 descriptor",
+        ));
     }
     Ok(())
 }
@@ -1464,9 +1606,10 @@ mod qwen25_tests {
     fn reviewed_qwen25_profiles_have_exact_bias_inventory() {
         let general = qwen25_manifest(None, QWEN25_STANDARD_CONTEXT, QWEN25_STANDARD_ROPE_THETA);
         validate_architecture(&general).expect("standard Qwen2.5 profile must validate");
-        assert!(
-            general.required_engine_version() > DIRECTORY_LOADER_ENGINE_VERSION,
-            "metadata support must not silently activate the future manifest"
+        assert_eq!(
+            general.required_engine_version(),
+            DIRECTORY_LOADER_ENGINE_VERSION,
+            "the reviewed v1.1 profile is bound to the 0.2 loader revision"
         );
         let math = qwen25_manifest(None, QWEN25_MATH_CONTEXT, QWEN25_MATH_ROPE_THETA);
         validate_architecture(&math).expect("math Qwen2.5 profile must validate");

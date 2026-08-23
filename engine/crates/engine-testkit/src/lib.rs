@@ -297,12 +297,13 @@ impl PackageFixtureBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecoderPackageFixtureBuilder {
     context_limit: u32,
+    printable_output: bool,
 }
 
 impl DecoderPackageFixtureBuilder {
     /// Creates the deterministic tiny decoder fixture builder.
     pub const fn new() -> Self {
-        Self { context_limit: 8 }
+        Self { context_limit: 8, printable_output: false }
     }
 
     /// Sets the synthetic decoder context limit without changing its weights.
@@ -314,9 +315,20 @@ impl DecoderPackageFixtureBuilder {
         Ok(self)
     }
 
+    /// Forces the synthetic decoder to select one of eight printable byte
+    /// tokens without predetermining which one its real hidden state favors.
+    #[must_use]
+    pub const fn with_printable_output(mut self) -> Self {
+        self.printable_output = true;
+        self
+    }
+
     /// Builds a signed two-layer GQA f32 decoder package with byte tokenizer data.
     pub fn build(self) -> Result<SignedPackageFixture, EngineError> {
-        build_signed_package(decoder_manifest(self.context_limit), decoder_tensors()?)
+        build_signed_package(
+            decoder_manifest(self.context_limit),
+            decoder_tensors(self.printable_output)?,
+        )
     }
 }
 
@@ -416,11 +428,20 @@ fn decoder_manifest(context_limit: u32) -> ManifestFixture {
     }
 }
 
-fn decoder_tensors() -> Result<Vec<TensorFixture>, EngineError> {
+fn decoder_tensors(printable_output: bool) -> Result<Vec<TensorFixture>, EngineError> {
+    let mut output = repeated(1_036, 0.0003);
+    if printable_output {
+        for dimension in 0..4_usize {
+            let positive = (65_usize + dimension * 2) * 4 + dimension;
+            let negative = positive + 4;
+            output[positive] = 100.0;
+            output[negative] = -100.0;
+        }
+    }
     let mut tensors = vec![
         f32_tensor("token_embedding.weight", &[259, 4], &repeated(1_036, 0.0005))?,
         f32_tensor("final_norm.weight", &[4], &[1.0; 4])?,
-        f32_tensor("output.weight", &[259, 4], &repeated(1_036, 0.0003))?,
+        f32_tensor("output.weight", &[259, 4], &output)?,
     ];
     for layer in 0..2 {
         let prefix = format!("layers.{layer:03}");

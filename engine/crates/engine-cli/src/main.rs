@@ -31,7 +31,8 @@ use personalai_engine_server::{
     RuntimeBackend, RuntimeV3ServiceConfig, UnixFrameListener,
 };
 use personalai_engine_server::{
-    FOUNDATION_STATUS, ProtocolDescriptor, RegistrySelectionV2, ServiceConfig,
+    FOUNDATION_STATUS, ProtocolDescriptor, QwenRegistrySelectionV3, RegistrySelectionV2,
+    ServiceConfig,
 };
 #[cfg(all(unix, feature = "cpu-reference"))]
 use personalai_engine_types::{
@@ -101,6 +102,10 @@ const USAGE: &str = "usage:
     --registry-entry-sha384 HEX96 \
     --registry-signer-key-id HEX32 --registry-signer-public-key HEX64 \
     --package-signer-key-id HEX32 --package-signer-public-key HEX64
+  development-only Qwen ARM64 serving additionally requires:
+    --registration-mode experimental-qwen-registry-v3 \
+    --experimental-qwen-development-execution owner-approved \
+    --runtime-v3 'LOGICAL_MODEL_ID|ARTIFACT_ID|version.0_2_0|BACKEND_INSTANCE|ENGINE_INSTANCE|MAX_ACTIVE|MAX_INFERENCE_MEMORY_BYTES|AVAILABILITY_TTL_MILLIS'
   serving reads exactly 32 binary response-key seed bytes from stdin;
   continuous serving drains on SIGINT or SIGTERM";
 
@@ -108,7 +113,7 @@ const USAGE: &str = "usage:
 enum Command {
     Version,
     Capabilities,
-    CheckConfig(ServiceConfig),
+    CheckConfig(Box<ServiceConfig>),
     Generate(Box<GenerateConfig>),
     Serve(Box<ServeConfig>),
 }
@@ -154,6 +159,7 @@ struct ServeConfig {
     mode: ServeMode,
     runtime_v3: Option<RuntimeV3CliConfig>,
     runtime_v3_development_fixed_output: Option<String>,
+    experimental_qwen_development_execution: bool,
 }
 
 #[derive(Debug)]
@@ -211,12 +217,14 @@ enum RegistrationConfig {
         signer_public_key: [u8; 32],
     },
     ModelFoundryRegistryV2(RegistrySelectionV2),
+    ExperimentalQwenRegistryV3(QwenRegistrySelectionV3),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistrationMode {
     OwnerPinned,
     ModelFoundryRegistryV2,
+    ExperimentalQwenRegistryV3,
 }
 
 #[derive(Default)]
@@ -255,6 +263,7 @@ struct RawServeConfig {
     additional_models: Vec<AdditionalOwnerModel>,
     runtime_v3: Option<RuntimeV3CliConfig>,
     runtime_v3_development_fixed_output: Option<String>,
+    experimental_qwen_development_execution: Option<bool>,
 }
 
 const MAX_ADDITIONAL_MODELS: usize = 127;
@@ -331,7 +340,9 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "generate" => parse_generate(arguments).map(Box::new).map(Command::Generate),
         "serve" => parse_serve(arguments, false).map(Box::new).map(Command::Serve),
         "serve-continuous" => parse_serve(arguments, true).map(Box::new).map(Command::Serve),
-        "check-config" => parse_config(arguments).map(Command::CheckConfig),
+        "check-config" => {
+            parse_config(arguments).map(|config| Command::CheckConfig(Box::new(config)))
+        }
         "version" | "capabilities" => {
             Err(CliError::InvalidArguments("selected command does not accept arguments"))
         }
@@ -556,6 +567,16 @@ fn parse_serve(
                 }
                 config.runtime_v3_development_fixed_output = Some(text.to_owned());
             }
+            "--experimental-qwen-development-execution"
+                if config.experimental_qwen_development_execution.is_none() =>
+            {
+                if text != "owner-approved" {
+                    return Err(CliError::InvalidArguments(
+                        "experimental Qwen execution requires the exact owner-approved value",
+                    ));
+                }
+                config.experimental_qwen_development_execution = Some(true);
+            }
             "--model-root"
             | "--runtime-root"
             | "--socket"
@@ -588,7 +609,8 @@ fn parse_serve(
             | "--max-device-memory-bytes"
             | "--max-metal-buffers"
             | "--runtime-v3"
-            | "--runtime-v3-development-fixed-output" => {
+            | "--runtime-v3-development-fixed-output"
+            | "--experimental-qwen-development-execution" => {
                 return Err(CliError::InvalidArguments("serve flag may appear only once"));
             }
             "--additional-owner-model" => {
@@ -618,6 +640,22 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
     let registration = finish_registration(&config, &model_id)?;
     validate_additional_models(&config, &model_id)?;
     let backend = finish_serve_backend(&config)?;
+    let experimental_qwen_development_execution =
+        config.experimental_qwen_development_execution.unwrap_or(false);
+    if experimental_qwen_development_execution {
+        if config.registration_mode != Some(RegistrationMode::ExperimentalQwenRegistryV3)
+            || config.execution_backend != Some(ServeBackendKind::Arm64)
+            || config.runtime_v3.is_none()
+        {
+            return Err(CliError::InvalidArguments(
+                "experimental Qwen execution requires Qwen V3 registration, ARM64, and runtime-v3",
+            ));
+        }
+    } else if config.registration_mode == Some(RegistrationMode::ExperimentalQwenRegistryV3) {
+        return Err(CliError::InvalidArguments(
+            "Qwen V3 serving requires explicit owner development execution approval",
+        ));
+    }
     let placement_policy = match config.weight_residency {
         None | Some(WeightResidencyMode::FullyResident) => PlacementPolicy::fully_resident(),
         Some(WeightResidencyMode::LayerStreamed) => {
@@ -661,6 +699,7 @@ fn finish_serve_config(config: RawServeConfig, continuous: bool) -> Result<Serve
         mode,
         runtime_v3: config.runtime_v3,
         runtime_v3_development_fixed_output: config.runtime_v3_development_fixed_output,
+        experimental_qwen_development_execution,
     })
 }
 
@@ -776,6 +815,10 @@ fn validate_additional_models(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "three mutually exclusive trust modes keep every prohibited/required input visible"
+)]
 fn finish_registration(
     config: &RawServeConfig,
     model_id: &ModelId,
@@ -834,6 +877,55 @@ fn finish_registration(
                 package_signer,
             )?))
         }
+        RegistrationMode::ExperimentalQwenRegistryV3 => {
+            if config.package_name.is_some()
+                || config.package_hash.is_some()
+                || config.signer_key_id.is_some()
+                || config.signer_public_key.is_some()
+            {
+                return Err(CliError::InvalidArguments(
+                    "owner-pinned package flags are forbidden in Qwen V3 registry mode",
+                ));
+            }
+            let runtime = config.runtime_v3.as_ref().ok_or(CliError::InvalidArguments(
+                "Qwen V3 registry mode requires exact runtime-v3 identity",
+            ))?;
+            let artifact_id = required(config.artifact_id.as_deref(), "--artifact-id is required")?;
+            if artifact_id != runtime.artifact_id.as_str() {
+                return Err(CliError::InvalidArguments(
+                    "Qwen registry and runtime-v3 artifact identities must match",
+                ));
+            }
+            let registry_signer = TrustedSigner::active(
+                required(config.registry_signer_key_id, "--registry-signer-key-id is required")?,
+                required(
+                    config.registry_signer_public_key,
+                    "--registry-signer-public-key is required",
+                )?,
+            )?;
+            let package_signer = TrustedSigner::active(
+                required(config.package_signer_key_id, "--package-signer-key-id is required")?,
+                required(
+                    config.package_signer_public_key,
+                    "--package-signer-public-key is required",
+                )?,
+            )?;
+            Ok(RegistrationConfig::ExperimentalQwenRegistryV3(
+                QwenRegistrySelectionV3::from_owner_text(
+                    model_id.clone(),
+                    runtime.logical_model_id.as_str(),
+                    artifact_id,
+                    required(config.registry_entry_hash, "--registry-entry-sha384 is required")?,
+                    required(config.registry_sequence, "--registry-sequence is required")?,
+                    required(
+                        config.minimum_registry_sequence,
+                        "--minimum-registry-sequence is required",
+                    )?,
+                    registry_signer,
+                    package_signer,
+                )?,
+            ))
+        }
     }
 }
 
@@ -852,8 +944,9 @@ fn parse_registration_mode(value: &str) -> Result<RegistrationMode, CliError> {
     match value {
         "owner-pinned" => Ok(RegistrationMode::OwnerPinned),
         "model-foundry-registry-v2" => Ok(RegistrationMode::ModelFoundryRegistryV2),
+        "experimental-qwen-registry-v3" => Ok(RegistrationMode::ExperimentalQwenRegistryV3),
         _ => Err(CliError::InvalidArguments(
-            "registration mode must be owner-pinned or model-foundry-registry-v2",
+            "registration mode must be owner-pinned, model-foundry-registry-v2, or experimental-qwen-registry-v3",
         )),
     }
 }
@@ -1186,6 +1279,29 @@ fn serve(
         RegistrationConfig::ModelFoundryRegistryV2(selection) => {
             service.register_model_foundry_registry_v2(&selection)?;
         }
+        RegistrationConfig::ExperimentalQwenRegistryV3(selection) => {
+            service.register_experimental_qwen_registry_v3(&selection)?;
+        }
+    }
+    if config.experimental_qwen_development_execution {
+        #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+        {
+            let runtime = config.runtime_v3.as_ref().ok_or(CliError::InvalidArguments(
+                "experimental Qwen execution lost runtime-v3 configuration",
+            ))?;
+            service.authorize_experimental_qwen_arm64_development_execution(
+                runtime.logical_model_id.clone(),
+                config.model_id.clone(),
+                runtime.artifact_id.clone(),
+                runtime.backend_version.clone(),
+                runtime.backend_instance_id.clone(),
+                runtime.engine_instance_id.clone(),
+            )?;
+        }
+        #[cfg(not(all(feature = "arm64", target_arch = "aarch64")))]
+        return Err(CliError::InvalidArguments(
+            "experimental Qwen execution requires an ARM64-enabled aarch64 build",
+        ));
     }
     for model in &config.additional_models {
         service.register_configured_model(
@@ -1227,7 +1343,36 @@ fn serve(
             event_write_failed = true;
         }
     };
-    runtime.load_registered_model(&config.model_id, &config.budget, &mut package_events)?;
+    let load_signals = os_signal::ProcessSignalGuard::install()?;
+    let load_cancelled = Arc::new(AtomicBool::new(false));
+    let load_watcher_stop = Arc::new(AtomicBool::new(false));
+    let load_watcher =
+        spawn_load_shutdown_watcher(Arc::clone(&load_cancelled), Arc::clone(&load_watcher_stop));
+    let load_watcher = match load_watcher {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            load_signals.restore()?;
+            return Err(CliError::Engine(error));
+        }
+    };
+    let load_result = runtime.load_registered_model_cancellable(
+        &config.model_id,
+        &config.budget,
+        &load_cancelled,
+        &mut package_events,
+    );
+    load_watcher_stop.store(true, Ordering::Release);
+    let load_watcher_result = load_watcher
+        .join()
+        .map_err(|_| EngineError::internal_invariant("model-load signal watcher panicked"));
+    let load_shutdown_requested = os_signal::ProcessSignalGuard::shutdown_requested();
+    let load_restore_result = load_signals.restore();
+    load_result?;
+    load_watcher_result?;
+    load_restore_result?;
+    if load_shutdown_requested {
+        return Err(CliError::Engine(EngineError::cancellation(None)));
+    }
     if event_write_failed {
         return Err(CliError::Io);
     }
@@ -1306,6 +1451,13 @@ fn validate_registration_key_roles(
                 || response_signer.public_key() == *signer_public_key
         }
         RegistrationConfig::ModelFoundryRegistryV2(selection) => {
+            control_keys
+                .configured_keys()
+                .any(|key| selection.conflicts_with_identity(key.key_id(), key.public_key()))
+                || selection
+                    .conflicts_with_identity(response_signer.key_id(), response_signer.public_key())
+        }
+        RegistrationConfig::ExperimentalQwenRegistryV3(selection) => {
             control_keys
                 .configured_keys()
                 .any(|key| selection.conflicts_with_identity(key.key_id(), key.public_key()))
@@ -1431,6 +1583,26 @@ fn spawn_shutdown_watcher(
         .map_err(|_| EngineError::backend_failure("process shutdown watcher creation failed"))
 }
 
+#[cfg(all(unix, feature = "cpu-reference"))]
+fn spawn_load_shutdown_watcher(
+    cancelled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, EngineError> {
+    thread::Builder::new()
+        .name("personalai-model-load-shutdown".to_owned())
+        .stack_size(64 * 1_024)
+        .spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if os_signal::ProcessSignalGuard::shutdown_requested() {
+                    cancelled.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .map_err(|_| EngineError::backend_failure("model-load signal watcher creation failed"))
+}
+
 #[cfg(not(all(unix, feature = "cpu-reference")))]
 fn serve(
     _config: ServeConfig,
@@ -1524,9 +1696,10 @@ mod tests {
             &mut errors,
         )
         .expect("version must work");
-        assert!(
-            std::str::from_utf8(&output).expect("output must be UTF-8").contains(FOUNDATION_STATUS)
-        );
+        let version = std::str::from_utf8(&output).expect("output must be UTF-8");
+        assert!(version.contains(FOUNDATION_STATUS));
+        assert!(version.contains("personalai-engine 0.2.0"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
         assert!(errors.is_empty());
 
         output.clear();
@@ -1924,6 +2097,47 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    #[test]
+    fn qwen_v3_requires_separate_exact_development_execution_approval() {
+        let without_approval = complete_qwen_registry_serve_arguments(false);
+        let error = parse_command(without_approval.into_iter())
+            .expect_err("Qwen execution without owner approval must fail");
+        assert!(
+            matches!(
+                error,
+                CliError::InvalidArguments(
+                    "Qwen V3 serving requires explicit owner development execution approval"
+                )
+            ),
+            "{error:?}"
+        );
+
+        let Command::Serve(config) =
+            parse_command(complete_qwen_registry_serve_arguments(true).into_iter())
+                .expect("exact owner-approved Qwen V3 configuration must parse")
+        else {
+            panic!("Qwen V3 serving changed command kind");
+        };
+        assert!(config.experimental_qwen_development_execution);
+        assert!(matches!(config.backend, ServeBackend::Arm64));
+        assert!(matches!(config.registration, RegistrationConfig::ExperimentalQwenRegistryV3(_)));
+
+        let mut wrong_approval = complete_qwen_registry_serve_arguments(true);
+        let value = wrong_approval
+            .iter_mut()
+            .skip_while(|value| {
+                value != &&OsString::from("--experimental-qwen-development-execution")
+            })
+            .nth(1)
+            .expect("approval value exists");
+        *value = OsString::from("request-selected");
+        assert!(matches!(
+            parse_command(wrong_approval.into_iter()),
+            Err(CliError::InvalidArguments(_))
+        ));
+    }
+
     #[cfg(all(unix, feature = "cpu-reference"))]
     #[test]
     fn continuous_serve_requires_explicit_bounded_limits() {
@@ -1984,6 +2198,19 @@ mod tests {
         assert!(shutdown.is_requested());
         stop.store(true, Ordering::Release);
         signals.restore().expect("test process signal handlers must restore");
+
+        let load_signals = os_signal::ProcessSignalGuard::install()
+            .expect("model-load signal handlers must install");
+        let load_cancelled = Arc::new(AtomicBool::new(false));
+        let load_stop = Arc::new(AtomicBool::new(false));
+        let load_watcher =
+            spawn_load_shutdown_watcher(Arc::clone(&load_cancelled), Arc::clone(&load_stop))
+                .expect("model-load shutdown watcher must start");
+        os_signal::request_shutdown_for_test();
+        load_watcher.join().expect("model-load shutdown watcher must stop");
+        assert!(load_cancelled.load(Ordering::Acquire));
+        load_stop.store(true, Ordering::Release);
+        load_signals.restore().expect("model-load signal handlers must restore");
     }
 
     #[cfg(all(unix, feature = "cpu-reference"))]
@@ -2154,5 +2381,59 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect()
+    }
+
+    #[cfg(all(feature = "arm64", target_arch = "aarch64"))]
+    fn complete_qwen_registry_serve_arguments(owner_approved: bool) -> Vec<OsString> {
+        let mut arguments = vec![
+            "serve".to_owned(),
+            "--model-root".to_owned(),
+            "/models".to_owned(),
+            "--runtime-root".to_owned(),
+            "/run/personalai-engine".to_owned(),
+            "--socket".to_owned(),
+            "/run/personalai-engine/engine.sock".to_owned(),
+            "--model-id".to_owned(),
+            "qwen2.5-1.5b-instruct-989aa798".to_owned(),
+            "--registration-mode".to_owned(),
+            "experimental-qwen-registry-v3".to_owned(),
+            "--artifact-id".to_owned(),
+            "art_qwen25_general_1_5b_989aa798".to_owned(),
+            "--registry-sequence".to_owned(),
+            "1".to_owned(),
+            "--minimum-registry-sequence".to_owned(),
+            "1".to_owned(),
+            "--registry-entry-sha384".to_owned(),
+            "11".repeat(48),
+            "--registry-signer-key-id".to_owned(),
+            "61616161616161616161616161616161".to_owned(),
+            "--registry-signer-public-key".to_owned(),
+            "2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653".to_owned(),
+            "--package-signer-key-id".to_owned(),
+            "71717171717171717171717171717171".to_owned(),
+            "--package-signer-public-key".to_owned(),
+            "2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7".to_owned(),
+            "--control-key-id".to_owned(),
+            "03030303030303030303030303030303".to_owned(),
+            "--control-public-key".to_owned(),
+            "04".repeat(32),
+            "--response-key-id".to_owned(),
+            "07070707070707070707070707070707".to_owned(),
+            "--max-memory-bytes".to_owned(),
+            "4294967296".to_owned(),
+            "--max-kv-cache-bytes".to_owned(),
+            "1073741824".to_owned(),
+            "--execution-backend".to_owned(),
+            "arm64".to_owned(),
+            "--runtime-v3".to_owned(),
+            "mdl_qwen25_general_1_5b_989aa798|art_qwen25_general_1_5b_989aa798|version.0_2_0|backend.arm64.local.dev1|engine.local.dev1|1|4294967296|10000".to_owned(),
+        ];
+        if owner_approved {
+            arguments.extend([
+                "--experimental-qwen-development-execution".to_owned(),
+                "owner-approved".to_owned(),
+            ]);
+        }
+        arguments.into_iter().map(OsString::from).collect()
     }
 }

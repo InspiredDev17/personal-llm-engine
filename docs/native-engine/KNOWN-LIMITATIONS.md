@@ -19,17 +19,15 @@
 
 ## Models and numerical evidence
 
-- Manifest v1.0 accepts `decoder-rms-rope-swiglu-gqa-v1`. Engine-private
-  manifest v1.1 parses the exact
-  `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1` 1.5B bootstrap profiles as future
-  0.2.0 artifacts. The current 0.1.0 loader rejects them. Tiny configurations
+- Manifest v1.0 accepts `decoder-rms-rope-swiglu-gqa-v1`. Engine 0.2.0 parses
+  the exact engine-private manifest v1.1
+  `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1` 1.5B bootstrap profiles. Tiny configurations
   provide scalar math evidence only; the exact 1.5B position-zero estimate is
   1,543,712,768 operations and fails the 100,000,000-operation scalar ceiling
   before model materialization. A bounded `AIPTOK02` Qwen table parser and a
   private fixed scanner/BPE/decode/incremental-decode core now exist. A narrow
   wrapper can construct the exact pinned profile only after revalidating its
-  complete package tokenizer hash; ordinary service construction remains
-  closed. A startup-only, default-disabled metadata readiness surface can bind
+  complete package tokenizer hash. A startup-only, default-disabled metadata readiness surface can bind
   a signed future package to that tokenizer, its selectable domain and an exact
   Runtime-v3 identity, but it deliberately does not verify tensor contents,
   perform runtime resource admission, or expose an executable result. The core
@@ -38,31 +36,31 @@
   bounded NFC, every `L*`/`N*` General Category, and the closed contraction
   simple-fold mapping. Exact pinned-source conversion and fixed production
   encode/decode/incremental-decode replay now pass through an offline,
-  feature-gated content-free diagnostic, but ordinary tokenizer construction
-  remains disabled.
-  Offline
-  importer emission, the Model Foundry registry compatibility profile, an
-  optimized backend, signed package, independent logits, and production
+  feature-gated content-free diagnostic. An offline exporter can publish only
+  that exact AIPTOK02 to a fresh owner-private read-only path. Registry V2
+  remains frozen; a separate signed V3 development record plus canonical
+  Models 2.0 descriptor and explicit owner startup approval can admit only the
+  ARM64 path. A real signed package, independent logits, and production
   qualification remain absent. ARM64 uses the exact split-half scalar
   correctness operation instead of its legacy interleaved RoPE when the Qwen
   architecture is selected; that is not optimized-backend qualification.
-  Metal ordinary service remains closed. A second authenticated-service
-  tokenizer gate prevents AIPTok v1 from being mislabeled after any future
-  engine-version activation.
+  CPU-reference and Metal Qwen service remain closed. A second
+  authenticated-service tokenizer gate prevents AIPTok v1 from being
+  mislabeled.
 - A separate default-disabled ARM64 preparation policy now derives the exact
   selectable domain and bounded per-sequence KV plan from verified metadata.
   ARM64 session/step admission retains checked operation arithmetic without
   applying the scalar correctness-oracle ceiling. This is model-independent
-  resource preparation only: it allocates no 3-GB weight set, creates no
-  execution lease, has no client/CLI activation surface, and remains blocked on
-  engine 0.2.0, canonical Registry V2 support, tensor verification, production
-  qualification, optimized Qwen evidence, and explicit owner activation.
+  resource preparation is composed only by the explicit Qwen V3 ARM64
+  development load. It remains blocked without exact package verification,
+  production qualification, optimized Qwen evidence, and explicit owner
+  activation. Client requests cannot enable it.
 - The package loader can now cooperatively cancel full shard hashing and tensor
   materialization, and BF16/F16 conversion no longer retains a second owned
   source tensor. This closes portable cancellation and peak-copy prerequisites
-  only. It does not authorize an internal Qwen load: the signed PAIDIR01 v1.1
-  package requires engine 0.2.0, while the current engine remains 0.1.0, and the
-  qualification and ordinary-service gates remain unresolved.
+  only. It does not authorize an internal Qwen load by itself: the signed V3
+  record, Models 2.0 descriptor, exact PAIDIR01 v1.1 package, owner-approved
+  ARM64 identity and qualification gates remain independently mandatory.
 - Only synthetic signed tiny packages are qualified. No production model,
   license/provenance review, tokenizer conformance corpus, long-context quality,
   or generated-output acceptance evidence exists.

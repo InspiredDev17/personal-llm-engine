@@ -4,10 +4,12 @@ use sovereign_ai_contracts::cognitive::{
     validate_execution_against_request, CognitiveExecutionRequest, CognitiveExecutionResult,
 };
 use sovereign_ai_contracts::common::ContractVersion;
-use sovereign_ai_contracts::identity::{ModelArtifactId, ModelId, RequestId};
+use sovereign_ai_contracts::identity::{
+    EvaluationRevisionId, ModelArtifactId, ModelId, QualificationEvidenceId, RequestId,
+};
 use sovereign_ai_contracts::inference_runtime_v3::{
-    InferenceExecutionRequestV3, InferenceExecutionResultV3, InferenceReservationDecisionV3,
-    InferenceReservationRequestV3, RuntimeAvailabilityV3,
+    ArtifactDigestAlgorithmV3, InferenceExecutionRequestV3, InferenceExecutionResultV3,
+    InferenceReservationDecisionV3, InferenceReservationRequestV3, RuntimeAvailabilityV3,
 };
 use sovereign_ai_contracts::knowledge::{
     canonical_memory_revision_invalidation_digest, canonical_static_knowledge_bundle_digest,
@@ -23,6 +25,10 @@ use sovereign_ai_contracts::knowledge_prefix::{
 use sovereign_ai_contracts::memory::SensitivityClass;
 use sovereign_ai_contracts::qualification_v2::{
     canonical_model_capability_digest, validate_manifest_revision, ModelCapabilityManifest,
+};
+use sovereign_ai_contracts::qualification_v2_1::{
+    canonical_model_capability_digest_v21, validate_manifest_revision_v21,
+    ModelCapabilityManifestV21, ModelQualificationStateV21, QualificationTrustStateV21,
 };
 use sovereign_ai_contracts::{Result, Validate};
 
@@ -57,6 +63,7 @@ fn shared_semantic_fixtures_fail_closed() {
             "runtime_v3" => runtime_mutation(&case.mutation),
             "cognitive" => cognitive_mutation(&case.mutation),
             "qualification_v2" => qualification_mutation(&case.mutation),
+            "qualification_v2_1" => qualification_v21_mutation(&case.mutation),
             "knowledge" => knowledge_mutation(&case.mutation),
             "knowledge_prefix" => knowledge_prefix_mutation(&case.mutation),
             other => panic!("unknown suite {other}"),
@@ -67,6 +74,156 @@ fn shared_semantic_fixtures_fail_closed() {
             case.name,
             case.mutation
         );
+    }
+}
+
+fn finalize_v21(manifest: &mut ModelCapabilityManifestV21) -> Result<()> {
+    manifest.canonical_digest = canonical_model_capability_digest_v21(&manifest.payload)?;
+    Ok(())
+}
+
+fn next_v21(previous: &ModelCapabilityManifestV21) -> Result<ModelCapabilityManifestV21> {
+    let mut current = previous.clone();
+    current.payload.revision += 1;
+    current.payload.anti_rollback_metadata.sequence += 1;
+    current.payload.previous_revision_digest = Some(previous.canonical_digest.clone());
+    current.payload.issued_at = "2026-08-15T12:10:00Z".into();
+    finalize_v21(&mut current)?;
+    Ok(current)
+}
+
+fn apply_fresh_evaluation_v21(manifest: &mut ModelCapabilityManifestV21) -> Result<()> {
+    manifest.payload.issued_at = "2026-08-15T12:20:00Z".into();
+    manifest.payload.evaluation_revision = EvaluationRevisionId::new("evr_fixture_2")?;
+    manifest.payload.qualification_timestamp = "2026-08-15T12:14:00Z".into();
+    manifest.payload.state_transition.occurred_at = "2026-08-15T12:15:00Z".into();
+    manifest.payload.state_transition.reason_code = "evaluation.reaffirmed".into();
+    let evidence_id = QualificationEvidenceId::new("qev_fixture_2")?;
+    manifest.payload.evidence[0].evidence_id = evidence_id.clone();
+    manifest.payload.evidence[0].evaluation_revision = manifest.payload.evaluation_revision.clone();
+    manifest.payload.evidence[0].evidence_reference.reference_id = "evidence:rust-v2".into();
+    manifest.payload.evidence[0].evidence_reference.digest = "d".repeat(64);
+    manifest.payload.evidence[0].observed_at = "2026-08-15T12:13:00Z".into();
+    manifest.payload.capabilities[0].evaluation_revision =
+        manifest.payload.evaluation_revision.clone();
+    manifest.payload.capabilities[0].evidence_ids = vec![evidence_id];
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn qualification_v21_mutation(mutation: &str) -> Result<()> {
+    let mut previous: ModelCapabilityManifestV21 = fixture("model-capability-manifest-v2.1.json");
+    match mutation {
+        "maximum_revision_terminal" => {
+            previous.payload.revision = u64::MAX;
+            previous.payload.anti_rollback_metadata.sequence = u64::MAX;
+            previous.payload.previous_revision_digest = Some("a".repeat(64));
+            finalize_v21(&mut previous)?;
+            validate_manifest_revision_v21(&previous, &previous)
+        }
+        "revoked_terminal" => {
+            previous.payload.qualification_state = ModelQualificationStateV21::Revoked;
+            previous.payload.state_transition.reason_code = "security.revoked".into();
+            finalize_v21(&mut previous)?;
+            let current = next_v21(&previous)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "trust_downgrade" => {
+            previous.payload.trust_state = QualificationTrustStateV21::Verified;
+            finalize_v21(&mut previous)?;
+            let mut current = next_v21(&previous)?;
+            current.payload.trust_state = QualificationTrustStateV21::DevelopmentFixture;
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "requalification_without_evidence" => {
+            previous.payload.trust_state = QualificationTrustStateV21::Verified;
+            previous.payload.qualification_state = ModelQualificationStateV21::Suspended;
+            previous.payload.state_transition.reason_code = "security.suspended".into();
+            finalize_v21(&mut previous)?;
+            let mut current = next_v21(&previous)?;
+            current.payload.qualification_state = ModelQualificationStateV21::Qualified;
+            current.payload.state_transition.occurred_at = "2026-08-15T12:05:00Z".into();
+            current.payload.state_transition.reason_code = "evaluation.requalified".into();
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "evidence_id_reuse_with_new_evaluation" => {
+            let mut current = next_v21(&previous)?;
+            apply_fresh_evaluation_v21(&mut current)?;
+            current.payload.evidence[0].evidence_id =
+                previous.payload.evidence[0].evidence_id.clone();
+            current.payload.capabilities[0].evidence_ids =
+                vec![previous.payload.evidence[0].evidence_id.clone()];
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "evidence_reference_reuse_with_new_evaluation" => {
+            let mut current = next_v21(&previous)?;
+            apply_fresh_evaluation_v21(&mut current)?;
+            current.payload.evidence[0].evidence_reference =
+                previous.payload.evidence[0].evidence_reference.clone();
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "same_state_event_without_evaluation" => {
+            let mut current = next_v21(&previous)?;
+            current.payload.state_transition.occurred_at = "2026-08-15T12:05:00Z".into();
+            current.payload.state_transition.reason_code = "evaluation.reaffirmed".into();
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        "qualified_rejection_without_evaluation" => {
+            previous.payload.trust_state = QualificationTrustStateV21::Verified;
+            previous.payload.qualification_state = ModelQualificationStateV21::Qualified;
+            previous.payload.state_transition.reason_code = "fixture.qualified".into();
+            finalize_v21(&mut previous)?;
+            let mut current = next_v21(&previous)?;
+            current.payload.qualification_state = ModelQualificationStateV21::Rejected;
+            current.payload.state_transition.occurred_at = "2026-08-15T12:05:00Z".into();
+            current.payload.state_transition.reason_code = "evaluation.rejected".into();
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
+        _ => {
+            let mut current = next_v21(&previous)?;
+            match mutation {
+                "runtime_identity_substitution" => {
+                    current.payload.runtime_identity.engine_instance_id =
+                        "engine.instance-2".into();
+                }
+                "lineage_substitution" => {
+                    current.payload.anti_rollback_metadata.lineage_id = "lineage:other".into();
+                }
+                "state_timestamp_rollback" => {
+                    current.payload.state_transition.occurred_at = "2026-08-15T11:57:15Z".into();
+                }
+                "issued_timestamp_rollback" => {
+                    current.payload.issued_at = "2026-08-15T11:57:45Z".into();
+                }
+                "expiry_extension_without_evaluation" => {
+                    current.payload.expires_at = "2026-10-14T11:58:00Z".into();
+                }
+                "capability_substitution_without_evaluation" => {
+                    current.payload.capabilities[0].score_basis_points += 1;
+                }
+                "evidence_substitution_without_evaluation" => {
+                    current.payload.evidence[0].observed_at = "2026-08-15T11:54:00Z".into();
+                }
+                "resource_substitution_without_evaluation" => {
+                    current.payload.resource_requirements.expected_memory_bytes += 1;
+                }
+                "modality_substitution_without_evaluation" => {
+                    current.payload.modalities = vec!["audio".into(), "text".into()];
+                }
+                "taxonomy_substitution_without_evaluation" => {
+                    current.payload.taxonomy_revision = "cognitive.v3".into();
+                }
+                other => panic!("unknown qualification v2.1 mutation {other}"),
+            }
+            finalize_v21(&mut current)?;
+            validate_manifest_revision_v21(&previous, &current)
+        }
     }
 }
 
@@ -321,7 +478,14 @@ fn cognitive_mutation(mutation: &str) -> Result<()> {
 }
 
 fn qualification_mutation(mutation: &str) -> Result<()> {
-    let previous: ModelCapabilityManifest = fixture("model-capability-manifest-v2.json");
+    let mut previous: ModelCapabilityManifest = fixture("model-capability-manifest-v2.json");
+    if mutation == "maximum_revision_terminal" {
+        previous.payload.revision = u64::MAX;
+        previous.payload.anti_rollback_metadata.sequence = u64::MAX;
+        previous.payload.previous_revision_digest = Some("a".repeat(64));
+        previous.canonical_digest = canonical_model_capability_digest(&previous.payload)?;
+        return validate_manifest_revision(&previous, &previous);
+    }
     let mut current = previous.clone();
     current.payload.revision = 2;
     current.payload.anti_rollback_metadata.sequence = 2;
@@ -331,14 +495,53 @@ fn qualification_mutation(mutation: &str) -> Result<()> {
             current.payload.revision = 1;
             current.payload.anti_rollback_metadata.sequence = 1;
         }
+        "logical_model_substitution" => {
+            current.payload.logical_model_id = ModelId::new("mdl_other")?;
+            current.payload.runtime_identity.model_id = ModelId::new("mdl_other")?;
+        }
+        "provider_model_substitution" => {
+            current.payload.runtime_identity.provider_model_id = "runtime-model-2".into();
+        }
         "artifact_substitution" => {
             current.payload.runtime_identity.artifact_id = ModelArtifactId::new("art_other")?;
             for evidence in &mut current.payload.evidence {
                 evidence.artifact_id = ModelArtifactId::new("art_other")?;
             }
         }
+        "artifact_digest_substitution" => {
+            current.payload.runtime_identity.artifact_digest = "d".repeat(64);
+        }
+        "artifact_digest_algorithm_substitution" => {
+            current.payload.runtime_identity.artifact_digest_algorithm =
+                ArtifactDigestAlgorithmV3::Sha384;
+            current.payload.runtime_identity.artifact_digest = "d".repeat(96);
+        }
+        "backend_substitution" => {
+            current.payload.runtime_identity.backend_id = "backend.other".into();
+        }
+        "backend_version_substitution" => {
+            current.payload.runtime_identity.backend_version = "version.2".into();
+        }
+        "backend_instance_substitution" => {
+            current.payload.runtime_identity.backend_instance_id = "backend.instance-2".into();
+        }
+        "engine_instance_substitution" => {
+            current.payload.runtime_identity.engine_instance_id = "engine.instance-2".into();
+        }
         other => panic!("unknown qualification mutation {other}"),
     }
     current.canonical_digest = canonical_model_capability_digest(&current.payload)?;
     validate_manifest_revision(&previous, &current)
+}
+
+#[test]
+fn qualification_v2_accepts_identity_stable_revision() {
+    let previous: ModelCapabilityManifest = fixture("model-capability-manifest-v2.json");
+    let mut current = previous.clone();
+    current.payload.revision = 2;
+    current.payload.anti_rollback_metadata.sequence = 2;
+    current.payload.previous_revision_digest = Some(previous.canonical_digest.clone());
+    current.canonical_digest =
+        canonical_model_capability_digest(&current.payload).expect("canonical revision digest");
+    validate_manifest_revision(&previous, &current).expect("identity-stable revision");
 }

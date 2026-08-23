@@ -72,25 +72,24 @@ boundary. Deterministic tests model the exact Qwen counts and prove that IDs
 min-p, or repetition-penalty selection even when every reserved row has the
 largest logit. Trusted loader-side domain derivation now selects either the
 legacy all-vocabulary domain or the exact tokenizer-defined prefix after
-checking model-row equality and the complete tokenizer hash. The ordinary
-service still cannot construct or execute the Qwen tokenizer, so the remaining
-runtime, registry, package-emission, backend, signing, Foundry, and
-owner-activation gates remain closed.
+checking model-row equality and the complete tokenizer hash. Only the exact
+signed Qwen V3 ARM64 development path may construct the tokenizer; generic,
+CPU-reference, Metal and production service paths remain closed.
 
 ## Package boundary
 
-`PAIDIR01` v1.1 and the scalar Qwen correctness scaffold now exist without
-changing v1.0. That does not activate the source profile: v1.1 deliberately
-requires engine 0.2.0 while the current engine is 0.1.0, ordinary-service
-tokenizer construction remains disabled, Registry V2 remains legacy-only,
-and the full profile exceeds the scalar oracle ceiling without a qualified optimized
-backend. Package emission therefore still returns `NotImplemented`; none of
-these source files are approved, signed, activated, or loadable.
+`PAIDIR01` v1.1 and the scalar Qwen correctness scaffold exist without changing
+v1.0. Engine 0.2.0 accepts the profile only through canonical Sovereign Models
+2.0 identity, a separately signed development registry V3 record, exact package
+verification and a separate owner-approved ARM64 startup identity. Registry V2
+remains legacy-only, CPU/Metal remain ineligible, and production activation is
+unavailable. Importer package emission still returns `NotImplemented`; Model
+Foundry owns package creation, signing and qualification.
 An internal ARM64 backend selection no longer risks legacy interleaved RoPE:
 the decoder resolves the Qwen architecture first and uses the exact split-half
 correctness operation. That narrow parity guard neither supplies a production
-Qwen backend nor changes the engine-version, package, Registry V2, tokenizer,
-service, qualification, signing or owner-activation gates.
+Qwen backend nor changes the package, registry, qualification, signing or
+owner-activation gates.
 Every public importer package/emission entry performs this unsupported-target check before
 path inspection, source reads, shard parsing, tensor conversion, or allocation.
 
@@ -103,10 +102,9 @@ metadata, exact Qwen architecture profile, package-bound `AIPTOK02` runtime
 tables, selectable token domain, and owner Runtime-v3 model/package/artifact/
 backend/version/instance identities. It deliberately does not hash tensor-shard
 contents or reserve/model-load their runtime resources. Its typed result always
-reports service ineligibility and the remaining engine-version, Registry V2,
-qualification, tensor-verification, resource-admission, tokenizer-service and
-owner-activation blockers. Ordinary load still rejects v1.1 at engine 0.1.0,
-and ordinary tokenizer construction still rejects `AIPTOK02`.
+reports service ineligibility and remaining qualification, tensor-verification,
+resource-admission and owner-activation blockers. It is not the execution gate;
+the V3 ARM64 path independently verifies the complete package and identity.
 
 The loader parser also has a content-free cross-repository conformance vector
 from the Model Foundry candidate encoder. It contains the complete canonical
@@ -121,31 +119,26 @@ This proves deterministic metadata-format parity only. The vector is unsigned,
 contains synthetic content digests, and grants no package trust,
 qualification, tensor-content evidence, or activation authority.
 
-A second, separately owner-selected startup policy can now turn that verified
-metadata into an ARM64 execution-preparation record. It reuses the exact
+A second, separately owner-selected startup policy turns that verified
+metadata into ARM64 execution preparation. It reuses the exact
 package-bound tokenizer, retains the 151,936-row/151,665-selectable token
 domain, revalidates the complete Runtime-v3 identity, and derives the bounded
 full-context per-sequence KV requirement (1,879,048,192 bytes for this profile)
 under the caller's memory, KV and concurrency ceilings. Cancellation is checked
 before package work and between preparation stages. The ARM64 compute check
 retains checked operation arithmetic but does not apply the scalar
-correctness-oracle ceiling to a different backend. This creates no model,
-reservation, execution lease, protocol or CLI command; its result always says
-execution is not activated, and accelerated-backend qualification remains an
-explicit blocker.
-
-An executable ARM64 load is intentionally still absent. The exact signed v1.1
-manifest requires engine 0.2.0 while the current loader truthfully enforces
-0.1.0; owner startup policy is not authority to bypass that signed minimum.
-The ordinary loader now has a cancellation-aware full-content path that hashes
+correctness-oracle ceiling to a different backend. Engine 0.2 composes this
+preparation only after V3/Models 2.0 validation and the exact CLI
+`owner-approved` decision. The load then uses the cancellation-aware
+full-content path that hashes
 large shard mappings in 1 MiB chunks and drops partial state on cancellation.
 Tensor materialization likewise polls snapshot hashing/copying and conversion;
 BF16/F16 conversion writes directly to the accounted F32 destination instead
 of retaining another owned source tensor, and quantized conversion polls at
-fixed block boundaries. These are portable load prerequisites, not permission
-to accept the Qwen package. The 0.2.0 implementation contract, exact Foundry
-qualification, complete real-package verification, production ARM64 evidence,
-and a separate activation decision remain mandatory.
+fixed block boundaries. Cancellation drops partial package/tokenizer/tensor
+state. A real signed package, exact Foundry qualification, independent output
+evidence, production ARM64 evidence and a separate production design remain
+mandatory.
 
 The portable preflight now requires one absolute normalized owner-private
 ingress root, one safe direct-child artifact name, an owner-private `source/`
@@ -190,6 +183,20 @@ only content-free identities/counts:
 ```text
 cargo run --locked -p personalai-engine-model-importer --example verify_qwen25_tokenizer_conversion < tokenizer.json
 ```
+
+After verification, an operator may publish the exact bytes for Model Foundry
+to one new file inside a same-owner mode-0700 directory:
+
+```text
+cargo run --locked -p personalai-engine-model-importer --example export_qwen25_aiptok -- /absolute/pinned/tokenizer.json /absolute/private/new-tokenizer.aiptok
+```
+
+The source must be the exact pinned file at mode `0400`. The exporter binds the
+owner-private parent, uses no-follow/create-new publication, cannot overwrite,
+verifies the 4,613,135 output bytes and both fixed digests through the opened
+descriptor, synchronizes the file and directory, and publishes mode `0400`.
+Failure cleanup unlinks only the inode it created. Its report is content-free;
+the command is offline supply-chain tooling and has no service authority.
 
 The source parser accepts only the exact 7,031,645-byte input, fixed counts and
 bounded 256-byte token/512-byte merge strings. The encoded tokenizer is further

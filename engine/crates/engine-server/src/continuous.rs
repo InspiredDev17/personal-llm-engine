@@ -13,7 +13,8 @@ use super::{
     record_runtime_error_parts, retain_security_event, service_response_frame,
     terminal_connection_result, watch_generation_cancellation, write_queued_events,
 };
-use personalai_engine_protocol::ServiceResponseBody;
+use crate::transport::InboundWatchEvent;
+use personalai_engine_protocol::{RuntimeV3Document, ServiceRequestBody, ServiceResponseBody};
 use personalai_engine_types::SignerKeyId;
 use personalai_engine_types::{ResourceBudget, SecurityEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ pub const MAX_CONTINUOUS_CONNECTIONS: u32 = MAX_CONCURRENT_CONNECTION_BATCH;
 
 const CONTINUOUS_IDLE_POLL: Duration = Duration::from_millis(1);
 const INGRESS_WORKER_STACK_BYTES: usize = 256 * 1_024;
+const RUNTIME_V3_EXECUTION_WORKER_STACK_BYTES: usize = 512 * 1_024;
 
 /// Validated connection ceiling for one continuous reference service run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +161,16 @@ struct RetiringConnection {
     writer: JoinHandle<Result<(), EngineError>>,
 }
 
+struct RuntimeV3ExecutionConnection {
+    control: UnixFrameConnection,
+    request_id: RequestId,
+    request_nonce: u64,
+    cancelled: Arc<AtomicBool>,
+    watcher_done: Arc<AtomicBool>,
+    watcher: JoinHandle<()>,
+    worker: JoinHandle<Result<Vec<u8>, EngineError>>,
+}
+
 struct ContinuousState<'a> {
     service: &'a mut EngineService,
     trusted_control_keys: Arc<TrustedControlPlaneKeys>,
@@ -170,7 +182,7 @@ struct ContinuousState<'a> {
     model_load_budgets: &'a BTreeMap<String, ResourceBudget>,
     security_events: &'a mut std::collections::VecDeque<SecurityEvent>,
     metrics: &'a mut RuntimeMetrics,
-    runtime_v3: &'a mut Option<super::runtime_v3_service::RuntimeV3ServiceState>,
+    runtime_v3: &'a mut Option<Arc<super::runtime_v3_service::RuntimeV3ServiceState>>,
     next_sequence: &'a mut u64,
     pending_cache_attachments: &'a mut BTreeMap<RequestId, super::PendingCacheAttachment>,
     coordinator: GenerationRoundRobin,
@@ -178,6 +190,7 @@ struct ContinuousState<'a> {
     pending: Vec<PendingGenerationConnection>,
     active: Vec<ContinuousActiveConnection>,
     retiring: Vec<RetiringConnection>,
+    runtime_v3_executions: Vec<RuntimeV3ExecutionConnection>,
     summary: ContinuousServeSummary,
     maximum_connections: usize,
 }
@@ -242,6 +255,10 @@ impl CpuEngineRuntime {
             pending: bounded_vec(maximum_connections, "continuous pending")?,
             active: bounded_vec(maximum_connections, "continuous active")?,
             retiring: bounded_vec(maximum_connections, "continuous retiring")?,
+            runtime_v3_executions: bounded_vec(
+                maximum_connections,
+                "continuous runtime v3 execution",
+            )?,
             summary: ContinuousServeSummary::default(),
             maximum_connections,
         };
@@ -273,6 +290,7 @@ impl ContinuousState<'_> {
             }
             progressed |= self.drive_one_generation()?;
             progressed |= self.reap_retiring()?;
+            progressed |= self.reap_runtime_v3_executions()?;
             self.update_peak()?;
 
             if draining && self.is_drained() {
@@ -443,6 +461,18 @@ impl ContinuousState<'_> {
             authenticated;
         match command {
             InboundCommand::Service(request) => {
+                if matches!(request.body(), ServiceRequestBody::RuntimeV3Execute(_)) {
+                    let result = self.start_runtime_v3_execution(
+                        connection,
+                        session,
+                        replay_journal,
+                        &request,
+                    );
+                    if result.is_err() {
+                        increment(&mut self.summary.failed_connections, "failed connection count")?;
+                    }
+                    return Ok(());
+                }
                 let result = self.respond_to_service_request(connection, &request);
                 if result.is_err() {
                     increment(&mut self.summary.failed_connections, "failed connection count")?;
@@ -525,6 +555,193 @@ impl ContinuousState<'_> {
         };
         let frame = service_response_frame(request_id, nonce, &body, self.response_signer)?;
         connection.write_outbound_frame(&frame)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        reason = "one linear worker startup path keeps watcher, queue, admission, and terminal cleanup ordering auditable"
+    )]
+    fn start_runtime_v3_execution(
+        &mut self,
+        mut connection: UnixFrameConnection,
+        _session: AuthenticatedControlSession,
+        _replay_journal: Arc<Mutex<DurableReplayJournal>>,
+        request: &super::AuthenticatedServiceRequest,
+    ) -> Result<(), EngineError> {
+        let state = Arc::clone(self.runtime_v3.as_ref().ok_or_else(|| {
+            EngineError::not_implemented(
+                "runtime v3 authenticated service is not enabled by owner configuration",
+            )
+        })?);
+        if self.runtime_v3_executions.len() >= state.maximum_execution_workers() {
+            let error =
+                EngineError::resource_exhaustion("runtime v3 execution worker limit is reached");
+            self.record_ingress_error(&error)?;
+            let body = ServiceResponseBody::Error(super::service_error_code(&error));
+            let frame = service_response_frame(
+                request.request_id(),
+                request.nonce(),
+                &body,
+                self.response_signer,
+            )?;
+            connection.write_outbound_frame(&frame)?;
+            return Ok(());
+        }
+        let ServiceRequestBody::RuntimeV3Execute(document) = request.body() else {
+            return Err(EngineError::internal_invariant(
+                "runtime v3 worker received a non-execution service request",
+            ));
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let watcher_connection = connection.try_clone()?;
+        let watcher_cancelled = Arc::clone(&cancelled);
+        let watcher_finished = Arc::clone(&watcher_done);
+        let watcher = thread::Builder::new()
+            .name("personalai-runtime-v3-watch".to_owned())
+            .stack_size(CANCELLATION_WATCHER_STACK_BYTES)
+            .spawn(move || {
+                watch_runtime_v3_disconnect(
+                    watcher_connection,
+                    watcher_cancelled.as_ref(),
+                    watcher_finished.as_ref(),
+                );
+            })
+            .map_err(|_| {
+                EngineError::backend_failure("runtime v3 watcher thread creation failed")
+            })?;
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker = thread::Builder::new()
+            .name("personalai-runtime-v3-execute".to_owned())
+            .stack_size(RUNTIME_V3_EXECUTION_WORKER_STACK_BYTES)
+            .spawn(move || {
+                let prepared = receiver.recv().map_err(|_| EngineError::cancellation(None))?;
+                match prepared {
+                    super::runtime_v3_service::PreparedRuntimeV3Execution::Replay(encoded) => {
+                        Ok(encoded)
+                    }
+                    prepared
+                    @ super::runtime_v3_service::PreparedRuntimeV3Execution::Admitted {
+                        ..
+                    } => worker_state
+                        .execute_prepared(prepared, super::runtime_v3_now_unix_millis()?),
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => {
+                watcher_done.store(true, Ordering::Release);
+                let _shutdown = connection.shutdown_inbound();
+                let _watcher = watcher.join();
+                return Err(EngineError::backend_failure(
+                    "runtime v3 execution thread creation failed",
+                ));
+            }
+        };
+
+        let prepared = state.prepare_continuous_execution(
+            document.as_bytes(),
+            super::runtime_v3_now_unix_millis()?,
+            self.service,
+            self.models,
+            self.backend,
+            self.pending_cache_attachments,
+            Arc::clone(&cancelled),
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(sender);
+                watcher_done.store(true, Ordering::Release);
+                let _shutdown = connection.shutdown_inbound();
+                let _watcher = watcher.join();
+                let _worker = worker.join();
+                self.record_ingress_error(&error)?;
+                let body = ServiceResponseBody::Error(super::service_error_code(&error));
+                let frame = service_response_frame(
+                    request.request_id(),
+                    request.nonce(),
+                    &body,
+                    self.response_signer,
+                )?;
+                connection.write_outbound_frame(&frame)?;
+                return Ok(());
+            }
+        };
+        if let Err(send_error) = sender.send(prepared) {
+            let prepared = send_error.0;
+            let _finalized =
+                state.cancel_prepared_execution(prepared, super::runtime_v3_now_unix_millis()?);
+            watcher_done.store(true, Ordering::Release);
+            let _shutdown = connection.shutdown_inbound();
+            let _watcher = watcher.join();
+            let _worker = worker.join();
+            return Err(EngineError::backend_failure("runtime v3 worker queue closed"));
+        }
+        self.runtime_v3_executions.push(RuntimeV3ExecutionConnection {
+            control: connection,
+            request_id: request.request_id(),
+            request_nonce: request.nonce(),
+            cancelled,
+            watcher_done,
+            watcher,
+            worker,
+        });
+        Ok(())
+    }
+
+    fn reap_runtime_v3_executions(&mut self) -> Result<bool, EngineError> {
+        let mut progressed = false;
+        let mut index = self.runtime_v3_executions.len();
+        while index > 0 {
+            index -= 1;
+            if !self.runtime_v3_executions[index].worker.is_finished() {
+                continue;
+            }
+            progressed = true;
+            let mut execution = self.runtime_v3_executions.swap_remove(index);
+            let result = execution
+                .worker
+                .join()
+                .map_err(|_| EngineError::internal_invariant("runtime v3 worker panicked"))?;
+            execution.watcher_done.store(true, Ordering::Release);
+            let shutdown = execution.control.shutdown_inbound();
+            execution
+                .watcher
+                .join()
+                .map_err(|_| EngineError::internal_invariant("runtime v3 watcher panicked"))?;
+            shutdown?;
+            let body = match result {
+                Ok(encoded) => {
+                    ServiceResponseBody::RuntimeV3Execution(RuntimeV3Document::new(encoded)?)
+                }
+                Err(error) => {
+                    record_runtime_error_parts(
+                        self.metrics,
+                        self.security_events,
+                        self.backend,
+                        execution.request_id,
+                        &error,
+                    )?;
+                    ServiceResponseBody::Error(super::service_error_code(&error))
+                }
+            };
+            let frame = service_response_frame(
+                execution.request_id,
+                execution.request_nonce,
+                &body,
+                self.response_signer,
+            )?;
+            if execution.control.write_outbound_frame(&frame).is_err() {
+                increment(&mut self.summary.failed_connections, "failed connection count")?;
+            }
+        }
+        Ok(progressed)
     }
 
     fn activate_pending(&mut self) -> Result<bool, EngineError> {
@@ -843,8 +1060,15 @@ impl ContinuousState<'_> {
         for active in &self.active {
             active.workers.cancelled.store(true, Ordering::Release);
         }
-        let active_count = u64::try_from(self.active.len())
-            .map_err(|_| EngineError::internal_invariant("continuous active count exceeds u64"))?;
+        for execution in &self.runtime_v3_executions {
+            execution.cancelled.store(true, Ordering::Release);
+        }
+        let active_count = u64::try_from(
+            self.active.len().checked_add(self.runtime_v3_executions.len()).ok_or_else(|| {
+                EngineError::resource_exhaustion("active cancellation count overflows")
+            })?,
+        )
+        .map_err(|_| EngineError::internal_invariant("continuous active count exceeds u64"))?;
         self.metrics.cancelled_requests = self
             .metrics
             .cancelled_requests
@@ -854,7 +1078,11 @@ impl ContinuousState<'_> {
     }
 
     fn owned_connections(&self) -> usize {
-        self.ingress.len() + self.pending.len() + self.active.len() + self.retiring.len()
+        self.ingress.len()
+            + self.pending.len()
+            + self.active.len()
+            + self.retiring.len()
+            + self.runtime_v3_executions.len()
     }
 
     fn update_peak(&mut self) -> Result<(), EngineError> {
@@ -874,6 +1102,7 @@ impl ContinuousState<'_> {
             && self.pending.is_empty()
             && self.active.is_empty()
             && self.retiring.is_empty()
+            && self.runtime_v3_executions.is_empty()
     }
 }
 
@@ -897,6 +1126,13 @@ impl Drop for ContinuousState<'_> {
             let _watcher_join = retiring.watcher.join();
             let _writer_join = retiring.writer.join();
         }
+        for execution in self.runtime_v3_executions.drain(..) {
+            execution.cancelled.store(true, Ordering::Release);
+            execution.watcher_done.store(true, Ordering::Release);
+            let _shutdown = execution.control.shutdown_inbound();
+            let _watcher_join = execution.watcher.join();
+            let _worker_join = execution.worker.join();
+        }
     }
 }
 
@@ -917,6 +1153,31 @@ fn authenticate_continuous(
         })?);
     admit_durable_nonce(&replay_journal, session.last_nonce())?;
     Ok(ContinuousAuthenticatedConnection { connection, session, replay_journal, command })
+}
+
+fn watch_runtime_v3_disconnect(
+    mut connection: UnixFrameConnection,
+    cancelled: &AtomicBool,
+    watcher_done: &AtomicBool,
+) {
+    loop {
+        if watcher_done.load(Ordering::Acquire) {
+            return;
+        }
+        match connection.watch_inbound_event() {
+            Ok(InboundWatchEvent::Timeout) => continue,
+            Ok(InboundWatchEvent::PeerClosed | InboundWatchEvent::UnexpectedData) | Err(_) => {
+                if !watcher_done.load(Ordering::Acquire) {
+                    // A real disconnect, transport failure, or unexpected
+                    // second command on an execution stream invalidates the
+                    // request-local execution. A finite SO_RCVTIMEO is only a
+                    // liveness poll and must not cancel legitimate work.
+                    cancelled.store(true, Ordering::Release);
+                }
+                return;
+            }
+        }
+    }
 }
 
 fn start_stream_workers(

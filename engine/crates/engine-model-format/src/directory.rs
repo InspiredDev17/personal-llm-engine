@@ -19,9 +19,9 @@ pub const DIRECTORY_MANIFEST_VERSION: (u16, u16) = (1, 0);
 pub const DIRECTORY_QWEN2_MANIFEST_VERSION: (u16, u16) = (1, 1);
 /// Minimum engine revision eligible to activate the Qwen2.5 manifest profile.
 ///
-/// The current production runtime remains 0.1.0. Keeping this profile at a
-/// future revision makes v1.1 packages unambiguously non-activatable until the
-/// tokenizer, registry, backend, and release gates are completed together.
+/// Engine 0.2 admits this profile only through the separately signed,
+/// development-only Qwen Registry V3/Models 2.0 path and explicit owner ARM64
+/// opt-in. It does not establish production qualification or activation.
 pub const DIRECTORY_QWEN2_MINIMUM_ENGINE_VERSION: (u16, u16, u16) = (0, 2, 0);
 /// Fixed directory-manifest header length.
 pub const DIRECTORY_MANIFEST_HEADER_BYTES: usize = 512;

@@ -385,12 +385,12 @@ pub fn validate_manifest_revision(
     current: &ModelCapabilityManifest,
 ) -> Result<()> {
     previous.validate()?;
+    let next_revision = checked_revision_successor(previous.payload.revision)?;
     current.validate()?;
     if current.payload.manifest_id != previous.payload.manifest_id
         || current.payload.logical_model_id != previous.payload.logical_model_id
-        || current.payload.runtime_identity.artifact_id
-            != previous.payload.runtime_identity.artifact_id
-        || current.payload.revision != previous.payload.revision + 1
+        || current.payload.runtime_identity != previous.payload.runtime_identity
+        || current.payload.revision != next_revision
         || current.payload.anti_rollback_metadata.sequence
             <= previous.payload.anti_rollback_metadata.sequence
         || current.payload.previous_revision_digest.as_deref() != Some(&previous.canonical_digest)
@@ -401,6 +401,12 @@ pub fn validate_manifest_revision(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn checked_revision_successor(revision: u64) -> Result<u64> {
+    revision
+        .checked_add(1)
+        .ok_or(ContractError::RevisionTerminal { revision })
 }
 
 const _: &str = COGNITIVE_CONTRACT_VERSION;

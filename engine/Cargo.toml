@@ -28,7 +28,7 @@ exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -56,7 +56,8 @@ personalai-engine-scheduler = { path = "crates/engine-scheduler" }
 personalai-engine-protocol = { path = "crates/engine-protocol" }
 personalai-engine-server = { path = "crates/engine-server", default-features = false }
 personalai-engine-testkit = { path = "crates/engine-testkit" }
-sovereign-ai-contracts = { git = "https://github.com/InspiredDev17/Sovereign-AI-Contracts.git", rev = "2c4a7a6afd5625e7def3afec26f18fedac343d11", default-features = false, features = ["runtime-v3"] }
+sovereign-ai-contracts = { git = "https://github.com/InspiredDev17/Sovereign-AI-Contracts.git", rev = "dd3e18496b669a8aa28f822ca85e0299c16c9b99", default-features = false, features = ["models-v2"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 sha2 = { version = "=0.11.0", default-features = false }
 libc = { version = "=0.2.189", default-features = false }

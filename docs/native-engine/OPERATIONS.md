@@ -83,10 +83,53 @@ correlation must exactly match the signed registry artifact ID. These startup
 fields do not qualify a model; AI-Avenger must still validate the independently
 signed qualification manifest. Canonical execution requests/results are
 transported only after exact reservation admission and identity revalidation.
-Default builds return a typed not-configured failure. Deterministic fixture
-execution requires the compile-time `development-runtime-v3-simulator` feature
-and the explicit `--runtime-v3-development-fixed-output` flag; it is test
-evidence, not model execution or production qualification.
+Default builds return a typed not-configured failure. With an exact loaded model
+binding, `serve-continuous` executes canonical requests on a finite worker set;
+`serve` rejects Runtime-v3 execution because it cannot process a concurrent
+cancel. Deterministic fault execution additionally requires the compile-time
+`development-runtime-v3-simulator` feature and the explicit
+`--runtime-v3-development-fixed-output` flag; simulator output is test evidence,
+not model execution or production qualification.
+
+### Development actual-package acceptance
+
+The operated Qwen check is opt-in and must use an owner-held signed package,
+Registry V3 record, Models 2.0 descriptor, development keys, and the explicit
+`experimental-qwen-registry-v3`/`owner-approved` CLI gates shown by
+`personalai-engine capabilities`. Start only `serve-continuous`, with finite
+`--max-active-sequences`, `--max-connections`, Runtime-v3 memory/count limits,
+and the exact `version.0_2_0` identity. The authenticated AI-Avenger native
+client is the controller-side harness; the engine repository intentionally does
+not contain owner keys or manufacture cache authorization.
+
+One acceptance run must retain the signed, content-free request/result
+transcripts and prove: successful generation by the exact returned identity;
+canonical cancellation from a second connection; deadline terminal status;
+reservation memory denial; artifact/backend/model substitution denial; exact
+terminal replay without a second invocation; process restart with no claim that
+an in-memory accepted reservation survived; and CAG cached/uncached equality for
+the exact token sequence `raw static-prefix tokens + identical ChatML dynamic
+suffix`. Cache creation/attach must use the platform's exact Memory Vault-bound
+authorization. A test that uses the fixed simulator or the repository's tiny
+synthetic decoder is not actual-package evidence.
+
+Portable regressions are available without operator material:
+
+```sh
+cargo +1.85.0 test -p personalai-engine-server \
+  runtime_v3_executes_the_exact_loaded_model_and_replays_its_terminal_result \
+  --all-features --locked --offline
+cargo +1.85.0 test -p personalai-engine-server \
+  continuous_runtime_v3_execution_accepts_correlated_cancel_while_worker_is_active \
+  --all-features --locked --offline
+cargo +1.85.0 test -p personalai-engine-server \
+  runtime_v3_cag_attachment_matches_raw_prefix_plus_identical_dynamic_suffix \
+  --all-features --locked --offline
+```
+
+These commands are synthetic portable evidence only. Record the exact engine,
+Contracts, package, registry, descriptor, platform, and Foundry revisions when
+running the actual-package acceptance.
 
 ## Release signing and pre-launch verification
 

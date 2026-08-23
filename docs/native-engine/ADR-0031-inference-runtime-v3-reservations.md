@@ -3,7 +3,7 @@
 - Status: Accepted; authenticated development execution implemented, production execution and recovery pending
 - Date: 2026-08-14
 - Contract: Sovereign-AI-Contracts `inference/runtime v3.0.0`
-- Current consumer pin: `2c4a7a6afd5625e7def3afec26f18fedac343d11`
+- Current consumer pin: `dd3e18496b669a8aa28f822ca85e0299c16c9b99`
 
 ## Context
 
@@ -46,12 +46,14 @@ failure modes can be proven before production hardware or models exist. The
 state is currently in-memory; process restart does not yet reconcile accepted
 reservations. The protected UDS service exposes canonical availability,
 reservation, cancellation, release, and execution documents. Execution remains
-fail-closed unless the compile-time-gated deterministic development simulator
-is explicitly configured, so this is authenticated development integration
-evidence, not an operated production-inference claim.
+fail-closed unless the exact selected registered model is loaded. Continuous
+serving uses a finite owner-bounded worker set so a second authenticated
+connection can cancel a running request; the single-connection driver rejects
+execution rather than advertise cancellation it cannot provide. The simulator
+remains only an explicit development fault fixture. Synthetic execution
+evidence is not an operated production-inference claim.
 
-Before activation, compose production backend dispatch, Go transport
-conformance, a bounded durable journal or explicit supervisor reconciliation
-design, scheduler cancellation/deadline mapping, and restart/expiry/terminal-
-result recovery tests. These additions must preserve the canonical contract
+Before activation, complete Go operated transport evidence, a bounded durable
+journal or explicit supervisor reconciliation design, and restart recovery of
+accepted reservations. These additions must preserve the canonical contract
 rather than inventing a repository-local substitute.

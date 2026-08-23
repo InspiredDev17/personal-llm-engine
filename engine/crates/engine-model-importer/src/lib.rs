@@ -10,6 +10,8 @@ mod bounded_json;
 mod qwen25_config_json;
 #[cfg(unix)]
 mod qwen25_source_preflight;
+#[cfg(unix)]
+mod qwen25_tokenizer_export;
 mod qwen25_tokenizer_json;
 mod safetensors;
 
@@ -20,6 +22,8 @@ pub use qwen25_config_json::{
 };
 #[cfg(unix)]
 pub use qwen25_source_preflight::{Qwen25SourcePreflightReport, preflight_qwen25_ingress};
+#[cfg(unix)]
+pub use qwen25_tokenizer_export::{Qwen25AipTokExportReport, export_qwen25_aiptok};
 pub use qwen25_tokenizer_json::{
     QWEN25_ADDED_TOKEN_COUNT, QWEN25_AIPTOK_BYTES, QWEN25_AIPTOK_SHA256, QWEN25_AIPTOK_SHA384,
     QWEN25_BOS_TOKEN_ID, QWEN25_BPE_VOCABULARY_SIZE, QWEN25_DEFINED_TOKEN_COUNT,
@@ -644,7 +648,7 @@ fn finish_package(
 fn ensure_package_target_supported(spec: &ImportSpec) -> Result<(), EngineError> {
     if spec.mapping == SourceMapping::Qwen25SafetensorsV1 {
         Err(EngineError::not_implemented(
-            "Qwen2.5 package emission remains disabled pending reviewed package binding, independent package acceptance, engine 0.2 activation, registry admission, and optimized-backend qualification",
+            "Qwen2.5 package emission remains disabled pending Model Foundry package construction, independent package acceptance, signed development registry admission, and optimized-backend qualification",
         ))
     } else {
         Ok(())
@@ -2601,8 +2605,8 @@ mod tests {
         assert_eq!(
             first.package_hash(),
             ModelPackageHash::from_sha384_hex(
-                "6879ff670b27095c8adcf50286ae1cd1af1da8c34e622da9f8bbd472eef04a8c\
-                 6f77eebb520efe4f4de917642b3a0c22",
+                "979b5ffe376f078a28f4fae69fc5e92a68aea290287cb8a4876136889bf7a508\
+                 bee6238c9fffc8e683229aa56b79c5f7",
             )
             .expect("fixture package hash must parse"),
         );
@@ -2660,7 +2664,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn signed_qwen_v11_is_rejected_by_current_loader_and_service_identity() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one supply-chain regression keeps package, loader, service, and event denial correlated"
+    )]
+    fn owner_pinned_qwen_v11_is_rejected_by_loader_and_service_identity() {
         let root = temporary_root("qwen-v11-future-runtime");
         let store = root.join("models");
         let runtime = root.join("runtime");
@@ -2703,12 +2711,18 @@ mod tests {
             )
             .expect("signed package must register");
         let mut loader_events = Vec::new();
-        assert!(matches!(
-            registry.load_registered_directory(spec().model_id(), &budget, &mut |event| {
+        let error = registry
+            .load_registered_directory(spec().model_id(), &budget, &mut |event| {
                 loader_events.push(event);
-            }),
-            Err(EngineError::NotImplemented(_))
-        ));
+            })
+            .expect_err("owner-pinned Qwen package must remain ineligible");
+        assert!(
+            matches!(
+                error,
+                EngineError::AuthenticationFailure(_) | EngineError::CorruptModelPackage(_)
+            ),
+            "{error:?}"
+        );
         assert_eq!(
             loader_events,
             vec![SecurityEvent::ModelPackageRejected {
@@ -2717,15 +2731,21 @@ mod tests {
             }]
         );
         let mut cancellable_events = Vec::new();
-        assert!(matches!(
-            registry.load_registered_directory_cancellable(
+        let error = registry
+            .load_registered_directory_cancellable(
                 spec().model_id(),
                 &budget,
                 &std::sync::atomic::AtomicBool::new(false),
                 &mut |event| cancellable_events.push(event),
+            )
+            .expect_err("cancellable owner-pinned Qwen package must remain ineligible");
+        assert!(
+            matches!(
+                error,
+                EngineError::AuthenticationFailure(_) | EngineError::CorruptModelPackage(_)
             ),
-            Err(EngineError::NotImplemented(_))
-        ));
+            "{error:?}"
+        );
         assert_eq!(cancellable_events, loader_events);
 
         let config = ServiceConfig::new(&store, &runtime, runtime.join("engine.sock"))
@@ -2744,12 +2764,20 @@ mod tests {
             )
             .expect("service package must register");
         let mut service_events = Vec::new();
-        assert!(matches!(
-            service.load_registered_cpu_model(spec().model_id(), &budget, &mut |event| {
+        let error =
+            match service.load_registered_cpu_model(spec().model_id(), &budget, &mut |event| {
                 service_events.push(event);
-            }),
-            Err(EngineError::NotImplemented(_))
-        ));
+            }) {
+                Ok(_) => panic!("owner-pinned Qwen service load must remain ineligible"),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(
+                error,
+                EngineError::AuthenticationFailure(_) | EngineError::CorruptModelPackage(_)
+            ),
+            "{error:?}"
+        );
         assert_eq!(
             service_events,
             vec![SecurityEvent::ModelPackageRejected {

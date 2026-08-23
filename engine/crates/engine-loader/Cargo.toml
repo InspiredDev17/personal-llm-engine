@@ -13,11 +13,14 @@ personalai-engine-quantization.workspace = true
 personalai-engine-memory.workspace = true
 personalai-engine-tensor.workspace = true
 personalai-engine-types.workspace = true
+serde_json.workspace = true
+sovereign-ai-contracts.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 personalai-engine-testkit.workspace = true
 
 [lints]

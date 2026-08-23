@@ -41,9 +41,10 @@ records. Version 1.0 declares only the reviewed
 `decoder-rms-rope-swiglu-gqa-v1` architecture. Engine-private version 1.1
 declares only `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1`, binds the formerly
 reserved header word to an explicit RMSNorm epsilon, and requires tied output
-plus unscaled positions. V1.1 requires future engine 0.2.0; the current 0.1.0
-production loader verifies its signature and manifest framing, then rejects it
-before activation. The architecture validator narrows v1.1 to the reviewed
+plus unscaled positions. Engine 0.2.0 accepts V1.1 only through the separately
+signed development registry V3 plus canonical Models 2.0 descriptor and exact
+owner-approved ARM64 Runtime-v3 identity. Registry V2 remains frozen and cannot
+authorize it. The architecture validator narrows v1.1 to the reviewed
 Qwen2.5 1.5B bootstrap dimensions and exact general/coder or math
 context/theta pairs. Records carry canonical tensor
 name, dtype, rank/dimensions, shard index, byte range, alignment,
@@ -62,18 +63,16 @@ AIPQ format with those declared F32 exclusions. AIPQ8/AIPQ4 mixing is rejected.
 Those restrictions
 are implementation gates, not package-controlled kernel or graph choices.
 
-The importer now contains a disabled transition slice that pins the three
+The importer contains a transition slice that pins the three
 Qwen2.5 config identities, shared tokenizer identity and closed graph, exact
 single-file tensor identities, canonical tensor names/shapes, Q/K/V biases, and
-tied output. It still emits only the legacy profile; the Model Foundry Registry
-V2 compatibility string remains legacy-only, so neither component can create
-or approve a Qwen2.5 v1.1 artifact. Activation requires a reviewed first-party
-tokenizer runtime activation implementing the exact fixed Qwen
-NFC/category/ByteLevel and no-implicit-BOS semantics without arbitrary
-tokenizer graphs or chat templates, exact descriptor preflight bound to the
-securely opened source, v1.1 emission,
-independent numeric vectors, engine 0.2, a qualified optimized backend, and a
-new signed registry decision. AIPTok v1 cannot be relabeled as that tokenizer.
+tied output. It still emits only the legacy profile. A separate offline exporter
+can publish the exact pinned `AIPTOK02` bytes to one fresh owner-private
+read-only path for Model Foundry consumption; it cannot emit or approve a model
+package. Registry V2 remains legacy-only. Development execution requires exact
+descriptor/package emission in Model Foundry, a signed V3 decision, independent
+numeric vectors, exact owner startup approval and ARM64 admission. AIPTok v1
+cannot be relabeled as that tokenizer.
 The production engine does not infer or manufacture any of those supply-chain
 decisions.
 
@@ -92,14 +91,17 @@ bounded parser validates fixed behavior IDs, contiguous vocabulary/merge/added
 records, exact byte mapping, special roles, declared resource limits, table
 hash, undefined logit tail, and the pinned 22-token suffix when production
 counts are present. The importer converts only the exact source into a pinned
-4,613,135-byte canonical `AIPTOK02`; it does not place those bytes into a model
-package. A private scanner/BPE/decode runtime core and its version-checked
+4,613,135-byte canonical `AIPTOK02`. Its offline exporter creates one new file
+with no-follow checks, verifies the exact bytes and digests, synchronizes it,
+and publishes it mode `0400` without overwrite. It does not place those bytes
+into a model package. A private scanner/BPE/decode runtime core and its version-checked
 bounded Unicode-16 adapter are reachable only through a narrow constructor that
 revalidates the complete tokenizer hash from an independently verified package.
 A feature-gated offline diagnostic binds the complete output identity and
 replays the fixed production encode/decode corpus without returning a tokenizer
-handle. Package emission, registry admission, ordinary service selection and
-activation remain fail-closed under ADR-0035 through ADR-0037.
+handle. The exact Qwen V3 ARM64 development service may construct the tokenizer
+only after package verification; CPU, Metal and production selection remain
+fail-closed under ADR-0035 through ADR-0037 and ADR-0039.
 
 The exact 1.5B profile is also outside the scalar oracle's compute admission:
 its first step is estimated at 1,543,712,768 checked operations, including the

@@ -506,7 +506,9 @@ pub(crate) fn validate_semver(field: &'static str, value: &str) -> Result<()> {
     let (without_build, build) = value
         .split_once('+')
         .map_or((value, None), |(prefix, suffix)| (prefix, Some(suffix)));
-    if build.is_some_and(str::is_empty) || without_build.contains('+') {
+    if build.is_some_and(|suffix| suffix.is_empty() || suffix.contains('+'))
+        || without_build.contains('+')
+    {
         return Err(ContractError::field(field, "invalid semantic version"));
     }
     let (core, prerelease) = without_build
@@ -677,6 +679,7 @@ mod tests {
         assert!(reference.validate().is_err());
         assert!(super::validate_semver("version", "1.0.0-").is_err());
         assert!(super::validate_semver("version", "1.0.0+").is_err());
+        assert!(super::validate_semver("version", "1.0.0+build+other").is_err());
         assert!(super::validate_semver("version", "1.0.0-alpha+build").is_ok());
     }
 }

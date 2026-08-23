@@ -266,6 +266,13 @@ pub struct UnixFrameConnection {
     stream: UnixStream,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboundWatchEvent {
+    Timeout,
+    PeerClosed,
+    UnexpectedData,
+}
+
 impl UnixFrameConnection {
     /// Clones the underlying local stream for a bounded full-duplex control watcher.
     pub fn try_clone(&self) -> Result<Self, EngineError> {
@@ -286,6 +293,32 @@ impl UnixFrameConnection {
             // idempotent terminal condition rather than a failed generation.
             Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
             Err(_) => Err(EngineError::backend_failure("Unix stream read shutdown failed")),
+        }
+    }
+
+    /// Waits for peer liveness or unexpected follow-up data without mapping a
+    /// finite socket timeout to a protocol violation. Runtime execution uses
+    /// this only as a disconnect watcher; canonical cancellation arrives on a
+    /// separately authenticated connection.
+    pub(crate) fn watch_inbound_event(&mut self) -> Result<InboundWatchEvent, EngineError> {
+        let mut byte = [0_u8; 1];
+        loop {
+            match self.stream.read(&mut byte) {
+                Ok(0) => return Ok(InboundWatchEvent::PeerClosed),
+                Ok(_) => return Ok(InboundWatchEvent::UnexpectedData),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(InboundWatchEvent::Timeout);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    return Err(EngineError::backend_failure("Unix stream liveness watch failed"));
+                }
+            }
         }
     }
 
@@ -466,6 +499,29 @@ mod tests {
         drop(peer);
         connection.shutdown_inbound().expect("disconnected inbound shutdown must be terminal");
         connection.shutdown_inbound().expect("repeated inbound shutdown must be idempotent");
+    }
+
+    #[test]
+    fn inbound_liveness_watch_distinguishes_timeout_data_and_peer_close() {
+        let (server, mut peer) = UnixStream::pair().expect("local pair must create");
+        server
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("read timeout must configure");
+        let mut connection = UnixFrameConnection { stream: server };
+        assert_eq!(
+            connection.watch_inbound_event().expect("finite liveness poll"),
+            InboundWatchEvent::Timeout
+        );
+        peer.write_all(&[0xff]).expect("unexpected follow-up byte must write");
+        assert_eq!(
+            connection.watch_inbound_event().expect("follow-up activity"),
+            InboundWatchEvent::UnexpectedData
+        );
+        drop(peer);
+        assert_eq!(
+            connection.watch_inbound_event().expect("peer closure"),
+            InboundWatchEvent::PeerClosed
+        );
     }
 
     #[test]

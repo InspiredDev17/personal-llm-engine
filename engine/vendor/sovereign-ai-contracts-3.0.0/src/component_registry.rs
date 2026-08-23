@@ -239,6 +239,13 @@ const COMPONENT_CONTRACT_REGISTRY: &[ComponentContractRegistryEntry] = &[
         &["memory_vault", "personal_ai_platform"],
     ),
     entry(
+        "1.3.0",
+        "knowledge",
+        "schemas/knowledge/v1/knowledge-1.3.0.schema.json",
+        &["memory_vault", "personal_ai_platform"],
+        &["memory_vault", "personal_ai_platform"],
+    ),
+    entry(
         "2.0.0",
         "common",
         "schemas/common/v2/common.schema.json",
@@ -254,8 +261,22 @@ const COMPONENT_CONTRACT_REGISTRY: &[ComponentContractRegistryEntry] = &[
     ),
     entry(
         "2.0.0",
+        "models",
+        "schemas/models/v2/models.schema.json",
+        &["model_foundry"],
+        &["native_inference_engine", "personal_ai_platform"],
+    ),
+    entry(
+        "2.0.0",
         "qualification",
         "schemas/qualification/v2/qualification.schema.json",
+        &["model_foundry"],
+        &["personal_ai_platform"],
+    ),
+    entry(
+        "2.1.0",
+        "qualification",
+        "schemas/qualification/v2/qualification-2.1.0.schema.json",
         &["model_foundry"],
         &["personal_ai_platform"],
     ),

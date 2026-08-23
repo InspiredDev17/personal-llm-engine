@@ -1,6 +1,7 @@
 # ADR-0033: Closed Qwen2.5 1.5B scalar bootstrap profile
 
-- Status: Accepted for portable scalar mechanics; production activation blocked
+- Status: Accepted for portable scalar mechanics; engine-version gate
+  superseded by ADR-0039; production activation blocked
 - Date: 2026-08-21
 
 ## Context
@@ -23,12 +24,13 @@ must remain zero in v1.0, carry the explicit little-endian F32 RMSNorm epsilon
 in v1.1. V1.1 requires tied output and RoPE scaling exactly 1.0. Unknown
 version/architecture combinations fail closed.
 
-V1.1 declares minimum engine revision 0.2.0. The current production runtime
-identity remains 0.1.0, so the signed-package loader rejects v1.1 before
-architecture or tokenizer activation. This deliberately prevents an older
-0.1.0 engine that predates these semantics from appearing compatible. A future
-release may bump the runtime identity only after the tokenizer, registry,
-optimized backend, release, and qualification gates are reviewed together.
+V1.1 declares minimum engine revision 0.2.0. The workspace, loader compatibility
+gate, and CLI runtime identity now all report 0.2.0, so the separately signed
+development Registry V3/Models 2.0 path may admit the exact package when the
+owner also enables its explicit development gate. An older 0.1.0 engine still
+fails before architecture or tokenizer activation. ADR-0039 records this
+reviewed 0.2 development transition; production qualification and activation
+remain unavailable.
 
 The v1.1 architecture validator is further closed to the exact Qwen2.5 1.5B dimensions:
 151,936 vocabulary entries, hidden size 1,536, 28 layers, 12 query heads, two

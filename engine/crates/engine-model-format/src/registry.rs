@@ -219,25 +219,25 @@ fn parse_entry(parser: &mut Parser<'_>) -> Result<ModelRegistryEntryV2, EngineEr
     })
 }
 
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     cursor: usize,
 }
 
 impl<'a> Parser<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, cursor: 0 }
     }
 
-    const fn position(&self) -> usize {
+    pub(crate) const fn position(&self) -> usize {
         self.cursor
     }
 
-    fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.cursor == self.bytes.len()
     }
 
-    fn expect(&mut self, expected: &[u8]) -> Result<(), EngineError> {
+    pub(crate) fn expect(&mut self, expected: &[u8]) -> Result<(), EngineError> {
         let end = self
             .cursor
             .checked_add(expected.len())
@@ -276,12 +276,16 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn ascii_string(&mut self, maximum: usize, label: &str) -> Result<String, EngineError> {
+    pub(crate) fn ascii_string(
+        &mut self,
+        maximum: usize,
+        label: &str,
+    ) -> Result<String, EngineError> {
         let value = self.take_until_quote(maximum, label)?;
         String::from_utf8(value.to_vec()).map_err(|_| corrupt(format!("{label} is invalid UTF-8")))
     }
 
-    fn exact_string(&mut self, expected: &str, label: &str) -> Result<(), EngineError> {
+    pub(crate) fn exact_string(&mut self, expected: &str, label: &str) -> Result<(), EngineError> {
         let observed = self.take_until_quote(expected.len(), label)?;
         if observed != expected.as_bytes() {
             return Err(corrupt(format!("{label} is unsupported")));
@@ -289,7 +293,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn identifier(&mut self, maximum: usize, label: &str) -> Result<String, EngineError> {
+    pub(crate) fn identifier(
+        &mut self,
+        maximum: usize,
+        label: &str,
+    ) -> Result<String, EngineError> {
         let value = self.take_until_quote(maximum, label)?;
         if !matches!(value[0], b'a'..=b'z' | b'0'..=b'9')
             || value
@@ -302,7 +310,7 @@ impl<'a> Parser<'a> {
         String::from_utf8(value.to_vec()).map_err(|_| corrupt(format!("{label} is invalid UTF-8")))
     }
 
-    fn positive_u64(&mut self, label: &str) -> Result<u64, EngineError> {
+    pub(crate) fn positive_u64(&mut self, label: &str) -> Result<u64, EngineError> {
         let start = self.cursor;
         while self.bytes.get(self.cursor).is_some_and(u8::is_ascii_digit) {
             self.cursor = self
@@ -326,7 +334,7 @@ impl<'a> Parser<'a> {
         u32::try_from(self.positive_u64(label)?).map_err(|_| corrupt(format!("{label} overflows")))
     }
 
-    fn key_id(&mut self, label: &str) -> Result<SignerKeyId, EngineError> {
+    pub(crate) fn key_id(&mut self, label: &str) -> Result<SignerKeyId, EngineError> {
         let bytes = self.hex_array::<16>(label)?;
         SignerKeyId::from_bytes(bytes).map_err(|_| corrupt(format!("{label} is invalid")))
     }
@@ -335,7 +343,7 @@ impl<'a> Parser<'a> {
         Ok(ModelPackageHash::from_sha384_bytes(self.hex_array::<48>(label)?))
     }
 
-    fn nonzero_hash(&mut self, label: &str) -> Result<ModelPackageHash, EngineError> {
+    pub(crate) fn nonzero_hash(&mut self, label: &str) -> Result<ModelPackageHash, EngineError> {
         let hash = self.hash(label)?;
         if hash.as_bytes().iter().all(|byte| *byte == 0) {
             return Err(corrupt(format!("{label} hash must not be zero")));
@@ -343,7 +351,10 @@ impl<'a> Parser<'a> {
         Ok(hash)
     }
 
-    fn hex_array<const N: usize>(&mut self, label: &str) -> Result<[u8; N], EngineError> {
+    pub(crate) fn hex_array<const N: usize>(
+        &mut self,
+        label: &str,
+    ) -> Result<[u8; N], EngineError> {
         let length =
             N.checked_mul(2).ok_or_else(|| corrupt("registry hexadecimal length overflows"))?;
         let end = self
@@ -415,7 +426,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn require_canonical_timestamp(value: &str) -> Result<(), EngineError> {
+pub(crate) fn require_canonical_timestamp(value: &str) -> Result<(), EngineError> {
     let bytes = value.as_bytes();
     if bytes.len() != 20
         || bytes[4] != b'-'
@@ -455,7 +466,7 @@ const fn nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn corrupt(detail: impl AsRef<str>) -> EngineError {
+pub(crate) fn corrupt(detail: impl AsRef<str>) -> EngineError {
     EngineError::corrupt_model_package(detail)
 }
 

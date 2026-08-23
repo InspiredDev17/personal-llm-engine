@@ -1335,7 +1335,7 @@ mod tests {
         .collect();
         let manifest = ReleaseManifest::new(
             generation,
-            format!("native-engine-0.1.0-g{generation}"),
+            format!("native-engine-0.2.0-g{generation}"),
             "aarch64-apple-darwin",
             "rustc-1.85.0",
             artifacts,
