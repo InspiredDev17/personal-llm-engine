@@ -7,6 +7,7 @@
 //! has no cognitive role, qualification, user policy, cloud policy, tool, or
 //! memory authority.
 
+use crate::runtime_reservations::VerifiedExecutionTerminal;
 use crate::{
     ArtifactAuthorityId, LogicalModelId, MAX_RUNTIME_RESERVATION_RECORDS, ReservationDecision,
     ReservationDenial, ReservationId, ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId,
@@ -570,31 +571,29 @@ impl RuntimeV3ContractAdapter {
         }
 
         let encoded = contract_result(encode_inference_execution_result_v3(result))?;
-        match self.reservations.status(&record.reservation_id)? {
-            Some(ReservationStatus::Consumed) => {
-                if !self.reservations.release(
-                    &record.reservation_id,
-                    record.request_id,
-                    &record.task_id,
-                    &record.identity,
-                    now_unix_millis,
-                )? {
-                    return Err(EngineError::internal_invariant(
-                        "consumed runtime reservation was not released",
-                    ));
+        let terminal = match &result.status {
+            sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::Succeeded
+            | sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::Failed => {
+                VerifiedExecutionTerminal::Completed
+            }
+            sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::Cancelled => {
+                VerifiedExecutionTerminal::Cancelled
+            }
+            sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::DeadlineExceeded => {
+                VerifiedExecutionTerminal::DeadlineExceeded {
+                    completed_unix_millis: contract_result(result.completed_unix_millis())?,
+                    deadline_unix_millis: contract_result(admitted.request.deadline_unix_millis())?,
                 }
             }
-            Some(ReservationStatus::Cancelled)
-                if matches!(
-                    result.status,
-                    sovereign_ai_contracts::inference_runtime_v3::ExecutionStatusV3::Cancelled
-                ) => {}
-            _ => {
-                return Err(EngineError::authentication_failure(
-                    "runtime reservation is not eligible for terminal result finalization",
-                ));
-            }
-        }
+        };
+        self.reservations.finalize_verified_execution(
+            &record.reservation_id,
+            record.request_id,
+            &record.task_id,
+            &record.identity,
+            now_unix_millis,
+            terminal,
+        )?;
         record.result = Some(result.clone());
         record.encoded_result = Some(encoded.clone());
         Ok(encoded)
@@ -840,7 +839,7 @@ fn contract_result<T>(result: sovereign_ai_contracts::Result<T>) -> Result<T, En
 #[cfg(test)]
 mod tests {
     use super::{RuntimeIdentityAuthority, RuntimeV3ContractAdapter, map_identity, map_request_id};
-    use crate::RuntimeIdentityBinding;
+    use crate::{ReservationStatus, RuntimeIdentityBinding};
     use personalai_engine_types::EngineError;
     use sha2::{Digest, Sha256};
     use sovereign_ai_contracts::identity::{ModelArtifactId, ModelId, RequestId, TaskId};
@@ -1024,6 +1023,38 @@ mod tests {
             failure: Some(RuntimeFailureV3 {
                 class: RuntimeFailureClassV3::Cancelled,
                 code: "owner_cancelled".to_owned(),
+                retryable: false,
+            }),
+            extensions: None,
+            required_extensions: None,
+        }
+    }
+
+    fn deadline_result(execution: &InferenceExecutionRequestV3) -> InferenceExecutionResultV3 {
+        let started = execution.created_unix_millis().expect("created") + 1;
+        let completed = execution.deadline_unix_millis().expect("deadline");
+        InferenceExecutionResultV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ExecutionResultKindV3::ExecutionResult,
+            reservation_id: execution.reservation_id.clone(),
+            request_id: execution.request_id.clone(),
+            task_id: execution.task_id.clone(),
+            identity: execution.identity.clone(),
+            status: ExecutionStatusV3::DeadlineExceeded,
+            started_at: runtime_v3_timestamp_from_unix_millis(started).expect("start timestamp"),
+            completed_at: runtime_v3_timestamp_from_unix_millis(completed)
+                .expect("completion timestamp"),
+            usage: GenerationUsage { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            resource_usage: vec![RuntimeResourceUsageV3 {
+                resource: RuntimeResourceV3::WallTime,
+                units: completed - started,
+                unit: RuntimeResourceUnitV3::Milliseconds,
+            }],
+            output_digest: None,
+            output: None,
+            failure: Some(RuntimeFailureV3 {
+                class: RuntimeFailureClassV3::DeadlineExceeded,
+                code: "execution_deadline_exceeded".to_owned(),
                 retryable: false,
             }),
             extensions: None,
@@ -1301,6 +1332,71 @@ mod tests {
             adapter
                 .finalize_execution_result(&admitted, &result, completed, &authority)
                 .expect("exact result replay"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn exact_expiry_accepts_only_identity_bound_deadline_terminal_evidence() {
+        let (adapter, authority) = adapter();
+        let mut reservation = reservation();
+        let execution = execution(&reservation);
+        let expiry = execution.deadline_unix_millis().expect("execution deadline");
+        reservation.expires_at =
+            runtime_v3_timestamp_from_unix_millis(expiry).expect("reservation expiry");
+        let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
+        let now = reservation.created_unix_millis().expect("created") + 1;
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
+        let source = encode_inference_execution_request_v3(&execution).expect("encode execution");
+        let admitted = adapter
+            .admit_execution_document(
+                &source,
+                execution.created_unix_millis().expect("created"),
+                &authority,
+            )
+            .expect("admit");
+
+        let mut wrong_status = successful_result(&execution);
+        wrong_status.completed_at =
+            runtime_v3_timestamp_from_unix_millis(expiry).expect("completion");
+        assert!(
+            adapter
+                .finalize_execution_result(&admitted, &wrong_status, expiry, &authority)
+                .is_err()
+        );
+        let mut cancelled = cancelled_result(&execution);
+        cancelled.completed_at = runtime_v3_timestamp_from_unix_millis(expiry).expect("completion");
+        assert!(
+            adapter.finalize_execution_result(&admitted, &cancelled, expiry, &authority).is_err()
+        );
+        let mut premature = deadline_result(&execution);
+        premature.completed_at =
+            runtime_v3_timestamp_from_unix_millis(expiry - 1).expect("premature completion");
+        assert!(
+            adapter.finalize_execution_result(&admitted, &premature, expiry, &authority).is_err()
+        );
+        let mut substituted = deadline_result(&execution);
+        substituted.identity.backend_instance_id = "backend.instance-2".to_owned();
+        assert!(
+            adapter.finalize_execution_result(&admitted, &substituted, expiry, &authority).is_err()
+        );
+
+        let result = deadline_result(&execution);
+        let encoded = adapter
+            .finalize_execution_result(&admitted, &result, expiry, &authority)
+            .expect("exact deadline terminal finalizes an expired execution");
+        assert_eq!(decode_inference_execution_result_v3(&encoded).expect("decode result"), result);
+        assert_eq!(
+            adapter.reservations.status(admitted.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        let statistics = adapter.reservation_statistics().unwrap();
+        assert_eq!(statistics.active, 0);
+        assert_eq!(statistics.reserved_memory_bytes, 0);
+        assert_eq!(
+            adapter
+                .finalize_execution_result(&admitted, &result, expiry, &authority)
+                .expect("exact deadline result replay"),
             encoded
         );
     }

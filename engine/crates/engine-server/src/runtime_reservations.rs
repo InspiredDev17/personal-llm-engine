@@ -359,6 +359,27 @@ pub enum ReservationStatus {
     Denied,
 }
 
+/// Terminal evidence already validated against one admitted execution.
+///
+/// This is crate-private because only the canonical runtime adapter may turn a
+/// result document into a reservation transition. It does not replace the
+/// distinct owner cancellation or explicit reservation-release operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifiedExecutionTerminal {
+    /// Successful or failed execution completed while holding its reservation.
+    Completed,
+    /// Execution observed cancellation, whether or not cancellation had already
+    /// released the reservation through the separate cancellation operation.
+    Cancelled,
+    /// Execution produced canonical deadline evidence.
+    DeadlineExceeded {
+        /// Exact terminal completion carried by the validated result.
+        completed_unix_millis: u64,
+        /// Exact deadline bound by the admitted execution request.
+        deadline_unix_millis: u64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReservationRecord {
     request: RuntimeReservationRequest,
@@ -567,6 +588,67 @@ impl RuntimeReservationManager {
             now_unix_millis,
             ReservationStatus::Released,
         )
+    }
+
+    /// Finalizes one already-validated, identity-bound execution result.
+    ///
+    /// Ordinary consumed executions release capacity exactly once. A prior
+    /// exact cancellation accepts only a cancelled result. Expiry remains a
+    /// distinct terminal state and accepts only deadline-exceeded evidence at
+    /// the exact shared execution/reservation expiry; its accounting was
+    /// already released by expiry reconciliation.
+    pub(crate) fn finalize_verified_execution(
+        &self,
+        reservation_id: &ReservationId,
+        request_id: RequestId,
+        task_id: &TaskAuthorityId,
+        identity: &RuntimeIdentityBinding,
+        now_unix_millis: u64,
+        terminal: VerifiedExecutionTerminal,
+    ) -> Result<ReservationStatus, EngineError> {
+        let mut state = self.lock()?;
+        expire_locked(&mut state, now_unix_millis)?;
+        let record = state
+            .records
+            .get_mut(reservation_id)
+            .ok_or_else(|| EngineError::invalid_input("runtime reservation does not exist"))?;
+        validate_record_authority(record, request_id, task_id, identity)?;
+        match record.status {
+            ReservationStatus::Consumed => {
+                let memory = record.request.budget.maximum_inference_memory_bytes;
+                record.status = ReservationStatus::Released;
+                release_accounting(&mut state, memory)?;
+                Ok(ReservationStatus::Released)
+            }
+            ReservationStatus::Cancelled
+                if matches!(terminal, VerifiedExecutionTerminal::Cancelled) =>
+            {
+                Ok(ReservationStatus::Cancelled)
+            }
+            ReservationStatus::Expired => {
+                let VerifiedExecutionTerminal::DeadlineExceeded {
+                    completed_unix_millis,
+                    deadline_unix_millis,
+                } = terminal
+                else {
+                    return Err(EngineError::authentication_failure(
+                        "expired runtime reservation requires exact deadline evidence",
+                    ));
+                };
+                if completed_unix_millis != deadline_unix_millis
+                    || completed_unix_millis != record.request.expires_unix_millis
+                    || now_unix_millis != completed_unix_millis
+                {
+                    return Err(EngineError::authentication_failure(
+                        "expired runtime reservation deadline evidence does not match exact expiry",
+                    ));
+                }
+                Ok(ReservationStatus::Expired)
+            }
+            _ => Err(EngineError::authentication_failure(
+                "runtime reservation is not eligible for verified execution finalization",
+            )),
+        }
     }
 
     /// Expires stale reservations and returns the number whose state changed.
@@ -789,6 +871,7 @@ mod tests {
         ArtifactAuthorityId, LogicalModelId, ReservationDecision, ReservationDenial, ReservationId,
         ReservationStatus, RuntimeIdentityBinding, RuntimeInstanceId, RuntimeReservationManager,
         RuntimeReservationRequest, RuntimeResourceCeiling, TaskAuthorityId,
+        VerifiedExecutionTerminal,
     };
     use personalai_engine_types::{
         BackendId, ModelHashAlgorithm, ModelId, ModelPackageHash, RequestId,
@@ -830,6 +913,25 @@ mod tests {
             expires_unix_millis,
         )
         .unwrap()
+    }
+
+    fn consumed_request_expiring_at(
+        expires_unix_millis: u64,
+    ) -> (RuntimeReservationManager, RuntimeReservationRequest) {
+        let manager = RuntimeReservationManager::new(1, 100).unwrap();
+        let reserved = request_expiring_at(1, 100, expires_unix_millis);
+        manager.reserve(reserved.clone(), 1).unwrap();
+        manager
+            .consume(
+                reserved.reservation_id(),
+                reserved.request_id(),
+                reserved.task_id(),
+                reserved.identity(),
+                64,
+                2,
+            )
+            .unwrap();
+        (manager, reserved)
     }
 
     #[test]
@@ -907,6 +1009,118 @@ mod tests {
             Some(ReservationStatus::Expired)
         );
         assert_eq!(manager.statistics().unwrap().active, 0);
+    }
+
+    #[test]
+    fn verified_deadline_finalization_preserves_exact_expiry_and_accounting() {
+        let (manager, reserved) = consumed_request_expiring_at(100);
+        assert!(
+            manager
+                .release(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    100,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            manager.status(reserved.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        assert_eq!(manager.statistics().unwrap().active, 0);
+        assert_eq!(manager.statistics().unwrap().reserved_memory_bytes, 0);
+
+        assert_eq!(
+            manager
+                .finalize_verified_execution(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    100,
+                    VerifiedExecutionTerminal::DeadlineExceeded {
+                        completed_unix_millis: 100,
+                        deadline_unix_millis: 100,
+                    },
+                )
+                .unwrap(),
+            ReservationStatus::Expired
+        );
+        assert_eq!(
+            manager.status(reserved.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        assert_eq!(manager.statistics().unwrap().active, 0);
+        assert_eq!(manager.statistics().unwrap().reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn verified_deadline_finalization_rejects_terminal_and_identity_substitution() {
+        let (manager, reserved) = consumed_request_expiring_at(100);
+        assert_eq!(manager.expire(100).unwrap(), 1);
+        for terminal in [
+            VerifiedExecutionTerminal::Completed,
+            VerifiedExecutionTerminal::Cancelled,
+            VerifiedExecutionTerminal::DeadlineExceeded {
+                completed_unix_millis: 99,
+                deadline_unix_millis: 100,
+            },
+            VerifiedExecutionTerminal::DeadlineExceeded {
+                completed_unix_millis: 100,
+                deadline_unix_millis: 101,
+            },
+        ] {
+            assert!(
+                manager
+                    .finalize_verified_execution(
+                        reserved.reservation_id(),
+                        reserved.request_id(),
+                        reserved.task_id(),
+                        reserved.identity(),
+                        100,
+                        terminal,
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            manager
+                .finalize_verified_execution(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    &identity("substituted-model"),
+                    100,
+                    VerifiedExecutionTerminal::DeadlineExceeded {
+                        completed_unix_millis: 100,
+                        deadline_unix_millis: 100,
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .finalize_verified_execution(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    101,
+                    VerifiedExecutionTerminal::DeadlineExceeded {
+                        completed_unix_millis: 100,
+                        deadline_unix_millis: 100,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            manager.status(reserved.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        assert_eq!(manager.statistics().unwrap().active, 0);
+        assert_eq!(manager.statistics().unwrap().reserved_memory_bytes, 0);
     }
 
     #[test]
