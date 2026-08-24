@@ -39,9 +39,10 @@ atomic output slots avoid shared mutable pointers. Metrics report fixed workers,
 live/peak jobs, completions, cancellations, and isolated panics.
 
 All architecture-specific pointer operations are confined to
-`engine-arm64/src/intrinsics.rs`. Its twelve reviewed unsafe blocks process
-only complete 4-lane F32, 4-lane U16, 8-lane I8, or fixed 32-code blocks proven
-in bounds by safe slice or array lengths; scalar tails never use pointers.
+`engine-arm64/src/intrinsics.rs`. Its thirteen reviewed unsafe blocks process
+only complete 4-lane F32, canonical little-endian F32-byte, 4-lane U16,
+8-lane I8, or fixed 32-code blocks proven in bounds by safe slice or array
+lengths; scalar tails never use pointers.
 Inputs need not be 16-byte aligned because the documented AArch64 load/store
 intrinsics permit unaligned addresses. AArch64 defines Advanced SIMD as a
 baseline facility, but the backend still verifies it at runtime. Optional FP16

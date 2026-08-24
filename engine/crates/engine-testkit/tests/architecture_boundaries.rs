@@ -1274,7 +1274,7 @@ fn rust_sources_have_only_approved_listener_and_unsafe_ffi_boundaries() {
             &source,
             &unsafe_block_marker,
             &unsafe_allow_marker,
-            12,
+            13,
             "ARM64 Advanced SIMD",
         );
         assert_exact_unsafe_boundary(

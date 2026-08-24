@@ -7,11 +7,15 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(target_endian = "big")]
+use std::arch::aarch64::vrev32q_u8;
 use std::arch::aarch64::{
-    float32x4_t, vaddq_f32, vaddq_u32, vaddvq_f32, vandq_u32, vcvtq_f32_s32, vdupq_n_f32,
-    vdupq_n_u32, vget_high_s16, vget_low_s16, vld1_s8, vld1_u16, vld1q_f32, vmovl_s8, vmovl_s16,
-    vmovl_u16, vmulq_f32, vorrq_u32, vreinterpretq_f32_u32, vrev64q_f32, vshlq_n_u32, vst1q_f32,
+    float32x4_t, vaddq_f32, vaddq_u32, vaddvq_f32, vandq_u32, vceqq_u32, vcvtq_f32_s32,
+    vdupq_n_f32, vdupq_n_u32, vget_high_s16, vget_low_s16, vld1_s8, vld1_u16, vld1q_f32, vld1q_u8,
+    vmaxvq_u32, vmovl_s8, vmovl_s16, vmovl_u16, vmulq_f32, vorrq_u32, vreinterpretq_f32_u32,
+    vreinterpretq_u32_u8, vrev64q_f32, vshlq_n_u32, vst1q_f32,
 };
+use std::mem::{size_of, size_of_val};
 
 pub(super) fn dot(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
@@ -32,6 +36,50 @@ pub(super) fn dot(left: &[f32], right: &[f32]) -> f32 {
         .copied()
         .zip(right[vector_end..].iter().copied())
         .fold(vector_sum, |sum, (left, right)| sum + left * right)
+}
+
+/// Dots canonical little-endian F32 bytes directly with one finite F32 slice.
+///
+/// The safe facade proves the exact byte/value length relationship. This
+/// boundary checks every encoded input lane before interpreting it as F32 so a
+/// NaN or infinity can never bypass the backend's ordinary finite-input rule.
+pub(super) fn dot_canonical_f32_le_bytes(left: &[u8], right: &[f32]) -> Option<f32> {
+    debug_assert_eq!(left.len(), size_of_val(right));
+    let vector_end = right.len() - right.len() % 4;
+    let vector_sum = unsafe {
+        let exponent_mask = vdupq_n_u32(0x7f80_0000);
+        let mut lanes: float32x4_t = vdupq_n_f32(0.0);
+        let mut index = 0;
+        while index < vector_end {
+            let byte_offset = index * size_of::<f32>();
+            let encoded = vld1q_u8(left.as_ptr().add(byte_offset));
+            #[cfg(target_endian = "big")]
+            let encoded = vrev32q_u8(encoded);
+            let bits = vreinterpretq_u32_u8(encoded);
+            let nonfinite = vceqq_u32(vandq_u32(bits, exponent_mask), exponent_mask);
+            if vmaxvq_u32(nonfinite) != 0 {
+                return None;
+            }
+            lanes = vaddq_f32(
+                lanes,
+                vmulq_f32(vreinterpretq_f32_u32(bits), vld1q_f32(right.as_ptr().add(index))),
+            );
+            index += 4;
+        }
+        vaddvq_f32(lanes)
+    };
+    let mut sum = vector_sum;
+    for (encoded, right) in left[vector_end * size_of::<f32>()..]
+        .chunks_exact(size_of::<f32>())
+        .zip(&right[vector_end..])
+    {
+        let value = f32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+        if !value.is_finite() {
+            return None;
+        }
+        sum += value * right;
+    }
+    Some(sum)
 }
 
 pub(super) fn add(left: &[f32], right: &[f32], output: &mut [f32]) {

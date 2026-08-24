@@ -20,6 +20,7 @@ use personalai_engine_model_format::Quantization;
 use personalai_engine_quantization::QuantizedTensor;
 use personalai_engine_tensor::{DType, Device, MutableTensor, Tensor, TensorRead, TensorShape};
 use personalai_engine_types::{BackendId, EngineError};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use worker_pool::WorkerPool;
@@ -41,7 +42,7 @@ const AIPQ_V1_BLOCK_VALUES: usize = 32;
 const MAX_ARM64_LOGIT_PROJECTION_OPERATIONS: u64 = 233_373_696;
 /// Fixed output-row quantum between cooperative cancellation polls.
 const LOGIT_PROJECTION_ROW_CHUNK: usize = 64;
-/// Fixed stack staging used while reading one contiguous F32 weight row.
+/// Fixed input quantum between cooperative cancellation polls.
 const LOGIT_PROJECTION_COLUMN_CHUNK: usize = 256;
 
 /// Trusted execution policy selected by local engine configuration.
@@ -420,7 +421,6 @@ impl Arm64Backend {
         let staging = self.staging_pool(pool);
         let vector = f32_values(vector, &staging)?;
         let mut output = StagedF32::zeros(rows, &staging)?;
-        let mut weights = [0.0_f32; LOGIT_PROJECTION_COLUMN_CHUNK];
         for first_row in (0..rows).step_by(LOGIT_PROJECTION_ROW_CHUNK) {
             if cancelled() {
                 return Err(EngineError::cancellation(None));
@@ -447,19 +447,12 @@ impl Arm64Backend {
                     let input_end = first_column.checked_add(width).ok_or_else(|| {
                         EngineError::resource_exhaustion("ARM64 logit input range overflows")
                     })?;
-                    for (offset, weight) in weights.iter_mut().take(width).enumerate() {
-                        let index = row_start
-                            .checked_add(first_column)
-                            .and_then(|index| index.checked_add(offset))
-                            .ok_or_else(|| {
-                                EngineError::resource_exhaustion(
-                                    "ARM64 logit weight index overflows",
-                                )
-                            })?;
-                        *weight = require_finite(matrix.f32_value(index)?)?;
-                    }
-                    let partial = accelerated_dot(
-                        &weights[..width],
+                    let weight_offset = row_start.checked_add(first_column).ok_or_else(|| {
+                        EngineError::resource_exhaustion("ARM64 logit weight index overflows")
+                    })?;
+                    let weight_bytes = contiguous_f32_byte_chunk(matrix, weight_offset, width)?;
+                    let partial = accelerated_dot_canonical_f32_bytes(
+                        weight_bytes,
                         &vector.as_slice()[first_column..input_end],
                     )?;
                     accumulator += f64::from(require_finite(partial)?);
@@ -1010,6 +1003,47 @@ fn validate_matrix_vector_work(
     Ok(operations)
 }
 
+fn contiguous_f32_byte_chunk(
+    tensor: &Tensor,
+    first_element: usize,
+    element_length: usize,
+) -> Result<&[u8], EngineError> {
+    if element_length == 0 {
+        return Err(EngineError::internal_invariant("ARM64 contiguous F32 byte chunk is empty"));
+    }
+    let end_element = first_element.checked_add(element_length).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 contiguous F32 element range overflows")
+    })?;
+    let element_count = addressable(
+        tensor.shape().element_count(),
+        "ARM64 contiguous F32 tensor length is not addressable",
+    )?;
+    if end_element > element_count {
+        return Err(EngineError::internal_invariant(
+            "ARM64 contiguous F32 element range exceeds tensor storage",
+        ));
+    }
+    let first_element = u64::try_from(first_element).map_err(|_| {
+        EngineError::resource_exhaustion("ARM64 contiguous F32 offset is not addressable")
+    })?;
+    let storage_element_offset = addressable(
+        tensor.metadata().layout().storage_offset(first_element)?,
+        "ARM64 contiguous F32 storage offset is not addressable",
+    )?;
+    let byte_offset = storage_element_offset.checked_mul(size_of::<f32>()).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 contiguous F32 byte offset overflows")
+    })?;
+    let byte_length = element_length.checked_mul(size_of::<f32>()).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 contiguous F32 byte length overflows")
+    })?;
+    let byte_end = byte_offset.checked_add(byte_length).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 contiguous F32 byte range overflows")
+    })?;
+    tensor.as_bytes().get(byte_offset..byte_end).ok_or_else(|| {
+        EngineError::internal_invariant("ARM64 contiguous F32 byte range exceeds tensor storage")
+    })
+}
+
 fn same_contiguous_f32(
     left: &Tensor,
     right: &Tensor,
@@ -1423,6 +1457,28 @@ fn accelerated_dot(_left: &[f32], _right: &[f32]) -> Result<f32, EngineError> {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn accelerated_dot_canonical_f32_bytes(left: &[u8], right: &[f32]) -> Result<f32, EngineError> {
+    let expected_bytes = right.len().checked_mul(size_of::<f32>()).ok_or_else(|| {
+        EngineError::resource_exhaustion("ARM64 canonical F32 dot byte length overflows")
+    })?;
+    if left.len() != expected_bytes {
+        return Err(EngineError::internal_invariant("ARM64 canonical F32 dot lengths differ"));
+    }
+    match intrinsics::dot_canonical_f32_le_bytes(left, right) {
+        Some(value) => Ok(value),
+        None => Err(EngineError::backend_failure_for(
+            BackendId::new(ARM64_BACKEND_ID)?,
+            "ARM64 operation encountered a non-finite value",
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn accelerated_dot_canonical_f32_bytes(_left: &[u8], _right: &[f32]) -> Result<f32, EngineError> {
+    Err(EngineError::not_implemented("ARM64 kernel requires an aarch64 target"))
+}
+
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::unnecessary_wraps)] // Preserves the explicit off-target failure signature.
 fn accelerated_add(left: &[f32], right: &[f32], output: &mut [f32]) -> Result<(), EngineError> {
     intrinsics::add(left, right, output);
@@ -1685,6 +1741,20 @@ mod tests {
         let matrix_values =
             (0_i16..40).map(|value| f32::from(value % 13) / 13.0 - 0.4).collect::<Vec<_>>();
         let matrix = tensor(&pool, [5, 8], &matrix_values);
+        let copied = contiguous_f32_byte_chunk(&matrix, 7, 5).unwrap();
+        let expected_bytes =
+            matrix_values[7..12].iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        assert_eq!(copied, expected_bytes);
+        assert!(contiguous_f32_byte_chunk(&matrix, 38, 5).is_err());
+        assert!(contiguous_f32_byte_chunk(&matrix, 0, 0).is_err());
+        let nonfinite = tensor(&pool, [1, 8], &[0.0, 1.0, 2.0, f32::NAN, 4.0, 5.0, 6.0, 7.0]);
+        assert!(
+            accelerated_dot_canonical_f32_bytes(
+                contiguous_f32_byte_chunk(&nonfinite, 0, 8).unwrap(),
+                &[1.0; 8],
+            )
+            .is_err()
+        );
         let vector = tensor(&pool, [8], &[0.5, -1.0, 0.25, 2.0, -0.75, 1.5, 0.125, -0.5]);
         let actual = backend
             .execute_operation(&Operation::LogitProjection, &[&matrix, &vector], &pool)
@@ -1704,6 +1774,39 @@ mod tests {
         ));
         assert!(polls.load(Ordering::Acquire) > LOGIT_PROJECTION_ROW_CHUNK);
         assert_eq!(pool.used_bytes().unwrap(), baseline);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn canonical_f32_byte_dot_matches_staged_dot_and_rejects_invalid_lanes() {
+        let pool = MemoryPool::new(1 << 20).unwrap();
+        let values = [1.0_f32, -2.0, 3.5, 0.25, -0.5, 8.0, -4.0, 2.0, 0.125, -1.5];
+        let right = [0.5_f32, 1.0, -0.25, 4.0, 2.0, -0.5, 0.75, 1.5, -2.0, 0.25];
+        let finite_tensor = tensor(&pool, [10], &values);
+        let bytes = contiguous_f32_byte_chunk(&finite_tensor, 0, values.len()).unwrap();
+        let direct = accelerated_dot_canonical_f32_bytes(bytes, &right).unwrap();
+        let staged = accelerated_dot(&values, &right).unwrap();
+        assert_eq!(direct.to_bits(), staged.to_bits());
+        assert!(accelerated_dot_canonical_f32_bytes(&bytes[..bytes.len() - 1], &right).is_err());
+
+        let simd_nonfinite =
+            tensor(&pool, [8], &[0.0, 1.0, f32::INFINITY, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert!(
+            accelerated_dot_canonical_f32_bytes(
+                contiguous_f32_byte_chunk(&simd_nonfinite, 0, 8).unwrap(),
+                &[1.0; 8],
+            )
+            .is_err()
+        );
+        let tail_nonfinite =
+            tensor(&pool, [10], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, f32::NEG_INFINITY]);
+        assert!(
+            accelerated_dot_canonical_f32_bytes(
+                contiguous_f32_byte_chunk(&tail_nonfinite, 0, 10).unwrap(),
+                &[1.0; 10],
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_arch = "aarch64")]

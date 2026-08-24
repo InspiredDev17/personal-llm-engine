@@ -35,7 +35,7 @@ fn main() {
         println!("ARM64 benchmark skipped outside an optimized cargo bench build");
         return;
     }
-    println!("suite=arm64-graph-v2");
+    println!("suite=arm64-graph-v3");
     println!("target_arch={}", std::env::consts::ARCH);
     println!("build_mode={}", if cfg!(debug_assertions) { "debug" } else { "release" });
     println!("fixture=deterministic-synthetic-f32-v1");
@@ -51,6 +51,7 @@ fn main() {
     let arm64 = Arm64Backend::new().expect("ARM64 backend must construct");
 
     bench_matrix_vector(&pool, &scalar, &arm64);
+    bench_logit_projection(&pool, &scalar, &arm64);
     bench_matrix_matrix_by_thread_count(&pool, &scalar);
     bench_operation(&pool, &scalar, &arm64, &Operation::RmsNorm { epsilon: 1.0e-6 }, 32, 256);
     bench_operation(&pool, &scalar, &arm64, &Operation::Softmax, 32, 256);
@@ -73,6 +74,32 @@ fn main() {
     let stats = pool.statistics().expect("benchmark accounting must remain readable");
     println!("peak_host_memory_bytes={}", stats.peak_bytes());
     println!("final_host_memory_bytes={}", stats.reserved_bytes());
+}
+
+#[cfg(target_arch = "aarch64")]
+fn bench_logit_projection(pool: &MemoryPool, scalar: &CpuReferenceBackend, arm64: &Arm64Backend) {
+    const ROWS: u64 = 4_096;
+    const COLUMNS: u64 = 1_536;
+    let matrix = tensor(pool, [ROWS, COLUMNS], ROWS as usize * COLUMNS as usize);
+    let vector = tensor(pool, [COLUMNS], COLUMNS as usize);
+    report_parity(
+        "logit-projection-4096x1536",
+        &scalar.execute_operation(&Operation::LogitProjection, &[&matrix, &vector], pool).unwrap(),
+        &arm64.execute_operation(&Operation::LogitProjection, &[&matrix, &vector], pool).unwrap(),
+    );
+    for (label, backend) in [("scalar", scalar as &dyn Backend), ("arm64", arm64 as &dyn Backend)] {
+        let elapsed = measure(|| {
+            backend
+                .execute_operation(&Operation::LogitProjection, &[&matrix, &vector], pool)
+                .expect("logit-projection benchmark must execute")
+        });
+        let operations = 2.0 * ROWS as f64 * COLUMNS as f64 * f64::from(MEASURED_ITERATIONS);
+        println!(
+            "benchmark=logit-projection-4096x1536 backend={label} elapsed_ns={} gflops={:.6}",
+            elapsed.as_nanos(),
+            operations / elapsed.as_secs_f64() / 1.0e9
+        );
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
