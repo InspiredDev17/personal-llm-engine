@@ -551,7 +551,8 @@ impl RuntimeReservationManager {
     }
 
     /// Cancels an exact reserved or consumed request and releases capacity.
-    /// Repeating the exact cancellation is idempotent and returns `false`.
+    /// Repeating the exact cancellation, including after expiry has already
+    /// released capacity, is idempotent and returns `false`.
     pub fn cancel(
         &self,
         reservation_id: &ReservationId,
@@ -571,7 +572,8 @@ impl RuntimeReservationManager {
     }
 
     /// Releases an exact reserved or consumed request. Repeating the exact
-    /// release is idempotent and returns `false`.
+    /// release, including after expiry has already released capacity, is
+    /// idempotent and returns `false`.
     pub fn release(
         &self,
         reservation_id: &ReservationId,
@@ -721,6 +723,14 @@ impl RuntimeReservationManager {
             .ok_or_else(|| EngineError::invalid_input("runtime reservation does not exist"))?;
         validate_record_authority(record, request_id, task_id, identity)?;
         if record.status == target {
+            return Ok(false);
+        }
+        // Expiry is a terminal reconciliation which has already released the
+        // reservation's accounting. An exact post-expiry cancel or release is
+        // therefore an idempotent cleanup acknowledgement, not authority to
+        // rewrite history or resurrect capacity. Authority is validated above
+        // before this no-op is accepted.
+        if record.status == ReservationStatus::Expired {
             return Ok(false);
         }
         if !matches!(record.status, ReservationStatus::Reserved | ReservationStatus::Consumed) {
@@ -1015,7 +1025,7 @@ mod tests {
     fn verified_deadline_finalization_preserves_exact_expiry_and_accounting() {
         let (manager, reserved) = consumed_request_expiring_at(100);
         assert!(
-            manager
+            !manager
                 .release(
                     reserved.reservation_id(),
                     reserved.request_id(),
@@ -1023,7 +1033,7 @@ mod tests {
                     reserved.identity(),
                     100,
                 )
-                .is_err()
+                .expect("exact post-expiry release is an idempotent no-op")
         );
         assert_eq!(
             manager.status(reserved.reservation_id()).unwrap(),
@@ -1047,6 +1057,69 @@ mod tests {
                 )
                 .unwrap(),
             ReservationStatus::Expired
+        );
+        assert_eq!(
+            manager.status(reserved.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        assert_eq!(manager.statistics().unwrap().active, 0);
+        assert_eq!(manager.statistics().unwrap().reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn exact_post_expiry_cleanup_does_not_rewrite_history_or_resurrect_accounting() {
+        let (manager, reserved) = consumed_request_expiring_at(100);
+        assert_eq!(manager.expire(100).unwrap(), 1);
+        assert!(
+            !manager
+                .cancel(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    100,
+                )
+                .expect("exact post-expiry cancellation is an idempotent no-op")
+        );
+        assert!(
+            !manager
+                .release(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    101,
+                )
+                .expect("exact post-expiry release is an idempotent no-op")
+        );
+        assert_eq!(
+            manager.status(reserved.reservation_id()).unwrap(),
+            Some(ReservationStatus::Expired)
+        );
+        assert_eq!(manager.statistics().unwrap().active, 0);
+        assert_eq!(manager.statistics().unwrap().reserved_memory_bytes, 0);
+
+        assert!(
+            manager
+                .cancel(
+                    reserved.reservation_id(),
+                    RequestId::new(99_u128).unwrap(),
+                    reserved.task_id(),
+                    reserved.identity(),
+                    101,
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .release(
+                    reserved.reservation_id(),
+                    reserved.request_id(),
+                    reserved.task_id(),
+                    &identity("substituted-model"),
+                    101,
+                )
+                .is_err()
         );
         assert_eq!(
             manager.status(reserved.reservation_id()).unwrap(),

@@ -254,6 +254,43 @@ impl RuntimeV3ServiceState {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn active_execution_is_cancelled_for_test(
+        &self,
+        reservation_id: &ReservationId,
+    ) -> Result<Option<bool>, EngineError> {
+        Ok(self
+            .active_execution_cancellations
+            .lock()
+            .map_err(|_| {
+                EngineError::internal_invariant("runtime execution cancellation lock is poisoned")
+            })?
+            .get(reservation_id)
+            .map(|cancelled| cancelled.load(Ordering::Acquire)))
+    }
+
+    /// Signals an active execution only after its cancellation document has
+    /// passed the adapter's complete correlation and authority validation.
+    /// The adapter may return `false` for an exact idempotent cancellation,
+    /// including one observed just after reservation expiry; that still must
+    /// reach an active worker so it can stop at its next safe boundary.
+    fn signal_active_execution_cancellation(
+        &self,
+        reservation_id: &ReservationId,
+    ) -> Result<(), EngineError> {
+        if let Some(cancelled) = self
+            .active_execution_cancellations
+            .lock()
+            .map_err(|_| {
+                EngineError::internal_invariant("runtime execution cancellation lock is poisoned")
+            })?
+            .get(reservation_id)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "development-runtime-v3-simulator")]
     pub(crate) fn enable_development_simulator(
         &mut self,
@@ -446,25 +483,12 @@ impl RuntimeV3ServiceState {
                 )?)
             }
             ServiceRequestBody::RuntimeV3Cancel(document) => {
-                let changed = self.adapter.cancel_document(document.as_bytes(), now_unix_millis)?;
-                if changed {
-                    let cancellation = contract_result(decode_runtime_cancellation_request_v3(
-                        document.as_bytes(),
-                    ))?;
-                    let reservation_id = ReservationId::new(cancellation.reservation_id)?;
-                    if let Some(cancelled) = self
-                        .active_execution_cancellations
-                        .lock()
-                        .map_err(|_| {
-                            EngineError::internal_invariant(
-                                "runtime execution cancellation lock is poisoned",
-                            )
-                        })?
-                        .get(&reservation_id)
-                    {
-                        cancelled.store(true, Ordering::Release);
-                    }
-                }
+                let cancellation =
+                    contract_result(decode_runtime_cancellation_request_v3(document.as_bytes()))?;
+                let reservation_id = ReservationId::new(cancellation.reservation_id)?;
+                let _changed =
+                    self.adapter.cancel_document(document.as_bytes(), now_unix_millis)?;
+                self.signal_active_execution_cancellation(&reservation_id)?;
                 ServiceResponseBody::RuntimeV3Cancelled
             }
             ServiceRequestBody::RuntimeV3Release(document) => {
@@ -1398,7 +1422,11 @@ impl RuntimeIdentityAuthority for LiveRuntimeIdentityAuthority<'_> {
     reason = "focused private helper tests remain next to the live authority implementation they exercise"
 )]
 mod tests {
-    use super::{accepted_context_limit, execution_deadline_reached};
+    use super::{
+        RuntimeV3ServiceConfig, RuntimeV3ServiceState, accepted_context_limit,
+        execution_deadline_reached,
+    };
+    use crate::{ReservationId, RuntimeInstanceId};
     use personalai_engine_types::EngineError;
     use std::time::Duration;
 
@@ -1420,6 +1448,48 @@ mod tests {
         assert!(!execution_deadline_reached(9_999, 10_000, Duration::from_millis(99), 100,));
         assert!(execution_deadline_reached(10_000, 10_000, Duration::from_millis(99), 100,));
         assert!(execution_deadline_reached(9_999, 10_000, Duration::from_millis(100), 100,));
+    }
+
+    #[test]
+    fn exact_idempotent_cancellation_still_signals_an_active_execution() {
+        let state = RuntimeV3ServiceState::new(
+            RuntimeV3ServiceConfig::new(
+                RuntimeInstanceId::new("version.1").expect("backend version"),
+                RuntimeInstanceId::new("backend.instance-1").expect("backend instance"),
+                RuntimeInstanceId::new("engine.instance-1").expect("engine instance"),
+                1,
+                1_024,
+                1_000,
+            )
+            .expect("runtime configuration"),
+        )
+        .expect("runtime state");
+        let reservation_id = ReservationId::new("rsv_fixture-1").expect("reservation ID");
+        state.insert_active_execution_for_test(reservation_id.clone()).expect("active execution");
+        assert_eq!(
+            state
+                .active_execution_is_cancelled_for_test(&reservation_id)
+                .expect("read active execution"),
+            Some(false)
+        );
+
+        // The handler calls this only after the adapter accepted the exact
+        // cancellation document. It must also run for an idempotent `false`
+        // result, such as the post-expiry cancellation path.
+        state
+            .signal_active_execution_cancellation(&reservation_id)
+            .expect("signal active execution");
+        assert_eq!(
+            state
+                .active_execution_is_cancelled_for_test(&reservation_id)
+                .expect("read cancellation signal"),
+            Some(true)
+        );
+        state
+            .signal_active_execution_cancellation(
+                &ReservationId::new("rsv_inactive-1").expect("inactive reservation ID"),
+            )
+            .expect("inactive cancellation is harmless");
     }
 }
 

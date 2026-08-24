@@ -1290,6 +1290,79 @@ mod tests {
     }
 
     #[test]
+    fn exact_post_expiry_cancellation_and_release_are_safe_noops() {
+        let (adapter, authority) = adapter();
+        let reservation = reservation();
+        let source = encode_inference_reservation_request_v3(&reservation).expect("encode reserve");
+        let now = reservation.created_unix_millis().expect("created") + 1;
+        adapter.reserve_document(&source, now, &authority).expect("reserve");
+        let execution = execution(&reservation);
+        let execution_source =
+            encode_inference_execution_request_v3(&execution).expect("encode execution");
+        adapter
+            .admit_execution_document(
+                &execution_source,
+                execution.created_unix_millis().expect("execution creation"),
+                &authority,
+            )
+            .expect("consume reservation");
+        let expiry = reservation.expires_unix_millis().expect("expiry");
+
+        let cancellation = RuntimeCancellationRequestV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: RuntimeCancellationRequestKindV3::RuntimeCancellationRequestV3,
+            reservation_id: reservation.reservation_id.clone(),
+            request_id: reservation.request_id.clone(),
+            task_id: reservation.task_id.clone(),
+            cancellation_request_id: RequestId::new("req_44444444444444444444444444444444")
+                .expect("cancel request"),
+            reason_code: "owner_cancelled".to_owned(),
+            requested_at: runtime_v3_timestamp_from_unix_millis(expiry).expect("cancel time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let cancellation_source =
+            encode_runtime_cancellation_request_v3(&cancellation).expect("encode cancellation");
+        assert!(
+            !adapter
+                .cancel_document(&cancellation_source, expiry)
+                .expect("exact post-expiry cancellation")
+        );
+
+        let release = InferenceReservationReleaseV3 {
+            contract_version: InferenceRuntimeContractVersionV3,
+            kind: ReservationReleaseKindV3::ReservationRelease,
+            reservation_id: reservation.reservation_id.clone(),
+            request_id: reservation.request_id.clone(),
+            task_id: reservation.task_id.clone(),
+            reason_code: "complete".to_owned(),
+            requested_at: runtime_v3_timestamp_from_unix_millis(expiry + 1).expect("release time"),
+            extensions: None,
+            required_extensions: None,
+        };
+        let release_source =
+            encode_inference_reservation_release_v3(&release).expect("encode release");
+        assert!(
+            !adapter
+                .release_document(&release_source, expiry + 1)
+                .expect("exact post-expiry release")
+        );
+        let statistics = adapter.reservation_statistics().expect("statistics");
+        assert_eq!(statistics.active, 0);
+        assert_eq!(statistics.reserved_memory_bytes, 0);
+
+        let mut wrong = cancellation;
+        wrong.request_id =
+            RequestId::new("req_55555555555555555555555555555555").expect("wrong request");
+        let wrong_source =
+            encode_runtime_cancellation_request_v3(&wrong).expect("encode wrong cancel");
+        assert!(adapter.cancel_document(&wrong_source, expiry + 1).is_err());
+        let statistics = adapter.reservation_statistics().expect("statistics after rejection");
+        assert_eq!(statistics.active, 0);
+        assert_eq!(statistics.reserved_memory_bytes, 0);
+    }
+
+    #[test]
     fn cancelled_execution_accepts_only_a_bound_cancelled_terminal_result() {
         let (adapter, authority) = adapter();
         let reservation = reservation();
