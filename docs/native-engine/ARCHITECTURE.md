@@ -49,7 +49,7 @@ call, and the isolated `mmap`/`munmap` read-only tensor mapping. There is no thi
 tokenizer, model-loader, scheduler, server, or GPU-kernel dependency.
 
 The runtime-v3 reservation lifecycle is pinned to Sovereign AI Contracts
-commit `af62132e46fc641e7dd74eb3e21eabb6d40947c7`. It does not define or parse a
+commit `f3ea60596c33faca673ad368304f162b30f2ac2f`. It does not define or parse a
 second wire format. A strict bounded adapter consumes only canonical v3
 documents decoded by the pinned Contracts implementation, maps them into the
 engine state machine, revalidates engine-owned identity before reservation and
@@ -127,6 +127,22 @@ write access. OS authentication of the verifier and operated evidence remain
 supervisor/installer assumptions.
 
 ## Package and loading flow
+
+GLM-5.3-Flash is not part of the package or loading flow. ADR-0040 defines a
+separate offline, digest-pinned metadata preflight and non-executable checked
+state plan. The profile is intentionally absent from the model format, loader,
+server, client protocol and CLI. Source-only `F8_E4M3` recognition does not
+grant a runtime dtype or decoder. This keeps source inspection distinct from
+package trust, backend implementation, Model Foundry qualification and owner
+activation.
+
+Canonical Sovereign Models 2.1 execution admission is consumed but not
+activated. ADR-0041 records the exact published Contracts pin and authenticated
+evidence boundary. The engine validates canonical admission, owner trust,
+freshness, anti-rollback selection, Runtime V3 identity, and exact Models 2.0
+descriptor/catalog binding. It exposes no package-registration constructor,
+CLI activation, service route, or inference claim; the execution-adapter check
+remains typed `NotImplemented`.
 
 The import and production components are intentionally separate:
 

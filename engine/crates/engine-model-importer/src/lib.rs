@@ -7,6 +7,7 @@
 
 mod aiptok_metadata;
 mod bounded_json;
+mod glm53_source;
 mod qwen25_config_json;
 #[cfg(unix)]
 mod qwen25_source_preflight;
@@ -16,6 +17,17 @@ mod qwen25_tokenizer_json;
 mod safetensors;
 
 pub use aiptok_metadata::{AIPTOK_METADATA_SOURCE_FORMAT, convert as convert_aiptok_metadata};
+pub use glm53_source::{
+    GLM53_CONFIG_BYTES, GLM53_FLASH_ARCHITECTURE_ID, GLM53_FLASH_SOURCE_REPOSITORY,
+    GLM53_FLASH_SOURCE_REVISION, GLM53_FP8_BLOCK_COLUMNS, GLM53_FP8_BLOCK_ROWS,
+    GLM53_IMAGE_PATCH_SIZE, GLM53_MAX_IMAGE_TOKENS, GLM53_MAX_VIDEO_TOKENS, GLM53_MIN_IMAGE_TOKENS,
+    GLM53_MODEL_INDEX_BYTES, GLM53_MODEL_SHARD_COUNT, GLM53_MODEL_TENSOR_BYTES,
+    GLM53_MODEL_TENSOR_COUNT, GLM53_MODEL_VOCABULARY_SIZE, GLM53_PROCESSOR_CONFIG_BYTES,
+    GLM53_SPATIAL_MERGE_SIZE, GLM53_TEMPORAL_PATCH_SIZE, GLM53_TOKENIZER_ADDED_TOKEN_COUNT,
+    GLM53_TOKENIZER_BPE_VOCABULARY_SIZE, GLM53_TOKENIZER_BYTES, GLM53_TOKENIZER_MERGE_COUNT,
+    GLM53_TOKENIZER_PROFILE_ID, GLM53_VIDEO_FRAMES_PER_SECOND, Glm53MetadataFiles,
+    Glm53SourcePreflightReport, preflight_glm53_flash_metadata,
+};
 pub use qwen25_config_json::{
     QWEN25_CONFIG_JSON_SOURCE_FORMAT, QWEN25_MODEL_SAFETENSORS_BYTES, Qwen25Config,
     Qwen25ConfigProfile,
@@ -34,7 +46,7 @@ pub use qwen25_tokenizer_json::{
 
 pub use safetensors::{
     MAX_SAFETENSORS_HEADER_BYTES, MAX_SOURCE_TENSOR_NAME_BYTES, ParsedSafetensors,
-    ParsedSafetensorsHeader, SafeTensorRecord,
+    ParsedSafetensorsHeader, SafeTensorRecord, SafeTensorSourceDType,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -902,15 +914,14 @@ fn build_shards(
             let shape = expected
                 .get(&name)
                 .ok_or_else(|| corrupt("source tensor inventory contains an unexpected tensor"))?;
-            if !matches!(tensor.dtype(), DType::F32 | DType::F16 | DType::BFloat16)
-                || tensor.shape() != shape
-            {
+            let runtime_dtype = tensor.runtime_dtype()?;
+            if tensor.shape() != shape {
                 return Err(corrupt("source tensor dtype or shape does not match architecture"));
             }
             let source_bytes = parsed.tensor_bytes(tensor)?;
             let aligned =
                 align_up(shard.len(), usize::try_from(IMPORT_TENSOR_ALIGNMENT).unwrap_or(64))?;
-            let converted = convert_source_tensor_to_f32(tensor.dtype(), source_bytes)?;
+            let converted = convert_source_tensor_to_f32(runtime_dtype, source_bytes)?;
             let values = f32_values(&converted)?;
             let quantization = spec.quantization_profile.tensor_format(tensor.shape().rank());
             let (destination, metrics) = match quantization {

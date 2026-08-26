@@ -485,10 +485,10 @@ Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Packag
 PackageName: sovereign-ai-contracts
 SPDXID: SPDXRef-Package-sovereign-ai-contracts
 PackageVersion: 3.0.0
-PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@af62132e46fc641e7dd74eb3e21eabb6d40947c7
+PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@f3ea60596c33faca673ad368304f162b30f2ac2f
 FilesAnalyzed: false
 PackageLicenseConcluded: NOASSERTION
 PackageLicenseDeclared: NOASSERTION
 PackageCopyrightText: NOASSERTION
-PackageComment: Exact reviewed commit; only the minimal runtime-v3 feature is compiled into the engine.
+PackageComment: Exact reviewed commit; only model-admission-v1 and its models-v2/runtime-v3 dependencies are compiled into the engine.
 Relationship: SPDXRef-Package-personalai-native-engine DEPENDS_ON SPDXRef-Package-sovereign-ai-contracts

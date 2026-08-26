@@ -2,6 +2,7 @@
 
 #[cfg(feature = "cpu-reference")]
 mod cpu_decoder;
+mod glm53_plan;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_decoder;
 #[cfg(feature = "cpu-reference")]
@@ -9,6 +10,20 @@ mod sparse_moe;
 
 #[cfg(feature = "cpu-reference")]
 pub use cpu_decoder::{CpuDecoderModel, CpuDecoderSession};
+pub use glm53_plan::{
+    GLM53_ACTIVE_ROUTED_EXPERT_COUNT, GLM53_DECLARED_CONTEXT_TOKENS,
+    GLM53_DENSE_INTERMEDIATE_DIMENSION, GLM53_DENSE_MLP_LAYER_COUNT, GLM53_DSA_INDEX_HEAD_COUNT,
+    GLM53_DSA_INDEX_HEAD_DIMENSION, GLM53_DSA_INDEX_KPOOL, GLM53_DSA_INDEX_TOPK,
+    GLM53_DSA_KV_LORA_RANK, GLM53_DSA_LAYER_COUNT, GLM53_DSA_Q_LORA_RANK,
+    GLM53_DSA_QK_NOPE_HEAD_DIMENSION, GLM53_DSA_QK_ROPE_HEAD_DIMENSION,
+    GLM53_DSA_VALUE_HEAD_DIMENSION, GLM53_FLASH_ARCHITECTURE_ID, GLM53_HIDDEN_DIMENSION,
+    GLM53_KDA_CONV_KERNEL, GLM53_KDA_HEAD_COUNT, GLM53_KDA_HEAD_DIMENSION, GLM53_KDA_LAYER_COUNT,
+    GLM53_LAYER_COUNT, GLM53_MHC_EPSILON, GLM53_MHC_MULTIPLIER, GLM53_MHC_SINKHORN_ITERATIONS,
+    GLM53_MOE_INTERMEDIATE_DIMENSION, GLM53_ROUTED_EXPERT_COUNT, GLM53_ROUTED_SCALING_FACTOR,
+    GLM53_SHARED_EXPERT_COUNT, GLM53_SOURCE_WEIGHT_BYTES, GLM53_VOCABULARY_SIZE,
+    Glm53ArchitecturePlan, Glm53AttentionKind, Glm53LayerPlan, Glm53MlpKind, Glm53ReadinessBlocker,
+    Glm53ReadinessReport, Glm53ResourcePlan, Glm53RouterPlan,
+};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_decoder::{MetalDecoderModel, MetalDecoderSession};
 #[cfg(feature = "arm64")]

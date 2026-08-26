@@ -26,7 +26,8 @@ readme = false
 
 [features]
 default = ["full"]
-full = ["models-v2"]
+full = ["model-admission-v1"]
+model-admission-v1 = ["models-v2"]
 models-v2 = ["runtime-v3"]
 runtime-v3 = [
     "dep:serde",

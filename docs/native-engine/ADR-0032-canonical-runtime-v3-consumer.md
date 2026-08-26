@@ -20,9 +20,10 @@ blur the authority boundary even if those modules were unused.
 ## Decision
 
 The engine pins exact Contracts commit
-`af62132e46fc641e7dd74eb3e21eabb6d40947c7` and compiles only its narrow
-`models-v2` feature plus its `runtime-v3` dependency. The resulting dependency graph contains common typed IDs,
-generation data, and runtime-v3 documents only. Cognitive roles, qualification
+`f3ea60596c33faca673ad368304f162b30f2ac2f` and compiles only its narrow
+`model-admission-v1` feature plus its `models-v2` and `runtime-v3` dependencies.
+The resulting dependency graph contains common typed IDs, generation data,
+Runtime V3 documents, Models 2.0 package identity, and Models 2.1 admission only. Cognitive roles, qualification
 authority, tool authority, memory authority, security authority, and component
 administration are excluded.
 

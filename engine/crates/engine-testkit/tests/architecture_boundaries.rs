@@ -85,7 +85,7 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
             if name == "sovereign-ai-contracts" {
                 assert_eq!(
                     source,
-                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=af62132e46fc641e7dd74eb3e21eabb6d40947c7#af62132e46fc641e7dd74eb3e21eabb6d40947c7",
+                    "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=f3ea60596c33faca673ad368304f162b30f2ac2f#f3ea60596c33faca673ad368304f162b30f2ac2f",
                     "canonical runtime/models contract dependency must use its exact reviewed commit"
                 );
                 assert!(
@@ -111,9 +111,9 @@ fn workspace_external_dependencies_match_the_reviewed_allowlist() {
         fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest must exist");
     assert!(
         workspace_manifest.contains(
-            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"af62132e46fc641e7dd74eb3e21eabb6d40947c7\", default-features = false, features = [\"models-v2\"] }"
+            "sovereign-ai-contracts = { git = \"https://github.com/InspiredDev17/Sovereign-AI-Contracts.git\", rev = \"f3ea60596c33faca673ad368304f162b30f2ac2f\", default-features = false, features = [\"model-admission-v1\"] }"
         ),
-        "canonical contracts must remain exact-commit pinned with only models-v2 and its runtime-v3 dependency enabled"
+        "canonical contracts must remain exact-commit pinned with only model-admission-v1 and its models-v2/runtime-v3 dependencies enabled"
     );
 
     let prohibited = [
@@ -834,7 +834,7 @@ fn spdx_sbom_covers_every_locked_external_package_and_checksum() {
             );
         } else {
             assert!(
-                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@af62132e46fc641e7dd74eb3e21eabb6d40947c7"),
+                sbom.contains("PackageDownloadLocation: git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git@f3ea60596c33faca673ad368304f162b30f2ac2f"),
                 "SPDX document omits the exact canonical contract commit"
             );
         }
@@ -1142,6 +1142,119 @@ fn experimental_qwen_readiness_is_not_client_or_cli_activation_authority() {
     assert!(
         registry
             .contains("pub const fn production_activation(&self) -> bool {\n        false\n    }")
+    );
+}
+
+#[test]
+fn canonical_execution_descriptor_checks_are_provider_neutral() {
+    let root = engine_root();
+    let loader = fs::read_to_string(root.join("crates/engine-loader/src/directory_loader.rs"))
+        .expect("directory loader source must be readable");
+    assert!(loader.contains("registration.execution_package_descriptor()"));
+    assert!(loader.contains("descriptor.architecture.architecture_id"));
+    assert!(!loader.contains("registration.qwen_registry_binding()"));
+
+    let registry = fs::read_to_string(root.join("crates/engine-loader/src/qwen_registry_v3.rs"))
+        .expect("registry adapter source must be readable");
+    assert!(registry.contains("fn decode_models_v2_descriptor"));
+    assert!(
+        !registry.contains("fn decode_qwen_models_v2_descriptor"),
+        "canonical Models 2.0 decoding must not encode one model family in its API"
+    );
+}
+
+#[test]
+fn canonical_model_admission_is_authenticated_evidence_not_execution_authority() {
+    let root = engine_root();
+    let admission = fs::read_to_string(root.join("crates/engine-loader/src/model_admission_v1.rs"))
+        .expect("canonical admission consumer source must be readable");
+    for required in [
+        "authenticate_model_execution_admission",
+        "validate_model_execution_admission_descriptor",
+        "validate_model_execution_admission_package_catalog",
+        "verify_canonical_contract_signature",
+        "owner_allows_development_execution",
+        "canonical Models 2.1 package registration and execution adapter",
+    ] {
+        assert!(
+            admission.contains(required),
+            "canonical admission evidence boundary changed: {required}"
+        );
+    }
+    assert!(admission.contains("pub fn require_execution_adapter"));
+    assert!(admission.contains("Err(EngineError::not_implemented("));
+
+    for relative in
+        ["crates/engine-protocol/src", "crates/engine-server/src", "crates/engine-cli/src"]
+    {
+        for source in collect_files(&root.join(relative), "rs") {
+            let contents = fs::read_to_string(&source).expect("Rust source must be readable");
+            assert!(
+                !contents.contains("authenticate_model_execution_admission")
+                    && !contents.contains("ModelExecutionAdmissionSelection"),
+                "canonical admission gained protocol/service/CLI activation authority: {}",
+                source.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn experimental_glm53_foundation_has_no_protocol_service_or_activation_authority() {
+    let root = engine_root();
+    for relative in [
+        "crates/engine-protocol/src",
+        "crates/engine-server/src",
+        "crates/engine-cli/src",
+        "crates/engine-loader/src",
+        "crates/engine-model-format/src",
+    ] {
+        for source in collect_files(&root.join(relative), "rs") {
+            let contents = fs::read_to_string(&source).expect("Rust source must be readable");
+            for prohibited in [
+                "Glm53ArchitecturePlan",
+                "Glm53ResourcePlan",
+                "Glm53SourcePreflightReport",
+                "glm5-next-flash-experimental-v1",
+                "GLM-5.3-Flash",
+            ] {
+                assert!(
+                    !contents.contains(prohibited),
+                    "experimental GLM source/planning evidence escaped into runtime authority: {}",
+                    source.display()
+                );
+            }
+        }
+    }
+
+    let importer =
+        fs::read_to_string(root.join("crates/engine-model-importer/src/glm53_source.rs"))
+            .expect("GLM source preflight must be readable");
+    assert!(importer.contains("3f1971b7b5f7a528c9c4ef6212c8785298a8c24a"));
+    assert!(importer.contains("pub fn preflight_glm53_flash_metadata"));
+    assert!(importer.contains("Err(EngineError::unsupported_architecture"));
+
+    let planner = fs::read_to_string(root.join("crates/engine-transformer/src/glm53_plan.rs"))
+        .expect("GLM architecture plan must be readable");
+    for required in [
+        "PackageDecoderUnavailable",
+        "KdaRuntimeUnavailable",
+        "DsaRuntimeUnavailable",
+        "MhcRuntimeUnavailable",
+        "Fp8RuntimeUnavailable",
+        "MultimodalRuntimeUnavailable",
+        "RuntimeContextCeilingTooLow",
+        "QualificationUnavailable",
+        "pub const fn executable(&self) -> bool {\n        false",
+    ] {
+        assert!(planner.contains(required), "GLM fail-closed boundary changed: {required}");
+    }
+
+    let types = fs::read_to_string(root.join("crates/engine-types/src/lib.rs"))
+        .expect("runtime type source must be readable");
+    assert!(
+        !types.contains("F8E4M3") && !types.contains("F8_E4M3"),
+        "source-only FP8 recognition must not masquerade as executable runtime dtype support"
     );
 }
 
@@ -1462,7 +1575,7 @@ fn locked_external_packages(lock: &str) -> BTreeSet<String> {
                 lock_value(package, "checksum").is_some()
                     || (name == "sovereign-ai-contracts"
                         && source
-                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=af62132e46fc641e7dd74eb3e21eabb6d40947c7#af62132e46fc641e7dd74eb3e21eabb6d40947c7"),
+                            == "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=f3ea60596c33faca673ad368304f162b30f2ac2f#f3ea60596c33faca673ad368304f162b30f2ac2f"),
                 "external dependency must have a locked checksum or exact reviewed commit: {name}"
             );
             format!("{name}@{version}")

@@ -27,7 +27,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Exact Contracts source for Models 2.0 and runtime-v3 identity.
-pub const MODELS_V2_CONTRACT_COMMIT: &str = "af62132e46fc641e7dd74eb3e21eabb6d40947c7";
+pub const MODELS_V2_CONTRACT_COMMIT: &str = "f3ea60596c33faca673ad368304f162b30f2ac2f";
 /// Maximum exact canonical descriptor bytes.
 pub const MAX_MODELS_V2_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 /// Exact canonical package profile identifier.
@@ -269,7 +269,7 @@ pub fn verify_qwen_registry_selection_v3(
             "Models 2.0 descriptor identity differs from the signed Qwen registry entry",
         ));
     }
-    let descriptor = decode_qwen_models_v2_descriptor(descriptor_bytes)?;
+    let descriptor = decode_models_v2_descriptor(descriptor_bytes)?;
     validate_qwen_models_v2_profile(&descriptor, selection, entry.package_catalog_hash())?;
     Ok(VerifiedQwenRegistrySelectionV3 {
         descriptor,
@@ -281,7 +281,7 @@ pub fn verify_qwen_registry_selection_v3(
     })
 }
 
-fn decode_qwen_models_v2_descriptor(
+pub(crate) fn decode_models_v2_descriptor(
     bytes: &[u8],
 ) -> Result<ExecutionPackageDescriptor, EngineError> {
     if bytes.is_empty() || bytes.len() > MAX_MODELS_V2_DESCRIPTOR_BYTES {
@@ -696,8 +696,8 @@ mod tests {
         let struct_order = serde_json::to_vec(&descriptor).expect("encode descriptor");
 
         assert_ne!(struct_order, canonical);
-        decode_qwen_models_v2_descriptor(&canonical).expect("canonical descriptor validates");
-        assert!(decode_qwen_models_v2_descriptor(&struct_order).is_err());
+        decode_models_v2_descriptor(&canonical).expect("canonical descriptor validates");
+        assert!(decode_models_v2_descriptor(&struct_order).is_err());
     }
 
     fn canonical_descriptor(descriptor: &ExecutionPackageDescriptor) -> Vec<u8> {

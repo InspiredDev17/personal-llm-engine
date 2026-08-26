@@ -8,6 +8,7 @@
 mod canonical_json;
 #[cfg(unix)]
 mod directory_loader;
+mod model_admission_v1;
 mod qwen_registry_v3;
 #[cfg(unix)]
 mod read_only_map;
@@ -17,6 +18,11 @@ mod registry_v2;
 pub use directory_loader::{
     DIRECTORY_LOADER_ENGINE_VERSION, DirectoryLoadCancellationProbe, DirectorySecurityEventSink,
     LoadedDirectoryTensors, VerifiedDirectoryPackage, VerifiedDirectoryReadinessMetadata,
+};
+pub use model_admission_v1::{
+    AuthenticatedModelExecutionAdmission, MAX_MODEL_ADMISSION_CATALOG_BYTES,
+    MAX_MODEL_EXECUTION_ADMISSION_BYTES, MODEL_EXECUTION_ADMISSION_CONTRACT_COMMIT,
+    ModelExecutionAdmissionSelection, authenticate_model_execution_admission,
 };
 #[cfg(unix)]
 use qwen_registry_v3::read_verified_qwen_registry_selection_v3;
@@ -91,12 +97,6 @@ pub(crate) struct QwenRegistryBindingV3 {
     registry_entry_hash: ModelPackageHash,
 }
 
-impl QwenRegistryBindingV3 {
-    pub(crate) const fn descriptor(&self) -> &ExecutionPackageDescriptor {
-        &self.descriptor
-    }
-}
-
 /// One configuration-owned model package registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredModel {
@@ -162,27 +162,23 @@ impl RegisteredModel {
         })
     }
 
-    /// Returns the canonical Models 2.0 descriptor for a V3 Qwen registration.
+    /// Returns the canonical Models 2.0 descriptor for a signed package registration.
     pub fn execution_package_descriptor(&self) -> Option<&ExecutionPackageDescriptor> {
         self.qwen_registry_binding.as_ref().map(|binding| &binding.descriptor)
     }
 
-    /// Returns exact descriptor SHA-384 for a V3 Qwen registration.
+    /// Returns the exact canonical descriptor SHA-384 when one is bound.
     pub fn execution_package_descriptor_hash(&self) -> Option<ModelPackageHash> {
         self.qwen_registry_binding.as_ref().map(|binding| binding.descriptor_hash)
     }
 
-    /// Returns the canonical runtime identity for a V3 Qwen registration.
+    /// Returns the canonical runtime identity when a descriptor is bound.
     pub fn execution_runtime_identity(&self) -> Option<&RuntimeIdentityV3> {
         self.execution_package_descriptor().map(|descriptor| &descriptor.runtime_identity)
     }
 
     pub(crate) const fn registry_binding(&self) -> Option<&RegistryBindingV2> {
         self.registry_binding.as_ref()
-    }
-
-    pub(crate) const fn qwen_registry_binding(&self) -> Option<&QwenRegistryBindingV3> {
-        self.qwen_registry_binding.as_ref()
     }
 }
 

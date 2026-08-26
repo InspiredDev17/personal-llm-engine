@@ -1109,10 +1109,10 @@ fn validate_models_v2_member(
     observed_hash: personalai_engine_types::ModelPackageHash,
     observed_bytes: usize,
 ) -> Result<(), EngineError> {
-    let Some(binding) = registration.qwen_registry_binding() else {
+    let Some(descriptor) = registration.execution_package_descriptor() else {
         return Ok(());
     };
-    let member = descriptor_member(binding.descriptor(), member_id)?;
+    let member = descriptor_member(descriptor, member_id)?;
     let observed_bytes = u64::try_from(observed_bytes)
         .map_err(|_| EngineError::resource_exhaustion("package member length exceeds u64"))?;
     if !models_v2_digest_matches(&member.content.digest, observed_hash)
@@ -1138,9 +1138,9 @@ fn validate_models_v2_manifest(
     manifest_bytes: &[u8],
 ) -> Result<(), EngineError> {
     let is_qwen = manifest.architecture_id().as_str() == DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID;
-    if is_qwen && registration.mode() != RegistrationMode::ExperimentalQwenRegistryV3 {
+    if is_qwen && registration.execution_package_descriptor().is_none() {
         return Err(EngineError::authentication_failure(
-            "Qwen package execution requires the separate signed V3/Models 2.0 binding",
+            "Qwen package execution requires a signed canonical Models 2.0 binding",
         ));
     }
     if !is_qwen && registration.mode() == RegistrationMode::ExperimentalQwenRegistryV3 {
@@ -1148,12 +1148,10 @@ fn validate_models_v2_manifest(
             "Qwen V3 registration cannot authorize another architecture",
         ));
     }
-    let Some(binding) = registration.qwen_registry_binding() else {
+    let Some(descriptor) = registration.execution_package_descriptor() else {
         return Ok(());
     };
-    let descriptor = binding.descriptor();
-    if manifest.architecture_id().as_str() != DIRECTORY_QWEN2_DECODER_ARCHITECTURE_ID
-        || descriptor.architecture.architecture_id != manifest.architecture_id().as_str()
+    if descriptor.architecture.architecture_id != manifest.architecture_id().as_str()
         || descriptor.architecture.context_limit != manifest.context_limit().get()
         || !models_v2_digest_matches(
             &descriptor.tokenizer.content.digest,
@@ -1180,10 +1178,10 @@ fn validate_models_v2_total(
     registration: &RegisteredModel,
     observed_bytes: u64,
 ) -> Result<(), EngineError> {
-    let Some(binding) = registration.qwen_registry_binding() else {
+    let Some(descriptor) = registration.execution_package_descriptor() else {
         return Ok(());
     };
-    if binding.descriptor().package_size_bytes != observed_bytes {
+    if descriptor.package_size_bytes != observed_bytes {
         return Err(EngineError::authentication_failure(
             "PAIDIR01 byte total differs from the canonical Models 2.0 descriptor",
         ));
@@ -1296,7 +1294,7 @@ fn check_cancelled(cancellation: &dyn DirectoryLoadCancellationProbe) -> Result<
 }
 
 fn validate_provenance(bytes: &[u8], registration: &RegisteredModel) -> Result<(), EngineError> {
-    if registration.mode() == RegistrationMode::ExperimentalQwenRegistryV3 {
+    if registration.execution_package_descriptor().is_some() {
         return validate_models_v2_provenance(bytes);
     }
     if bytes.is_empty()

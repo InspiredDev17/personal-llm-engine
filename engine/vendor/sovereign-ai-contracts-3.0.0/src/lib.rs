@@ -43,6 +43,8 @@ pub mod knowledge_lifecycle;
 pub mod knowledge_prefix;
 #[cfg(feature = "full")]
 pub mod memory;
+#[cfg(feature = "model-admission-v1")]
+pub mod model_admission_v1;
 #[cfg(feature = "full")]
 pub mod models;
 #[cfg(feature = "models-v2")]

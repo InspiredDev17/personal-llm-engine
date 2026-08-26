@@ -215,6 +215,55 @@ pub fn public_type_registry() -> Vec<PublicTypeRegistryEntry> {
             "models/v2/models.schema.json",
             "TensorInventoryBinding",
         ),
+        entry_version::<crate::model_admission_v1::ModelAdmissionId>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelAdmissionId",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelAdmissionID",
+        ),
+        entry_version::<crate::model_admission_v1::ModelAdmissionState>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelAdmissionState",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelAdmissionState",
+        ),
+        entry_version::<crate::model_admission_v1::ModelAdmissionTrustState>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelAdmissionTrustState",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelAdmissionTrustState",
+        ),
+        entry_version::<crate::model_admission_v1::ModelAdmissionSignerIdentity>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelAdmissionSignerIdentity",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelAdmissionSignerIdentity",
+        ),
+        entry_version::<crate::model_admission_v1::ModelEngineCompatibility>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelEngineCompatibility",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelEngineCompatibility",
+        ),
+        entry_version::<crate::model_admission_v1::ModelExecutionAdmissionPayload>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelExecutionAdmissionPayload",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelExecutionAdmissionPayload",
+        ),
+        entry_version::<crate::model_admission_v1::ModelAdmissionSignatureEnvelope>(
+            crate::model_admission_v1::MODEL_EXECUTION_ADMISSION_CONTRACT_VERSION,
+            "models",
+            "ModelAdmissionSignatureEnvelope",
+            "models/v2/models-2.1.0.schema.json",
+            "ModelAdmissionSignatureEnvelope",
+        ),
     ]);
     registry.extend(vec![
         entry_version::<crate::cognitive_taxonomy::CognitiveCapabilityId>(

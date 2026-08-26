@@ -42,9 +42,9 @@ negative, weak-key, domain-separation, revocation, and malformed-input tests.
 Direct production dependencies are exact `sha2 0.11.0`, `ed25519-dalek 3.0.0`,
 `zeroize 1.8.2`, `libc 0.2.189`, `unicode-normalization 0.1.24`,
 `unicode-general-category 1.1.0`, and Sovereign AI Contracts commit
-`af62132e46fc641e7dd74eb3e21eabb6d40947c7`, all with unnecessary default
+`f3ea60596c33faca673ad368304f162b30f2ac2f`, all with unnecessary default
 features disabled. The Contracts dependency enables only the narrow
-`models-v2` consumer profile and its runtime-v3 dependency; cognitive, tool, memory, security, and other
+`model-admission-v1` consumer profile and its models-v2/runtime-v3 dependencies; cognitive, tool, memory, security, and other
 control-plane authority modules are excluded from the compiled engine graph.
 SHA-384 and strict Ed25519 are package/control-message/response/release integrity
 mechanisms. `engine-tokenizer` reuses the existing first-party SHA-384 wrapper

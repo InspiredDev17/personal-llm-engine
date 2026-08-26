@@ -633,6 +633,42 @@ pub fn verify_model_foundry_qwen_registry_signature(
         .map_err(|_| EngineError::signature_failure("Qwen registry signature is invalid"))
 }
 
+/// Verifies one already domain-separated canonical contract transcript.
+///
+/// The transcript is constructed by the pinned Sovereign Contracts binding;
+/// this engine helper contributes only owner-pinned Ed25519 trust. It does not
+/// define a second signing format or grant model, package, or execution
+/// authority.
+pub fn verify_canonical_contract_signature(
+    signer: &TrustedSigner,
+    envelope_key_id: SignerKeyId,
+    transcript: &[u8],
+    signature_bytes: &[u8; ED25519_SIGNATURE_BYTES],
+) -> Result<(), EngineError> {
+    if transcript.is_empty() || transcript.len() > 256 {
+        return Err(EngineError::invalid_input(
+            "canonical contract signature transcript is outside hard bounds",
+        ));
+    }
+    if !signer.is_active() {
+        return Err(EngineError::signature_failure("canonical contract signer is revoked"));
+    }
+    if signer.key_id() != envelope_key_id {
+        return Err(EngineError::signature_failure(
+            "canonical contract signer does not match owner configuration",
+        ));
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signer.public_key)
+        .map_err(|_| EngineError::signature_failure("configured contract key is invalid"))?;
+    if verifying_key.is_weak() {
+        return Err(EngineError::signature_failure("configured contract key is weak"));
+    }
+    let signature = Signature::from_bytes(signature_bytes);
+    verifying_key
+        .verify_strict(transcript, &signature)
+        .map_err(|_| EngineError::signature_failure("canonical contract signature is invalid"))
+}
+
 /// Strictly verifies one authenticated Go control-plane request body.
 pub fn verify_control_plane_signature(
     trusted_key: &TrustedControlPlaneKey,
@@ -770,6 +806,37 @@ mod tests {
         let revoked = TrustedSigner::revoked(key_id, signing_key.verifying_key().to_bytes())
             .expect("public key must validate");
         assert!(verify_package_signature(&revoked, key_id, &digest, &signature).is_err());
+    }
+
+    #[test]
+    fn canonical_contract_signature_uses_exact_owner_pinned_transcript() {
+        let signing_key = SigningKey::from_bytes(&[0x19; 32]);
+        let key_id = SignerKeyId::from_bytes([0x29; 16]).expect("key ID must validate");
+        let signer = TrustedSigner::active(key_id, signing_key.verifying_key().to_bytes())
+            .expect("owner-pinned signer must validate");
+        let transcript = b"SOVEREIGN-MODEL-EXECUTION-ADMISSION-V1\nfixture";
+        let signature = signing_key.sign(transcript).to_bytes();
+        verify_canonical_contract_signature(&signer, key_id, transcript, &signature)
+            .expect("exact canonical transcript must verify");
+
+        assert!(
+            verify_canonical_contract_signature(
+                &signer,
+                key_id,
+                b"SOVEREIGN-MODEL-EXECUTION-ADMISSION-V1\nsubstitution",
+                &signature,
+            )
+            .is_err()
+        );
+        let wrong_key = SignerKeyId::from_bytes([0x39; 16]).expect("key ID must validate");
+        assert!(
+            verify_canonical_contract_signature(&signer, wrong_key, transcript, &signature)
+                .is_err()
+        );
+        assert!(
+            verify_canonical_contract_signature(&signer, key_id, &[0_u8; 257], &signature,)
+                .is_err()
+        );
     }
 
     #[test]

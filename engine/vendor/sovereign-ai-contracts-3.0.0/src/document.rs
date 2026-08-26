@@ -37,6 +37,7 @@ use crate::knowledge_prefix::{StaticPrefixMaterialRequest, StaticPrefixMaterialR
 use crate::memory::{
     ApprovedMemoryWrite, MemoryCandidate, MemoryQuery, MemoryRecord, MemoryWriteProposal,
 };
+use crate::model_admission_v1::ModelExecutionAdmission;
 use crate::models::{ModelActivationRequest, ModelActivationState, ModelArtifactDescriptor};
 use crate::models_v2::ExecutionPackageDescriptor;
 use crate::negotiation::{
@@ -475,6 +476,11 @@ const DOCUMENT_REGISTRY: &[DocumentRegistryEntry] = &[
     },
     DocumentRegistryEntry {
         contract_version: "2.1.0",
+        kind: "model.execution_admission",
+        schema: "models/v2/models-2.1.0.schema.json",
+    },
+    DocumentRegistryEntry {
+        contract_version: "2.1.0",
         kind: "qualification.model_capability_manifest",
         schema: "qualification/v2/qualification-2.1.0.schema.json",
     },
@@ -600,6 +606,7 @@ fn normalize_value(contract_version: &str, kind: &str, value: Value) -> Result<V
         ("2.1.0", "qualification.model_capability_manifest") => {
             normalize::<ModelCapabilityManifestV21>(value)
         }
+        ("2.1.0", "model.execution_admission") => normalize::<ModelExecutionAdmission>(value),
         ("3.0.0", "inference.runtime_availability") => normalize::<RuntimeAvailabilityV3>(value),
         ("3.0.0", "inference.reservation_request") => {
             normalize::<InferenceReservationRequestV3>(value)

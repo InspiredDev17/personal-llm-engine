@@ -19,6 +19,25 @@
 
 ## Models and numerical evidence
 
+- GLM-5.3-Flash has an exact experimental metadata preflight and checked
+  architecture/state plan only. The importer pins the immutable upstream
+  revision and exact config/tokenizer/processor/index byte identities; its
+  safetensors source vocabulary can represent `F8_E4M3` without exposing it as
+  a runtime tensor dtype. The planner retains the exact 45-layer KDA/DSA,
+  mHC, sparse-MoE, context and lower-bound state facts. No signed package
+  profile, tokenizer runtime, FP8 decoder, KDA/DSA/mHC implementation,
+  multimodal processor, service route, Metal/CUDA execution, qualification or
+  activation exists. Every executable request remains typed
+  `UnsupportedArchitecture`; see ADR-0040.
+- Canonical Sovereign Models 2.1 `ModelExecutionAdmission` is consumed from
+  exact published Contracts commit
+  `f3ea60596c33faca673ad368304f162b30f2ac2f`. The engine authenticates bounded
+  canonical evidence, freshness, owner-pinned signer roles, anti-rollback
+  selection, Runtime V3 identity, and exact Models 2.0 descriptor/catalog
+  binding. This does not register or execute a package: the canonical
+  registration/runtime-attestation adapter remains deliberately
+  `NotImplemented`, and production activation remains unavailable. See
+  ADR-0041.
 - Manifest v1.0 accepts `decoder-rms-rope-swiglu-gqa-v1`. Engine 0.2.0 parses
   the exact engine-private manifest v1.1
   `qwen2.5-rms-rope-swiglu-gqa-bias-tied-v1` 1.5B bootstrap profiles. Tiny configurations

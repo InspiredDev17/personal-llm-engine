@@ -282,6 +282,13 @@ const COMPONENT_CONTRACT_REGISTRY: &[ComponentContractRegistryEntry] = &[
     ),
     entry(
         "2.1.0",
+        "models",
+        "schemas/models/v2/models-2.1.0.schema.json",
+        &["model_foundry"],
+        &["native_inference_engine", "personal_ai_platform"],
+    ),
+    entry(
+        "2.1.0",
         "qualification",
         "schemas/qualification/v2/qualification-2.1.0.schema.json",
         &["model_foundry"],

@@ -556,7 +556,7 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 [[package]]
 name = "sovereign-ai-contracts"
 version = "3.0.0"
-source = "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=af62132e46fc641e7dd74eb3e21eabb6d40947c7#af62132e46fc641e7dd74eb3e21eabb6d40947c7"
+source = "git+https://github.com/InspiredDev17/Sovereign-AI-Contracts.git?rev=f3ea60596c33faca673ad368304f162b30f2ac2f#f3ea60596c33faca673ad368304f162b30f2ac2f"
 dependencies = [
  "serde",
  "serde_json",

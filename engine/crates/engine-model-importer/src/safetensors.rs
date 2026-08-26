@@ -11,11 +11,51 @@ pub const MAX_SAFETENSORS_HEADER_BYTES: usize = 64 * 1024 * 1024;
 /// Largest external tensor name inspected by the importer.
 pub const MAX_SOURCE_TENSOR_NAME_BYTES: usize = 256;
 
+/// Closed storage vocabulary accepted from safetensors source metadata.
+///
+/// `F8E4M3` is represented here only so an offline source preflight can account
+/// for the reviewed GLM-5.3-Flash artifact without lying about executable
+/// tensor support. It deliberately is not a runtime [`DType`]: conversion,
+/// kernels, and package admission must remain unsupported until independently
+/// implemented and qualified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafeTensorSourceDType {
+    /// IEEE 754 binary32 source storage.
+    F32,
+    /// IEEE 754 binary16 source storage.
+    F16,
+    /// Brain floating point 16-bit source storage.
+    BFloat16,
+    /// Safetensors `F8_E4M3` source storage.
+    F8E4M3,
+}
+
+impl SafeTensorSourceDType {
+    /// Returns the exact source-storage width.
+    pub const fn byte_width(self) -> u64 {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::BFloat16 => 2,
+            Self::F8E4M3 => 1,
+        }
+    }
+
+    /// Returns a runtime dtype only for already implemented source formats.
+    pub const fn runtime_dtype(self) -> Option<DType> {
+        match self {
+            Self::F32 => Some(DType::F32),
+            Self::F16 => Some(DType::F16),
+            Self::BFloat16 => Some(DType::BFloat16),
+            Self::F8E4M3 => None,
+        }
+    }
+}
+
 /// One validated tensor view into an immutable source file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SafeTensorRecord {
     name: String,
-    dtype: DType,
+    dtype: SafeTensorSourceDType,
     shape: TensorShape,
     data_range: Range<usize>,
 }
@@ -94,9 +134,14 @@ impl ParsedSafetensorsHeader {
             let absolute_end = data_start
                 .checked_add(tensor.end)
                 .ok_or_else(|| EngineError::resource_exhaustion("tensor end overflows"))?;
-            let expected = usize::try_from(tensor.shape.byte_len(tensor.dtype)?).map_err(|_| {
-                EngineError::resource_exhaustion("tensor length is not addressable")
-            })?;
+            let expected = tensor
+                .shape
+                .element_count()
+                .checked_mul(tensor.dtype.byte_width())
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    EngineError::resource_exhaustion("tensor length is not addressable")
+                })?;
             if tensor.end - tensor.start != expected || absolute_end > file_length {
                 return Err(corrupt("safetensors tensor range is out of bounds or wrong length"));
             }
@@ -149,8 +194,17 @@ impl SafeTensorRecord {
     }
 
     /// Returns the source tensor dtype.
-    pub const fn dtype(&self) -> DType {
+    pub const fn dtype(&self) -> SafeTensorSourceDType {
         self.dtype
+    }
+
+    /// Returns the corresponding runtime dtype when execution support exists.
+    pub fn runtime_dtype(&self) -> Result<DType, EngineError> {
+        self.dtype.runtime_dtype().ok_or_else(|| {
+            EngineError::not_implemented(
+                "safetensors F8_E4M3 decoding and runtime execution are unavailable",
+            )
+        })
     }
 
     /// Returns the checked source tensor shape.
@@ -211,7 +265,7 @@ impl<'a> ParsedSafetensors<'a> {
 #[derive(Debug)]
 struct RelativeTensor {
     name: String,
-    dtype: DType,
+    dtype: SafeTensorSourceDType,
     shape: TensorShape,
     start: usize,
     end: usize,
@@ -443,11 +497,12 @@ impl<'a> HeaderParser<'a> {
     }
 }
 
-fn parse_dtype(value: &str) -> Result<DType, EngineError> {
+fn parse_dtype(value: &str) -> Result<SafeTensorSourceDType, EngineError> {
     match value {
-        "F32" => Ok(DType::F32),
-        "F16" => Ok(DType::F16),
-        "BF16" => Ok(DType::BFloat16),
+        "F32" => Ok(SafeTensorSourceDType::F32),
+        "F16" => Ok(SafeTensorSourceDType::F16),
+        "BF16" => Ok(SafeTensorSourceDType::BFloat16),
+        "F8_E4M3" => Ok(SafeTensorSourceDType::F8E4M3),
         _ => Err(EngineError::not_implemented("safetensors source dtype is unsupported")),
     }
 }
@@ -497,6 +552,16 @@ mod tests {
             assert_eq!(parsed.tensors().len(), 1);
             assert_eq!(parsed.tensor_bytes(&parsed.tensors()[0]).expect("bytes must exist"), data);
         }
+    }
+
+    #[test]
+    fn represents_f8_e4m3_source_without_claiming_runtime_support() {
+        let header = r#"{"weight":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[0,2]}}"#;
+        let bytes = fixture(header, &[0x7f, 0x01]);
+        let parsed = ParsedSafetensors::parse(&bytes).expect("FP8 source metadata must parse");
+        let tensor = &parsed.tensors()[0];
+        assert_eq!(tensor.dtype(), SafeTensorSourceDType::F8E4M3);
+        assert!(matches!(tensor.runtime_dtype(), Err(EngineError::NotImplemented(_))));
     }
 
     #[test]

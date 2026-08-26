@@ -15,6 +15,8 @@ memory, tool, approval, or Agent Green behavior.
 
 | Stage | Status | Current evidence |
 | --- | --- | --- |
+| GLM-5.3-Flash portability | EXPERIMENTAL SOURCE/PLAN ONLY | Exact immutable metadata identities, source-only `F8_E4M3` representation, exact 45-layer KDA/DSA and MoE/mHC facts, checked minimum state accounting, and content-free blockers. No package, tokenizer runtime, decoder, service, backend qualification, or activation exists. |
+| Canonical Models 2.1 admission | AUTHENTICATED EVIDENCE / UNACTIVATED | Exact published Contracts commit `f3ea60596c33faca673ad368304f162b30f2ac2f` is pinned and vendored. The engine authenticates canonical admission, owner trust, freshness, anti-rollback selection, Runtime V3 identity and Models 2.0 descriptor/catalog binding. Package registration, runtime attestation, service execution and production activation remain unavailable. |
 | 0. Boundaries/workspace | COMPLETE | 22-crate workspace, docs, limits, feature/DAG tests, and a pinned offline Linux/macOS verification definition |
 | 1. Package/cryptography | COMPLETE for legacy v1.0 and experimental Qwen2.5 v1.1 mechanics | Fixed manifest/catalog/records, SHA-384, strict Ed25519, closed files, version/architecture binding and corruption tests; v1.1 is engine 0.2.0 and no production Qwen package approval exists |
 | 2. Registry/loader | COMPLETE for legacy v1.0 and default-off Qwen development admission | Registry V2 stays frozen. A separate signed, anti-rollback V3 record plus canonical Models 2.0 descriptor, exact PAIDIR01 identity and owner Runtime-v3 identity admit only the ARM64 development path; CPU, Metal and production remain ineligible. |

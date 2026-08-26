@@ -23,6 +23,10 @@ use sovereign_ai_contracts::knowledge_prefix::{
     StaticPrefixMaterialRequest, StaticPrefixMaterialResult,
 };
 use sovereign_ai_contracts::memory::SensitivityClass;
+use sovereign_ai_contracts::model_admission_v1::{
+    canonical_model_execution_admission_digest, validate_model_execution_admission_revision,
+    ModelAdmissionState, ModelAdmissionTrustState, ModelExecutionAdmission,
+};
 use sovereign_ai_contracts::qualification_v2::{
     canonical_model_capability_digest, validate_manifest_revision, ModelCapabilityManifest,
 };
@@ -64,6 +68,7 @@ fn shared_semantic_fixtures_fail_closed() {
             "cognitive" => cognitive_mutation(&case.mutation),
             "qualification_v2" => qualification_mutation(&case.mutation),
             "qualification_v2_1" => qualification_v21_mutation(&case.mutation),
+            "model_admission_v1" => model_admission_v1_mutation(&case.mutation),
             "knowledge" => knowledge_mutation(&case.mutation),
             "knowledge_prefix" => knowledge_prefix_mutation(&case.mutation),
             other => panic!("unknown suite {other}"),
@@ -74,6 +79,83 @@ fn shared_semantic_fixtures_fail_closed() {
             case.name,
             case.mutation
         );
+    }
+}
+
+fn finalize_admission(value: &mut ModelExecutionAdmission) -> Result<()> {
+    value.canonical_digest = canonical_model_execution_admission_digest(&value.payload)?;
+    Ok(())
+}
+
+fn next_admission(previous: &ModelExecutionAdmission) -> Result<ModelExecutionAdmission> {
+    let mut current = previous.clone();
+    current.payload.revision += 1;
+    current.payload.registry_sequence += 1;
+    current.payload.previous_revision_digest = Some(previous.canonical_digest.clone());
+    current.payload.issued_at = "2026-08-25T12:02:00Z".into();
+    finalize_admission(&mut current)?;
+    Ok(current)
+}
+
+fn model_admission_v1_mutation(mutation: &str) -> Result<()> {
+    let mut previous: ModelExecutionAdmission = fixture("model-execution-admission-v2.1.json");
+    match mutation {
+        "development_production_activation" => {
+            previous.payload.admission_state = ModelAdmissionState::ProductionActivated;
+            previous.payload.development_execution_authorized = false;
+            previous.payload.production_activation = true;
+            previous.validate()
+        }
+        "same_revision_replay" => validate_model_execution_admission_revision(&previous, &previous),
+        "maximum_revision_terminal" => {
+            previous.payload.revision = u64::MAX;
+            previous.payload.previous_revision_digest = Some("a".repeat(64));
+            finalize_admission(&mut previous)?;
+            validate_model_execution_admission_revision(&previous, &previous)
+        }
+        "revoked_terminal" => {
+            previous.payload.admission_state = ModelAdmissionState::Revoked;
+            previous.payload.development_execution_authorized = false;
+            finalize_admission(&mut previous)?;
+            let current = next_admission(&previous)?;
+            validate_model_execution_admission_revision(&previous, &current)
+        }
+        "trust_downgrade" => {
+            previous.payload.trust_state = ModelAdmissionTrustState::Verified;
+            finalize_admission(&mut previous)?;
+            let mut current = next_admission(&previous)?;
+            current.payload.trust_state = ModelAdmissionTrustState::DevelopmentFixture;
+            finalize_admission(&mut current)?;
+            validate_model_execution_admission_revision(&previous, &current)
+        }
+        _ => {
+            let mut current = next_admission(&previous)?;
+            match mutation {
+                "runtime_identity_substitution" => {
+                    current.payload.runtime_identity.provider_model_id =
+                        "provider.substituted".into();
+                }
+                "descriptor_substitution" => {
+                    current.payload.execution_package_descriptor_digest.digest = format!(
+                        "a{}",
+                        &current.payload.execution_package_descriptor_digest.digest[1..]
+                    );
+                }
+                "signer_substitution" => {
+                    current.payload.package_signer_identity.authority_id =
+                        "package.authority.other".into();
+                }
+                "registry_floor_rollback" => {
+                    current.payload.minimum_registry_sequence -= 1;
+                }
+                "expiry_extension" => {
+                    current.payload.expires_at = "2026-10-25T12:01:00Z".into();
+                }
+                other => panic!("unknown model admission v1 mutation {other}"),
+            }
+            finalize_admission(&mut current)?;
+            validate_model_execution_admission_revision(&previous, &current)
+        }
     }
 }
 

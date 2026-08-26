@@ -34,7 +34,7 @@ loading, or GPU kernels.
 | `unicode-ident 1.0.24` | (MIT OR Apache-2.0) AND Unicode-3.0 | Rust identifier parsing beneath proc macros |
 | `rustc_version 0.4.1` | MIT OR Apache-2.0 | Locked curve build-time compiler capability selection; no fetch |
 | `semver 1.0.28` | MIT OR Apache-2.0 | Version parsing for `rustc_version` |
-| `sovereign-ai-contracts 3.0.0` at `af62132e46fc641e7dd74eb3e21eabb6d40947c7` | Apache-2.0 | Direct canonical Models 2.0 package identity plus provider-neutral runtime-v3 identity; only the narrow `models-v2` feature and its runtime-v3 dependency are compiled, excluding cognitive/tool/memory/security authority modules |
+| `sovereign-ai-contracts 3.0.0` at `f3ea60596c33faca673ad368304f162b30f2ac2f` | Apache-2.0 | Direct canonical Models 2.1 admission, Models 2.0 package identity, and provider-neutral Runtime V3 identity; only the narrow `model-admission-v1` feature and its models-v2/runtime-v3 dependencies are compiled, excluding cognitive/tool/memory/security authority modules |
 | `serde 1.0.229` | MIT OR Apache-2.0 | Strict bounded runtime-v3 document serialization support beneath the canonical contract |
 | `serde_core 1.0.229` | MIT OR Apache-2.0 | Serde core traits beneath the canonical contract |
 | `serde_derive 1.0.229` | MIT OR Apache-2.0 | Offline compile-time derivation for closed canonical contract documents |

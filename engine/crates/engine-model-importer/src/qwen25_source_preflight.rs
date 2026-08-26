@@ -9,11 +9,13 @@
 use crate::safetensors::ParsedSafetensorsHeader;
 use crate::{
     ImportSpec, QWEN25_MODEL_SAFETENSORS_BYTES, QWEN25_TOKENIZER_BYTES, Qwen25ConfigProfile,
-    SourceMapping, canonical_name, corrupt, expected_shapes,
+    SafeTensorSourceDType, SourceMapping, canonical_name, corrupt, expected_shapes,
 };
 use personalai_engine_crypto::hash_sha256_bounded_reader;
 use personalai_engine_quantization::QuantizationProfile;
-use personalai_engine_types::{DType, EngineError, ModelId, Sha256Digest};
+#[cfg(test)]
+use personalai_engine_types::DType;
+use personalai_engine_types::{EngineError, ModelId, Sha256Digest};
 use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -243,7 +245,7 @@ fn validate_qwen25_tensor_inventory(
     }
     let mut seen = BTreeSet::new();
     for tensor in metadata.tensors() {
-        if tensor.dtype() != DType::BFloat16 {
+        if tensor.dtype() != SafeTensorSourceDType::BFloat16 {
             return Err(corrupt("Qwen2.5 source tensor dtype must be BF16"));
         }
         let canonical = canonical_name(SourceMapping::Qwen25SafetensorsV1, tensor.name(), 28)?;
